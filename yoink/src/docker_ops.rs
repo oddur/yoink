@@ -59,6 +59,16 @@ impl Host {
     pub fn ssh_url(&self) -> String {
         format!("ssh://{}@{}", self.user, self.address)
     }
+
+    /// The magical "local" host bypasses ssh and talks to the
+    /// platform-default docker socket (unix socket on Linux/macOS,
+    /// npipe on Windows). Auto-injected at config-load time when a
+    /// local docker daemon is reachable; explicit users can also
+    /// add `address: local` to `yoink.yaml`.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        self.address == "local"
+    }
 }
 
 impl From<&YoinkHost> for Host {
@@ -495,12 +505,23 @@ impl RealDockerOps {
         if let Some(c) = clients.get(&key) {
             return Ok(c.clone());
         }
-        let docker =
-            Docker::connect_with_ssh(&key, self.timeout_secs, bollard::API_DEFAULT_VERSION, None)
-                .map_err(|source| DockerError::Connect {
+        // The magical "local" host (address == "local", no user)
+        // routes to the local docker socket via bollard's
+        // platform-default unix socket / npipe transport. Lets the
+        // operator run yoink against their laptop's docker without
+        // editing yoink.yaml.
+        let docker = if host.is_local() {
+            Docker::connect_with_local_defaults().map_err(|source| DockerError::Connect {
                 host: host.address.clone(),
                 source,
-            })?;
+            })?
+        } else {
+            Docker::connect_with_ssh(&key, self.timeout_secs, bollard::API_DEFAULT_VERSION, None)
+                .map_err(|source| DockerError::Connect {
+                    host: host.address.clone(),
+                    source,
+                })?
+        };
         clients.insert(key.clone(), docker.clone());
         Ok(docker)
     }

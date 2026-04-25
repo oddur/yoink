@@ -336,6 +336,26 @@ pub struct ConfigFragment {
     pub hooks: HookConfig,
 }
 
+/// True when one of the platform-default docker socket paths exists.
+/// Doesn't actually try to connect — that's a config-load fast path
+/// and hangs would be much worse than a stale check.
+fn local_socket_exists() -> bool {
+    // Order matters: rootless / Docker Desktop / OrbStack on macOS
+    // expose `~/.docker/run/docker.sock`; the system daemon symlinks
+    // the same path at `/var/run/docker.sock`. Either one is good.
+    if std::path::Path::new("/var/run/docker.sock").exists() {
+        return true;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".docker/run/docker.sock");
+        if p.exists() {
+            return true;
+        }
+    }
+    false
+}
+
 impl Config {
     pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -356,6 +376,31 @@ impl Config {
         let config: Self = yaml_serde::from_str(text)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Add a synthetic `local` host pointing at the local docker
+    /// socket — for the operator's laptop daemon, k3d/colima/orbstack
+    /// dev environments, or anywhere yoink is run without a real
+    /// fleet. Only fires when (a) the config doesn't already declare
+    /// a `local` host and (b) one of the platform-default socket
+    /// paths exists. No-op on Windows for now (npipe detection
+    /// requires a connect attempt rather than a path check).
+    ///
+    /// Read-only commands (`tui`, `status`, `diff`, `version`) call
+    /// this so the dashboard "just works" pointing at your laptop;
+    /// destructive commands (`up`, `restart`, `prune`, `rollback`)
+    /// don't, since silently deploying to localhost would surprise.
+    pub fn push_local_host_if_socket(&mut self) {
+        if self.hosts.iter().any(|h| h.address == "local") {
+            return;
+        }
+        if !local_socket_exists() {
+            return;
+        }
+        self.hosts.push(HostConfig {
+            address: "local".to_string(),
+            user: "local".to_string(),
+        });
     }
 
     /// Expand `self.include` globs against `self.config_dir`, parse each

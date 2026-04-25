@@ -849,9 +849,16 @@ async fn pty_session(
 }
 
 async fn cmd_tui(config: &Config, config_path: PathBuf, mode: Mode) -> Result<()> {
+    let mut config = config.clone();
+    // Magical local host: if a docker socket exists on this machine,
+    // append a `local` entry so the dashboard "just works" against
+    // your laptop daemon (Docker Desktop / OrbStack / rootless / k3d
+    // / colima). Read-only views only — destructive commands stay
+    // strict about what's in yoink.yaml.
+    config.push_local_host_if_socket();
     let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
         std::sync::Arc::new(RealDockerOps::new());
-    tui::run(config, config_path, ops, mode)
+    tui::run(&config, config_path, ops, mode)
         .await
         .context("run TUI")
 }
