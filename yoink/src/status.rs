@@ -2,6 +2,7 @@
 //! the typed responses into a `StatusReport`. Multi-service-aware: the
 //! report is grouped by host with all yoink-managed containers visible.
 
+use futures_util::future::try_join_all;
 use thiserror::Error;
 
 use crate::config::Config;
@@ -29,18 +30,7 @@ impl StatusReport {
     /// in the config. Filtered server-side via the `yoink.managed=true`
     /// label.
     pub async fn collect(ops: &dyn DockerOps, config: &Config) -> Result<Self, StatusError> {
-        let mut hosts = Vec::with_capacity(config.hosts.len());
-        for host_cfg in &config.hosts {
-            let host = Host::from(host_cfg);
-            let containers = ops
-                .list_containers_by_label(&host, "yoink.managed=true")
-                .await?;
-            hosts.push(HostStatus {
-                host: host.address,
-                containers,
-            });
-        }
-        Ok(Self { hosts })
+        Self::collect_with_label(ops, config, "yoink.managed=true").await
     }
 
     /// All containers for one named service across every host.
@@ -49,16 +39,28 @@ impl StatusReport {
         config: &Config,
         service_name: &str,
     ) -> Result<Self, StatusError> {
-        let label = format!("yoink.service={service_name}");
-        let mut hosts = Vec::with_capacity(config.hosts.len());
-        for host_cfg in &config.hosts {
+        Self::collect_with_label(ops, config, &format!("yoink.service={service_name}")).await
+    }
+
+    /// Per-host listing fan-out — runs the docker API calls concurrently
+    /// across hosts. Called every `FAST_TICK` from the dashboard, so
+    /// concurrency matters once we have multiple hosts.
+    async fn collect_with_label(
+        ops: &dyn DockerOps,
+        config: &Config,
+        label: &str,
+    ) -> Result<Self, StatusError> {
+        let per_host = config.hosts.iter().map(|host_cfg| {
             let host = Host::from(host_cfg);
-            let containers = ops.list_containers_by_label(&host, &label).await?;
-            hosts.push(HostStatus {
-                host: host.address,
-                containers,
-            });
-        }
+            async move {
+                let containers = ops.list_containers_by_label(&host, label).await?;
+                Ok::<_, DockerError>(HostStatus {
+                    host: host.address,
+                    containers,
+                })
+            }
+        });
+        let hosts = try_join_all(per_host).await?;
         Ok(Self { hosts })
     }
 

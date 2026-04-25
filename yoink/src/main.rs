@@ -190,21 +190,24 @@ async fn cmd_up(
     // tokio heartbeat task touches it every few seconds. If yoink
     // dies, heartbeats stop, sentinel self-exits within ~30s, and
     // the next deploy reaps it as an orphan. See `lock.rs`.
-    let mut locks: Vec<HostLock> = Vec::with_capacity(config.hosts.len());
-    for host_cfg in &config.hosts {
+    let acquire_futs = config.hosts.iter().map(|host_cfg| {
         let host = Host::from(host_cfg);
-        let mut lock = HostLock::acquire(&*ops, host.clone())
-            .await
-            .with_context(|| {
-                format!(
+        let ops = ops.clone();
+        async move {
+            let lock = HostLock::acquire(&*ops, host.clone())
+                .await
+                .with_context(|| format!(
                     "another `yoink up` appears to be in progress on {} (lock container running). \
-                 If you're sure no operator is deploying, the sentinel will self-exit within ~30s; \
-                 retry then. To force-clear: `docker rm -f yoink-deploy-lock` on the host.",
-                    host.address
-                )
-            })?;
+                     If you're sure no operator is deploying, the sentinel will self-exit within ~30s; \
+                     retry then. To force-clear: `docker rm -f yoink-deploy-lock` on the host.",
+                    host.address,
+                ))?;
+            anyhow::Ok(lock)
+        }
+    });
+    let mut locks: Vec<HostLock> = futures_util::future::try_join_all(acquire_futs).await?;
+    for lock in &mut locks {
         lock.spawn_heartbeat(ops.clone());
-        locks.push(lock);
     }
 
     let stderr = io::stderr();

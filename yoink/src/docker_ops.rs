@@ -385,6 +385,50 @@ impl RealDockerOps {
             source,
         }
     }
+
+    /// Create + start a container, then wait for it to exit. Returns
+    /// the exit code. The caller owns inspecting the container (logs)
+    /// and the final `force_remove_container` — this helper only
+    /// reaps on the *error* path so partial state never lingers.
+    /// Shared between the HTTP healthcheck, the TCP healthcheck, and
+    /// `run_one_shot` — they all do the same dance.
+    async fn create_start_wait(
+        &self,
+        host: &Host,
+        name: &str,
+        body: ContainerCreateBody,
+    ) -> Result<i64, DockerError> {
+        let docker = self.client_for(host).await?;
+        let create_opts = CreateContainerOptionsBuilder::new().name(name).build();
+        docker
+            .create_container(Some(create_opts), body)
+            .await
+            .map_err(|e| Self::err(host, e))?;
+        if let Err(e) = docker.start_container(name, None).await {
+            let _ = self.force_remove_container(host, name).await;
+            return Err(Self::err(host, e));
+        }
+        let wait_opts = WaitContainerOptionsBuilder::new()
+            .condition("not-running")
+            .build();
+        let mut wait_stream = docker.wait_container(name, Some(wait_opts));
+        match wait_stream.next().await {
+            Some(Ok(resp)) => Ok(resp.status_code),
+            Some(Err(bollard::errors::Error::DockerContainerWaitError { error: _, code })) => {
+                Ok(code)
+            }
+            Some(Err(other)) => {
+                let _ = self.force_remove_container(host, name).await;
+                Err(Self::err(host, other))
+            }
+            None => {
+                let _ = self.force_remove_container(host, name).await;
+                Err(DockerError::Invalid(
+                    "wait_container yielded no event".into(),
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -576,15 +620,11 @@ impl DockerOps for RealDockerOps {
         port: u16,
         path: &str,
     ) -> Result<u16, DockerError> {
-        let docker = self.client_for(host).await?;
         let url = format!("http://{target}:{port}{path}");
         let probe_name = format!("yoink-probe-{}-{}", target, rand_hex());
-
-        let mut endpoints = HashMap::new();
-        endpoints.insert(network.to_string(), EndpointSettings::default());
-        let body = ContainerCreateBody {
-            image: Some(HEALTHCHECK_CURL_IMAGE.to_string()),
-            cmd: Some(vec![
+        let body = probe_body(
+            network,
+            vec![
                 "-fsS".into(),
                 "-o".into(),
                 "/dev/null".into(),
@@ -593,52 +633,9 @@ impl DockerOps for RealDockerOps {
                 "--max-time".into(),
                 "5".into(),
                 url,
-            ]),
-            networking_config: Some(NetworkingConfig {
-                endpoints_config: Some(endpoints),
-            }),
-            host_config: Some(HostConfig {
-                auto_remove: Some(false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let create_opts = CreateContainerOptionsBuilder::new()
-            .name(&probe_name)
-            .build();
-        docker
-            .create_container(Some(create_opts), body)
-            .await
-            .map_err(|s| Self::err(host, s))?;
-        docker
-            .start_container(&probe_name, None)
-            .await
-            .map_err(|s| Self::err(host, s))?;
-
-        // Wait for the probe to exit.
-        let wait_opts = WaitContainerOptionsBuilder::new()
-            .condition("not-running")
-            .build();
-        let mut wait_stream = docker.wait_container(&probe_name, Some(wait_opts));
-        let exit_status_code = match wait_stream.next().await {
-            Some(Ok(resp)) => i32::try_from(resp.status_code).unwrap_or(i32::MAX),
-            Some(Err(bollard::errors::Error::DockerContainerWaitError { error: _, code })) => {
-                i32::try_from(code).unwrap_or(i32::MAX)
-            }
-            Some(Err(other)) => {
-                let _ = self.force_remove_container(host, &probe_name).await;
-                return Err(Self::err(host, other));
-            }
-            None => {
-                let _ = self.force_remove_container(host, &probe_name).await;
-                return Err(DockerError::Invalid(
-                    "wait_container yielded no event".into(),
-                ));
-            }
-        };
-
-        // Drain stdout to recover the HTTP status code curl printed.
+            ],
+        );
+        let exit_status = self.create_start_wait(host, &probe_name, body).await?;
         let logs = self.fetch_recent_logs(host, &probe_name, 32).await?;
         let _ = self.force_remove_container(host, &probe_name).await;
 
@@ -655,11 +652,7 @@ impl DockerOps for RealDockerOps {
             return Ok(n);
         }
         // Couldn't parse — fall back to exit code interpretation.
-        if exit_status_code == 0 {
-            Ok(200)
-        } else {
-            Ok(0)
-        }
+        if exit_status == 0 { Ok(200) } else { Ok(0) }
     }
 
     async fn exec_oneshot(
@@ -713,75 +706,31 @@ impl DockerOps for RealDockerOps {
         target: &str,
         port: u16,
     ) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
         // curl supports the telnet:// scheme with `--connect-timeout`
-        // for raw TCP probes — connect succeeds → exit 0, connect
-        // fails (refused/timeout/host unreachable) → non-zero exit.
-        // Reuses the same probe image as the HTTP healthcheck so we
-        // don't pull a second tools image just for `nc`.
+        // for raw TCP probes — connect succeeds → exit 0, connect fails
+        // (refused/timeout/host unreachable) → non-zero. Reuses the same
+        // image as the HTTP healthcheck so we don't pull a second tools
+        // image just for `nc`.
         let url = format!("telnet://{target}:{port}");
         let probe_name = format!("yoink-tcp-probe-{}-{}", target, rand_hex());
-
-        let mut endpoints = HashMap::new();
-        endpoints.insert(network.to_string(), EndpointSettings::default());
-        let body = ContainerCreateBody {
-            image: Some(HEALTHCHECK_CURL_IMAGE.to_string()),
-            cmd: Some(vec![
+        let body = probe_body(
+            network,
+            vec![
                 "--connect-timeout".into(),
                 "5".into(),
                 "--max-time".into(),
                 "5".into(),
                 url,
-            ]),
-            networking_config: Some(NetworkingConfig {
-                endpoints_config: Some(endpoints),
-            }),
-            host_config: Some(HostConfig {
-                auto_remove: Some(false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let create_opts = CreateContainerOptionsBuilder::new()
-            .name(&probe_name)
-            .build();
-        docker
-            .create_container(Some(create_opts), body)
-            .await
-            .map_err(|s| Self::err(host, s))?;
-        docker
-            .start_container(&probe_name, None)
-            .await
-            .map_err(|s| Self::err(host, s))?;
-
-        let wait_opts = WaitContainerOptionsBuilder::new()
-            .condition("not-running")
-            .build();
-        let mut wait_stream = docker.wait_container(&probe_name, Some(wait_opts));
-        let exit_status_code = match wait_stream.next().await {
-            Some(Ok(resp)) => i32::try_from(resp.status_code).unwrap_or(i32::MAX),
-            Some(Err(bollard::errors::Error::DockerContainerWaitError { error: _, code })) => {
-                i32::try_from(code).unwrap_or(i32::MAX)
-            }
-            Some(Err(other)) => {
-                let _ = self.force_remove_container(host, &probe_name).await;
-                return Err(Self::err(host, other));
-            }
-            None => {
-                let _ = self.force_remove_container(host, &probe_name).await;
-                return Err(DockerError::Invalid(
-                    "wait_container yielded no event".into(),
-                ));
-            }
-        };
+            ],
+        );
+        let exit_status = self.create_start_wait(host, &probe_name, body).await?;
         let _ = self.force_remove_container(host, &probe_name).await;
 
-        if exit_status_code == 0 {
+        if exit_status == 0 {
             Ok(())
         } else {
             Err(DockerError::Invalid(format!(
-                "tcp probe to {target}:{port} failed (curl exit {exit_status_code})"
+                "tcp probe to {target}:{port} failed (curl exit {exit_status})"
             )))
         }
     }
@@ -824,36 +773,8 @@ impl DockerOps for RealDockerOps {
         name: &str,
         body: ContainerCreateBody,
     ) -> Result<OneShotResult, DockerError> {
+        let exit_code = self.create_start_wait(host, name, body).await?;
         let docker = self.client_for(host).await?;
-        let create_opts = CreateContainerOptionsBuilder::new().name(name).build();
-        docker
-            .create_container(Some(create_opts), body)
-            .await
-            .map_err(|e| Self::err(host, e))?;
-        if let Err(e) = docker.start_container(name, None).await {
-            let _ = self.force_remove_container(host, name).await;
-            return Err(Self::err(host, e));
-        }
-
-        let wait_opts = WaitContainerOptionsBuilder::new()
-            .condition("not-running")
-            .build();
-        let mut wait_stream = docker.wait_container(name, Some(wait_opts));
-        let exit_code: i64 = match wait_stream.next().await {
-            Some(Ok(resp)) => resp.status_code,
-            Some(Err(bollard::errors::Error::DockerContainerWaitError { error: _, code })) => code,
-            Some(Err(other)) => {
-                let _ = self.force_remove_container(host, name).await;
-                return Err(Self::err(host, other));
-            }
-            None => {
-                let _ = self.force_remove_container(host, name).await;
-                return Err(DockerError::Invalid(
-                    "wait_container yielded no event".into(),
-                ));
-            }
-        };
-
         let (stdout, stderr) = collect_stdout_stderr(&docker, name).await?;
         let _ = self.force_remove_container(host, name).await;
         Ok(OneShotResult {
@@ -1084,6 +1005,27 @@ fn rand_hex() -> String {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
     format!("{nanos:08x}")
+}
+
+/// Build a `ContainerCreateBody` for a one-shot curl probe container:
+/// always uses `HEALTHCHECK_CURL_IMAGE`, attaches to the named docker
+/// network as a guest, and disables auto-remove so the caller can
+/// inspect logs / exit code before reaping.
+fn probe_body(network: &str, cmd: Vec<String>) -> ContainerCreateBody {
+    let mut endpoints = HashMap::new();
+    endpoints.insert(network.to_string(), EndpointSettings::default());
+    ContainerCreateBody {
+        image: Some(HEALTHCHECK_CURL_IMAGE.to_string()),
+        cmd: Some(cmd),
+        networking_config: Some(NetworkingConfig {
+            endpoints_config: Some(endpoints),
+        }),
+        host_config: Some(HostConfig {
+            auto_remove: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 // ───── FakeDockerOps ────────────────────────────────────────────────────

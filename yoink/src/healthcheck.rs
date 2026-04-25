@@ -25,6 +25,53 @@ pub enum HealthcheckError {
     },
 }
 
+/// Outcome of one probe attempt: either healthy (caller stops polling)
+/// or not-yet, with an optional HTTP status to surface in the timeout
+/// error message. The TCP probe always reports `None` since there's no
+/// HTTP code to report.
+enum AttemptOutcome {
+    Healthy,
+    NotYet { last_http_status: Option<u16> },
+}
+
+/// Generic backoff loop shared by `poll` (HTTP) and `poll_tcp` (TCP).
+/// Calls `attempt_fn` repeatedly until it returns `Healthy` or `budget`
+/// elapses. Backoff is `min(attempt_secs, time_left)` — same shape
+/// Kamal's poller uses.
+async fn poll_until<F, Fut>(budget: Duration, mut attempt_fn: F) -> Result<u32, HealthcheckError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<AttemptOutcome, DockerError>>,
+{
+    let deadline = Instant::now() + budget;
+    let mut attempt: u32 = 0;
+    // `last_http_status` is overwritten by the first `NotYet` arm
+    // before any read; the initial `None` is just to satisfy the
+    // borrow checker on the timeout branch.
+    #[allow(unused_assignments)]
+    let mut last_http_status: Option<u16> = None;
+    loop {
+        attempt += 1;
+        match attempt_fn(attempt).await? {
+            AttemptOutcome::Healthy => return Ok(attempt),
+            AttemptOutcome::NotYet {
+                last_http_status: s,
+            } => last_http_status = s,
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(HealthcheckError::TimedOut {
+                budget,
+                attempts: attempt,
+                last_http_status,
+            });
+        }
+        let remaining = deadline - now;
+        let backoff = Duration::from_secs(u64::from(attempt)).min(remaining);
+        sleep(backoff).await;
+    }
+}
+
 /// Poll a TCP-connect probe until it succeeds or `budget` elapses.
 /// Used for services that don't expose a useful HTTP endpoint —
 /// redis (line-protocol on :6379), caddy (TLS on :443), and so on.
@@ -38,36 +85,25 @@ pub async fn poll_tcp(
     port: u16,
     budget: Duration,
 ) -> Result<u32, HealthcheckError> {
-    let deadline = Instant::now() + budget;
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
+    poll_until(budget, |attempt| async move {
         match ops.healthcheck_tcp(host, network, container, port).await {
             Ok(()) => {
                 debug!(host = %host.address, container, attempt, "tcp probe ok");
-                return Ok(attempt);
+                Ok(AttemptOutcome::Healthy)
             }
             Err(e) => {
                 debug!(host = %host.address, container, attempt, error = %e, "tcp probe failed");
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(HealthcheckError::TimedOut {
-                        budget,
-                        attempts: attempt,
-                        last_http_status: None,
-                    });
-                }
-                let remaining = deadline - now;
-                let backoff = Duration::from_secs(u64::from(attempt)).min(remaining);
-                sleep(backoff).await;
+                Ok(AttemptOutcome::NotYet {
+                    last_http_status: None,
+                })
             }
         }
-    }
+    })
+    .await
 }
 
-/// Poll the new container's healthcheck endpoint until 200 or `budget`
-/// elapses. Returns the number of attempts on success.
-#[allow(clippy::too_many_arguments)]
+/// Poll the new container's HTTP healthcheck endpoint until 200 or
+/// `budget` elapses. Returns the number of attempts on success.
 pub async fn poll(
     ops: &dyn DockerOps,
     host: &Host,
@@ -77,38 +113,21 @@ pub async fn poll(
     path: &str,
     budget: Duration,
 ) -> Result<u32, HealthcheckError> {
-    let deadline = Instant::now() + budget;
-    let mut attempt: u32 = 0;
-    let mut last_http_status: Option<u16>;
-    loop {
-        attempt += 1;
+    poll_until(budget, |attempt| async move {
         let status = ops
             .healthcheck(host, network, container, port, path)
             .await?;
         if status == 200 {
             debug!(host = %host.address, container, attempt, "healthcheck 200");
-            return Ok(attempt);
+            Ok(AttemptOutcome::Healthy)
+        } else {
+            debug!(host = %host.address, container, attempt, status, "healthcheck non-200");
+            Ok(AttemptOutcome::NotYet {
+                last_http_status: Some(status),
+            })
         }
-        last_http_status = Some(status);
-        debug!(
-            host = %host.address,
-            container,
-            attempt,
-            status,
-            "healthcheck non-200"
-        );
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(HealthcheckError::TimedOut {
-                budget,
-                attempts: attempt,
-                last_http_status,
-            });
-        }
-        let remaining = deadline - now;
-        let backoff = Duration::from_secs(u64::from(attempt)).min(remaining);
-        sleep(backoff).await;
-    }
+    })
+    .await
 }
 
 #[cfg(test)]
