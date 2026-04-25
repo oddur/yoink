@@ -7,7 +7,7 @@
 # infrastructure (caddy, redis) live side-by-side.
 
 deploy:
-  network: yoink
+  networks: [yoink]
 
 hosts:
   - address: host-a

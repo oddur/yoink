@@ -110,6 +110,9 @@ pub struct ContainerInfo {
     /// Unix-seconds timestamp the container was deployed, parsed
     /// from `yoink.deployed-at`. Used by `yoink history` to sort.
     pub yoink_deployed_at: Option<i64>,
+    /// Docker networks this container is attached to (sorted, so
+    /// the rendered display is stable).
+    pub networks: Vec<String>,
     pub other_labels: BTreeMap<String, String>,
 }
 
@@ -152,6 +155,15 @@ impl ContainerInfo {
             .first()
             .map(|n| n.trim_start_matches('/').to_string())
             .unwrap_or_default();
+        let networks = summary
+            .network_settings
+            .and_then(|n| n.networks)
+            .map(|m| {
+                let mut keys: Vec<String> = m.into_keys().collect();
+                keys.sort();
+                keys
+            })
+            .unwrap_or_default();
         Self {
             host: host.to_string(),
             name,
@@ -167,6 +179,7 @@ impl ContainerInfo {
             yoink_spec_hash,
             yoink_deployed_by,
             yoink_deployed_at,
+            networks,
             other_labels,
         }
     }

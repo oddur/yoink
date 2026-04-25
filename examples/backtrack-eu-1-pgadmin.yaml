@@ -45,7 +45,7 @@
 #   (then) kamal accessory boot pgadmin
 
 deploy:
-  network: yoink
+  networks: [yoink]
 
 hosts:
   - address: backtrack-eu-1

@@ -345,17 +345,22 @@ async fn prepare_one_host(
         host: host.address.clone(),
     });
 
-    let created = network::ensure(ops, &host, &config.deploy.network)
-        .await
-        .map_err(|source| DeployError::Docker {
+    // Ensure every declared network exists on this host. Each
+    // ensure_network call is idempotent (returns whether it had to
+    // create) — emit one NetworkReady event per network.
+    for net in &config.deploy.networks {
+        let created = network::ensure(ops, &host, net)
+            .await
+            .map_err(|source| DeployError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
+        on_event(DeployEvent::NetworkReady {
             host: host.address.clone(),
-            source,
-        })?;
-    on_event(DeployEvent::NetworkReady {
-        host: host.address.clone(),
-        network: config.deploy.network.clone(),
-        created,
-    });
+            network: net.clone(),
+            created,
+        });
+    }
 
     let credentials = registry_credentials(config, secrets);
     pull_image(ops, &host, &service.image, tag, credentials, on_event).await?;
@@ -543,7 +548,7 @@ fn build_run_spec(
     RunSpec {
         image: service.image.clone(),
         tag: tag.to_string(),
-        network: config.deploy.network.clone(),
+        networks: service.effective_networks(&config.deploy),
         container_name,
         labels: build_labels(service, tag, spec_hash),
         env: build_env(service, secrets),
@@ -715,12 +720,16 @@ async fn wait_until_healthy(
     };
     // Path present → HTTP probe. Path absent → TCP-connect probe (for
     // non-HTTP services like redis or TLS-only edges like caddy).
+    // The probe must share at least one network with the target;
+    // pick the service's first effective network.
+    let effective = service.effective_networks(&config.deploy);
+    let probe_network = effective.first().map_or("bridge", String::as_str);
     let result = match service.run.healthcheck_path.as_deref() {
         Some(path) => {
             healthcheck::poll(
                 ops,
                 host,
-                &config.deploy.network,
+                probe_network,
                 new_name,
                 port,
                 path,
@@ -732,7 +741,7 @@ async fn wait_until_healthy(
             healthcheck::poll_tcp(
                 ops,
                 host,
-                &config.deploy.network,
+                probe_network,
                 new_name,
                 port,
                 service.run.healthcheck_timeout,
@@ -833,10 +842,19 @@ async fn run_hook(
             source,
         })?;
 
+    // Hooks share the deploy's first network so they can reach
+    // services on it (e.g. a migration hook hitting the database).
+    // Operators with stricter isolation needs can put their hooks
+    // on a dedicated network and put it first in deploy.networks.
+    let hook_network = config
+        .deploy
+        .networks
+        .first()
+        .map_or("bridge", String::as_str);
     let body = docker::build_hook_container(
         &hook.image,
         tag,
-        &config.deploy.network,
+        hook_network,
         hook.entrypoint.as_deref(),
         &hook.cmd,
         &hook_env(hook, secrets),
@@ -978,6 +996,7 @@ services:
                 yoink_spec_hash: None,
             yoink_deployed_by: None,
             yoink_deployed_at: None,
+            networks: Vec::new(),
                 other_labels: std::collections::BTreeMap::new(),
             })
             .collect()));
@@ -1072,6 +1091,7 @@ services:
             yoink_spec_hash: Some(hash.clone()),
             yoink_deployed_by: None,
             yoink_deployed_at: None,
+            networks: Vec::new(),
             other_labels: std::collections::BTreeMap::new(),
         }]));
 

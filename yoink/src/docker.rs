@@ -37,7 +37,12 @@ pub enum BuildError {
 pub struct RunSpec {
     pub image: String,
     pub tag: String,
-    pub network: String,
+    /// Docker networks the container attaches to. Always non-empty
+    /// (validated upstream in `Config::validate`). The first entry
+    /// is also used as `host_config.network_mode` (docker requires
+    /// a primary), and as the network the healthcheck probe is
+    /// attached to.
+    pub networks: Vec<String>,
     pub container_name: String,
     pub labels: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
@@ -71,7 +76,7 @@ pub fn build_container(spec: &RunSpec) -> Result<ContainerCreateBody, BuildError
 
     let host_config = build_host_config(spec, port_bindings)?;
     let networking_config =
-        build_networking_config(&spec.network, &spec.container_name, &spec.options);
+        build_networking_config(&spec.networks, &spec.container_name, &spec.options);
 
     Ok(ContainerCreateBody {
         image: Some(format!("{}:{}", spec.image, spec.tag)),
@@ -138,7 +143,13 @@ fn build_host_config(
     port_bindings: HashMap<String, Option<Vec<PortBinding>>>,
 ) -> Result<HostConfig, BuildError> {
     let options = &spec.options;
-    let network = spec.network.as_str();
+    // Docker requires a single primary `network_mode`; we use the
+    // first declared network and attach the rest via the
+    // networking_config endpoints map.
+    let network = spec
+        .networks
+        .first()
+        .map_or("bridge", String::as_str);
     let memory = options.memory.as_deref().map(parse_memory).transpose()?;
 
     let restart_policy = match options.restart.as_deref().unwrap_or("unless-stopped") {
@@ -195,24 +206,26 @@ fn build_host_config(
 }
 
 fn build_networking_config(
-    network: &str,
+    networks: &[String],
     container_name: &str,
     options: &RunOptions,
 ) -> NetworkingConfig {
-    // The container is always reachable on the shared docker network by
-    // its container name (Docker's built-in alias). We add additional
-    // user-supplied aliases on top, which is how Caddy / other apps
-    // discover this service when its name isn't a stable URL.
+    // The container is reachable on each attached network by its
+    // container name (docker's built-in alias). User-supplied
+    // aliases are added to every network — same alias works
+    // regardless of which network the caller dialed in on.
     let mut aliases = vec![container_name.to_string()];
     aliases.extend(options.network_aliases.iter().cloned());
     let mut endpoints = HashMap::new();
-    endpoints.insert(
-        network.to_string(),
-        EndpointSettings {
-            aliases: Some(aliases),
-            ..Default::default()
-        },
-    );
+    for network in networks {
+        endpoints.insert(
+            network.clone(),
+            EndpointSettings {
+                aliases: Some(aliases.clone()),
+                ..Default::default()
+            },
+        );
+    }
     NetworkingConfig {
         endpoints_config: Some(endpoints),
     }
@@ -306,7 +319,10 @@ pub fn compute_spec_hash(spec: &RunSpec) -> String {
     let mut h = Sha256::new();
     feed(&mut h, "image", spec.image.as_bytes());
     feed(&mut h, "tag", spec.tag.as_bytes());
-    feed(&mut h, "network", spec.network.as_bytes());
+    // Sort networks so the hash is stable across yaml reorderings.
+    let mut networks_sorted = spec.networks.clone();
+    networks_sorted.sort();
+    feed_list(&mut h, "networks", &networks_sorted);
     feed_map(&mut h, "env", &spec.env);
     feed_map(&mut h, "labels", &spec.labels);
     feed_opt_list(&mut h, "entrypoint", spec.entrypoint.as_deref());
@@ -398,7 +414,7 @@ mod tests {
         RunSpec {
             image: "registry.example.com/app-a".into(),
             tag: "a1b2c3d".into(),
-            network: "yoink".into(),
+            networks: vec!["yoink".into()],
             container_name: "app-a-a1b2c3d".into(),
             labels,
             env,

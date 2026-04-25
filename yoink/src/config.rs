@@ -77,8 +77,10 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeployDefaults {
-    #[serde(default = "default_network")]
-    pub network: String,
+    /// Docker networks the deploy declares. Every name a service
+    /// references in its own `networks:` list must appear here.
+    /// At least one entry required.
+    pub networks: Vec<String>,
     #[serde(default)]
     pub strategy: Strategy,
     #[serde(default)]
@@ -88,7 +90,7 @@ pub struct DeployDefaults {
 impl Default for DeployDefaults {
     fn default() -> Self {
         Self {
-            network: default_network(),
+            networks: vec![default_network()],
             strategy: Strategy::default(),
             on_failure: OnFailure::default(),
         }
@@ -187,7 +189,24 @@ pub struct ServiceConfig {
     /// (so `yoink up --service api` does NOT run web's migrations).
     #[serde(default)]
     pub pre_deploy: Vec<HookSpec>,
+    /// Docker networks this service attaches to. When unset (the
+    /// common single-network case), the service attaches to every
+    /// network declared under `deploy.networks`. When set, must be
+    /// a non-empty subset of `deploy.networks` — this is how the
+    /// operator opts a service out of a network for tier
+    /// isolation (e.g. caddy with `[frontend]` only, no db reach).
+    #[serde(default)]
+    pub networks: Option<Vec<String>>,
     pub run: ServiceRun,
+}
+
+impl ServiceConfig {
+    /// The networks this service will actually attach to — its
+    /// declared list when set, else every network in `deploy.networks`.
+    #[must_use]
+    pub fn effective_networks(&self, deploy: &DeployDefaults) -> Vec<String> {
+        self.networks.clone().unwrap_or_else(|| deploy.networks.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -452,9 +471,9 @@ impl Config {
 
     #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.deploy.network.trim().is_empty() {
+        if self.deploy.networks.is_empty() {
             return Err(ConfigError::Invalid(
-                "deploy.network must not be empty".into(),
+                "deploy.networks must declare at least one network".into(),
             ));
         }
         if self.hosts.is_empty() {
@@ -480,6 +499,24 @@ impl Config {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate hosts.address {:?}",
                     host.address
+                )));
+            }
+        }
+
+        // Top-level network declarations: each entry must be unique
+        // and non-empty. Services can only attach to networks
+        // declared here.
+        let mut declared_networks: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for n in &self.deploy.networks {
+            if n.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "deploy.networks entries must not be empty".into(),
+                ));
+            }
+            if !declared_networks.insert(n.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate deploy.networks entry {n:?}"
                 )));
             }
         }
@@ -550,6 +587,31 @@ impl Config {
                     "service {:?}.run.port required when healthcheck_path is set",
                     service.name
                 )));
+            }
+            if let Some(nets) = &service.networks {
+                if nets.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.networks is set but empty; remove the field to attach to every \
+                         deploy.networks entry",
+                        service.name
+                    )));
+                }
+                let mut seen = std::collections::HashSet::new();
+                for n in nets {
+                    if !declared_networks.contains(n.as_str()) {
+                        return Err(ConfigError::Invalid(format!(
+                            "service {:?}.networks references undeclared network {n:?} \
+                             (declare it under deploy.networks)",
+                            service.name
+                        )));
+                    }
+                    if !seen.insert(n.as_str()) {
+                        return Err(ConfigError::Invalid(format!(
+                            "service {:?}.networks contains duplicate {n:?}",
+                            service.name
+                        )));
+                    }
+                }
             }
         }
 
@@ -670,7 +732,7 @@ services:
                 "yoink.yaml",
                 r#"
 deploy:
-  network: kamal
+  networks: [kamal]
 hosts:
   - { address: h1, user: root }
 include:
@@ -708,7 +770,7 @@ hooks:
         let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
         // sorted by file name ⇒ api before web
         assert_eq!(names, vec!["api", "web"]);
-        assert_eq!(cfg.deploy.network, "kamal");
+        assert_eq!(cfg.deploy.networks, vec!["kamal".to_string()]);
         assert_eq!(cfg.hooks.pre_deploy.len(), 1);
         assert_eq!(cfg.hooks.pre_deploy[0].name, "migrate");
     }
@@ -768,7 +830,7 @@ services:
     #[test]
     fn parses_minimal() {
         let c = Config::parse_str(minimal()).unwrap();
-        assert_eq!(c.deploy.network, "yoink");
+        assert_eq!(c.deploy.networks, vec!["yoink".to_string()]);
         assert_eq!(c.hosts.len(), 1);
         assert_eq!(c.services.len(), 1);
         assert_eq!(c.services[0].name, "app-a");

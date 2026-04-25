@@ -116,6 +116,7 @@ services:
             yoink_spec_hash: None,
             yoink_deployed_by: None,
             yoink_deployed_at: None,
+            networks: Vec::new(),
             other_labels: BTreeMap::new(),
         }
     }

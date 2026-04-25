@@ -25,7 +25,7 @@
 #       | xargs -r docker rm -f && docker network rm yoink-test 2>/dev/null'
 
 deploy:
-  network: yoink-test
+  networks: [yoink-test]
 
 hosts:
   - address: backtrack-eu-1

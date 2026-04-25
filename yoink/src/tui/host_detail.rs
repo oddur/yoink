@@ -160,8 +160,9 @@ impl HostDetailState {
         let widths = [
             Constraint::Length(14), // service
             Constraint::Length(28), // container
-            Constraint::Length(32), // image
-            Constraint::Length(22), // status
+            Constraint::Length(28), // image
+            Constraint::Length(22), // networks
+            Constraint::Length(20), // status
             Constraint::Length(10), // state
             Constraint::Length(10), // health
             Constraint::Length(20), // cpu (value + bracketed gauge)
@@ -190,6 +191,11 @@ impl HostDetailState {
                         Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
                         Cell::from(c.name.clone()),
                         Cell::from(short_image(&c.image)),
+                        Cell::from(if c.networks.is_empty() {
+                            "-".to_string()
+                        } else {
+                            c.networks.join(", ")
+                        }),
                         Cell::from(c.status_text.clone()),
                         Cell::from(c.state.clone()).style(state_style(&c.state)),
                         Cell::from(health.to_string()).style(health_style(health)),
@@ -204,6 +210,7 @@ impl HostDetailState {
                 Cell::from("service").style(bold()),
                 Cell::from("container").style(bold()),
                 Cell::from("image").style(bold()),
+                Cell::from("networks").style(bold()),
                 Cell::from("status").style(bold()),
                 Cell::from("state").style(bold()),
                 Cell::from("health").style(bold()),
@@ -429,6 +436,7 @@ mod tests {
             yoink_spec_hash: None,
             yoink_deployed_by: None,
             yoink_deployed_at: None,
+            networks: Vec::new(),
             other_labels: BTreeMap::new(),
         }
     }

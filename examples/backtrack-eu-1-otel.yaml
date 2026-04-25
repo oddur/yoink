@@ -41,7 +41,7 @@ deploy:
   # resolving `backtrack-otel` to our container via Docker's built-in
   # DNS. yoink uses the network alias `<service-name>` automatically;
   # we add an explicit alias below to match what api/web look up.
-  network: kamal
+  networks: [kamal]
 
 hosts:
   - address: backtrack-eu-1
