@@ -53,6 +53,10 @@ enum Command {
         /// Allow operating with a dirty git working tree.
         #[arg(long)]
         allow_dirty: bool,
+        /// Print the planned actions (per-host: image to pull, what
+        /// would be swapped/created/removed) without executing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show what's running where (across all services).
     Status {
@@ -149,6 +153,60 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Mode::Dashboard)]
         mode: Mode,
     },
+    /// Bounce a service's container without re-deploying. Stops the
+    /// container with the configured drain, then starts it again.
+    Restart {
+        /// Service name as declared in the config.
+        service: String,
+        /// Pin to a specific host when the service has replicas.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Lint the config and (optionally) ping each host's docker daemon.
+    /// Use this in CI before merging a yoink.yaml change.
+    Validate {
+        /// Also test the ssh+docker connection to every configured host.
+        #[arg(long)]
+        check_hosts: bool,
+    },
+    /// Inspect / release the per-host deploy lock. Useful after a
+    /// crashed deploy left a sentinel container running.
+    Lock {
+        #[command(subcommand)]
+        action: LockAction,
+    },
+    /// Show what would change between the running container and the
+    /// target spec for `service` (image SHA, env vars, ports, mounts).
+    Diff {
+        /// Service name as declared in the config.
+        service: String,
+        /// Override the target tag the same way `up --tag` does.
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Generate shell completions. e.g.
+    ///   `yoink completions zsh > ~/.config/zsh/completions/_yoink`
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+}
+
+/// Subcommands for `yoink lock`.
+#[derive(clap::Subcommand)]
+enum LockAction {
+    /// Print holder + age of the deploy lock on each configured host.
+    Status,
+    /// Force-remove the deploy lock sentinel on each host. Use with
+    /// care — only safe when no operator is actually deploying.
+    Release {
+        /// Restrict to one host instead of all.
+        #[arg(long)]
+        host: Option<String>,
+        /// Skip the "are you sure?" confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -190,7 +248,8 @@ async fn run(cli: Cli) -> Result<()> {
             services,
             tag,
             allow_dirty,
-        } => cmd_up(&config, &services, &tag, allow_dirty).await,
+            dry_run,
+        } => cmd_up(&config, &services, &tag, allow_dirty, dry_run).await,
         Command::Status { json } => cmd_status(&config, json).await,
         Command::Rollback { service, tag } => cmd_rollback(&config, service, tag).await,
         Command::Prune { dry_run } => cmd_prune(&config, dry_run).await,
@@ -214,6 +273,16 @@ async fn run(cli: Cli) -> Result<()> {
             host,
             image,
         } => cmd_pty(&config, &service, host.as_deref(), PtyMode::Debug { image }).await,
+        Command::Restart { service, host } => {
+            cmd_restart(&config, &service, host.as_deref()).await
+        }
+        Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
+        Command::Lock { action } => cmd_lock(&config, action).await,
+        Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
+        Command::Completions { shell } => {
+            cmd_completions(shell);
+            Ok(())
+        }
         Command::Tui { mode } => cmd_tui(&config, cli.config.clone(), mode).await,
     }
 }
@@ -249,6 +318,7 @@ async fn cmd_up(
     services: &[String],
     tag_args: &[String],
     allow_dirty: bool,
+    dry_run: bool,
 ) -> Result<()> {
     use yoink::docker_ops::Host;
     use yoink::lock::HostLock;
@@ -264,6 +334,10 @@ async fn cmd_up(
     } else {
         Some(services)
     };
+
+    if dry_run {
+        return print_dry_run_plan(config, &tag_overrides, services_filter);
+    }
 
     // Per-host advisory locks. Sentinel container holds the lock; a
     // tokio heartbeat task touches it every few seconds. If yoink
@@ -440,7 +514,7 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
     let services_arg = std::slice::from_ref(&service);
     let tag_arg = format!("{service}={resolved_tag}");
     let tag_args = std::slice::from_ref(&tag_arg);
-    cmd_up(config, services_arg, tag_args, true).await
+    cmd_up(config, services_arg, tag_args, true, false).await
 }
 
 async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
@@ -780,4 +854,194 @@ async fn cmd_tui(config: &Config, config_path: PathBuf, mode: Mode) -> Result<()
     tui::run(config, config_path, ops, mode)
         .await
         .context("run TUI")
+}
+
+fn print_dry_run_plan(
+    config: &Config,
+    tag_overrides: &std::collections::BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
+) -> Result<()> {
+    println!("yoink up — dry run (no changes will be made)\n");
+    println!("hosts:");
+    for h in &config.hosts {
+        println!("  - {}@{}", h.user, h.address);
+    }
+    println!("\nservices that would be reconciled:");
+    let mut any = false;
+    for svc in &config.services {
+        if let Some(filter) = services_filter
+            && !filter.iter().any(|s| s == &svc.name)
+        {
+            continue;
+        }
+        any = true;
+        let tag = tag_overrides
+            .get(&svc.name)
+            .cloned()
+            .or_else(|| svc.tag.clone())
+            .unwrap_or_else(|| "<git>".into());
+        println!("  - {}: {}:{}", svc.name, svc.image, tag);
+    }
+    if !any {
+        anyhow::bail!("no services match the --service filter");
+    }
+    println!(
+        "\nrun without --dry-run to actually pull, swap, and run hooks. \
+         Existing containers whose spec matches will be left running."
+    );
+    Ok(())
+}
+
+async fn cmd_restart(
+    config: &Config,
+    service: &str,
+    host_filter: Option<&str>,
+) -> Result<()> {
+    let ops = RealDockerOps::new();
+    let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
+    let drain = std::time::Duration::from_secs(10);
+    eprintln!("stopping {}@{container} (drain {drain:?})…", host.address);
+    ops.stop_container(&host, &container, drain)
+        .await
+        .with_context(|| format!("stop {}@{container}", host.address))?;
+    eprintln!("starting {}@{container}…", host.address);
+    ops.start_container(&host, &container)
+        .await
+        .with_context(|| format!("start {}@{container}", host.address))?;
+    eprintln!("ok");
+    Ok(())
+}
+
+async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
+    // Config already parses successfully (loaded by `run`); the extra
+    // checks here catch things parsing alone doesn't catch.
+    let mut had_error = false;
+    let mut seen_names = std::collections::HashSet::new();
+    for svc in &config.services {
+        if !seen_names.insert(&svc.name) {
+            eprintln!("✗ duplicate service name: {}", svc.name);
+            had_error = true;
+        }
+    }
+    let mut seen_addrs = std::collections::HashSet::new();
+    for host in &config.hosts {
+        if !seen_addrs.insert(&host.address) {
+            eprintln!("✗ duplicate host address: {}", host.address);
+            had_error = true;
+        }
+    }
+    if !had_error {
+        println!(
+            "✓ config OK — {} services across {} hosts",
+            config.services.len(),
+            config.hosts.len()
+        );
+    }
+    if check_hosts {
+        cmd_preflight(config).await?;
+    }
+    if had_error {
+        anyhow::bail!("validation failed");
+    }
+    Ok(())
+}
+
+async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
+    let ops = RealDockerOps::new();
+    match action {
+        LockAction::Status => {
+            for host_cfg in &config.hosts {
+                let host = Host::from(host_cfg);
+                let containers = ops
+                    .list_running_containers(&host)
+                    .await
+                    .with_context(|| format!("list containers on {}", host.address))?;
+                let lock = containers.iter().find(|c| c.name == "yoink-deploy-lock");
+                match lock {
+                    Some(c) => {
+                        let age = output::format_relative_time(c.created_unix);
+                        println!("{}: HELD (acquired {age})", host.address);
+                    }
+                    None => println!("{}: free", host.address),
+                }
+            }
+        }
+        LockAction::Release { host, yes } => {
+            if !yes {
+                eprintln!(
+                    "force-releasing the deploy lock while another operator is deploying \
+                     will corrupt that deploy. pass --yes to confirm."
+                );
+                anyhow::bail!("aborted");
+            }
+            for host_cfg in &config.hosts {
+                if let Some(filter) = &host
+                    && filter != &host_cfg.address
+                {
+                    continue;
+                }
+                let h = Host::from(host_cfg);
+                match ops.force_remove_container(&h, "yoink-deploy-lock").await {
+                    Ok(()) => println!("{}: released", h.address),
+                    Err(e) => eprintln!("{}: {e:#}", h.address),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_diff(config: &Config, service: &str, tag_override: Option<&str>) -> Result<()> {
+    let svc_cfg = config
+        .services
+        .iter()
+        .find(|s| s.name == service)
+        .with_context(|| format!("service {service:?} not in config"))?;
+    let target_tag = tag_override
+        .map(str::to_string)
+        .or_else(|| svc_cfg.tag.clone())
+        .unwrap_or_else(|| "<git>".into());
+
+    let ops = RealDockerOps::new();
+    let report = StatusReport::collect_for_service(&ops, config, service)
+        .await
+        .context("collect status")?;
+    let mut printed = false;
+    for host in &report.hosts {
+        for c in &host.containers {
+            if !c.is_running() {
+                continue;
+            }
+            let current = c.yoink_version.as_deref().unwrap_or("?");
+            let same = current == target_tag;
+            let arrow = if same { "==" } else { "→" };
+            println!(
+                "{}/{}: {} {} {}{}",
+                host.host,
+                c.name,
+                current,
+                arrow,
+                target_tag,
+                if same { " (no change)" } else { "" }
+            );
+            printed = true;
+        }
+    }
+    if !printed {
+        println!(
+            "no running container for {service:?} — `up` would create the first one with tag {target_tag}"
+        );
+    }
+    println!(
+        "\nspec: {}:{} (env, ports, mounts compared at deploy time via spec hash)",
+        svc_cfg.image, target_tag
+    );
+    Ok(())
+}
+
+fn cmd_completions(shell: clap_complete::Shell) {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut io::stdout());
 }

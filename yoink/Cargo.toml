@@ -21,6 +21,7 @@ async-trait = "0.1"
 bollard = { version = "0.20", features = ["ssh"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = "0.3"
 glob = "0.3"
