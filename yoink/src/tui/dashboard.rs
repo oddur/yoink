@@ -16,7 +16,9 @@ use crate::docker_ops::{ContainerStats, DockerOps, Host};
 use crate::output::{format_bytes, format_relative_time};
 use crate::status::StatusReport;
 
-use super::ui::{bold, health_style, inline_gauge, pane_layout, state_style};
+use super::ui::{
+    bold, filter_footer, health_style, inline_gauge, pane_layout, state_style, FilterState,
+};
 
 pub struct DashboardRefresh {
     pub report: Option<StatusReport>,
@@ -37,6 +39,7 @@ pub struct DashboardState {
     /// Toggle with `e` from the Dashboard view. Useful for drilling
     /// into the logs of the just-replaced container after a deploy.
     show_exited: bool,
+    pub filter: FilterState,
 }
 
 impl DashboardState {
@@ -112,20 +115,14 @@ impl DashboardState {
         } else {
             "[exited: off]"
         };
-        let footer_text = if let Some(err) = &self.last_error {
-            format!(
-                "error: {err}  ·  q quit · r refresh · e {exited_indicator} · d dashboard · s services · h hosts · l logs"
-            )
-        } else {
-            format!(
-                "q quit · r refresh · e {exited_indicator} · d dashboard · s services · h hosts · l logs"
-            )
-        };
-        let footer = Paragraph::new(footer_text).style(if self.last_error.is_some() {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        });
+        let help = format!("q quit · r refresh · e {exited_indicator} · ? help");
+        if let Some(err) = &self.last_error {
+            let footer = Paragraph::new(format!("error: {err}  ·  {help}"))
+                .style(Style::default().fg(Color::Red));
+            frame.render_widget(footer, layout[2]);
+            return;
+        }
+        let footer = filter_footer(&self.filter, &help);
         frame.render_widget(footer, layout[2]);
     }
 
@@ -151,6 +148,17 @@ impl DashboardState {
             }
             for c in &host.containers {
                 if !self.show_exited && !c.is_running() {
+                    continue;
+                }
+                let searchable = format!(
+                    "{} {} {} {} {}",
+                    host.host,
+                    c.yoink_service.as_deref().unwrap_or(""),
+                    c.name,
+                    c.state,
+                    c.yoink_version.as_deref().unwrap_or(""),
+                );
+                if !self.filter.matches(&searchable) {
                     continue;
                 }
                 let health = c.health_hint().unwrap_or("-");

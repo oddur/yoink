@@ -8,14 +8,15 @@ use std::sync::Arc;
 
 use ratatui::Frame;
 use ratatui::layout::Constraint;
-use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::config::Config;
 use crate::docker_ops::{ContainerInfo, Host};
 use crate::status::StatusReport;
 
-use super::ui::{bold, clamp_selection, health_style, pane_layout, state_style};
+use super::ui::{
+    bold, clamp_selection, filter_footer, health_style, pane_layout, state_style, FilterState,
+};
 
 #[derive(Default)]
 pub struct ServicesState {
@@ -25,6 +26,7 @@ pub struct ServicesState {
     /// uses this so navigation order matches what the operator wrote.
     service_names: Vec<String>,
     loaded: bool,
+    pub filter: FilterState,
 }
 
 #[derive(Default)]
@@ -35,6 +37,7 @@ pub struct ServiceDetailState {
     /// drill-through aligned with what the user sees.
     rows: Vec<ServiceContainerRow>,
     loaded: bool,
+    pub filter: FilterState,
 }
 
 #[derive(Debug, Clone)]
@@ -61,16 +64,16 @@ impl ServicesState {
     }
 
     pub fn select_next(&mut self) {
-        if self.service_names.is_empty() {
+        let n = self.visible_names().len();
+        if n == 0 {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
-        self.table
-            .select(Some((i + 1).min(self.service_names.len() - 1)));
+        self.table.select(Some((i + 1).min(n - 1)));
     }
 
     pub fn select_prev(&mut self) {
-        if self.service_names.is_empty() {
+        if self.visible_names().is_empty() {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
@@ -78,10 +81,16 @@ impl ServicesState {
     }
 
     pub fn selected_service(&self) -> Option<String> {
-        self.table
-            .selected()
-            .and_then(|i| self.service_names.get(i))
+        let visible = self.visible_names();
+        self.table.selected().and_then(|i| visible.into_iter().nth(i))
+    }
+
+    fn visible_names(&self) -> Vec<String> {
+        self.service_names
+            .iter()
+            .filter(|n| self.filter.matches(n))
             .cloned()
+            .collect()
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, config: &Config) {
@@ -100,13 +109,18 @@ impl ServicesState {
             Constraint::Length(10), // health
             Constraint::Min(20),    // hosts
         ];
-        let rows: Vec<Row<'_>> = if self.loaded {
-            self.service_names
+        let visible_count = self.visible_names().len();
+        clamp_selection(&mut self.table, visible_count);
+        let visible = self.visible_names();
+        let rows: Vec<Row<'_>> = if !self.loaded {
+            vec![Row::new(vec![Cell::from("(loading…)")])]
+        } else if visible.is_empty() && !self.service_names.is_empty() {
+            vec![Row::new(vec![Cell::from("(no services match filter)")])]
+        } else {
+            visible
                 .iter()
                 .map(|name| build_service_row(name, config, self.report.as_ref()))
                 .collect()
-        } else {
-            vec![Row::new(vec![Cell::from("(loading…)")])]
         };
         let table = Table::new(rows, widths)
             .header(Row::new(vec![
@@ -121,8 +135,10 @@ impl ServicesState {
             .block(Block::default().borders(Borders::ALL).title("services"));
         frame.render_stateful_widget(table, layout[1], &mut self.table);
 
-        let footer = Paragraph::new("q quit · ↑↓ select · enter detail · r refresh")
-            .style(Style::default().fg(Color::DarkGray));
+        let footer = filter_footer(
+            &self.filter,
+            "q quit · ↑↓ select · enter detail · r refresh · ? help",
+        );
         frame.render_widget(footer, layout[2]);
     }
 }
@@ -239,15 +255,16 @@ impl ServiceDetailState {
     }
 
     pub fn select_next(&mut self) {
-        if self.rows.is_empty() {
+        let n = self.visible_rows().len();
+        if n == 0 {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
-        self.table.select(Some((i + 1).min(self.rows.len() - 1)));
+        self.table.select(Some((i + 1).min(n - 1)));
     }
 
     pub fn select_prev(&mut self) {
-        if self.rows.is_empty() {
+        if self.visible_rows().is_empty() {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
@@ -255,10 +272,24 @@ impl ServiceDetailState {
     }
 
     pub fn selected_row(&self) -> Option<ServiceContainerRow> {
+        let visible = self.visible_rows();
         self.table
             .selected()
-            .and_then(|i| self.rows.get(i))
+            .and_then(|i| visible.get(i).copied())
             .cloned()
+    }
+
+    fn visible_rows(&self) -> Vec<&ServiceContainerRow> {
+        self.rows
+            .iter()
+            .filter(|r| {
+                let searchable = format!(
+                    "{} {} {}",
+                    r.host.address, r.container.name, r.container.state
+                );
+                self.filter.matches(&searchable)
+            })
+            .collect()
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
@@ -281,12 +312,17 @@ impl ServiceDetailState {
             Constraint::Length(10), // version
             Constraint::Min(20),    // status text
         ];
+        let visible_count = self.visible_rows().len();
+        clamp_selection(&mut self.table, visible_count);
+        let visible = self.visible_rows();
         let rows: Vec<Row<'_>> = if !self.loaded {
             vec![Row::new(vec![Cell::from("(loading…)")])]
         } else if self.rows.is_empty() {
             vec![Row::new(vec![Cell::from("(no instances)")])]
+        } else if visible.is_empty() {
+            vec![Row::new(vec![Cell::from("(no instances match filter)")])]
         } else {
-            self.rows
+            visible
                 .iter()
                 .map(|r| {
                     let health = r.container.health_hint().unwrap_or("-");
@@ -320,8 +356,10 @@ impl ServiceDetailState {
             .block(Block::default().borders(Borders::ALL).title("instances"));
         frame.render_stateful_widget(table, layout[1], &mut self.table);
 
-        let footer = Paragraph::new("q quit · esc back · ↑↓ select · enter logs")
-            .style(Style::default().fg(Color::DarkGray));
+        let footer = filter_footer(
+            &self.filter,
+            "q quit · esc back · ↑↓ select · enter logs · ! shell · D debug",
+        );
         frame.render_widget(footer, layout[2]);
     }
 }

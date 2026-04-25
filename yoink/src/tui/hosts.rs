@@ -16,13 +16,14 @@ use crate::config::{Config, HostConfig};
 use crate::docker_ops::{DockerOps, DockerVersion, Host, HostInfo};
 use crate::output::format_bytes;
 
-use super::ui::{bold, clamp_selection, inline_gauge, pane_layout};
+use super::ui::{bold, clamp_selection, filter_footer, inline_gauge, pane_layout, FilterState};
 
 #[derive(Default)]
 pub struct HostsState {
     rows: Vec<HostRow>,
     table: TableState,
     loaded: bool,
+    pub filter: FilterState,
 }
 
 pub struct HostRow {
@@ -66,19 +67,21 @@ impl HostsState {
     pub fn apply(&mut self, rows: Vec<HostRow>) {
         self.rows = rows;
         self.loaded = true;
-        clamp_selection(&mut self.table, self.rows.len());
+        let n = self.visible_rows().len();
+        clamp_selection(&mut self.table, n);
     }
 
     pub fn select_next(&mut self) {
-        if self.rows.is_empty() {
+        let n = self.visible_rows().len();
+        if n == 0 {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
-        self.table.select(Some((i + 1).min(self.rows.len() - 1)));
+        self.table.select(Some((i + 1).min(n - 1)));
     }
 
     pub fn select_prev(&mut self) {
-        if self.rows.is_empty() {
+        if self.visible_rows().is_empty() {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
@@ -87,13 +90,24 @@ impl HostsState {
 
     /// `(user, address)` of the currently-selected host, if any.
     pub fn selected_host(&self) -> Option<Host> {
+        let visible = self.visible_rows();
         self.table
             .selected()
-            .and_then(|i| self.rows.get(i))
+            .and_then(|i| visible.get(i).copied())
             .map(|r| Host {
                 user: r.user.clone(),
                 address: r.address.clone(),
             })
+    }
+
+    fn visible_rows(&self) -> Vec<&HostRow> {
+        self.rows
+            .iter()
+            .filter(|r| {
+                let target = format!("{}@{}", r.user, r.address);
+                self.filter.matches(&target)
+            })
+            .collect()
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, _config: &Config) {
@@ -102,12 +116,17 @@ impl HostsState {
         let header = Paragraph::new("yoink hosts · ↑↓ select · enter for detail").style(bold());
         frame.render_widget(header, layout[0]);
 
+        let visible_count = self.visible_rows().len();
+        clamp_selection(&mut self.table, visible_count);
+        let visible = self.visible_rows();
         let rows: Vec<Row<'_>> = if !self.loaded {
             vec![Row::new(vec![Cell::from("(loading…)")])]
+        } else if visible.is_empty() && !self.rows.is_empty() {
+            vec![Row::new(vec![Cell::from("(no hosts match filter)")])]
         } else if self.rows.is_empty() {
             vec![Row::new(vec![Cell::from("(no hosts configured)")])]
         } else {
-            self.rows.iter().map(host_row).collect()
+            visible.iter().copied().map(host_row).collect()
         };
 
         let widths = [
@@ -136,9 +155,10 @@ impl HostsState {
             .block(Block::default().borders(Borders::ALL).title("hosts"));
         frame.render_stateful_widget(table, layout[1], &mut self.table);
 
-        let footer =
-            Paragraph::new("q quit · ↑↓ select · enter detail · r refresh · d dashboard · l logs")
-                .style(Style::default().fg(Color::DarkGray));
+        let footer = filter_footer(
+            &self.filter,
+            "q quit · ↑↓ select · enter detail · r refresh · ? help",
+        );
         frame.render_widget(footer, layout[2]);
     }
 }

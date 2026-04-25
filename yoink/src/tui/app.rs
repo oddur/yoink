@@ -115,6 +115,7 @@ impl View {
         let view_specific: Vec<&'static str> = match self {
             View::Dashboard => vec![
                 "dashboard",
+                "  /            filter substring · esc to clear",
                 "  r            refresh",
                 "  e            toggle exited containers",
             ],
@@ -122,6 +123,7 @@ impl View {
                 "hosts",
                 "  ↑↓ / j k     select host",
                 "  enter        host detail",
+                "  /            filter substring · esc to clear",
                 "  r            refresh",
             ],
             View::HostDetail(_) => vec![
@@ -130,13 +132,15 @@ impl View {
                 "  enter        live logs",
                 "  !            shell into container (bash/sh)",
                 "  D            debug sidecar (alpine, target's pid+net ns)",
+                "  /            filter substring · esc to clear",
                 "  r            refresh",
-                "  esc          back to hosts",
+                "  esc          back to hosts (when no active filter)",
             ],
             View::Services => vec![
                 "services",
                 "  ↑↓ / j k     select service",
                 "  enter        service detail",
+                "  /            filter substring · esc to clear",
                 "  r            refresh",
             ],
             View::ServiceDetail(_) => vec![
@@ -144,6 +148,7 @@ impl View {
                 "  ↑↓ / j k     select replica",
                 "  enter        live logs",
                 "  !            shell · D debug sidecar",
+                "  /            filter substring · esc to clear",
                 "  r            refresh · esc back",
             ],
             View::Logs => vec![
@@ -574,11 +579,31 @@ impl App {
             return self.handle_filter_input_key(key);
         }
 
+        // Filter input mode in selectable list/table panes — same
+        // shape as the logs filter, but the buffer lives on each
+        // pane's `FilterState`. Captured before navigation so the
+        // user can type any character into the filter.
+        if self.pane_filter_input_mode() {
+            return self.handle_pane_filter_input_key(key);
+        }
+
         if matches!(key.code, KeyCode::Char('q'))
             || (matches!(key.code, KeyCode::Char('c'))
                 && key.modifiers.contains(KeyModifiers::CONTROL))
         {
             return true;
+        }
+
+        // `/` enters filter input mode for the current pane (when it
+        // supports filtering — Logs handled separately above).
+        if key.code == KeyCode::Char('/') {
+            self.begin_pane_filter_input();
+            return false;
+        }
+        // Esc clears an active filter in panes that support it.
+        if key.code == KeyCode::Esc && self.pane_has_active_filter() {
+            self.clear_pane_filter();
+            return false;
         }
         match key.code {
             KeyCode::Char('d') => {
@@ -756,6 +781,57 @@ impl App {
                 KeyCode::Char('G') | KeyCode::End => self.logs.jump_to_bottom(),
                 _ => {}
             },
+        }
+        false
+    }
+
+    /// Per-pane filter helpers — Logs has its own (older) filter that
+    /// pre-dates the shared `FilterState`; everything else routes here.
+    fn pane_filter(&mut self) -> Option<&mut super::ui::FilterState> {
+        match &self.view {
+            View::Dashboard => Some(&mut self.dashboard.filter),
+            View::Hosts => Some(&mut self.hosts.filter),
+            View::HostDetail(_) => Some(&mut self.host_detail.filter),
+            View::Services => Some(&mut self.services.filter),
+            View::ServiceDetail(_) => Some(&mut self.service_detail.filter),
+            _ => None,
+        }
+    }
+
+    fn pane_filter_input_mode(&mut self) -> bool {
+        self.pane_filter().is_some_and(|f| f.input_mode())
+    }
+
+    fn pane_has_active_filter(&mut self) -> bool {
+        self.pane_filter().is_some_and(|f| f.current().is_some())
+    }
+
+    fn begin_pane_filter_input(&mut self) {
+        if let Some(f) = self.pane_filter() {
+            f.begin_input();
+        }
+    }
+
+    fn clear_pane_filter(&mut self) {
+        if let Some(f) = self.pane_filter() {
+            f.clear();
+        }
+    }
+
+    fn handle_pane_filter_input_key(&mut self, key: KeyEvent) -> bool {
+        if matches!(key.code, KeyCode::Char('c'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return true;
+        }
+        if let Some(f) = self.pane_filter() {
+            match key.code {
+                KeyCode::Esc => f.cancel(),
+                KeyCode::Enter => f.apply(),
+                KeyCode::Backspace => f.backspace(),
+                KeyCode::Char(c) => f.push_char(c),
+                _ => {}
+            }
         }
         false
     }

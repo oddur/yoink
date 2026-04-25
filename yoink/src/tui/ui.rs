@@ -193,6 +193,97 @@ pub fn inline_gauge(ratio: f32, width: usize, color: Color) -> Vec<Span<'static>
     ]
 }
 
+/// Substring-filter state shared by every list/table pane. Same
+/// lifecycle as `LogsState`'s filter:
+///   `/` enters input mode → `filter_push_char` / `filter_backspace`
+///   build the buffer → Enter applies → Esc cancels.
+/// `matches(text)` returns true when there's no filter, or when
+/// `text` (case-insensitive) contains the active filter.
+#[derive(Default, Debug, Clone)]
+pub struct FilterState {
+    /// Currently-applied filter; rows whose searched text doesn't
+    /// contain this (case-insensitive) are hidden.
+    filter: Option<String>,
+    /// `Some(buf)` while the user is typing a new filter via `/`.
+    input_buffer: Option<String>,
+}
+
+impl FilterState {
+    pub fn input_mode(&self) -> bool {
+        self.input_buffer.is_some()
+    }
+
+    pub fn begin_input(&mut self) {
+        self.input_buffer = Some(self.filter.clone().unwrap_or_default());
+    }
+
+    pub fn push_char(&mut self, c: char) {
+        if let Some(buf) = self.input_buffer.as_mut() {
+            buf.push(c);
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if let Some(buf) = self.input_buffer.as_mut() {
+            buf.pop();
+        }
+    }
+
+    pub fn apply(&mut self) {
+        if let Some(buf) = self.input_buffer.take() {
+            self.filter = if buf.is_empty() { None } else { Some(buf) };
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.input_buffer = None;
+    }
+
+    pub fn clear(&mut self) {
+        self.filter = None;
+        self.input_buffer = None;
+    }
+
+    #[must_use]
+    pub fn current(&self) -> Option<&str> {
+        self.filter.as_deref()
+    }
+
+    #[must_use]
+    pub fn input_buffer(&self) -> Option<&str> {
+        self.input_buffer.as_deref()
+    }
+
+    /// Case-insensitive substring match. Returns true when there's no
+    /// active filter (so unfiltered rows still render).
+    #[must_use]
+    pub fn matches(&self, text: &str) -> bool {
+        match &self.filter {
+            None => true,
+            Some(f) => text.to_ascii_lowercase().contains(&f.to_ascii_lowercase()),
+        }
+    }
+}
+
+/// Footer text for a pane with a filter — yellow editable line while
+/// typing, dim help line otherwise. Caller passes the help text it'd
+/// have shown without a filter.
+#[must_use]
+pub fn filter_footer(filter: &FilterState, default_help: &str) -> Paragraph<'static> {
+    if let Some(buf) = filter.input_buffer() {
+        Paragraph::new(format!("/{buf}_  (enter apply · esc cancel)"))
+            .style(Style::default().fg(Color::Yellow))
+    } else if let Some(f) = filter.current() {
+        Paragraph::new(format!(
+            "filter: {f}  ·  / edit · esc clear · {default_help}"
+        ))
+        .style(Style::default().fg(Color::Cyan))
+    } else {
+        Paragraph::new(format!("/ filter · {default_help}"))
+            .style(Style::default().fg(Color::DarkGray))
+    }
+}
+
 /// Render a vertical scrollbar overlay on the right edge of `area`.
 /// `position` is the index of the topmost visible item; `total` is
 /// the number of items in the underlying buffer; `viewport` is how

@@ -15,7 +15,9 @@ use ratatui::widgets::{Block, Borders, Cell, LineGauge, Paragraph, Row, Table, T
 use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
 use crate::output::format_bytes;
 
-use super::ui::{bold, clamp_selection, health_style, inline_gauge, state_style};
+use super::ui::{
+    bold, clamp_selection, filter_footer, health_style, inline_gauge, state_style, FilterState,
+};
 
 pub struct HostDetailRefresh {
     pub containers: Vec<ContainerInfo>,
@@ -31,6 +33,7 @@ pub struct HostDetailState {
     last_error: Option<String>,
     table: TableState,
     loaded: bool,
+    pub filter: FilterState,
 }
 
 impl HostDetailState {
@@ -72,16 +75,16 @@ impl HostDetailState {
     }
 
     pub fn select_next(&mut self) {
-        if self.containers.is_empty() {
+        let n = self.visible_containers().len();
+        if n == 0 {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
-        self.table
-            .select(Some((i + 1).min(self.containers.len() - 1)));
+        self.table.select(Some((i + 1).min(n - 1)));
     }
 
     pub fn select_prev(&mut self) {
-        if self.containers.is_empty() {
+        if self.visible_containers().is_empty() {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
@@ -90,10 +93,27 @@ impl HostDetailState {
 
     /// Currently-selected container name, if any.
     pub fn selected_container(&self) -> Option<String> {
+        let visible = self.visible_containers();
         self.table
             .selected()
-            .and_then(|i| self.containers.get(i))
+            .and_then(|i| visible.get(i).copied())
             .map(|c| c.name.clone())
+    }
+
+    fn visible_containers(&self) -> Vec<&ContainerInfo> {
+        self.containers
+            .iter()
+            .filter(|c| {
+                let searchable = format!(
+                    "{} {} {} {}",
+                    c.name,
+                    c.yoink_service.as_deref().unwrap_or(""),
+                    c.state,
+                    c.status_text,
+                );
+                self.filter.matches(&searchable)
+            })
+            .collect()
     }
 
     pub fn host(&self) -> Option<&Host> {
@@ -137,8 +157,11 @@ impl HostDetailState {
             Constraint::Length(20), // cpu (value + bracketed gauge)
             Constraint::Min(28),    // mem (value/limit + bracketed gauge)
         ];
+        let visible = self.visible_containers();
         let rows: Vec<Row<'_>> = if !self.loaded && self.last_error.is_none() {
             vec![Row::new(vec![Cell::from("(loading…)")])]
+        } else if visible.is_empty() && !self.containers.is_empty() {
+            vec![Row::new(vec![Cell::from("(no containers match filter)")])]
         } else if self.containers.is_empty() {
             vec![Row::new(vec![Cell::from(
                 self.last_error
@@ -146,7 +169,7 @@ impl HostDetailState {
                     .unwrap_or("(no running containers)"),
             )])]
         } else {
-            self.containers
+            visible
                 .iter()
                 .map(|c| {
                     let stats = self.stats.get(&c.name);
@@ -178,16 +201,18 @@ impl HostDetailState {
             .block(Block::default().borders(Borders::ALL).title("containers"));
         frame.render_stateful_widget(table, table_area, &mut self.table);
 
-        let footer_text = if let Some(err) = &self.last_error {
-            format!("error: {err}  ·  q quit · esc back · enter logs · r refresh")
-        } else {
-            "q quit · esc back · ↑↓ select · enter logs · r refresh".into()
-        };
-        let footer = Paragraph::new(footer_text).style(if self.last_error.is_some() {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        });
+        if let Some(err) = &self.last_error {
+            let footer = Paragraph::new(format!(
+                "error: {err}  ·  q quit · esc back · enter logs · r refresh"
+            ))
+            .style(Style::default().fg(Color::Red));
+            frame.render_widget(footer, footer_area);
+            return;
+        }
+        let footer = filter_footer(
+            &self.filter,
+            "q quit · esc back · ↑↓ select · enter logs · ! shell · D debug · r refresh",
+        );
         frame.render_widget(footer, footer_area);
     }
 
