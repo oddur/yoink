@@ -50,17 +50,20 @@ pub struct ShellState {
 
 struct ShellInner {
     parser: vt100::Parser,
-    /// Bytes coming back from the docker exec output stream. The bridge
-    /// task forwards everything here; `drain_output` is called on each
-    /// fast tick to feed the parser.
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
     /// `AsyncWrite` into docker exec stdin. Wrapped in a tokio Mutex so
     /// the event-handler can fire-and-forget keystroke writes from any
     /// task spawn.
     stdin: Arc<tokio::sync::Mutex<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>>>,
+    /// EOF sentinel — the bridge holds the matching sender; when it
+    /// drops, this channel disconnects and `drain_output` notices.
+    eof_rx: mpsc::UnboundedReceiver<()>,
     exec_id: String,
     /// Last (rows, cols) we sent via `resize_exec`; we re-send on change.
     last_size: (u16, u16),
+    /// Flipped true after the bridge delivers the first byte from the
+    /// daemon. Resize calls before this race against bollard's exec
+    /// plumbing and surface a noisy "exec process is not started" 400.
+    started: bool,
     bridge: JoinHandle<()>,
 }
 
@@ -91,8 +94,16 @@ impl ShellState {
     /// Spawn the docker exec and start the byte-pump. `rows`/`cols`
     /// are the inside-the-border dimensions of the panel — pass them
     /// at start time so the shell prompts at the right size on the
-    /// first frame.
-    pub async fn start(&mut self, ops: Arc<dyn DockerOps>, rows: u16, cols: u16) {
+    /// first frame. `bytes_tx` is the app-level mpsc that wakes the
+    /// event loop on every byte chunk, so the render fires as soon as
+    /// the daemon sends output (rather than waiting for the 2s tick).
+    pub async fn start(
+        &mut self,
+        ops: Arc<dyn DockerOps>,
+        bytes_tx: mpsc::UnboundedSender<Vec<u8>>,
+        rows: u16,
+        cols: u16,
+    ) {
         // Try bash first (most service images), fall back to sh.
         let session = match try_exec(&ops, &self.host, &self.container, "bash", rows, cols).await {
             Ok(s) => s,
@@ -111,13 +122,19 @@ impl ShellState {
             mut output,
         } = session;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Sentinel: dropped on EOF so the event loop notices the
+        // shell ended (Ctrl-D / `exit`) without us having to poll.
+        // `bytes_tx` carries each chunk; an empty Vec on EOF tells the
+        // app to call `drain_output` (which sees the disconnected
+        // sender via the eof_tx drop and bounces back to host detail).
+        let (eof_tx, eof_rx) = mpsc::unbounded_channel::<()>();
         let bridge = tokio::spawn(async move {
+            let _eof_guard = eof_tx;
             while let Some(item) = output.next().await {
                 match item {
                     Ok(bytes) if bytes.is_empty() => {}
                     Ok(bytes) => {
-                        if tx.send(bytes.to_vec()).is_err() {
+                        if bytes_tx.send(bytes.to_vec()).is_err() {
                             return;
                         }
                     }
@@ -140,31 +157,35 @@ impl ShellState {
 
         self.inner = Some(ShellInner {
             parser,
-            rx,
             stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
             exec_id,
             last_size: (rows, cols),
+            started: false,
+            eof_rx,
             bridge,
         });
     }
 
-    /// Drain everything the bridge has buffered since the last call,
-    /// feeding it through the vt100 parser. Called from the TUI event
-    /// loop on each fast tick.
-    pub fn drain_output(&mut self) {
+    /// Feed one chunk of bytes (delivered by the app's bytes channel)
+    /// into the vt100 parser. Called per chunk so the render fires as
+    /// soon as the daemon emits output.
+    pub fn process_bytes(&mut self, bytes: &[u8]) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.parser.process(bytes);
+            inner.started = true;
+        }
+    }
+
+    /// Check the EOF sentinel — when the bridge task drops it, the
+    /// container shell has exited. Called from the fast tick.
+    pub fn poll_exit(&mut self) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let mut empty = false;
-        while let Ok(bytes) = inner.rx.try_recv() {
-            inner.parser.process(&bytes);
-            empty = false;
-        }
-        // EOF detection: the bridge task exits when the docker stream
-        // ends, which drops the sender; try_recv then returns
-        // Disconnected on the next call. Mark exited so the app loop
-        // can pop us off.
-        if matches!(inner.rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)) && !empty {
+        if matches!(
+            inner.eof_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ) {
             self.exited = true;
         }
     }
@@ -250,6 +271,13 @@ impl ShellState {
         }
         inner.parser.screen_mut().set_size(rows, cols);
         inner.last_size = (rows, cols);
+        // Skip the daemon-side resize until the exec is actually
+        // started — otherwise bollard returns a 400 for the first
+        // frame's apply_size call. The screen-side size is updated
+        // either way so vt100 reflows immediately.
+        if !inner.started {
+            return;
+        }
         let host = self.host.clone();
         let exec_id = inner.exec_id.clone();
         tokio::spawn(async move {

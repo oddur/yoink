@@ -223,6 +223,11 @@ async fn run_loop(
             Some(line) = app.log_rx.recv() => {
                 app.logs.push_rendered(line);
             }
+            Some(bytes) = app.shell_bytes_rx.recv() => {
+                if let Some(shell) = app.shell.as_mut() {
+                    shell.process_bytes(&bytes);
+                }
+            }
         }
     }
 }
@@ -240,6 +245,12 @@ pub struct App {
     pub logs: LogsState,
     /// `Some` while a `ContainerShell` view is active; cleared on exit.
     shell: Option<ShellState>,
+    /// Byte chunks from the embedded shell's exec output stream. The
+    /// run loop selects on this so each chunk wakes the render
+    /// immediately — without it the only drain point would be the 2 s
+    /// fast tick, which is way too slow for an interactive terminal.
+    shell_bytes_tx: UnboundedSender<Vec<u8>>,
+    shell_bytes_rx: UnboundedReceiver<Vec<u8>>,
 
     // Refresh-in-flight flags coalesce ticks: a tick that fires while the
     // previous refresh hasn't finished is dropped, so a slow daemon can
@@ -273,6 +284,7 @@ impl App {
     ) -> Self {
         let (log_tx, log_rx) = mpsc::unbounded_channel();
         let (update_tx, update_rx) = mpsc::unbounded_channel();
+        let (shell_bytes_tx, shell_bytes_rx) = mpsc::unbounded_channel();
         Self {
             view,
             config,
@@ -284,6 +296,8 @@ impl App {
             service_detail: ServiceDetailState::new(),
             logs: LogsState::new(),
             shell: None,
+            shell_bytes_tx,
+            shell_bytes_rx,
             hosts_in_flight: false,
             host_detail_in_flight: false,
             dashboard_in_flight: false,
@@ -563,7 +577,9 @@ impl App {
                 let mut state = ShellState::new(host.clone(), container.clone());
                 // Pick a sensible initial size; the next render will
                 // resize to whatever the panel actually is.
-                state.start(self.ops.clone(), 24, 80).await;
+                state
+                    .start(self.ops.clone(), self.shell_bytes_tx.clone(), 24, 80)
+                    .await;
                 self.shell = Some(state);
             }
             View::Logs => self.start_service_log_streams().await,
@@ -617,7 +633,7 @@ impl App {
         let Some(shell) = self.shell.as_mut() else {
             return;
         };
-        shell.drain_output();
+        shell.poll_exit();
         if !shell.exited() {
             return;
         }
