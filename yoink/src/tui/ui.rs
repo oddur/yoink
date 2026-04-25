@@ -147,64 +147,50 @@ pub fn table_highlight_style() -> Style {
 /// `table_highlight_style`. Used by every selectable table.
 pub const TABLE_HIGHLIGHT_SYMBOL: &str = "▶ ";
 
-/// Block-character sparkline for a single table cell. `samples` is
-/// the time series (newest last); `width` is the number of chars to
-/// emit. The cell-level "Sparkline" widget renders into its own Rect,
-/// which Cell can't host, so we draw the same eight block glyphs as
-/// styled text — visually identical, fits inside a one-line cell.
+/// Inline mini-gauge for a table cell, drawn with the same eighth-blocks
+/// the real `Gauge` widget uses. Returns three styled spans: opening
+/// bracket, the bar (colored fill + dim unfilled), closing bracket.
+/// The brackets make the bounds obvious — without them the bar floats
+/// in whitespace and you can't tell where 0% / 100% sit.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
 #[must_use]
-pub fn inline_sparkline(samples: &[f32], width: usize, color: Color) -> Span<'static> {
-    if samples.is_empty() || width == 0 {
-        return Span::raw(String::new());
-    }
-    let levels = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let max = samples.iter().copied().fold(0.0_f32, f32::max).max(1.0);
-    // Take the most recent `width` samples; pad-left with low blocks
-    // so a fresh container doesn't show a misleading flat line.
-    let take = samples.len().min(width);
-    let pad = width.saturating_sub(take);
-    let mut s = String::with_capacity(width * 3);
-    for _ in 0..pad {
-        s.push(levels[0]);
-    }
-    for v in &samples[samples.len() - take..] {
-        let scaled = (v / max).clamp(0.0, 1.0);
-        let idx = ((scaled * (levels.len() as f32 - 1.0)).round() as usize).min(levels.len() - 1);
-        s.push(levels[idx]);
-    }
-    Span::styled(s, Style::default().fg(color))
-}
-
-/// Inline mini-gauge for a single table cell, drawn with the same
-/// eighth-blocks the real `Gauge` widget uses. Returns a styled
-/// `Span` that the caller drops into a `Cell`.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-#[must_use]
-pub fn inline_gauge(ratio: f32, width: usize, color: Color) -> Span<'static> {
+pub fn inline_gauge(ratio: f32, width: usize, color: Color) -> Vec<Span<'static>> {
     if width == 0 {
-        return Span::raw(String::new());
+        return Vec::new();
     }
+    let bracket_style = Style::default().fg(Color::DarkGray);
     let r = ratio.clamp(0.0, 1.0);
     let total_eighths = (r * (width as f32) * 8.0).round() as usize;
     let full = total_eighths / 8;
     let partial_idx = total_eighths % 8;
     let partials = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
-    let mut s = String::with_capacity(width * 3);
+
+    let mut filled = String::with_capacity(width);
     for _ in 0..full.min(width) {
-        s.push('█');
+        filled.push('█');
     }
-    if full < width {
-        s.push(partials[partial_idx]);
-        for _ in (full + 1)..width {
-            s.push(' ');
-        }
+    if full < width && partial_idx > 0 {
+        filled.push(partials[partial_idx]);
     }
-    Span::styled(s, Style::default().fg(color))
+    // Pad the remaining slots with a faint dotted glyph so the
+    // unfilled portion is visible — pure spaces look like missing
+    // data on most terminals.
+    let used = filled.chars().count();
+    let mut empty = String::with_capacity(width.saturating_sub(used));
+    for _ in 0..width.saturating_sub(used) {
+        empty.push('·');
+    }
+
+    vec![
+        Span::styled("[".to_string(), bracket_style),
+        Span::styled(filled, Style::default().fg(color)),
+        Span::styled(empty, bracket_style),
+        Span::styled("]".to_string(), bracket_style),
+    ]
 }
 
 /// Render a vertical scrollbar overlay on the right edge of `area`.

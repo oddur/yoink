@@ -1,7 +1,7 @@
 //! Dashboard pane: auto-refreshing service/host status grid with
 //! per-container CPU% and memory snapshots.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::future::join_all;
@@ -16,12 +16,7 @@ use crate::docker_ops::{ContainerStats, DockerOps, Host};
 use crate::output::{format_bytes, format_relative_time};
 use crate::status::StatusReport;
 
-use super::ui::{bold, health_style, inline_gauge, inline_sparkline, pane_layout, state_style};
-
-/// How many CPU/mem samples to keep per container for the inline
-/// sparklines. 24 samples × 2 s fast tick = ~48 s of trail — long
-/// enough to see a deploy spike, short enough to fit in 12 cells.
-const HISTORY_LEN: usize = 24;
+use super::ui::{bold, health_style, inline_gauge, pane_layout, state_style};
 
 pub struct DashboardRefresh {
     pub report: Option<StatusReport>,
@@ -35,12 +30,6 @@ pub struct DashboardState {
     /// Keyed by `<host>/<container>` so the render layer can look up live
     /// stats alongside the container info from the listing.
     stats: HashMap<String, ContainerStats>,
-    /// Per-container ring buffer of the last `HISTORY_LEN` (`cpu_pct`,
-    /// `mem_pct`) samples. Pushed on every `apply` so the sparkline
-    /// trails the live value. Mem is stored as a fraction of limit
-    /// (or 0 when no limit set) so both axes are 0..=1 for the
-    /// inline gauge.
-    history: HashMap<String, VecDeque<(f32, f32)>>,
     last_error: Option<String>,
     loaded: bool,
     /// When `true`, render also includes containers in the `exited` /
@@ -69,34 +58,9 @@ impl DashboardState {
     }
 
     /// Apply background-fetched results.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
     pub fn apply(&mut self, data: DashboardRefresh) {
         self.last_error = data.error;
         if let Some(report) = data.report {
-            // Snapshot every container's CPU% (normalized to 0..=1
-            // assuming a single core's worth of headroom — bigger
-            // values still render fine, the sparkline just clips at
-            // the top) and mem% (fraction of limit, 0 when no limit).
-            for (key, stats) in &data.stats {
-                let cpu_norm = (stats.cpu_pct as f32 / 100.0).max(0.0);
-                let mem_norm = match stats.mem_limit {
-                    Some(limit) if limit > 0 => (stats.mem_used as f32) / (limit as f32),
-                    _ => 0.0,
-                };
-                let buf = self.history.entry(key.clone()).or_default();
-                buf.push_back((cpu_norm, mem_norm));
-                if buf.len() > HISTORY_LEN {
-                    buf.pop_front();
-                }
-            }
-            // Drop history for containers that disappeared so the map
-            // doesn't grow without bound across restarts/rollbacks.
-            self.history.retain(|k, _| data.stats.contains_key(k));
-
             self.report = Some(report);
             self.stats = data.stats;
             self.loaded = true;
@@ -124,8 +88,8 @@ impl DashboardState {
             Constraint::Length(9),  // state
             Constraint::Length(10), // health
             Constraint::Length(10), // version
-            Constraint::Length(20), // cpu% (value + gauge + spark)
-            Constraint::Length(28), // mem (value + gauge + spark)
+            Constraint::Length(20), // cpu% (value + bracketed gauge)
+            Constraint::Length(34), // mem (value / limit + bracketed gauge)
             Constraint::Min(20),    // created
         ];
         let table = Table::new(rows, widths)
@@ -192,25 +156,21 @@ impl DashboardState {
                 let health = c.health_hint().unwrap_or("-");
                 let key = stats_key(&host.host, &c.name);
                 let stats = self.stats.get(&key);
-                let history = self.history.get(&key);
 
-                let cpu_cell = render_cpu_cell(stats, history);
-                let mem_cell = render_mem_cell(stats, history);
+                let cpu_cell = render_cpu_cell(stats);
+                let mem_cell = render_mem_cell(stats);
 
-                rows.push(
-                    Row::new(vec![
-                        Cell::from(host.host.clone()),
-                        Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
-                        Cell::from(c.name.clone()),
-                        Cell::from(c.state.clone()).style(state_style(&c.state)),
-                        Cell::from(health.to_string()).style(health_style(health)),
-                        Cell::from(c.yoink_version.clone().unwrap_or_else(|| "-".into())),
-                        cpu_cell,
-                        mem_cell,
-                        Cell::from(format_relative_time(c.created_unix)),
-                    ])
-                    .height(2),
-                );
+                rows.push(Row::new(vec![
+                    Cell::from(host.host.clone()),
+                    Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
+                    Cell::from(c.name.clone()),
+                    Cell::from(c.state.clone()).style(state_style(&c.state)),
+                    Cell::from(health.to_string()).style(health_style(health)),
+                    Cell::from(c.yoink_version.clone().unwrap_or_else(|| "-".into())),
+                    cpu_cell,
+                    mem_cell,
+                    Cell::from(format_relative_time(c.created_unix)),
+                ]));
             }
         }
         rows
@@ -221,64 +181,51 @@ fn stats_key(host: &str, container: &str) -> String {
     format!("{host}/{container}")
 }
 
-/// CPU cell: line 1 = percentage + 8-wide block-character gauge,
-/// line 2 = sparkline trail. Empty/no-stats containers get a single
-/// dim "-" so the column alignment doesn't shift.
+/// CPU cell: percentage + bracketed inline gauge. Empty/no-stats
+/// containers get a dim "-" so the column alignment doesn't shift.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn render_cpu_cell(
-    stats: Option<&ContainerStats>,
-    history: Option<&VecDeque<(f32, f32)>>,
-) -> Cell<'static> {
+fn render_cpu_cell(stats: Option<&ContainerStats>) -> Cell<'static> {
     let Some(s) = stats else {
         return Cell::from("-").style(Style::default().fg(Color::DarkGray));
     };
     let pct_text = format!("{:>5.1}% ", s.cpu_pct);
     // Gauge ratio: assume 1 core = 100%; clamps inside `inline_gauge`.
     let ratio = (s.cpu_pct as f32 / 100.0).clamp(0.0, 1.0);
-    let gauge = inline_gauge(ratio, 8, gauge_color(ratio));
-    let line1 = Line::from(vec![Span::raw(pct_text), gauge]);
-    let samples: Vec<f32> = history
-        .map(|h| h.iter().map(|(c, _)| *c).collect())
-        .unwrap_or_default();
-    let line2 = Line::from(inline_sparkline(&samples, 18, Color::Cyan));
-    Cell::from(vec![line1, line2])
+    let mut spans = vec![Span::raw(pct_text)];
+    spans.extend(inline_gauge(ratio, 10, gauge_color(ratio)));
+    Cell::from(Line::from(spans))
 }
 
-/// Mem cell: line 1 = "used / limit" + gauge (against limit when
-/// known), line 2 = sparkline of used/limit trail.
+/// Mem cell: "used / limit" + bracketed inline gauge against the
+/// limit when known. Containers with no limit show usage text only
+/// (no gauge — there's nothing to fill against).
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn render_mem_cell(
-    stats: Option<&ContainerStats>,
-    history: Option<&VecDeque<(f32, f32)>>,
-) -> Cell<'static> {
+fn render_mem_cell(stats: Option<&ContainerStats>) -> Cell<'static> {
     let Some(s) = stats else {
         return Cell::from("-").style(Style::default().fg(Color::DarkGray));
     };
-    let (text, ratio) = match s.mem_limit {
+    match s.mem_limit {
         Some(limit) if limit > 0 => {
-            let r = (s.mem_used as f32) / (limit as f32);
-            (
-                format!("{} / {}", format_bytes(s.mem_used), format_bytes(limit)),
-                r.clamp(0.0, 1.0),
-            )
+            let ratio = ((s.mem_used as f32) / (limit as f32)).clamp(0.0, 1.0);
+            let label = format!(
+                "{:>8} / {:<8} ",
+                format_bytes(s.mem_used),
+                format_bytes(limit)
+            );
+            let mut spans = vec![Span::raw(label)];
+            spans.extend(inline_gauge(ratio, 10, gauge_color(ratio)));
+            Cell::from(Line::from(spans))
         }
-        _ => (format_bytes(s.mem_used), 0.0),
-    };
-    let gauge = inline_gauge(ratio, 8, gauge_color(ratio));
-    let line1 = Line::from(vec![Span::raw(format!("{text:<16} ")), gauge]);
-    let samples: Vec<f32> = history
-        .map(|h| h.iter().map(|(_, m)| *m).collect())
-        .unwrap_or_default();
-    let line2 = Line::from(inline_sparkline(&samples, 26, Color::Magenta));
-    Cell::from(vec![line1, line2])
+        _ => Cell::from(format_bytes(s.mem_used)),
+    }
 }
 
 /// Green / yellow / red threshold for a 0..=1 gauge — same scale the

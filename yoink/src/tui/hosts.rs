@@ -9,13 +9,14 @@ use futures_util::future::join_all;
 use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::config::{Config, HostConfig};
 use crate::docker_ops::{DockerOps, DockerVersion, Host, HostInfo};
 use crate::output::format_bytes;
 
-use super::ui::{bold, clamp_selection, pane_layout};
+use super::ui::{bold, clamp_selection, inline_gauge, pane_layout};
 
 #[derive(Default)]
 pub struct HostsState {
@@ -113,8 +114,8 @@ impl HostsState {
             Constraint::Length(22), // ssh target
             Constraint::Length(11), // status
             Constraint::Length(8),  // server
-            Constraint::Length(12), // cpu (used / total cores)
-            Constraint::Length(22), // mem (used / total)
+            Constraint::Length(24), // cpu (used / total cores + gauge)
+            Constraint::Length(34), // mem (used / total + gauge)
             Constraint::Length(11), // running/total containers
             Constraint::Length(7),  // images
             Constraint::Min(20),    // platform / error
@@ -212,8 +213,8 @@ fn host_row(r: &HostRow) -> Row<'static> {
                 version.os.as_deref().unwrap_or("?"),
                 version.arch.as_deref().unwrap_or("?")
             );
-            let cpu = format_cpu(info, usage);
-            let mem = format_mem(info, usage);
+            let cpu_cell = cell_cpu(info, usage);
+            let mem_cell = cell_mem(info, usage);
             let (containers, images) = info.map_or_else(
                 || ("?".into(), "?".into()),
                 |i| {
@@ -231,8 +232,8 @@ fn host_row(r: &HostRow) -> Row<'static> {
                 Cell::from(target),
                 Cell::from("connected").style(Style::default().fg(Color::Green)),
                 Cell::from(server),
-                Cell::from(cpu),
-                Cell::from(mem),
+                cpu_cell,
+                mem_cell,
                 Cell::from(containers),
                 Cell::from(images),
                 Cell::from(platform),
@@ -251,25 +252,63 @@ fn host_row(r: &HostRow) -> Row<'static> {
     }
 }
 
-/// Cell renders `<used> / <total>` cores. Unit ("cores") lives in the
-/// header. Falls back gracefully when either side is missing.
-fn format_cpu(info: Option<&HostInfo>, usage: Option<&HostUsage>) -> String {
+/// Cell renders `<used> / <total>` cores plus a bracketed gauge of
+/// host CPU saturation against the daemon's reported core count.
+/// Falls back to text-only when either side is missing.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn cell_cpu(info: Option<&HostInfo>, usage: Option<&HostUsage>) -> Cell<'static> {
     let total = info.and_then(|i| i.n_cpu);
     match (usage, total) {
-        (Some(u), Some(t)) => format!("{:.2} / {t}", u.cpu_pct / 100.0),
-        (None, Some(t)) => format!("- / {t}"),
-        (Some(u), None) => format!("{:.2}", u.cpu_pct / 100.0),
-        (None, None) => "-".into(),
+        (Some(u), Some(t)) => {
+            let used = u.cpu_pct / 100.0;
+            let ratio = ((used as f32) / (t as f32)).clamp(0.0, 1.0);
+            let mut spans = vec![Span::raw(format!("{used:>4.2} / {t:<3} "))];
+            spans.extend(inline_gauge(ratio, 10, gauge_color(ratio)));
+            Cell::from(Line::from(spans))
+        }
+        (None, Some(t)) => Cell::from(format!("- / {t}")),
+        (Some(u), None) => Cell::from(format!("{:.2}", u.cpu_pct / 100.0)),
+        (None, None) => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
     }
 }
 
-fn format_mem(info: Option<&HostInfo>, usage: Option<&HostUsage>) -> String {
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn cell_mem(info: Option<&HostInfo>, usage: Option<&HostUsage>) -> Cell<'static> {
     let total = info.and_then(|i| i.mem_total);
     match (usage, total) {
-        (Some(u), Some(t)) => format!("{} / {}", format_bytes(u.mem_used), format_bytes(t)),
-        (None, Some(t)) => format!("- / {}", format_bytes(t)),
-        (Some(u), None) => format_bytes(u.mem_used),
-        (None, None) => "-".into(),
+        (Some(u), Some(t)) => {
+            let ratio = ((u.mem_used as f32) / (t as f32)).clamp(0.0, 1.0);
+            let label = format!(
+                "{:>8} / {:<8} ",
+                format_bytes(u.mem_used),
+                format_bytes(t)
+            );
+            let mut spans = vec![Span::raw(label)];
+            spans.extend(inline_gauge(ratio, 10, gauge_color(ratio)));
+            Cell::from(Line::from(spans))
+        }
+        (None, Some(t)) => Cell::from(format!("- / {}", format_bytes(t))),
+        (Some(u), None) => Cell::from(format_bytes(u.mem_used)),
+        (None, None) => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+    }
+}
+
+/// Green / yellow / red threshold for a 0..=1 gauge.
+fn gauge_color(ratio: f32) -> Color {
+    if ratio < 0.60 {
+        Color::Green
+    } else if ratio < 0.85 {
+        Color::Yellow
+    } else {
+        Color::Red
     }
 }
 
@@ -375,45 +414,6 @@ services:
             HostStatus::Err(e) => panic!("expected ok+usage, got Err({e})"),
         }
         assert!(matches!(state.rows[1].status, HostStatus::Err(_)));
-    }
-
-    #[test]
-    fn format_cpu_shows_used_over_total() {
-        let info = HostInfo {
-            n_cpu: Some(8),
-            ..base_info()
-        };
-        let usage = HostUsage {
-            cpu_pct: 250.0,
-            mem_used: 0,
-        };
-        assert_eq!(format_cpu(Some(&info), Some(&usage)), "2.50 / 8");
-    }
-
-    #[test]
-    fn format_mem_shows_used_over_total() {
-        let info = HostInfo {
-            mem_total: Some(32 * 1024 * 1024 * 1024),
-            ..base_info()
-        };
-        let usage = HostUsage {
-            cpu_pct: 0.0,
-            mem_used: 4 * 1024 * 1024 * 1024 + 200 * 1024 * 1024,
-        };
-        let s = format_mem(Some(&info), Some(&usage));
-        assert!(s.contains("/ 32.0 GiB"), "got {s}");
-    }
-
-    fn base_info() -> HostInfo {
-        HostInfo {
-            n_cpu: None,
-            mem_total: None,
-            containers: None,
-            containers_running: None,
-            images: None,
-            kernel: None,
-            operating_system: None,
-        }
     }
 
     #[test]

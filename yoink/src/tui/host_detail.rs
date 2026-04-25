@@ -2,21 +2,20 @@
 //! host (regardless of yoink labels) with live CPU/mem stats. Up/Down
 //! selects; Enter opens that container's live log stream.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::future::join_all;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Cell, LineGauge, Paragraph, Row, Sparkline, Table, TableState};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, LineGauge, Paragraph, Row, Table, TableState};
 
 use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
 use crate::output::format_bytes;
 
-use super::ui::{bold, clamp_selection, health_style, state_style};
-
-const HISTORY_LEN: usize = 60;
+use super::ui::{bold, clamp_selection, health_style, inline_gauge, state_style};
 
 pub struct HostDetailRefresh {
     pub containers: Vec<ContainerInfo>,
@@ -29,11 +28,6 @@ pub struct HostDetailState {
     host: Option<Host>,
     containers: Vec<ContainerInfo>,
     stats: HashMap<String, ContainerStats>,
-    /// Ring buffer of host-aggregate (`cpu_pct_total`,
-    /// `mem_bytes_total`) samples — drives the `LineGauge` + Sparkline
-    /// summary panel above
-    /// the container table.
-    history: VecDeque<(f32, f32)>,
     last_error: Option<String>,
     table: TableState,
     loaded: bool,
@@ -67,24 +61,11 @@ impl HostDetailState {
     }
 
     /// Apply background-fetched results, preserving selection where possible.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
     pub fn apply(&mut self, data: HostDetailRefresh) {
         self.last_error = data.error;
         if self.last_error.is_none() {
             self.containers = data.containers;
             self.stats = data.stats;
-            // Snapshot host-aggregate (sum of containers) for the
-            // top summary panel's LineGauge + Sparkline.
-            let cpu_total: f32 = self.stats.values().map(|s| s.cpu_pct as f32).sum();
-            let mem_total: f32 = self.stats.values().map(|s| s.mem_used as f32).sum();
-            self.history.push_back((cpu_total, mem_total));
-            if self.history.len() > HISTORY_LEN {
-                self.history.pop_front();
-            }
             self.loaded = true;
         }
         clamp_selection(&mut self.table, self.containers.len());
@@ -120,12 +101,12 @@ impl HostDetailState {
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-        // 4-section layout: header (1) · summary panel (6) · table (rest) · footer (1).
+        // 4-section layout: header (1) · summary panel (4) · table (rest) · footer (1).
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Length(6),
+                Constraint::Length(4),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
@@ -153,8 +134,8 @@ impl HostDetailState {
             Constraint::Length(28), // status
             Constraint::Length(10), // state
             Constraint::Length(10), // health
-            Constraint::Length(11), // cpu (cores)
-            Constraint::Min(20),    // mem
+            Constraint::Length(20), // cpu (value + bracketed gauge)
+            Constraint::Min(28),    // mem (value/limit + bracketed gauge)
         ];
         let rows: Vec<Row<'_>> = if !self.loaded && self.last_error.is_none() {
             vec![Row::new(vec![Cell::from("(loading…)")])]
@@ -169,17 +150,6 @@ impl HostDetailState {
                 .iter()
                 .map(|c| {
                     let stats = self.stats.get(&c.name);
-                    let cpu =
-                        stats.map_or_else(|| "-".into(), |s| format!("{:.2}", s.cpu_pct / 100.0));
-                    let mem = stats.map_or_else(
-                        || "-".into(),
-                        |s| match s.mem_limit {
-                            Some(limit) if limit > 0 => {
-                                format!("{} / {}", format_bytes(s.mem_used), format_bytes(limit))
-                            }
-                            _ => format_bytes(s.mem_used),
-                        },
-                    );
                     let health = c.health_hint().unwrap_or("-");
                     Row::new(vec![
                         Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
@@ -187,8 +157,8 @@ impl HostDetailState {
                         Cell::from(c.status_text.clone()),
                         Cell::from(c.state.clone()).style(state_style(&c.state)),
                         Cell::from(health.to_string()).style(health_style(health)),
-                        Cell::from(cpu),
-                        Cell::from(mem),
+                        cell_cpu(stats),
+                        cell_mem(stats),
                     ])
                 })
                 .collect()
@@ -221,9 +191,9 @@ impl HostDetailState {
         frame.render_widget(footer, footer_area);
     }
 
-    /// Host-aggregate summary panel: bordered block hosting a CPU
-    /// `LineGauge` + Mem `LineGauge` (current snapshot) over twin
-    /// `Sparkline` widgets (~2 minutes of trail at 2 s ticks).
+    /// Host-aggregate summary panel: bordered block hosting two
+    /// `LineGauge` rows (CPU / Mem) so the operator can see total
+    /// load at a glance without scanning every container row.
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -239,80 +209,41 @@ impl HostDetailState {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // CPU LineGauge
-                Constraint::Length(1), // Mem LineGauge
-                Constraint::Min(1),    // Twin sparklines (CPU/Mem) side by side
-            ])
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(inner);
 
         let cpu_total: f32 = self.stats.values().map(|s| s.cpu_pct as f32).sum();
         let mem_total: u64 = self.stats.values().map(|s| s.mem_used.max(0) as u64).sum();
 
-        // Cap CPU at the highest historical value (or at least 100%) so
-        // the bar has a meaningful scale even with multi-core spikes.
-        let cpu_max = self
-            .history
-            .iter()
-            .map(|(c, _)| *c)
-            .fold(100.0_f32, f32::max);
-        let cpu_ratio = (cpu_total / cpu_max).clamp(0.0, 1.0) as f64;
-        let mem_max = self
-            .history
-            .iter()
-            .map(|(_, m)| *m)
-            .fold(mem_total as f32, f32::max)
-            .max(1.0);
-        let mem_ratio = ((mem_total as f32) / mem_max).clamp(0.0, 1.0) as f64;
+        // CPU scale is one core-worth (100%) by default; if the host
+        // is busier than that the bar fills then clips — that's the
+        // signal the operator wants ("we're past one core's worth").
+        let cpu_ratio = (cpu_total / 100.0).clamp(0.0, 1.0) as f64;
+        let cpu_label = format!("CPU  {cpu_total:>6.1}%");
 
-        let cpu_label = format!("CPU  {cpu_total:>6.1}% / {cpu_max:.0}%");
-        let mem_label = format!(
-            "MEM  {} / {}",
-            format_bytes(i64::try_from(mem_total).unwrap_or(i64::MAX)),
-            format_bytes(mem_max as i64)
-        );
+        let mem_label = format!("MEM  {}", format_bytes(i64::try_from(mem_total).unwrap_or(i64::MAX)));
+        // Mem ratio needs a denominator we don't have at host level
+        // here — the per-container `mem_limit`s sum is meaningless.
+        // Show the bar against host RAM by leaving it at zero unless
+        // we surface host-total memory in a future refresh.
+        let mem_ratio: f64 = 0.0;
 
-        let cpu_gauge = LineGauge::default()
-            .label(cpu_label)
-            .ratio(cpu_ratio)
-            .filled_style(Style::default().fg(gauge_color(cpu_ratio as f32)).add_modifier(Modifier::BOLD))
-            .unfilled_style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(cpu_gauge, chunks[0]);
-
-        let mem_gauge = LineGauge::default()
-            .label(mem_label)
-            .ratio(mem_ratio)
-            .filled_style(Style::default().fg(gauge_color(mem_ratio as f32)).add_modifier(Modifier::BOLD))
-            .unfilled_style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(mem_gauge, chunks[1]);
-
-        // Side-by-side trend sparklines — left CPU, right Mem.
-        let trend_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[2]);
-
-        let cpu_series: Vec<u64> = self
-            .history
-            .iter()
-            .map(|(c, _)| (*c as u64).max(1))
-            .collect();
-        let mem_series: Vec<u64> = self
-            .history
-            .iter()
-            .map(|(_, m)| (*m as u64).max(1))
-            .collect();
-
-        let cpu_spark = Sparkline::default()
-            .data(&cpu_series)
-            .style(Style::default().fg(Color::Cyan));
-        frame.render_widget(cpu_spark, trend_chunks[0]);
-
-        let mem_spark = Sparkline::default()
-            .data(&mem_series)
-            .style(Style::default().fg(Color::Magenta));
-        frame.render_widget(mem_spark, trend_chunks[1]);
+        frame.render_widget(line_gauge(cpu_label, cpu_ratio), chunks[0]);
+        frame.render_widget(line_gauge(mem_label, mem_ratio), chunks[1]);
     }
+}
+
+/// Build a `LineGauge` with a bright-gray unfilled track so the
+/// bounds (start of bar, position of "100%") stay visible even on
+/// terminals where `DarkGray` melts into the background.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn line_gauge(label: String, ratio: f64) -> LineGauge<'static> {
+    let color = gauge_color(ratio as f32);
+    LineGauge::default()
+        .label(Line::from(Span::raw(label)))
+        .ratio(ratio.clamp(0.0, 1.0))
+        .filled_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+        .unfilled_style(Style::default().fg(Color::Gray))
 }
 
 /// Green / yellow / red threshold for a 0..=1 gauge (mirrors
@@ -324,6 +255,47 @@ fn gauge_color(ratio: f32) -> Color {
         Color::Yellow
     } else {
         Color::Red
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn cell_cpu(stats: Option<&ContainerStats>) -> Cell<'static> {
+    let Some(s) = stats else {
+        return Cell::from("-").style(Style::default().fg(Color::DarkGray));
+    };
+    let pct = s.cpu_pct as f32;
+    let ratio = (pct / 100.0).clamp(0.0, 1.0);
+    let mut spans = vec![Span::raw(format!("{pct:>5.1}% "))];
+    spans.extend(inline_gauge(ratio, 10, gauge_color(ratio)));
+    Cell::from(Line::from(spans))
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn cell_mem(stats: Option<&ContainerStats>) -> Cell<'static> {
+    let Some(s) = stats else {
+        return Cell::from("-").style(Style::default().fg(Color::DarkGray));
+    };
+    match s.mem_limit {
+        Some(limit) if limit > 0 => {
+            let ratio = ((s.mem_used as f32) / (limit as f32)).clamp(0.0, 1.0);
+            let label = format!(
+                "{:>8} / {:<8} ",
+                format_bytes(s.mem_used),
+                format_bytes(limit)
+            );
+            let mut spans = vec![Span::raw(label)];
+            spans.extend(inline_gauge(ratio, 10, gauge_color(ratio)));
+            Cell::from(Line::from(spans))
+        }
+        _ => Cell::from(format_bytes(s.mem_used)),
     }
 }
 
