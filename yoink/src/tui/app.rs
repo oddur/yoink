@@ -75,7 +75,14 @@ pub enum View {
     ContainerLogs { host: Host, container: String },
     /// Embedded PTY shell for one container — k9s-style "drop into the
     /// container" without leaving the TUI.
-    ContainerShell { host: Host, container: String },
+    ContainerShell {
+        host: Host,
+        container: String,
+        /// True when this is a debug sidecar (alpine container in the
+        /// target's pid+net namespaces) rather than an in-container
+        /// `docker exec`. Used for distroless / shell-less images.
+        debug: bool,
+    },
 }
 
 impl From<Mode> for View {
@@ -448,8 +455,25 @@ impl App {
                         self.host_detail.host().cloned(),
                         self.host_detail.selected_container(),
                     ) {
-                        self.transition(View::ContainerShell { host, container })
-                            .await;
+                        self.transition(View::ContainerShell {
+                            host,
+                            container,
+                            debug: false,
+                        })
+                        .await;
+                    }
+                }
+                KeyCode::Char('D') => {
+                    if let (Some(host), Some(container)) = (
+                        self.host_detail.host().cloned(),
+                        self.host_detail.selected_container(),
+                    ) {
+                        self.transition(View::ContainerShell {
+                            host,
+                            container,
+                            debug: true,
+                        })
+                        .await;
                     }
                 }
                 KeyCode::Esc => self.transition(View::Hosts).await,
@@ -464,8 +488,22 @@ impl App {
                 KeyCode::Char('!') => {
                     let host = host.clone();
                     let container = container.clone();
-                    self.transition(View::ContainerShell { host, container })
-                        .await;
+                    self.transition(View::ContainerShell {
+                        host,
+                        container,
+                        debug: false,
+                    })
+                    .await;
+                }
+                KeyCode::Char('D') => {
+                    let host = host.clone();
+                    let container = container.clone();
+                    self.transition(View::ContainerShell {
+                        host,
+                        container,
+                        debug: true,
+                    })
+                    .await;
                 }
                 KeyCode::Char('k') => self.logs.clear(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
@@ -510,6 +548,17 @@ impl App {
                         self.transition(View::ContainerShell {
                             host: row.host,
                             container: row.container.name,
+                            debug: false,
+                        })
+                        .await;
+                    }
+                }
+                KeyCode::Char('D') => {
+                    if let Some(row) = self.service_detail.selected_row() {
+                        self.transition(View::ContainerShell {
+                            host: row.host,
+                            container: row.container.name,
+                            debug: true,
                         })
                         .await;
                     }
@@ -559,9 +608,13 @@ impl App {
         self.stop_log_streams();
         self.logs.clear();
         // Always tear down any in-flight shell when leaving its view —
-        // the spawned exec will drop its bridge task on Drop.
-        if !matches!(new_view, View::ContainerShell { .. }) {
-            self.shell = None;
+        // the spawned exec will drop its bridge task on Drop, and a
+        // sidecar shell needs an explicit force-remove of its
+        // alpine container so we don't leave debug containers running.
+        if !matches!(new_view, View::ContainerShell { .. })
+            && let Some(mut shell) = self.shell.take()
+        {
+            shell.cleanup(self.ops.clone());
         }
 
         match &new_view {
@@ -573,13 +626,29 @@ impl App {
                 self.spawn_log_forwarder(host.clone(), container.clone())
                     .await;
             }
-            View::ContainerShell { host, container } => {
+            View::ContainerShell {
+                host,
+                container,
+                debug,
+            } => {
                 let mut state = ShellState::new(host.clone(), container.clone());
                 // Pick a sensible initial size; the next render will
                 // resize to whatever the panel actually is.
-                state
-                    .start(self.ops.clone(), self.shell_bytes_tx.clone(), 24, 80)
-                    .await;
+                if *debug {
+                    state
+                        .start_debug(
+                            self.ops.clone(),
+                            self.shell_bytes_tx.clone(),
+                            "alpine",
+                            24,
+                            80,
+                        )
+                        .await;
+                } else {
+                    state
+                        .start(self.ops.clone(), self.shell_bytes_tx.clone(), 24, 80)
+                        .await;
+                }
                 self.shell = Some(state);
             }
             View::Logs => self.start_service_log_streams().await,

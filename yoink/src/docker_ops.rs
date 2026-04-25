@@ -191,21 +191,33 @@ pub enum DockerEventKind {
     Other,
 }
 
-/// Handle to an interactive (TTY) docker exec. Output is the merged
-/// PTY byte stream (stdout+stderr combined when `tty: true`); writing
-/// to `stdin` sends keystrokes. Resize via `resize_exec(exec_id, …)`
-/// when the terminal panel changes size.
+/// Handle to an interactive (TTY) docker exec or attached sidecar
+/// container. Output is the merged PTY byte stream (stdout+stderr
+/// combined when `tty: true`); writing to `stdin` sends keystrokes.
+/// `kind` tells the caller which resize / cleanup endpoint to use.
 pub struct ExecSession {
-    pub exec_id: String,
+    /// Exec ID for `Exec` kind, or container name for `Sidecar` kind.
+    pub id: String,
+    pub kind: ExecKind,
     pub stdin: std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
     pub output:
         std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, DockerError>> + Send>>,
 }
 
+/// Whether an `ExecSession` is backed by a docker exec (resize via
+/// `resize_exec`) or by an attached sidecar container (resize via
+/// `resize_container_tty`, cleanup via `force_remove_container`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecKind {
+    Exec,
+    Sidecar,
+}
+
 impl std::fmt::Debug for ExecSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecSession")
-            .field("exec_id", &self.exec_id)
+            .field("id", &self.id)
+            .field("kind", &self.kind)
             .finish_non_exhaustive()
     }
 }
@@ -332,6 +344,33 @@ pub trait DockerOps: Send + Sync {
         rows: u16,
         cols: u16,
     ) -> Result<(), DockerError>;
+
+    /// Same idea as `resize_exec` but for an attached sidecar
+    /// container (different docker endpoint, same payload).
+    async fn resize_container_tty(
+        &self,
+        host: &Host,
+        container: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), DockerError>;
+
+    /// Start a "debug sidecar" container that shares the target's PID
+    /// and network namespaces, attach to it interactively, and return
+    /// the byte streams. Used as a fallback when the target is
+    /// distroless or otherwise lacks a usable shell — the sidecar can
+    /// `ps`, `ss`, peek at `/proc/<pid>/root/...`, etc., without
+    /// modifying the production image. The caller is responsible for
+    /// `force_remove_container` on shutdown; `auto_remove` handles the
+    /// happy-path cleanup when the user runs `exit` / Ctrl-D inside.
+    async fn start_debug_sidecar(
+        &self,
+        host: &Host,
+        target_container: &str,
+        image: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ExecSession, DockerError>;
 
     /// TCP-only liveness probe — used for services that don't speak
     /// HTTP (redis on :6379) or where the HTTP path is impractical to
@@ -829,7 +868,8 @@ impl DockerOps for RealDockerOps {
         });
 
         Ok(ExecSession {
-            exec_id: exec.id,
+            id: exec.id,
+            kind: ExecKind::Exec,
             stdin: input,
             output: Box::pin(mapped),
         })
@@ -853,6 +893,134 @@ impl DockerOps for RealDockerOps {
             )
             .await
             .map_err(|s| Self::err(host, s))
+    }
+
+    async fn resize_container_tty(
+        &self,
+        host: &Host,
+        container: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), DockerError> {
+        let docker = self.client_for(host).await?;
+        let opts = bollard::query_parameters::ResizeContainerTTYOptionsBuilder::default()
+            .h(i32::from(rows))
+            .w(i32::from(cols))
+            .build();
+        docker
+            .resize_container_tty(container, opts)
+            .await
+            .map_err(|s| Self::err(host, s))
+    }
+
+    async fn start_debug_sidecar(
+        &self,
+        host: &Host,
+        target_container: &str,
+        image: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ExecSession, DockerError> {
+        let docker = self.client_for(host).await?;
+
+        // Pull the debug image best-effort — if it's already cached
+        // this is a fast no-op; if the daemon can't reach the registry
+        // and the image isn't cached, create_container will surface a
+        // clearer error than pull would.
+        let _ = self.pull_image(host, image, "latest", None).await;
+
+        // Generate a unique-ish name so multiple debug sessions can
+        // coexist (operator opens two side-by-side, one crashes, etc.).
+        let suffix = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros())
+        );
+        let name = format!("yoink-debug-{target_container}-{suffix}");
+        let target_ref = format!("container:{target_container}");
+        let body = ContainerCreateBody {
+            image: Some(format!("{image}:latest")),
+            cmd: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                // Print a short banner so the operator immediately
+                // knows they're inside the sidecar (not the target).
+                format!(
+                    "echo '=== yoink debug sidecar — sharing pid+net with {target_container} ==='; \
+                     exec /bin/sh"
+                ),
+            ]),
+            tty: Some(true),
+            open_stdin: Some(true),
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            stdin_once: Some(false),
+            labels: Some(
+                [
+                    ("yoink.managed".to_string(), "true".to_string()),
+                    ("yoink.debug-sidecar".to_string(), "true".to_string()),
+                    ("yoink.debug-target".to_string(), target_container.to_string()),
+                ]
+                .into(),
+            ),
+            host_config: Some(HostConfig {
+                pid_mode: Some(target_ref.clone()),
+                network_mode: Some(target_ref),
+                auto_remove: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let create_opts = CreateContainerOptionsBuilder::default().name(&name).build();
+        docker
+            .create_container(Some(create_opts), body)
+            .await
+            .map_err(|s| Self::err(host, s))?;
+
+        // Attach BEFORE start so we don't miss the banner echo.
+        let attach_opts = bollard::query_parameters::AttachContainerOptionsBuilder::default()
+            .stdin(true)
+            .stdout(true)
+            .stderr(true)
+            .stream(true)
+            .build();
+        let attached = docker
+            .attach_container(&name, Some(attach_opts))
+            .await
+            .map_err(|s| Self::err(host, s))?;
+
+        docker
+            .start_container(
+                &name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|s| Self::err(host, s))?;
+
+        let resize_opts = bollard::query_parameters::ResizeContainerTTYOptionsBuilder::default()
+            .h(i32::from(rows))
+            .w(i32::from(cols))
+            .build();
+        let _ = docker.resize_container_tty(&name, resize_opts).await;
+
+        let host_for_err = host.clone();
+        let mapped = attached.output.map(move |item| match item {
+            Ok(bollard::container::LogOutput::Console { message }
+            | bollard::container::LogOutput::StdOut { message }
+            | bollard::container::LogOutput::StdErr { message }) => Ok(message),
+            Ok(bollard::container::LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
+            Err(e) => Err(Self::err(&host_for_err, e)),
+        });
+
+        Ok(ExecSession {
+            id: name,
+            kind: ExecKind::Sidecar,
+            stdin: attached.input,
+            output: Box::pin(mapped),
+        })
     }
 
     async fn healthcheck_tcp(
@@ -1478,6 +1646,27 @@ impl DockerOps for FakeDockerOps {
         _cols: u16,
     ) -> Result<(), DockerError> {
         Ok(())
+    }
+    async fn resize_container_tty(
+        &self,
+        _host: &Host,
+        _container: &str,
+        _rows: u16,
+        _cols: u16,
+    ) -> Result<(), DockerError> {
+        Ok(())
+    }
+    async fn start_debug_sidecar(
+        &self,
+        _host: &Host,
+        _target_container: &str,
+        _image: &str,
+        _rows: u16,
+        _cols: u16,
+    ) -> Result<ExecSession, DockerError> {
+        Err(DockerError::Invalid(
+            "start_debug_sidecar not supported by FakeDockerOps".into(),
+        ))
     }
     async fn fetch_recent_logs(
         &self,

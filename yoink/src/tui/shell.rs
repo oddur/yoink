@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use tui_term::widget::PseudoTerminal;
 
-use crate::docker_ops::{DockerOps, ExecSession, Host};
+use crate::docker_ops::{DockerOps, ExecKind, ExecSession, Host};
 
 use super::ui::pane_layout;
 
@@ -57,8 +57,10 @@ struct ShellInner {
     /// EOF sentinel — the bridge holds the matching sender; when it
     /// drops, this channel disconnects and `drain_output` notices.
     eof_rx: mpsc::UnboundedReceiver<()>,
-    exec_id: String,
-    /// Last (rows, cols) we sent via `resize_exec`; we re-send on change.
+    /// Exec id for `Exec`, container name for `Sidecar`.
+    id: String,
+    kind: ExecKind,
+    /// Last (rows, cols) we sent to the daemon; we re-send on change.
     last_size: (u16, u16),
     /// Flipped true after the bridge delivers the first byte from the
     /// daemon. Resize calls before this race against bollard's exec
@@ -127,18 +129,58 @@ impl ShellState {
                 return;
             }
         };
+        let banner = format!(
+            "\x1b[2myoink shell · {} · {}\x1b[0m\r\n",
+            self.host.address, self.container
+        );
+        self.wire_session(session, bytes_tx, rows, cols, &banner);
+    }
 
+    /// Variant of `start` that spawns a debug sidecar container in the
+    /// target's pid+net namespaces — for distroless / shell-less images.
+    pub async fn start_debug(
+        &mut self,
+        ops: Arc<dyn DockerOps>,
+        bytes_tx: mpsc::UnboundedSender<Vec<u8>>,
+        image: &str,
+        rows: u16,
+        cols: u16,
+    ) {
+        let session = match ops
+            .start_debug_sidecar(&self.host, &self.container, image, rows, cols)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                self.error = Some(format!("failed to start debug sidecar: {e}"));
+                return;
+            }
+        };
+        let banner = format!(
+            "\x1b[2myoink debug sidecar ({image}) · target {}\x1b[0m\r\n",
+            self.container
+        );
+        self.wire_session(session, bytes_tx, rows, cols, &banner);
+    }
+
+    fn wire_session(
+        &mut self,
+        session: ExecSession,
+        bytes_tx: mpsc::UnboundedSender<Vec<u8>>,
+        rows: u16,
+        cols: u16,
+        banner: &str,
+    ) {
         let ExecSession {
-            exec_id,
+            id,
+            kind,
             stdin,
             mut output,
         } = session;
 
-        // Sentinel: dropped on EOF so the event loop notices the
-        // shell ended (Ctrl-D / `exit`) without us having to poll.
-        // `bytes_tx` carries each chunk; an empty Vec on EOF tells the
-        // app to call `drain_output` (which sees the disconnected
-        // sender via the eof_tx drop and bounces back to host detail).
+        // EOF sentinel: dropped when the bridge exits so the event
+        // loop notices the shell ended (Ctrl-D / `exit` / sidecar
+        // auto-removed) without us having to poll the byte channel.
         let (eof_tx, eof_rx) = mpsc::unbounded_channel::<()>();
         let bridge = tokio::spawn(async move {
             let _eof_guard = eof_tx;
@@ -159,18 +201,13 @@ impl ShellState {
         });
 
         let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK);
-        // Identify ourselves so the operator can tell the embedded shell
-        // apart from the host shell at a glance.
-        let banner = format!(
-            "\x1b[2myoink shell · {} · {}\x1b[0m\r\n",
-            self.host.address, self.container
-        );
         parser.process(banner.as_bytes());
 
         self.inner = Some(ShellInner {
             parser,
             stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
-            exec_id,
+            id,
+            kind,
             last_size: (rows, cols),
             started: false,
             eof_rx,
@@ -291,10 +328,36 @@ impl ShellState {
             return;
         }
         let host = self.host.clone();
-        let exec_id = inner.exec_id.clone();
+        let id = inner.id.clone();
+        let kind = inner.kind;
         tokio::spawn(async move {
-            if let Err(e) = ops.resize_exec(&host, &exec_id, rows, cols).await {
-                warn!(host = %host.address, error = %e, "resize_exec failed");
+            let res = match kind {
+                ExecKind::Exec => ops.resize_exec(&host, &id, rows, cols).await,
+                ExecKind::Sidecar => ops.resize_container_tty(&host, &id, rows, cols).await,
+            };
+            if let Err(e) = res {
+                warn!(host = %host.address, error = %e, "resize failed");
+            }
+        });
+    }
+
+    /// Force-remove the sidecar container (no-op for in-container
+    /// exec). Called when the user presses Ctrl-Q so we don't leave a
+    /// debug container running on the host. Fire-and-forget — Drop
+    /// can't await, and best-effort is fine since `auto_remove` will
+    /// reap it eventually anyway.
+    pub fn cleanup(&mut self, ops: Arc<dyn DockerOps>) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        if inner.kind != ExecKind::Sidecar {
+            return;
+        }
+        let host = self.host.clone();
+        let name = inner.id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ops.force_remove_container(&host, &name).await {
+                warn!(host = %host.address, container = %name, error = %e, "sidecar cleanup failed");
             }
         });
     }
