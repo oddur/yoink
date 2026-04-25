@@ -40,6 +40,7 @@ use super::host_detail::{self, HostDetailRefresh, HostDetailState};
 use super::hosts::{self, HostRow, HostsState};
 use super::logs::{LogsState, RenderedLine};
 use super::services::{ServiceDetailState, ServicesState};
+use super::container_detail::{self, ContainerDetailRefresh, ContainerDetailState};
 use super::shell::{SessionResult, ShellState};
 
 /// Backstop polling cadence when no `docker events` push lands. The
@@ -73,6 +74,8 @@ pub enum View {
     ServiceDetail(String),
     Logs,
     ContainerLogs { host: Host, container: String },
+    /// Container detail: labels, state, version, live CPU/mem.
+    ContainerDetail { host: Host, container: String },
     /// Embedded PTY shell for one container — k9s-style "drop into the
     /// container" without leaving the TUI.
     ContainerShell {
@@ -95,7 +98,8 @@ impl View {
             View::Hosts
             | View::HostDetail(_)
             | View::ContainerLogs { .. }
-            | View::ContainerShell { .. } => 1,
+            | View::ContainerShell { .. }
+            | View::ContainerDetail { .. } => 1,
             View::Services | View::ServiceDetail(_) => 2,
             View::Logs => 3,
         }
@@ -130,11 +134,19 @@ impl View {
                 "host detail",
                 "  ↑↓ / j k     select container",
                 "  enter        live logs",
+                "  i            container detail (labels, env-ish, live cpu/mem)",
                 "  !            shell into container (bash/sh)",
                 "  D            debug sidecar (alpine, target's pid+net ns)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh",
                 "  esc          back to hosts (when no active filter)",
+            ],
+            View::ContainerDetail { .. } => vec![
+                "container detail",
+                "  enter / l    live logs",
+                "  !            shell · D debug sidecar",
+                "  r            refresh",
+                "  esc          back to host detail",
             ],
             View::Services => vec![
                 "services",
@@ -147,6 +159,7 @@ impl View {
                 "service detail",
                 "  ↑↓ / j k     select replica",
                 "  enter        live logs",
+                "  i            container detail",
                 "  !            shell · D debug sidecar",
                 "  /            filter substring · esc to clear",
                 "  r            refresh · esc back",
@@ -208,6 +221,13 @@ impl View {
                 container.clone(),
                 if *debug { "debug shell" } else { "shell" }.into(),
             ],
+            View::ContainerDetail { host, container } => vec![
+                root,
+                "Hosts".into(),
+                host.address.clone(),
+                container.clone(),
+                "detail".into(),
+            ],
         }
     }
 }
@@ -230,6 +250,11 @@ enum Update {
     HostDetail {
         host: Host,
         data: HostDetailRefresh,
+    },
+    ContainerDetail {
+        host: Host,
+        container: String,
+        data: ContainerDetailRefresh,
     },
     Dashboard(DashboardRefresh),
     /// Push notification from a host's `docker events` stream. Triggers
@@ -390,6 +415,7 @@ pub struct App {
     pub host_detail: HostDetailState,
     pub services: ServicesState,
     pub service_detail: ServiceDetailState,
+    pub container_detail: ContainerDetailState,
     pub logs: LogsState,
     /// `Some` while a `ContainerShell` view is active; cleared on exit.
     shell: Option<ShellState>,
@@ -453,6 +479,7 @@ impl App {
             host_detail: HostDetailState::new(),
             services: ServicesState::new(),
             service_detail: ServiceDetailState::new(),
+            container_detail: ContainerDetailState::new(),
             logs: LogsState::new(),
             shell: None,
             show_help: false,
@@ -674,8 +701,51 @@ impl App {
                         .await;
                     }
                 }
+                KeyCode::Char('i') => {
+                    if let (Some(host), Some(container)) = (
+                        self.host_detail.host().cloned(),
+                        self.host_detail.selected_container(),
+                    ) {
+                        self.transition(View::ContainerDetail { host, container })
+                            .await;
+                    }
+                }
                 KeyCode::Esc => self.transition(View::Hosts).await,
                 KeyCode::Char('r') => self.schedule_host_detail_refresh(),
+                _ => {}
+            },
+            View::ContainerDetail { host, container } => match key.code {
+                KeyCode::Esc => {
+                    let host = host.clone();
+                    self.transition(View::HostDetail(host)).await;
+                }
+                KeyCode::Char('l') | KeyCode::Enter => {
+                    let host = host.clone();
+                    let container = container.clone();
+                    self.transition(View::ContainerLogs { host, container })
+                        .await;
+                }
+                KeyCode::Char('!') => {
+                    let host = host.clone();
+                    let container = container.clone();
+                    self.transition(View::ContainerShell {
+                        host,
+                        container,
+                        debug: false,
+                    })
+                    .await;
+                }
+                KeyCode::Char('D') => {
+                    let host = host.clone();
+                    let container = container.clone();
+                    self.transition(View::ContainerShell {
+                        host,
+                        container,
+                        debug: true,
+                    })
+                    .await;
+                }
+                KeyCode::Char('r') => self.schedule_container_detail_refresh(),
                 _ => {}
             },
             View::ContainerLogs { host, container } => match key.code {
@@ -757,6 +827,15 @@ impl App {
                             host: row.host,
                             container: row.container.name,
                             debug: true,
+                        })
+                        .await;
+                    }
+                }
+                KeyCode::Char('i') => {
+                    if let Some(row) = self.service_detail.selected_row() {
+                        self.transition(View::ContainerDetail {
+                            host: row.host,
+                            container: row.container.name,
                         })
                         .await;
                     }
@@ -876,6 +955,10 @@ impl App {
                 self.spawn_log_forwarder(host.clone(), container.clone())
                     .await;
             }
+            View::ContainerDetail { host, container } => {
+                self.container_detail.set_target(host.clone(), container.clone());
+                self.schedule_container_detail_refresh();
+            }
             View::ContainerShell {
                 host,
                 container,
@@ -982,6 +1065,7 @@ impl App {
                 self.schedule_dashboard_refresh();
             }
             View::HostDetail(_) => self.schedule_host_detail_refresh(),
+            View::ContainerDetail { .. } => self.schedule_container_detail_refresh(),
             View::ContainerShell { .. } => self.shell_tick(),
             _ => {}
         }
@@ -1039,6 +1123,23 @@ impl App {
         });
     }
 
+    fn schedule_container_detail_refresh(&mut self) {
+        let Some((host, container)) = self.container_detail.target().cloned() else {
+            return;
+        };
+        let ops = self.ops.clone();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let data =
+                container_detail::fetch_owned(ops, host.clone(), container.clone()).await;
+            let _ = tx.send(Update::ContainerDetail {
+                host,
+                container,
+                data,
+            });
+        });
+    }
+
     fn schedule_dashboard_refresh(&mut self) {
         if self.dashboard_in_flight {
             return;
@@ -1066,6 +1167,17 @@ impl App {
                     self.host_detail.apply(data);
                 }
                 self.host_detail_in_flight = false;
+            }
+            Update::ContainerDetail {
+                host,
+                container,
+                data,
+            } => {
+                if self.container_detail.target().map(|(h, c)| (h, c.as_str()))
+                    == Some((&host, container.as_str()))
+                {
+                    self.container_detail.apply(data);
+                }
             }
             Update::Dashboard(data) => {
                 // Services & ServiceDetail share the same StatusReport
@@ -1196,6 +1308,7 @@ impl App {
             View::Dashboard => self.dashboard.render(frame, pane_area, &self.config),
             View::Hosts => self.hosts.render(frame, pane_area, &self.config),
             View::HostDetail(_) => self.host_detail.render(frame, pane_area),
+            View::ContainerDetail { .. } => self.container_detail.render(frame, pane_area),
             View::Services => self.services.render(frame, pane_area, &self.config),
             View::ServiceDetail(_) => self.service_detail.render(frame, pane_area),
             View::Logs | View::ContainerLogs { .. } => {

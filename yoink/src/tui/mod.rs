@@ -2,6 +2,7 @@
 //! rendering.
 
 mod app;
+mod container_detail;
 mod dashboard;
 mod host_detail;
 mod hosts;
