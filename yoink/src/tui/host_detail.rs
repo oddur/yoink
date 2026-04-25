@@ -16,8 +16,8 @@ use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
 use crate::output::format_bytes;
 
 use super::ui::{
-    bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge, state_style,
-    FilterState,
+    bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge, short_image,
+    state_style, FilterState,
 };
 
 pub struct HostDetailRefresh {
@@ -320,32 +320,6 @@ fn cell_mem(stats: Option<&ContainerStats>) -> Cell<'static> {
             Cell::from(Line::from(spans))
         }
         _ => Cell::from(format_bytes(s.mem_used)),
-    }
-}
-
-/// Squeeze a docker image reference into a column-friendly form:
-/// drop the registry prefix (everything up to the last `/`) and
-/// truncate `sha256:…` digests to 12 chars. `caddy/4db05qgnlk.registry.depot.dev/…`
-/// becomes `caddy:tag`; `sha256:abcdef…` becomes `sha256:abcdef…` truncated.
-fn short_image(image: &str) -> String {
-    if image.is_empty() {
-        return "-".into();
-    }
-    if let Some(rest) = image.strip_prefix("sha256:") {
-        let head: String = rest.chars().take(12).collect();
-        return format!("sha256:{head}");
-    }
-    let (path, tag) = image.split_once('@').unwrap_or_else(|| {
-        image.rsplit_once(':').map_or((image, ""), |(p, t)| (p, t))
-    });
-    let last = path.rsplit('/').next().unwrap_or(path);
-    if tag.is_empty() {
-        last.to_string()
-    } else if tag.starts_with("sha256:") {
-        let head: String = tag.chars().take(19).collect();
-        format!("{last}@{head}…")
-    } else {
-        format!("{last}:{tag}")
     }
 }
 

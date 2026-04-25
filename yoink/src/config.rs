@@ -391,15 +391,16 @@ impl Config {
     /// destructive commands (`up`, `restart`, `prune`, `rollback`)
     /// don't, since silently deploying to localhost would surprise.
     pub fn push_local_host_if_socket(&mut self) {
-        if self.hosts.iter().any(|h| h.address == "local") {
+        let local = crate::docker_ops::Host::LOCAL_ADDRESS;
+        if self.hosts.iter().any(|h| h.address == local) {
             return;
         }
         if !local_socket_exists() {
             return;
         }
         self.hosts.push(HostConfig {
-            address: "local".to_string(),
-            user: "local".to_string(),
+            address: local.to_string(),
+            user: local.to_string(),
         });
     }
 
@@ -473,8 +474,15 @@ impl Config {
                 )));
             }
         }
-        let host_addresses: std::collections::HashSet<&str> =
-            self.hosts.iter().map(|h| h.address.as_str()).collect();
+        let mut host_addresses: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for host in &self.hosts {
+            if !host_addresses.insert(host.address.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate hosts.address {:?}",
+                    host.address
+                )));
+            }
+        }
 
         if self.services.is_empty() {
             return Err(ConfigError::Invalid(

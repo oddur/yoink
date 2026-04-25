@@ -920,56 +920,45 @@ async fn cmd_restart(
 }
 
 async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
-    // Config already parses successfully (loaded by `run`); the extra
-    // checks here catch things parsing alone doesn't catch.
-    let mut had_error = false;
-    let mut seen_names = std::collections::HashSet::new();
-    for svc in &config.services {
-        if !seen_names.insert(&svc.name) {
-            eprintln!("✗ duplicate service name: {}", svc.name);
-            had_error = true;
-        }
-    }
-    let mut seen_addrs = std::collections::HashSet::new();
-    for host in &config.hosts {
-        if !seen_addrs.insert(&host.address) {
-            eprintln!("✗ duplicate host address: {}", host.address);
-            had_error = true;
-        }
-    }
-    if !had_error {
-        println!(
-            "✓ config OK — {} services across {} hosts",
-            config.services.len(),
-            config.hosts.len()
-        );
-    }
+    // `Config::load_from_path` (called from `run`) already ran the
+    // structural checks — duplicate names/addresses, missing fields,
+    // unknown YAML keys. If we got this far the config is well-formed.
+    println!(
+        "✓ config OK — {} services across {} hosts",
+        config.services.len(),
+        config.hosts.len()
+    );
     if check_hosts {
         cmd_preflight(config).await?;
-    }
-    if had_error {
-        anyhow::bail!("validation failed");
     }
     Ok(())
 }
 
 async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
+    use yoink::lock::LOCK_NAME;
     let ops = RealDockerOps::new();
     match action {
         LockAction::Status => {
-            for host_cfg in &config.hosts {
+            // Fan out across hosts — one slow daemon shouldn't make
+            // the others wait. Per-host errors surface as Err inline.
+            let probes = config.hosts.iter().map(|host_cfg| {
                 let host = Host::from(host_cfg);
-                let containers = ops
-                    .list_running_containers(&host)
-                    .await
-                    .with_context(|| format!("list containers on {}", host.address))?;
-                let lock = containers.iter().find(|c| c.name == "yoink-deploy-lock");
-                match lock {
-                    Some(c) => {
-                        let age = output::format_relative_time(c.created_unix);
-                        println!("{}: HELD (acquired {age})", host.address);
-                    }
-                    None => println!("{}: free", host.address),
+                let ops = &ops;
+                async move {
+                    let containers = ops.list_running_containers(&host).await?;
+                    let held = containers
+                        .iter()
+                        .find(|c| c.name == LOCK_NAME)
+                        .map(|c| output::format_relative_time(c.created_unix));
+                    anyhow::Ok((host.address, held))
+                }
+            });
+            let results = futures_util::future::join_all(probes).await;
+            for r in results {
+                match r {
+                    Ok((addr, Some(age))) => println!("{addr}: HELD (acquired {age})"),
+                    Ok((addr, None)) => println!("{addr}: free"),
+                    Err(e) => eprintln!("{e:#}"),
                 }
             }
         }
@@ -988,7 +977,7 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
                     continue;
                 }
                 let h = Host::from(host_cfg);
-                match ops.force_remove_container(&h, "yoink-deploy-lock").await {
+                match ops.force_remove_container(&h, LOCK_NAME).await {
                     Ok(()) => println!("{}: released", h.address),
                     Err(e) => eprintln!("{}: {e:#}", h.address),
                 }

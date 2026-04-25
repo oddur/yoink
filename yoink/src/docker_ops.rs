@@ -55,19 +55,21 @@ pub struct Host {
 }
 
 impl Host {
+    /// Sentinel address marking the synthetic host that talks to the
+    /// local docker socket instead of going over ssh. One constant so
+    /// the magic isn't a stringly-typed sprinkle across the codebase.
+    pub const LOCAL_ADDRESS: &'static str = "local";
+
     #[must_use]
     pub fn ssh_url(&self) -> String {
         format!("ssh://{}@{}", self.user, self.address)
     }
 
-    /// The magical "local" host bypasses ssh and talks to the
-    /// platform-default docker socket (unix socket on Linux/macOS,
-    /// npipe on Windows). Auto-injected at config-load time when a
-    /// local docker daemon is reachable; explicit users can also
-    /// add `address: local` to `yoink.yaml`.
+    /// True for the magical synthetic local host — bypasses ssh and
+    /// uses bollard's platform-default unix socket / npipe transport.
     #[must_use]
     pub fn is_local(&self) -> bool {
-        self.address == "local"
+        self.address == Self::LOCAL_ADDRESS
     }
 }
 

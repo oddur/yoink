@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use crate::docker_ops::{ContainerDetail, ContainerStats, DockerOps, Host};
 use crate::output::{format_bytes, format_relative_time};
 
-use super::ui::{bold, gauge_color, health_style, inline_gauge, state_style};
+use super::ui::{bold, gauge_color, health_style, inline_gauge, kv, kv_styled, state_style};
 
 /// Substrings that mark an env var as secret-ish — values are
 /// rendered as `<redacted>` so an over-the-shoulder operator can't
@@ -272,20 +272,6 @@ impl ContainerDetailState {
         let lines: Vec<Line<'static>> = items.iter().cloned().map(Line::from).collect();
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
-}
-
-fn kv(key: &str, value: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{key:>10}  "), Style::default().fg(Color::DarkGray)),
-        Span::styled(value.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-    ])
-}
-
-fn kv_styled(key: &str, value: &str, value_style: Style) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{key:>10}  "), Style::default().fg(Color::DarkGray)),
-        Span::styled(value.to_string(), value_style.add_modifier(Modifier::BOLD)),
-    ])
 }
 
 fn is_secret(key: &str) -> bool {

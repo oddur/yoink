@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use crate::docker_ops::{DockerError, DockerOps, Host};
 
 const LOCK_IMAGE: &str = "alpine:3.20";
-const LOCK_NAME: &str = "yoink-deploy-lock";
+pub const LOCK_NAME: &str = "yoink-deploy-lock";
 const HEARTBEAT_FILE: &str = "/tmp/heartbeat";
 /// Operator pings every 5s. Three pings before the sentinel decides
 /// we're dead, which gives plenty of slack for a slow ssh roundtrip.

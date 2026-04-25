@@ -38,6 +38,55 @@ pub fn state_style(state: &str) -> Style {
     }
 }
 
+/// Compact a docker image reference for table-cell display: drop
+/// the registry prefix (everything up to the last `/`) and truncate
+/// `sha256:…` digests so the cell stays readable.
+/// `4db05qgnlk.registry.depot.dev/backtrack-api:e0a6c4ef` becomes
+/// `backtrack-api:e0a6c4ef`.
+#[must_use]
+pub fn short_image(image: &str) -> String {
+    if image.is_empty() {
+        return "-".into();
+    }
+    if let Some(rest) = image.strip_prefix("sha256:") {
+        let head: String = rest.chars().take(12).collect();
+        return format!("sha256:{head}");
+    }
+    let (path, tag) = image.split_once('@').unwrap_or_else(|| {
+        image.rsplit_once(':').map_or((image, ""), |(p, t)| (p, t))
+    });
+    let last = path.rsplit('/').next().unwrap_or(path);
+    if tag.is_empty() {
+        last.to_string()
+    } else if tag.starts_with("sha256:") {
+        let head: String = tag.chars().take(19).collect();
+        format!("{last}@{head}…")
+    } else {
+        format!("{last}:{tag}")
+    }
+}
+
+/// Right-aligned dim key + bold value on one line — the shape every
+/// detail card uses ("image", "state", "command", …).
+#[must_use]
+pub fn kv(key: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{key:>10}  "), Style::default().fg(Color::DarkGray)),
+        Span::styled(value.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+    ])
+}
+
+/// Variant of `kv` where the value carries a caller-supplied style
+/// (e.g. state-colored, health-colored) — bold modifier is layered
+/// on top so the cell still reads as a value.
+#[must_use]
+pub fn kv_styled(key: &str, value: &str, value_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{key:>10}  "), Style::default().fg(Color::DarkGray)),
+        Span::styled(value.to_string(), value_style.add_modifier(Modifier::BOLD)),
+    ])
+}
+
 /// Carve the global header off the top of `area`. The header is a
 /// 4-row bordered block hosting the tab bar (row 1) + breadcrumb
 /// (row 2). Returns (`header_area`, `pane_area`).
