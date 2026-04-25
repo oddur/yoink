@@ -40,7 +40,7 @@ use super::host_detail::{self, HostDetailRefresh, HostDetailState};
 use super::hosts::{self, HostRow, HostsState};
 use super::logs::{LogsState, RenderedLine};
 use super::services::{ServiceDetailState, ServicesState};
-use super::shell::ShellState;
+use super::shell::{SessionResult, ShellState};
 
 /// Backstop polling cadence when no `docker events` push lands. The
 /// realtime updates ride on the events stream (see `subscribe_host_events`);
@@ -189,9 +189,14 @@ async fn run_loop(
     let mut fast_tick = interval(FAST_TICK);
     let mut hosts_tick = interval(HOSTS_TICK);
     let mut config_tick = interval(CONFIG_RELOAD_TICK);
+    // Drives the "starting shell…" spinner animation. Fires only
+    // matters when the shell view is up and `inner` is None; the
+    // branch is gated so it's a no-op otherwise.
+    let mut shell_spin_tick = interval(Duration::from_millis(125));
     fast_tick.tick().await;
     hosts_tick.tick().await;
     config_tick.tick().await;
+    shell_spin_tick.tick().await;
 
     loop {
         terminal.draw(|f| app.render(f))?;
@@ -235,6 +240,15 @@ async fn run_loop(
                     shell.process_bytes(&bytes);
                 }
             }
+            Some((origin_view, res, banner)) = app.shell_session_rx.recv() => {
+                app.apply_shell_session(&origin_view, res, &banner);
+            }
+            _ = shell_spin_tick.tick() => {
+                // Tick exists purely to wake the loop so the spinner
+                // animates while the shell is still spinning up.
+                // Every loop iteration redraws, so the no-op tick does
+                // its job just by being a select arm.
+            }
         }
     }
 }
@@ -258,6 +272,13 @@ pub struct App {
     /// fast tick, which is way too slow for an interactive terminal.
     shell_bytes_tx: UnboundedSender<Vec<u8>>,
     shell_bytes_rx: UnboundedReceiver<Vec<u8>>,
+    /// Result channel for the background "spin up the shell" task.
+    /// Bollard's create+attach+start round-trip can take a few seconds
+    /// (image pull, network setup) — running it on the event loop
+    /// freezes the TUI, so we spawn it and route the `ExecSession`
+    /// back through here.
+    shell_session_tx: UnboundedSender<(View, SessionResult, String)>,
+    shell_session_rx: UnboundedReceiver<(View, SessionResult, String)>,
 
     // Refresh-in-flight flags coalesce ticks: a tick that fires while the
     // previous refresh hasn't finished is dropped, so a slow daemon can
@@ -292,6 +313,7 @@ impl App {
         let (log_tx, log_rx) = mpsc::unbounded_channel();
         let (update_tx, update_rx) = mpsc::unbounded_channel();
         let (shell_bytes_tx, shell_bytes_rx) = mpsc::unbounded_channel();
+        let (shell_session_tx, shell_session_rx) = mpsc::unbounded_channel();
         Self {
             view,
             config,
@@ -305,6 +327,8 @@ impl App {
             shell: None,
             shell_bytes_tx,
             shell_bytes_rx,
+            shell_session_tx,
+            shell_session_rx,
             hosts_in_flight: false,
             host_detail_in_flight: false,
             dashboard_in_flight: false,
@@ -631,25 +655,44 @@ impl App {
                 container,
                 debug,
             } => {
-                let mut state = ShellState::new(host.clone(), container.clone());
-                // Pick a sensible initial size; the next render will
-                // resize to whatever the panel actually is.
-                if *debug {
-                    state
-                        .start_debug(
-                            self.ops.clone(),
-                            self.shell_bytes_tx.clone(),
-                            "alpine",
+                // Render the spinner immediately, then kick off the
+                // bollard create+attach+start in the background. The
+                // session lands via `shell_session_rx` and is wired
+                // into the panel without blocking the event loop.
+                let label = if *debug {
+                    "spinning up debug sidecar (alpine)".to_string()
+                } else {
+                    "starting in-container shell".to_string()
+                };
+                let state = ShellState::new(host.clone(), container.clone(), label);
+                let banner = if *debug {
+                    state.debug_banner("alpine")
+                } else {
+                    state.exec_banner()
+                };
+                self.shell = Some(state);
+                let key = new_view.clone();
+                let tx = self.shell_session_tx.clone();
+                let ops = self.ops.clone();
+                let host = host.clone();
+                let container = container.clone();
+                let is_debug = *debug;
+                tokio::spawn(async move {
+                    let res = if is_debug {
+                        ShellState::build_debug_future(
+                            ops,
+                            host,
+                            container,
+                            "alpine".into(),
                             24,
                             80,
                         )
-                        .await;
-                } else {
-                    state
-                        .start(self.ops.clone(), self.shell_bytes_tx.clone(), 24, 80)
-                        .await;
-                }
-                self.shell = Some(state);
+                        .await
+                    } else {
+                        ShellState::build_exec_future(ops, host, container, 24, 80).await
+                    };
+                    let _ = tx.send((key, res, banner));
+                });
             }
             View::Logs => self.start_service_log_streams().await,
             View::Dashboard | View::Services => self.schedule_dashboard_refresh(),
@@ -660,6 +703,31 @@ impl App {
             }
         }
         self.view = new_view;
+    }
+
+    /// The background `start_debug_sidecar` / `exec_interactive` task
+    /// returned. Drop the result if the user has navigated away from
+    /// the matching shell view (sidecar is `auto_remove` so it'll get
+    /// reaped on its own); otherwise wire it into the shell panel or
+    /// surface the error.
+    fn apply_shell_session(
+        &mut self,
+        origin_view: &View,
+        result: SessionResult,
+        banner: &str,
+    ) {
+        if &self.view != origin_view {
+            return;
+        }
+        let Some(shell) = self.shell.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(session) => {
+                shell.wire_session(session, self.shell_bytes_tx.clone(), 24, 80, banner);
+            }
+            Err(msg) => shell.set_error(msg),
+        }
     }
 
     /// Forward a key event into the embedded shell. Returns true if

@@ -38,8 +38,13 @@ const SCROLLBACK: usize = 5_000;
 pub struct ShellState {
     host: Host,
     container: String,
-    /// `None` until `start` succeeds; if start failed we render the
-    /// error in the panel rather than crashing the TUI.
+    /// What the spinner shows while the docker create+attach round-trip
+    /// is in flight (e.g. "spinning up debug sidecar (alpine)…"). Set
+    /// at construction time; cleared once `wire_session` is called.
+    starting_label: Option<String>,
+    /// `None` until the session arrives over the App's session channel;
+    /// if start failed we render the error in the panel rather than
+    /// crashing the TUI.
     inner: Option<ShellInner>,
     /// Set when the exec output stream `EOFed` (the container shell
     /// exited). The next key press returns the user to the previous
@@ -47,6 +52,11 @@ pub struct ShellState {
     exited: bool,
     error: Option<String>,
 }
+
+/// Result of the background "spin up the shell" task — fed into
+/// `ShellState::wire_session` (success) or `set_error` (failure) by
+/// the App run loop.
+pub type SessionResult = Result<ExecSession, String>;
 
 struct ShellInner {
     parser: vt100::Parser,
@@ -76,14 +86,20 @@ impl Drop for ShellInner {
 }
 
 impl ShellState {
-    pub fn new(host: Host, container: String) -> Self {
+    pub fn new(host: Host, container: String, starting_label: String) -> Self {
         Self {
             host,
             container,
+            starting_label: Some(starting_label),
             inner: None,
             exited: false,
             error: None,
         }
+    }
+
+    pub fn set_error(&mut self, msg: String) {
+        self.error = Some(msg);
+        self.starting_label = None;
     }
 
     /// True once the embedded shell has exited (Ctrl-D, `exit`, or
@@ -93,77 +109,69 @@ impl ShellState {
         self.exited
     }
 
-    /// Spawn the docker exec and start the byte-pump. `rows`/`cols`
-    /// are the inside-the-border dimensions of the panel — pass them
-    /// at start time so the shell prompts at the right size on the
-    /// first frame. `bytes_tx` is the app-level mpsc that wakes the
-    /// event loop on every byte chunk, so the render fires as soon as
-    /// the daemon sends output (rather than waiting for the 2s tick).
-    pub async fn start(
-        &mut self,
+    /// Build the in-container `sh -c …` future for `!`. Returned as a
+    /// boxed async closure so the App can spawn it in the background
+    /// and the TUI stays responsive while bollard does its create +
+    /// attach + start round-trip.
+    pub async fn build_exec_future(
         ops: Arc<dyn DockerOps>,
-        bytes_tx: mpsc::UnboundedSender<Vec<u8>>,
+        host: Host,
+        container: String,
         rows: u16,
         cols: u16,
-    ) {
+    ) -> SessionResult {
         // Pick the shell *inside* the container — exec'ing `bash`
         // directly returns OK at the API level even when the binary's
         // missing (the daemon then reports an OCI exec failure on the
         // output stream), so an outer bash→sh fallback never fires.
-        // Hardened/distroless/Alpine images frequently ship `sh` only;
-        // this one-liner picks bash when present and falls back to sh
-        // otherwise. If neither exists the container has no usable
-        // shell and we surface the resulting error in the panel.
+        // Hardened/distroless/Alpine images frequently ship `sh`
+        // only; this one-liner picks bash when present and falls back
+        // to sh otherwise.
         let cmd = vec![
             "/bin/sh".into(),
             "-c".into(),
             "if command -v bash >/dev/null 2>&1; then exec bash; else exec /bin/sh; fi".into(),
         ];
-        let session = match ops
-            .exec_interactive(&self.host, &self.container, cmd, rows, cols)
+        ops.exec_interactive(&host, &container, cmd, rows, cols)
             .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                self.error = Some(format!("failed to start shell: {e}"));
-                return;
-            }
-        };
-        let banner = format!(
-            "\x1b[2myoink shell · {} · {}\x1b[0m\r\n",
-            self.host.address, self.container
-        );
-        self.wire_session(session, bytes_tx, rows, cols, &banner);
+            .map_err(|e| format!("failed to start shell: {e}"))
     }
 
-    /// Variant of `start` that spawns a debug sidecar container in the
-    /// target's pid+net namespaces — for distroless / shell-less images.
-    pub async fn start_debug(
-        &mut self,
+    /// Debug-sidecar variant of `build_exec_future`. `auto_remove` +
+    /// Ctrl-Q cleanup means the alpine container is reaped on shell
+    /// exit.
+    pub async fn build_debug_future(
         ops: Arc<dyn DockerOps>,
-        bytes_tx: mpsc::UnboundedSender<Vec<u8>>,
-        image: &str,
+        host: Host,
+        container: String,
+        image: String,
         rows: u16,
         cols: u16,
-    ) {
-        let session = match ops
-            .start_debug_sidecar(&self.host, &self.container, image, rows, cols)
+    ) -> SessionResult {
+        ops.start_debug_sidecar(&host, &container, &image, rows, cols)
             .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                self.error = Some(format!("failed to start debug sidecar: {e}"));
-                return;
-            }
-        };
-        let banner = format!(
-            "\x1b[2myoink debug sidecar ({image}) · target {}\x1b[0m\r\n",
-            self.container
-        );
-        self.wire_session(session, bytes_tx, rows, cols, &banner);
+            .map_err(|e| format!("failed to start debug sidecar: {e}"))
     }
 
-    fn wire_session(
+    /// Standard banner for an in-container shell session.
+    #[must_use]
+    pub fn exec_banner(&self) -> String {
+        format!(
+            "\x1b[2myoink shell · {} · {}\x1b[0m\r\n",
+            self.host.address, self.container
+        )
+    }
+
+    /// Banner for a debug-sidecar session.
+    #[must_use]
+    pub fn debug_banner(&self, image: &str) -> String {
+        format!(
+            "\x1b[2myoink debug sidecar ({image}) · target {}\x1b[0m\r\n",
+            self.container
+        )
+    }
+
+    pub fn wire_session(
         &mut self,
         session: ExecSession,
         bytes_tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -202,6 +210,9 @@ impl ShellState {
 
         let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK);
         parser.process(banner.as_bytes());
+
+        // Cancel the spinner — the real PTY is taking over.
+        self.starting_label = None;
 
         self.inner = Some(ShellInner {
             parser,
@@ -297,8 +308,17 @@ impl ShellState {
             let pty = PseudoTerminal::new(inner.parser.screen()).block(block);
             frame.render_widget(pty, body_area);
         } else {
-            let msg = Paragraph::new("(starting shell…)")
-                .style(Style::default().fg(Color::DarkGray))
+            // Animated spinner — picks one frame per ~125 ms based on
+            // the system clock. Cheap, no extra ticks, and good enough
+            // to telegraph "yoink is working, not frozen".
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let idx = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| (d.as_millis() / 125) as usize)
+                % frames.len();
+            let label = self.starting_label.as_deref().unwrap_or("starting shell");
+            let msg = Paragraph::new(format!("  {} {label}…", frames[idx]))
+                .style(Style::default().fg(Color::Yellow))
                 .block(Block::default().borders(Borders::ALL).title("shell"));
             frame.render_widget(msg, body_area);
         }
