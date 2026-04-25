@@ -584,7 +584,8 @@ async fn upload_files(
 /// against the operator's `SecretsBundle` and return them as bollard
 /// `DockerCredentials`. Returns `None` when no registry block is set
 /// (typical for public-image-only deploys).
-fn registry_credentials(
+#[must_use]
+pub fn registry_credentials(
     config: &Config,
     secrets: Option<&SecretsBundle>,
 ) -> Option<bollard::auth::DockerCredentials> {

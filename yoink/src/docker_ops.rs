@@ -353,6 +353,12 @@ pub trait DockerOps: Send + Sync {
 
     async fn force_remove_container(&self, host: &Host, name: &str) -> Result<(), DockerError>;
 
+    /// Send SIGKILL to a container without removing it. The exited
+    /// container stays around for `docker logs` / `inspect` and can
+    /// be reaped later. Used by `yoink kill` for the "stop responding
+    /// NOW" case where the configured drain isn't fast enough.
+    async fn kill_container(&self, host: &Host, name: &str) -> Result<(), DockerError>;
+
     /// Run a one-shot curl container against `target:port/path` on
     /// `network`. Returns the HTTP status code curl observed (parsed from
     /// stdout) or 0 if curl couldn't reach the service.
@@ -774,6 +780,19 @@ impl DockerOps for RealDockerOps {
             Ok(())
             | Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
+            }) => Ok(()),
+            Err(other) => Err(Self::err(host, other)),
+        }
+    }
+
+    async fn kill_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
+        let docker = self.client_for(host).await?;
+        // Default signal is SIGKILL — that's exactly what we want here.
+        match docker.kill_container(name, None).await {
+            Ok(())
+            // 409 = "container not running"; treat as idempotent.
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409, ..
             }) => Ok(()),
             Err(other) => Err(Self::err(host, other)),
         }
@@ -1795,6 +1814,9 @@ impl DockerOps for FakeDockerOps {
             name.into(),
         ));
         pop(&mut s.force_remove_container, "force_remove_container")
+    }
+    async fn kill_container(&self, _host: &Host, _name: &str) -> Result<(), DockerError> {
+        Ok(())
     }
     async fn healthcheck(
         &self,

@@ -162,6 +162,29 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// SIGKILL a service's container (no graceful drain). Container
+    /// stays around for inspect/logs; use `up` or `restart` to bring
+    /// it back. Use this when the configured drain isn't fast enough.
+    Kill {
+        service: String,
+        #[arg(long)]
+        host: Option<String>,
+        /// Skip the "are you sure?" confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Pre-warm a service's image on every host (or a specific one)
+    /// without deploying. Useful right before a low-window deploy
+    /// where the pull is the longest leg.
+    Pull {
+        service: String,
+        /// Override the tag — same format as `up --tag`.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Restrict to one host.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Lint the config and (optionally) ping each host's docker daemon.
     /// Use this in CI before merging a yoink.yaml change.
     Validate {
@@ -276,6 +299,16 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Restart { service, host } => {
             cmd_restart(&config, &service, host.as_deref()).await
         }
+        Command::Kill {
+            service,
+            host,
+            yes,
+        } => cmd_kill(&config, &service, host.as_deref(), yes).await,
+        Command::Pull {
+            service,
+            tag,
+            host,
+        } => cmd_pull(&config, &service, tag.as_deref(), host.as_deref()).await,
         Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
         Command::Lock { action } => cmd_lock(&config, action).await,
         Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
@@ -916,6 +949,86 @@ async fn cmd_restart(
         .await
         .with_context(|| format!("start {}@{container}", host.address))?;
     eprintln!("ok");
+    Ok(())
+}
+
+async fn cmd_kill(
+    config: &Config,
+    service: &str,
+    host_filter: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    let ops = RealDockerOps::new();
+    let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
+    if !yes {
+        eprintln!(
+            "about to SIGKILL {}/{container} — the in-process drain is skipped. \
+             pass --yes to confirm.",
+            host.address
+        );
+        anyhow::bail!("aborted");
+    }
+    ops.kill_container(&host, &container)
+        .await
+        .with_context(|| format!("kill {}@{container}", host.address))?;
+    eprintln!("killed {}/{container}", host.address);
+    Ok(())
+}
+
+async fn cmd_pull(
+    config: &Config,
+    service: &str,
+    tag_override: Option<&str>,
+    host_filter: Option<&str>,
+) -> Result<()> {
+    let svc_cfg = config
+        .services
+        .iter()
+        .find(|s| s.name == service)
+        .with_context(|| format!("service {service:?} not in config"))?;
+    let tag = tag_override
+        .map(str::to_string)
+        .or_else(|| svc_cfg.tag.clone())
+        .unwrap_or_else(|| {
+            // Bare `git` version — same fallback `up` uses when no tag is given.
+            git::version(std::path::Path::new("."), true).unwrap_or_else(|_| "latest".into())
+        });
+    let bundle = load_secrets_bundle(config).await?;
+    let credentials = deploy::registry_credentials(config, bundle.as_ref());
+    let ops = RealDockerOps::new();
+    // Fan out across hosts so a slow daemon doesn't block the others.
+    let pulls = config
+        .hosts
+        .iter()
+        .filter(|h| host_filter.is_none_or(|f| f == h.address))
+        .map(|host_cfg| {
+            let host = Host::from(host_cfg);
+            let image = svc_cfg.image.clone();
+            let tag = tag.clone();
+            let credentials = credentials.clone();
+            let ops = &ops;
+            async move {
+                eprintln!("→ {}: pulling {image}:{tag}", host.address);
+                ops.pull_image(&host, &image, &tag, credentials)
+                    .await
+                    .with_context(|| format!("pull on {}", host.address))
+                    .map(|()| host.address)
+            }
+        });
+    let results = futures_util::future::join_all(pulls).await;
+    let mut had_err = false;
+    for r in results {
+        match r {
+            Ok(addr) => println!("✓ {addr}"),
+            Err(e) => {
+                eprintln!("✗ {e:#}");
+                had_err = true;
+            }
+        }
+    }
+    if had_err {
+        anyhow::bail!("one or more pulls failed");
+    }
     Ok(())
 }
 
