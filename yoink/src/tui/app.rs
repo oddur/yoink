@@ -48,6 +48,11 @@ use super::shell::{SessionResult, ShellState};
 /// this tick exists so the UI converges even if events are filtered out
 /// or the stream drops.
 const FAST_TICK: Duration = Duration::from_secs(2);
+/// How long a docker-event toast lingers in the breadcrumb's
+/// right-side info slot before fading.
+const TOAST_TTL: Duration = Duration::from_secs(5);
+/// Cap on toast ring buffer — older events fall off.
+const TOAST_CAP: usize = 8;
 const HOSTS_TICK: Duration = Duration::from_secs(10);
 /// How often to re-stat + re-parse the on-disk config so a `vim
 /// services/api.yaml` is reflected without restarting the TUI. Polling
@@ -429,6 +434,10 @@ pub struct App {
     /// current view. The user confirms with `y` (or Enter) and
     /// cancels with anything else. Cleared on transition.
     kill_target: Option<(Host, String)>,
+    /// Ring of recent docker-event toasts: `(deadline, line)`. The
+    /// most-recent line displaces the right-side host/service count
+    /// in the breadcrumb header for `TOAST_TTL`.
+    toasts: std::collections::VecDeque<(std::time::Instant, String)>,
     /// Byte chunks from the embedded shell's exec output stream. The
     /// run loop selects on this so each chunk wakes the render
     /// immediately — without it the only drain point would be the 2 s
@@ -491,6 +500,7 @@ impl App {
             shell: None,
             show_help: false,
             kill_target: None,
+            toasts: std::collections::VecDeque::new(),
             shell_bytes_tx,
             shell_bytes_rx,
             shell_session_tx,
@@ -1282,6 +1292,14 @@ impl App {
         if !interesting {
             return;
         }
+        // Surface the event as a toast in the breadcrumb header.
+        let container = event.container.as_deref().unwrap_or("?");
+        let line = format!("{} · {} {}", host.address, container, event.action);
+        self.toasts
+            .push_back((std::time::Instant::now() + TOAST_TTL, line));
+        while self.toasts.len() > TOAST_CAP {
+            self.toasts.pop_front();
+        }
         match &self.view {
             View::Dashboard | View::Services | View::ServiceDetail(_) => {
                 self.schedule_dashboard_refresh();
@@ -1347,10 +1365,22 @@ impl App {
     pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let (header_area, pane_area) = super::ui::split_with_header(frame.area());
         let crumbs = self.view.breadcrumb();
-        let right = format!(
-            "{} hosts · {} services",
-            self.config.hosts.len(),
-            self.config.services.len()
+        // Drop expired toasts and pick the freshest live one for the
+        // right-side info slot. When nothing's live, fall back to the
+        // host/service counts.
+        let now = std::time::Instant::now();
+        while self.toasts.front().is_some_and(|(d, _)| *d <= now) {
+            self.toasts.pop_front();
+        }
+        let right = self.toasts.back().map_or_else(
+            || {
+                format!(
+                    "{} hosts · {} services",
+                    self.config.hosts.len(),
+                    self.config.services.len()
+                )
+            },
+            |(_, msg)| format!("● {msg}"),
         );
         let tabs = ["Dashboard", "Hosts", "Services", "Logs"];
         let selected_tab = Some(self.view.top_section());
