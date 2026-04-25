@@ -16,7 +16,9 @@ use crate::config::{Config, HostConfig};
 use crate::docker_ops::{DockerOps, DockerVersion, Host, HostInfo};
 use crate::output::format_bytes;
 
-use super::ui::{bold, clamp_selection, filter_footer, inline_gauge, pane_layout, FilterState};
+use super::ui::{
+    bold, clamp_selection, filter_footer, gauge_color, inline_gauge, pane_layout, FilterState,
+};
 
 #[derive(Default)]
 pub struct HostsState {
@@ -67,12 +69,12 @@ impl HostsState {
     pub fn apply(&mut self, rows: Vec<HostRow>) {
         self.rows = rows;
         self.loaded = true;
-        let n = self.visible_rows().len();
+        let n = self.visible_indices().len();
         clamp_selection(&mut self.table, n);
     }
 
     pub fn select_next(&mut self) {
-        let n = self.visible_rows().len();
+        let n = self.visible_indices().len();
         if n == 0 {
             return;
         }
@@ -81,7 +83,7 @@ impl HostsState {
     }
 
     pub fn select_prev(&mut self) {
-        if self.visible_rows().is_empty() {
+        if self.visible_indices().is_empty() {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
@@ -90,22 +92,27 @@ impl HostsState {
 
     /// `(user, address)` of the currently-selected host, if any.
     pub fn selected_host(&self) -> Option<Host> {
-        let visible = self.visible_rows();
+        let visible = self.visible_indices();
         self.table
             .selected()
             .and_then(|i| visible.get(i).copied())
+            .and_then(|src| self.rows.get(src))
             .map(|r| Host {
                 user: r.user.clone(),
                 address: r.address.clone(),
             })
     }
 
-    fn visible_rows(&self) -> Vec<&HostRow> {
+    /// Indices into `self.rows` that pass the current filter — by
+    /// index so the borrow of `&self` ends with the call (otherwise
+    /// the result blocks `&mut self.table` later in the render).
+    fn visible_indices(&self) -> Vec<usize> {
         self.rows
             .iter()
-            .filter(|r| {
+            .enumerate()
+            .filter_map(|(i, r)| {
                 let target = format!("{}@{}", r.user, r.address);
-                self.filter.matches(&target)
+                self.filter.matches(&target).then_some(i)
             })
             .collect()
     }
@@ -116,9 +123,8 @@ impl HostsState {
         let header = Paragraph::new("yoink hosts · ↑↓ select · enter for detail").style(bold());
         frame.render_widget(header, layout[0]);
 
-        let visible_count = self.visible_rows().len();
-        clamp_selection(&mut self.table, visible_count);
-        let visible = self.visible_rows();
+        let visible = self.visible_indices();
+        clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded {
             vec![Row::new(vec![Cell::from("(loading…)")])]
         } else if visible.is_empty() && !self.rows.is_empty() {
@@ -126,7 +132,7 @@ impl HostsState {
         } else if self.rows.is_empty() {
             vec![Row::new(vec![Cell::from("(no hosts configured)")])]
         } else {
-            visible.iter().copied().map(host_row).collect()
+            visible.iter().map(|i| host_row(&self.rows[*i])).collect()
         };
 
         let widths = [
@@ -321,16 +327,6 @@ fn cell_mem(info: Option<&HostInfo>, usage: Option<&HostUsage>) -> Cell<'static>
     }
 }
 
-/// Green / yellow / red threshold for a 0..=1 gauge.
-fn gauge_color(ratio: f32) -> Color {
-    if ratio < 0.60 {
-        Color::Green
-    } else if ratio < 0.85 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
-}
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

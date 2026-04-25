@@ -147,6 +147,20 @@ pub fn table_highlight_style() -> Style {
 /// `table_highlight_style`. Used by every selectable table.
 pub const TABLE_HIGHLIGHT_SYMBOL: &str = "▶ ";
 
+/// Green / yellow / red threshold for a 0..=1 gauge — the convention
+/// matches what the real `Gauge` widget uses by default. <60% green,
+/// <85% yellow, otherwise red.
+#[must_use]
+pub fn gauge_color(ratio: f32) -> Color {
+    if ratio < 0.60 {
+        Color::Green
+    } else if ratio < 0.85 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
 /// Inline mini-gauge for a table cell, drawn with the same eighth-blocks
 /// the real `Gauge` widget uses. Returns three styled spans: opening
 /// bracket, the bar (colored fill + dim unfilled), closing bracket.
@@ -204,6 +218,11 @@ pub struct FilterState {
     /// Currently-applied filter; rows whose searched text doesn't
     /// contain this (case-insensitive) are hidden.
     filter: Option<String>,
+    /// Lowercased copy of `filter` — cached so per-row `matches()`
+    /// during a render doesn't have to lowercase the (constant)
+    /// filter every time. Set together with `filter` and cleared on
+    /// `apply`/`clear`.
+    filter_lc: Option<String>,
     /// `Some(buf)` while the user is typing a new filter via `/`.
     input_buffer: Option<String>,
 }
@@ -231,7 +250,13 @@ impl FilterState {
 
     pub fn apply(&mut self) {
         if let Some(buf) = self.input_buffer.take() {
-            self.filter = if buf.is_empty() { None } else { Some(buf) };
+            if buf.is_empty() {
+                self.filter = None;
+                self.filter_lc = None;
+            } else {
+                self.filter_lc = Some(buf.to_ascii_lowercase());
+                self.filter = Some(buf);
+            }
         }
     }
 
@@ -241,6 +266,7 @@ impl FilterState {
 
     pub fn clear(&mut self) {
         self.filter = None;
+        self.filter_lc = None;
         self.input_buffer = None;
     }
 
@@ -258,9 +284,9 @@ impl FilterState {
     /// active filter (so unfiltered rows still render).
     #[must_use]
     pub fn matches(&self, text: &str) -> bool {
-        match &self.filter {
+        match &self.filter_lc {
             None => true,
-            Some(f) => text.to_ascii_lowercase().contains(&f.to_ascii_lowercase()),
+            Some(f) => text.to_ascii_lowercase().contains(f.as_str()),
         }
     }
 }

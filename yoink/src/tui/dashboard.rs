@@ -17,7 +17,8 @@ use crate::output::{format_bytes, format_relative_time};
 use crate::status::StatusReport;
 
 use super::ui::{
-    bold, filter_footer, health_style, inline_gauge, pane_layout, state_style, FilterState,
+    bold, filter_footer, gauge_color, health_style, inline_gauge, pane_layout, state_style,
+    FilterState,
 };
 
 pub struct DashboardRefresh {
@@ -236,18 +237,6 @@ fn render_mem_cell(stats: Option<&ContainerStats>) -> Cell<'static> {
     }
 }
 
-/// Green / yellow / red threshold for a 0..=1 gauge — same scale the
-/// real `Gauge` widget uses by convention. <60% green, <85% yellow,
-/// otherwise red.
-fn gauge_color(ratio: f32) -> Color {
-    if ratio < 0.60 {
-        Color::Green
-    } else if ratio < 0.85 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
-}
 
 /// Background-friendly fetch — owned inputs so the future is `'static + Send`.
 pub async fn fetch_owned(ops: Arc<dyn DockerOps>, config: Arc<Config>) -> DashboardRefresh {

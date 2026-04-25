@@ -16,7 +16,8 @@ use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
 use crate::output::format_bytes;
 
 use super::ui::{
-    bold, clamp_selection, filter_footer, health_style, inline_gauge, state_style, FilterState,
+    bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge, state_style,
+    FilterState,
 };
 
 pub struct HostDetailRefresh {
@@ -75,7 +76,7 @@ impl HostDetailState {
     }
 
     pub fn select_next(&mut self) {
-        let n = self.visible_containers().len();
+        let n = self.visible_indices().len();
         if n == 0 {
             return;
         }
@@ -84,7 +85,7 @@ impl HostDetailState {
     }
 
     pub fn select_prev(&mut self) {
-        if self.visible_containers().is_empty() {
+        if self.visible_indices().is_empty() {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
@@ -93,17 +94,22 @@ impl HostDetailState {
 
     /// Currently-selected container name, if any.
     pub fn selected_container(&self) -> Option<String> {
-        let visible = self.visible_containers();
+        let visible = self.visible_indices();
         self.table
             .selected()
             .and_then(|i| visible.get(i).copied())
+            .and_then(|src| self.containers.get(src))
             .map(|c| c.name.clone())
     }
 
-    fn visible_containers(&self) -> Vec<&ContainerInfo> {
+    /// Indices into `self.containers` that pass the current filter
+    /// (by index so the borrow ends with the call — needed because
+    /// `render_stateful_widget` later wants `&mut self.table`).
+    fn visible_indices(&self) -> Vec<usize> {
         self.containers
             .iter()
-            .filter(|c| {
+            .enumerate()
+            .filter_map(|(i, c)| {
                 let searchable = format!(
                     "{} {} {} {}",
                     c.name,
@@ -111,7 +117,7 @@ impl HostDetailState {
                     c.state,
                     c.status_text,
                 );
-                self.filter.matches(&searchable)
+                self.filter.matches(&searchable).then_some(i)
             })
             .collect()
     }
@@ -157,7 +163,8 @@ impl HostDetailState {
             Constraint::Length(20), // cpu (value + bracketed gauge)
             Constraint::Min(28),    // mem (value/limit + bracketed gauge)
         ];
-        let visible = self.visible_containers();
+        let visible = self.visible_indices();
+        clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded && self.last_error.is_none() {
             vec![Row::new(vec![Cell::from("(loading…)")])]
         } else if visible.is_empty() && !self.containers.is_empty() {
@@ -171,7 +178,8 @@ impl HostDetailState {
         } else {
             visible
                 .iter()
-                .map(|c| {
+                .map(|i| {
+                    let c = &self.containers[*i];
                     let stats = self.stats.get(&c.name);
                     let health = c.health_hint().unwrap_or("-");
                     Row::new(vec![
@@ -269,18 +277,6 @@ fn line_gauge(label: String, ratio: f64) -> LineGauge<'static> {
         .ratio(ratio.clamp(0.0, 1.0))
         .filled_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
         .unfilled_style(Style::default().fg(Color::Gray))
-}
-
-/// Green / yellow / red threshold for a 0..=1 gauge (mirrors
-/// dashboard's helper).
-fn gauge_color(ratio: f32) -> Color {
-    if ratio < 0.60 {
-        Color::Green
-    } else if ratio < 0.85 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
 }
 
 #[allow(

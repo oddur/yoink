@@ -64,7 +64,7 @@ impl ServicesState {
     }
 
     pub fn select_next(&mut self) {
-        let n = self.visible_names().len();
+        let n = self.visible_indices().len();
         if n == 0 {
             return;
         }
@@ -73,7 +73,7 @@ impl ServicesState {
     }
 
     pub fn select_prev(&mut self) {
-        if self.visible_names().is_empty() {
+        if self.visible_indices().is_empty() {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
@@ -81,15 +81,19 @@ impl ServicesState {
     }
 
     pub fn selected_service(&self) -> Option<String> {
-        let visible = self.visible_names();
-        self.table.selected().and_then(|i| visible.into_iter().nth(i))
+        let visible = self.visible_indices();
+        self.table
+            .selected()
+            .and_then(|i| visible.get(i).copied())
+            .and_then(|src| self.service_names.get(src))
+            .cloned()
     }
 
-    fn visible_names(&self) -> Vec<String> {
+    fn visible_indices(&self) -> Vec<usize> {
         self.service_names
             .iter()
-            .filter(|n| self.filter.matches(n))
-            .cloned()
+            .enumerate()
+            .filter_map(|(i, n)| self.filter.matches(n).then_some(i))
             .collect()
     }
 
@@ -109,9 +113,8 @@ impl ServicesState {
             Constraint::Length(10), // health
             Constraint::Min(20),    // hosts
         ];
-        let visible_count = self.visible_names().len();
-        clamp_selection(&mut self.table, visible_count);
-        let visible = self.visible_names();
+        let visible = self.visible_indices();
+        clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded {
             vec![Row::new(vec![Cell::from("(loading…)")])]
         } else if visible.is_empty() && !self.service_names.is_empty() {
@@ -119,7 +122,7 @@ impl ServicesState {
         } else {
             visible
                 .iter()
-                .map(|name| build_service_row(name, config, self.report.as_ref()))
+                .map(|i| build_service_row(&self.service_names[*i], config, self.report.as_ref()))
                 .collect()
         };
         let table = Table::new(rows, widths)
@@ -255,7 +258,7 @@ impl ServiceDetailState {
     }
 
     pub fn select_next(&mut self) {
-        let n = self.visible_rows().len();
+        let n = self.visible_indices().len();
         if n == 0 {
             return;
         }
@@ -264,7 +267,7 @@ impl ServiceDetailState {
     }
 
     pub fn select_prev(&mut self) {
-        if self.visible_rows().is_empty() {
+        if self.visible_indices().is_empty() {
             return;
         }
         let i = self.table.selected().unwrap_or(0);
@@ -272,22 +275,24 @@ impl ServiceDetailState {
     }
 
     pub fn selected_row(&self) -> Option<ServiceContainerRow> {
-        let visible = self.visible_rows();
+        let visible = self.visible_indices();
         self.table
             .selected()
             .and_then(|i| visible.get(i).copied())
+            .and_then(|src| self.rows.get(src))
             .cloned()
     }
 
-    fn visible_rows(&self) -> Vec<&ServiceContainerRow> {
+    fn visible_indices(&self) -> Vec<usize> {
         self.rows
             .iter()
-            .filter(|r| {
+            .enumerate()
+            .filter_map(|(i, r)| {
                 let searchable = format!(
                     "{} {} {}",
                     r.host.address, r.container.name, r.container.state
                 );
-                self.filter.matches(&searchable)
+                self.filter.matches(&searchable).then_some(i)
             })
             .collect()
     }
@@ -312,9 +317,8 @@ impl ServiceDetailState {
             Constraint::Length(10), // version
             Constraint::Min(20),    // status text
         ];
-        let visible_count = self.visible_rows().len();
-        clamp_selection(&mut self.table, visible_count);
-        let visible = self.visible_rows();
+        let visible = self.visible_indices();
+        clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded {
             vec![Row::new(vec![Cell::from("(loading…)")])]
         } else if self.rows.is_empty() {
@@ -324,7 +328,8 @@ impl ServiceDetailState {
         } else {
             visible
                 .iter()
-                .map(|r| {
+                .map(|i| {
+                    let r = &self.rows[*i];
                     let health = r.container.health_hint().unwrap_or("-");
                     Row::new(vec![
                         Cell::from(r.host.address.clone()),
