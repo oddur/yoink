@@ -147,6 +147,66 @@ pub fn table_highlight_style() -> Style {
 /// `table_highlight_style`. Used by every selectable table.
 pub const TABLE_HIGHLIGHT_SYMBOL: &str = "▶ ";
 
+/// Block-character sparkline for a single table cell. `samples` is
+/// the time series (newest last); `width` is the number of chars to
+/// emit. The cell-level "Sparkline" widget renders into its own Rect,
+/// which Cell can't host, so we draw the same eight block glyphs as
+/// styled text — visually identical, fits inside a one-line cell.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+#[must_use]
+pub fn inline_sparkline(samples: &[f32], width: usize, color: Color) -> Span<'static> {
+    if samples.is_empty() || width == 0 {
+        return Span::raw(String::new());
+    }
+    let levels = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = samples.iter().copied().fold(0.0_f32, f32::max).max(1.0);
+    // Take the most recent `width` samples; pad-left with low blocks
+    // so a fresh container doesn't show a misleading flat line.
+    let take = samples.len().min(width);
+    let pad = width.saturating_sub(take);
+    let mut s = String::with_capacity(width * 3);
+    for _ in 0..pad {
+        s.push(levels[0]);
+    }
+    for v in &samples[samples.len() - take..] {
+        let scaled = (v / max).clamp(0.0, 1.0);
+        let idx = ((scaled * (levels.len() as f32 - 1.0)).round() as usize).min(levels.len() - 1);
+        s.push(levels[idx]);
+    }
+    Span::styled(s, Style::default().fg(color))
+}
+
+/// Inline mini-gauge for a single table cell, drawn with the same
+/// eighth-blocks the real `Gauge` widget uses. Returns a styled
+/// `Span` that the caller drops into a `Cell`.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[must_use]
+pub fn inline_gauge(ratio: f32, width: usize, color: Color) -> Span<'static> {
+    if width == 0 {
+        return Span::raw(String::new());
+    }
+    let r = ratio.clamp(0.0, 1.0);
+    let total_eighths = (r * (width as f32) * 8.0).round() as usize;
+    let full = total_eighths / 8;
+    let partial_idx = total_eighths % 8;
+    let partials = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let mut s = String::with_capacity(width * 3);
+    for _ in 0..full.min(width) {
+        s.push('█');
+    }
+    if full < width {
+        s.push(partials[partial_idx]);
+        for _ in (full + 1)..width {
+            s.push(' ');
+        }
+    }
+    Span::styled(s, Style::default().fg(color))
+}
+
 /// Render a vertical scrollbar overlay on the right edge of `area`.
 /// `position` is the index of the topmost visible item; `total` is
 /// the number of items in the underlying buffer; `viewport` is how

@@ -2,19 +2,21 @@
 //! host (regardless of yoink labels) with live CPU/mem stats. Up/Down
 //! selects; Enter opens that container's live log stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use futures_util::future::join_all;
 use ratatui::Frame;
-use ratatui::layout::Constraint;
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Borders, Cell, LineGauge, Paragraph, Row, Sparkline, Table, TableState};
 
 use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
 use crate::output::format_bytes;
 
-use super::ui::{bold, clamp_selection, health_style, pane_layout, state_style};
+use super::ui::{bold, clamp_selection, health_style, state_style};
+
+const HISTORY_LEN: usize = 60;
 
 pub struct HostDetailRefresh {
     pub containers: Vec<ContainerInfo>,
@@ -27,6 +29,11 @@ pub struct HostDetailState {
     host: Option<Host>,
     containers: Vec<ContainerInfo>,
     stats: HashMap<String, ContainerStats>,
+    /// Ring buffer of host-aggregate (`cpu_pct_total`,
+    /// `mem_bytes_total`) samples — drives the `LineGauge` + Sparkline
+    /// summary panel above
+    /// the container table.
+    history: VecDeque<(f32, f32)>,
     last_error: Option<String>,
     table: TableState,
     loaded: bool,
@@ -60,11 +67,24 @@ impl HostDetailState {
     }
 
     /// Apply background-fetched results, preserving selection where possible.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn apply(&mut self, data: HostDetailRefresh) {
         self.last_error = data.error;
         if self.last_error.is_none() {
             self.containers = data.containers;
             self.stats = data.stats;
+            // Snapshot host-aggregate (sum of containers) for the
+            // top summary panel's LineGauge + Sparkline.
+            let cpu_total: f32 = self.stats.values().map(|s| s.cpu_pct as f32).sum();
+            let mem_total: f32 = self.stats.values().map(|s| s.mem_used as f32).sum();
+            self.history.push_back((cpu_total, mem_total));
+            if self.history.len() > HISTORY_LEN {
+                self.history.pop_front();
+            }
             self.loaded = true;
         }
         clamp_selection(&mut self.table, self.containers.len());
@@ -100,7 +120,20 @@ impl HostDetailState {
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-        let layout = pane_layout(area);
+        // 4-section layout: header (1) · summary panel (6) · table (rest) · footer (1).
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(6),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let header_area = layout[0];
+        let summary_area = layout[1];
+        let table_area = layout[2];
+        let footer_area = layout[3];
 
         let header_text = match &self.host {
             Some(h) => format!(
@@ -110,7 +143,9 @@ impl HostDetailState {
             None => "yoink host · (no host selected)".into(),
         };
         let header = Paragraph::new(header_text).style(bold());
-        frame.render_widget(header, layout[0]);
+        frame.render_widget(header, header_area);
+
+        self.render_summary(frame, summary_area);
 
         let widths = [
             Constraint::Length(14), // service
@@ -171,7 +206,7 @@ impl HostDetailState {
             .row_highlight_style(super::ui::table_highlight_style())
             .highlight_symbol(super::ui::TABLE_HIGHLIGHT_SYMBOL)
             .block(Block::default().borders(Borders::ALL).title("containers"));
-        frame.render_stateful_widget(table, layout[1], &mut self.table);
+        frame.render_stateful_widget(table, table_area, &mut self.table);
 
         let footer_text = if let Some(err) = &self.last_error {
             format!("error: {err}  ·  q quit · esc back · enter logs · r refresh")
@@ -183,7 +218,112 @@ impl HostDetailState {
         } else {
             Style::default().fg(Color::DarkGray)
         });
-        frame.render_widget(footer, layout[2]);
+        frame.render_widget(footer, footer_area);
+    }
+
+    /// Host-aggregate summary panel: bordered block hosting a CPU
+    /// `LineGauge` + Mem `LineGauge` (current snapshot) over twin
+    /// `Sparkline` widgets (~2 minutes of trail at 2 s ticks).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_lossless
+    )]
+    fn render_summary(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" host summary ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // CPU LineGauge
+                Constraint::Length(1), // Mem LineGauge
+                Constraint::Min(1),    // Twin sparklines (CPU/Mem) side by side
+            ])
+            .split(inner);
+
+        let cpu_total: f32 = self.stats.values().map(|s| s.cpu_pct as f32).sum();
+        let mem_total: u64 = self.stats.values().map(|s| s.mem_used.max(0) as u64).sum();
+
+        // Cap CPU at the highest historical value (or at least 100%) so
+        // the bar has a meaningful scale even with multi-core spikes.
+        let cpu_max = self
+            .history
+            .iter()
+            .map(|(c, _)| *c)
+            .fold(100.0_f32, f32::max);
+        let cpu_ratio = (cpu_total / cpu_max).clamp(0.0, 1.0) as f64;
+        let mem_max = self
+            .history
+            .iter()
+            .map(|(_, m)| *m)
+            .fold(mem_total as f32, f32::max)
+            .max(1.0);
+        let mem_ratio = ((mem_total as f32) / mem_max).clamp(0.0, 1.0) as f64;
+
+        let cpu_label = format!("CPU  {cpu_total:>6.1}% / {cpu_max:.0}%");
+        let mem_label = format!(
+            "MEM  {} / {}",
+            format_bytes(i64::try_from(mem_total).unwrap_or(i64::MAX)),
+            format_bytes(mem_max as i64)
+        );
+
+        let cpu_gauge = LineGauge::default()
+            .label(cpu_label)
+            .ratio(cpu_ratio)
+            .filled_style(Style::default().fg(gauge_color(cpu_ratio as f32)).add_modifier(Modifier::BOLD))
+            .unfilled_style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(cpu_gauge, chunks[0]);
+
+        let mem_gauge = LineGauge::default()
+            .label(mem_label)
+            .ratio(mem_ratio)
+            .filled_style(Style::default().fg(gauge_color(mem_ratio as f32)).add_modifier(Modifier::BOLD))
+            .unfilled_style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(mem_gauge, chunks[1]);
+
+        // Side-by-side trend sparklines — left CPU, right Mem.
+        let trend_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[2]);
+
+        let cpu_series: Vec<u64> = self
+            .history
+            .iter()
+            .map(|(c, _)| (*c as u64).max(1))
+            .collect();
+        let mem_series: Vec<u64> = self
+            .history
+            .iter()
+            .map(|(_, m)| (*m as u64).max(1))
+            .collect();
+
+        let cpu_spark = Sparkline::default()
+            .data(&cpu_series)
+            .style(Style::default().fg(Color::Cyan));
+        frame.render_widget(cpu_spark, trend_chunks[0]);
+
+        let mem_spark = Sparkline::default()
+            .data(&mem_series)
+            .style(Style::default().fg(Color::Magenta));
+        frame.render_widget(mem_spark, trend_chunks[1]);
+    }
+}
+
+/// Green / yellow / red threshold for a 0..=1 gauge (mirrors
+/// dashboard's helper).
+fn gauge_color(ratio: f32) -> Color {
+    if ratio < 0.60 {
+        Color::Green
+    } else if ratio < 0.85 {
+        Color::Yellow
+    } else {
+        Color::Red
     }
 }
 
