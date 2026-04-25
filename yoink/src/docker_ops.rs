@@ -284,6 +284,30 @@ pub struct ContainerDetail {
     pub labels: BTreeMap<String, String>,
 }
 
+/// One docker network as the dashboard / `yoink networks` show it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NetworkInfo {
+    pub host: String,
+    pub name: String,
+    pub driver: String,
+    pub scope: String,
+    pub internal: bool,
+    /// Number of containers attached (parsed from inspect; some
+    /// drivers don't report this so it can be 0 even when in use).
+    pub container_count: usize,
+}
+
+/// One docker volume.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VolumeInfo {
+    pub host: String,
+    pub name: String,
+    pub driver: String,
+    pub mountpoint: String,
+    /// Created-at timestamp from docker (RFC-3339 string), if known.
+    pub created: Option<String>,
+}
+
 /// Result of a one-shot container run (e.g. a pre-deploy hook).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OneShotResult {
@@ -328,6 +352,12 @@ pub trait DockerOps: Send + Sync {
     ) -> Result<ContainerDetail, DockerError>;
 
     async fn ensure_network(&self, host: &Host, network: &str) -> Result<bool, DockerError>;
+
+    /// List every docker network on `host`. Used by `yoink networks`.
+    async fn list_networks(&self, host: &Host) -> Result<Vec<NetworkInfo>, DockerError>;
+
+    /// List every docker volume on `host`. Used by `yoink volumes`.
+    async fn list_volumes(&self, host: &Host) -> Result<Vec<VolumeInfo>, DockerError>;
 
     async fn pull_image(
         &self,
@@ -682,6 +712,49 @@ impl DockerOps for RealDockerOps {
             }
             Err(other) => Err(Self::err(host, other)),
         }
+    }
+
+    async fn list_networks(&self, host: &Host) -> Result<Vec<NetworkInfo>, DockerError> {
+        let docker = self.client_for(host).await?;
+        let nets = docker
+            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+            .await
+            .map_err(|s| Self::err(host, s))?;
+        Ok(nets
+            .into_iter()
+            .map(|n| NetworkInfo {
+                host: host.address.clone(),
+                name: n.name.unwrap_or_default(),
+                driver: n.driver.unwrap_or_default(),
+                scope: n.scope.unwrap_or_default(),
+                internal: n.internal.unwrap_or(false),
+                // bollard 0.20 dropped the `containers` map from the
+                // list response (it was only populated when the daemon
+                // returned a verbose-mode response). Container counts
+                // require a per-network inspect; skip for now.
+                container_count: 0,
+            })
+            .collect())
+    }
+
+    async fn list_volumes(&self, host: &Host) -> Result<Vec<VolumeInfo>, DockerError> {
+        let docker = self.client_for(host).await?;
+        let resp = docker
+            .list_volumes(None::<bollard::query_parameters::ListVolumesOptions>)
+            .await
+            .map_err(|s| Self::err(host, s))?;
+        Ok(resp
+            .volumes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| VolumeInfo {
+                host: host.address.clone(),
+                name: v.name,
+                driver: v.driver,
+                mountpoint: v.mountpoint,
+                created: v.created_at.map(|d| d.to_string()),
+            })
+            .collect())
     }
 
     async fn pull_image(
@@ -1756,6 +1829,12 @@ impl DockerOps for FakeDockerOps {
             name: name.into(),
             ..Default::default()
         })
+    }
+    async fn list_networks(&self, _host: &Host) -> Result<Vec<NetworkInfo>, DockerError> {
+        Ok(Vec::new())
+    }
+    async fn list_volumes(&self, _host: &Host) -> Result<Vec<VolumeInfo>, DockerError> {
+        Ok(Vec::new())
     }
     async fn ensure_network(&self, host: &Host, network: &str) -> Result<bool, DockerError> {
         let mut s = self.lock();

@@ -207,6 +207,18 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
+    /// List every docker network across all configured hosts.
+    Networks {
+        /// Restrict to one host.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// List every docker volume across all configured hosts.
+    Volumes {
+        /// Restrict to one host.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Lint the config and (optionally) ping each host's docker daemon.
     /// Use this in CI before merging a yoink.yaml change.
     Validate {
@@ -333,6 +345,8 @@ async fn run(cli: Cli) -> Result<()> {
         } => cmd_pull(&config, &service, tag.as_deref(), host.as_deref()).await,
         Command::History { service, limit } => cmd_history(&config, &service, limit).await,
         Command::Top { limit } => cmd_top(&config, limit).await,
+        Command::Networks { host } => cmd_networks(&config, host.as_deref()).await,
+        Command::Volumes { host } => cmd_volumes(&config, host.as_deref()).await,
         Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
         Command::Lock { action } => cmd_lock(&config, action).await,
         Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
@@ -1185,6 +1199,74 @@ async fn cmd_top(config: &Config, limit: usize) -> Result<()> {
         println!(
             "{host:<22}  {service:<14}  {container:<28}  {cpu:>5.1}%  {mem_str:>20}  {created_str}"
         );
+    }
+    Ok(())
+}
+
+async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> {
+    let ops = RealDockerOps::new();
+    let probes = config
+        .hosts
+        .iter()
+        .filter(|h| host_filter.is_none_or(|f| f == h.address))
+        .map(|h| {
+            let host = Host::from(h);
+            let ops = &ops;
+            async move {
+                let nets = ops.list_networks(&host).await?;
+                anyhow::Ok(nets)
+            }
+        });
+    let mut all = Vec::new();
+    for r in futures_util::future::join_all(probes).await {
+        all.extend(r?);
+    }
+    all.sort_by(|a, b| (a.host.as_str(), a.name.as_str()).cmp(&(b.host.as_str(), b.name.as_str())));
+    println!(
+        "{:<22}  {:<28}  {:<8}  {:<8}  {:>4}  internal",
+        "host", "name", "driver", "scope", "ctrs"
+    );
+    for n in all {
+        let internal = if n.internal { "yes" } else { "no" };
+        let host = n.host;
+        let name = n.name;
+        let driver = n.driver;
+        let scope = n.scope;
+        let count = n.container_count;
+        println!("{host:<22}  {name:<28}  {driver:<8}  {scope:<8}  {count:>4}  {internal}");
+    }
+    Ok(())
+}
+
+async fn cmd_volumes(config: &Config, host_filter: Option<&str>) -> Result<()> {
+    let ops = RealDockerOps::new();
+    let probes = config
+        .hosts
+        .iter()
+        .filter(|h| host_filter.is_none_or(|f| f == h.address))
+        .map(|h| {
+            let host = Host::from(h);
+            let ops = &ops;
+            async move {
+                let vols = ops.list_volumes(&host).await?;
+                anyhow::Ok(vols)
+            }
+        });
+    let mut all = Vec::new();
+    for r in futures_util::future::join_all(probes).await {
+        all.extend(r?);
+    }
+    all.sort_by(|a, b| (a.host.as_str(), a.name.as_str()).cmp(&(b.host.as_str(), b.name.as_str())));
+    println!(
+        "{:<22}  {:<40}  {:<10}  mountpoint",
+        "host", "name", "driver"
+    );
+    for v in all {
+        let host = v.host;
+        let name = v.name;
+        let driver = v.driver;
+        let mp = v.mountpoint;
+        println!("{host:<22}  {name:<40}  {driver:<10}  {mp}");
     }
     Ok(())
 }
