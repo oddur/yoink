@@ -84,6 +84,40 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Run a one-shot command inside a running container for a service.
+    /// Output is captured + printed; exit code mirrors the command's.
+    /// For an interactive shell with PTY (bash, etc.) use `yoink shell`.
+    Exec {
+        /// Service name as declared in the config.
+        service: String,
+        /// Pin to a specific host when the service has replicas across
+        /// multiple hosts; otherwise yoink errors with the candidate list.
+        #[arg(long)]
+        host: Option<String>,
+        /// Command to run, after `--`. e.g. `yoink exec api -- ls -la /app`.
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Stream or tail logs from a service's container.
+    Logs {
+        /// Service name as declared in the config.
+        service: String,
+        /// Pin to a specific host when the service has replicas across
+        /// multiple hosts.
+        #[arg(long)]
+        host: Option<String>,
+        /// Follow new log lines until Ctrl-C.
+        #[arg(long, short)]
+        follow: bool,
+        /// Lines of history to show before following (default 50).
+        #[arg(long, default_value_t = 50)]
+        tail: u32,
+    },
+    /// Print the currently-running tag(s) for a service across hosts.
+    /// One line per replica.
+    Version {
+        service: String,
+    },
     /// Launch the interactive ratatui dashboard.
     Tui {
         /// Initial mode to open.
@@ -135,6 +169,18 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Status { json } => cmd_status(&config, json).await,
         Command::Rollback { service, tag } => cmd_rollback(&config, service, tag).await,
         Command::Prune { dry_run } => cmd_prune(&config, dry_run).await,
+        Command::Exec {
+            service,
+            host,
+            cmd,
+        } => cmd_exec(&config, &service, host.as_deref(), cmd).await,
+        Command::Logs {
+            service,
+            host,
+            follow,
+            tail,
+        } => cmd_logs(&config, &service, host.as_deref(), follow, tail).await,
+        Command::Version { service } => cmd_version(&config, &service).await,
         Command::Tui { mode } => cmd_tui(&config, cli.config.clone(), mode).await,
     }
 }
@@ -400,6 +446,141 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
         .await
         .context("fetch secrets via infisical CLI")?;
     Ok(Some(bundle))
+}
+
+/// Resolve `(service, optional host)` to exactly one running container
+/// via the `yoink.service=<name>` label. Errors with the candidate set
+/// when the user doesn't pin a host on a multi-replica service, so an
+/// `exec` or `logs` command can't accidentally hit the wrong replica.
+async fn resolve_running_container(
+    ops: &dyn DockerOps,
+    config: &Config,
+    service: &str,
+    host_filter: Option<&str>,
+) -> Result<(yoink::docker_ops::Host, String)> {
+    use yoink::docker_ops::Host;
+    let label = format!("yoink.service={service}");
+    let mut candidates: Vec<(Host, String)> = Vec::new();
+    for host_cfg in &config.hosts {
+        if let Some(filter) = host_filter
+            && filter != host_cfg.address
+        {
+            continue;
+        }
+        let host = Host::from(host_cfg);
+        let containers = ops
+            .list_containers_by_label(&host, &label)
+            .await
+            .with_context(|| format!("list containers on {}", host.address))?;
+        for c in containers {
+            if c.is_running() {
+                candidates.push((host.clone(), c.name));
+            }
+        }
+    }
+    match candidates.len() {
+        0 => anyhow::bail!(
+            "no running container with yoink.service={service}{}",
+            host_filter
+                .map(|h| format!(" on host {h}"))
+                .unwrap_or_default()
+        ),
+        1 => Ok(candidates.into_iter().next().expect("len == 1")),
+        _ => {
+            let listing = candidates
+                .iter()
+                .map(|(h, n)| format!("  {} → {}", h.address, n))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "service {service:?} has multiple replicas; pin one with --host:\n{listing}"
+            )
+        }
+    }
+}
+
+async fn cmd_exec(
+    config: &Config,
+    service: &str,
+    host_filter: Option<&str>,
+    cmd: Vec<String>,
+) -> Result<()> {
+    let ops = RealDockerOps::new();
+    let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
+    let result = ops
+        .exec_oneshot(&host, &container, cmd)
+        .await
+        .with_context(|| format!("exec in {}@{container}", host.address))?;
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+    }
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+    }
+    if result.exit_code != 0 {
+        anyhow::bail!("command exited with code {}", result.exit_code);
+    }
+    Ok(())
+}
+
+async fn cmd_logs(
+    config: &Config,
+    service: &str,
+    host_filter: Option<&str>,
+    follow: bool,
+    tail: u32,
+) -> Result<()> {
+    let ops = RealDockerOps::new();
+    let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
+    if follow {
+        let mut rx = ops
+            .open_log_stream(&host, &container, tail)
+            .await
+            .with_context(|| format!("open log stream {}@{container}", host.address))?;
+        // Honor SIGINT cleanly so Ctrl-C doesn't dump a panic.
+        let ctrlc = tokio::signal::ctrl_c();
+        tokio::pin!(ctrlc);
+        loop {
+            tokio::select! {
+                line = rx.recv() => match line {
+                    Some(l) => println!("{}", l.message),
+                    None => break,
+                },
+                _ = &mut ctrlc => break,
+            }
+        }
+    } else {
+        let lines = ops
+            .fetch_recent_logs(&host, &container, tail)
+            .await
+            .with_context(|| format!("fetch logs {}@{container}", host.address))?;
+        for l in lines {
+            print!("{l}");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_version(config: &Config, service: &str) -> Result<()> {
+    let ops = RealDockerOps::new();
+    let report = StatusReport::collect_for_service(&ops, config, service)
+        .await
+        .context("collect status")?;
+    let mut printed = false;
+    for host in &report.hosts {
+        for c in &host.containers {
+            if !c.is_running() {
+                continue;
+            }
+            let version = c.yoink_version.as_deref().unwrap_or("?");
+            println!("{}: {} → {} ({})", host.host, c.name, version, c.state);
+            printed = true;
+        }
+    }
+    if !printed {
+        anyhow::bail!("no running container for service {service:?}");
+    }
+    Ok(())
 }
 
 async fn cmd_tui(config: &Config, config_path: PathBuf, mode: Mode) -> Result<()> {

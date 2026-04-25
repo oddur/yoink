@@ -277,15 +277,16 @@ pub trait DockerOps: Send + Sync {
     ) -> Result<u16, DockerError>;
 
     /// Run `cmd` inside `container` to completion (one-shot exec).
-    /// Used by the host advisory lock to heartbeat the sentinel
-    /// without recreating it. Returns Ok on exit code 0; surfaces
-    /// non-zero exits and bollard errors.
+    /// Captures stdout + stderr and the exit code. Used both by the
+    /// host advisory lock heartbeat (ignores the output, just needs
+    /// success/fail) and by `yoink exec` (prints output to the
+    /// operator's terminal, mirrors the exit code).
     async fn exec_oneshot(
         &self,
         host: &Host,
         container: &str,
         cmd: Vec<String>,
-    ) -> Result<(), DockerError>;
+    ) -> Result<OneShotResult, DockerError>;
 
     /// TCP-only liveness probe — used for services that don't speak
     /// HTTP (redis on :6379) or where the HTTP path is impractical to
@@ -660,43 +661,62 @@ impl DockerOps for RealDockerOps {
         host: &Host,
         container: &str,
         cmd: Vec<String>,
-    ) -> Result<(), DockerError> {
+    ) -> Result<OneShotResult, DockerError> {
         let docker = self.client_for(host).await?;
         let exec = docker
             .create_exec(
                 container,
                 bollard::exec::CreateExecOptions {
                     cmd: Some(cmd),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
                     ..Default::default()
                 },
             )
             .await
             .map_err(|s| Self::err(host, s))?;
-        // Detached start — returns immediately; we then inspect for the
-        // exit code. Heartbeats need to be cheap, so don't stream.
-        docker
+
+        // Non-detached: bollard returns a stream of frame-tagged log
+        // chunks that we drain into stdout/stderr buffers. The lock
+        // heartbeat callers ignore the output; `yoink exec` prints it.
+        let exec_results = docker
             .start_exec(
                 &exec.id,
                 Some(bollard::exec::StartExecOptions {
-                    detach: true,
+                    detach: false,
                     ..Default::default()
                 }),
             )
             .await
             .map_err(|s| Self::err(host, s))?;
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } = exec_results {
+            while let Some(item) = output.next().await {
+                match item {
+                    Ok(
+                        bollard::container::LogOutput::StdOut { message }
+                        | bollard::container::LogOutput::Console { message },
+                    ) => stdout.push_str(&String::from_utf8_lossy(&message)),
+                    Ok(bollard::container::LogOutput::StdErr { message }) => {
+                        stderr.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    Ok(bollard::container::LogOutput::StdIn { .. }) => {}
+                    Err(e) => return Err(Self::err(host, e)),
+                }
+            }
+        }
+
         let inspect = docker
             .inspect_exec(&exec.id)
             .await
             .map_err(|s| Self::err(host, s))?;
-        if inspect.exit_code.unwrap_or(0) != 0 {
-            return Err(DockerError::Invalid(format!(
-                "exec in {container} exited with code {:?}",
-                inspect.exit_code
-            )));
-        }
-        Ok(())
+        Ok(OneShotResult {
+            exit_code: inspect.exit_code.unwrap_or(0),
+            stdout,
+            stderr,
+        })
     }
 
     async fn healthcheck_tcp(
@@ -1051,7 +1071,7 @@ struct FakeState {
     force_remove_container: VecDeque<Result<(), DockerError>>,
     healthcheck: VecDeque<Result<u16, DockerError>>,
     healthcheck_tcp: VecDeque<Result<(), DockerError>>,
-    exec_oneshot: VecDeque<Result<(), DockerError>>,
+    exec_oneshot: VecDeque<Result<OneShotResult, DockerError>>,
     fetch_logs: VecDeque<Result<Vec<String>, DockerError>>,
     one_shot: VecDeque<Result<OneShotResult, DockerError>>,
     event_streams: VecDeque<Vec<DockerEvent>>,
@@ -1127,7 +1147,7 @@ impl FakeDockerOps {
     pub fn push_healthcheck_tcp(&self, v: Result<(), DockerError>) {
         self.lock().healthcheck_tcp.push_back(v);
     }
-    pub fn push_exec_oneshot(&self, v: Result<(), DockerError>) {
+    pub fn push_exec_oneshot(&self, v: Result<OneShotResult, DockerError>) {
         self.lock().exec_oneshot.push_back(v);
     }
     pub fn push_fetch_logs(&self, v: Result<Vec<String>, DockerError>) {
@@ -1296,13 +1316,10 @@ impl DockerOps for FakeDockerOps {
         host: &Host,
         container: &str,
         cmd: Vec<String>,
-    ) -> Result<(), DockerError> {
+    ) -> Result<OneShotResult, DockerError> {
         let mut s = self.lock();
-        s.calls.push(RecordedCall::ExecOneshot(
-            host.clone(),
-            container.into(),
-            cmd,
-        ));
+        s.calls
+            .push(RecordedCall::ExecOneshot(host.clone(), container.into(), cmd));
         pop(&mut s.exec_oneshot, "exec_oneshot")
     }
     async fn fetch_recent_logs(
