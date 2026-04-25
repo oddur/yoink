@@ -507,13 +507,18 @@ impl App {
     /// finished edit. If `hosts:` changed we tear down and respawn the
     /// docker-events subscriptions.
     fn maybe_reload_config(&mut self) {
-        let new_config = match Config::load_from_path(&self.config_path) {
+        let mut new_config = match Config::load_from_path(&self.config_path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(error = %e, path = %self.config_path.display(), "config reload failed");
                 return;
             }
         };
+        // Re-apply the magical local-host injection — load_from_path
+        // returns a fresh disk-shaped config that doesn't know about
+        // it, so without this the synthetic `local` host disappears
+        // every CONFIG_RELOAD_TICK.
+        new_config.push_local_host_if_socket();
         if new_config == *self.config {
             return;
         }
