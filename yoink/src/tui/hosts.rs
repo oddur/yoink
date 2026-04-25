@@ -8,7 +8,7 @@ use std::sync::Arc;
 use futures_util::future::join_all;
 use ratatui::Frame;
 use ratatui::layout::Constraint;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::config::{Config, HostConfig};
@@ -130,7 +130,8 @@ impl HostsState {
                 Cell::from("images").style(bold()),
                 Cell::from("platform / error").style(bold()),
             ]))
-            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .row_highlight_style(super::ui::table_highlight_style())
+            .highlight_symbol(super::ui::TABLE_HIGHLIGHT_SYMBOL)
             .block(Block::default().borders(Borders::ALL).title("hosts"));
         frame.render_stateful_widget(table, layout[1], &mut self.table);
 

@@ -205,6 +205,18 @@ impl LogsState {
         .block(Block::default().borders(Borders::ALL).title("logs"));
         frame.render_widget(body, layout[1]);
 
+        // Vertical scrollbar overlaid on the right edge — gives the
+        // operator a sense of "where in the buffer am I" while
+        // tailing or scrolling back through history. No-op when the
+        // buffer fits in the viewport.
+        super::ui::render_vertical_scrollbar(
+            frame,
+            layout[1],
+            usize::from(scroll),
+            usize::from(total),
+            usize::from(inner_height),
+        );
+
         let footer = if let Some(buf) = &self.input_buffer {
             Paragraph::new(format!("/{buf}_  (enter apply · esc cancel)"))
                 .style(Style::default().fg(Color::Yellow))

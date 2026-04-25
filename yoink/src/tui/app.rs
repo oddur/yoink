@@ -86,6 +86,21 @@ pub enum View {
 }
 
 impl View {
+    /// Index into the top-level tab bar (Dashboard / Hosts / Services
+    /// / Logs) that this view belongs to.
+    #[must_use]
+    pub fn top_section(&self) -> usize {
+        match self {
+            View::Dashboard => 0,
+            View::Hosts
+            | View::HostDetail(_)
+            | View::ContainerLogs { .. }
+            | View::ContainerShell { .. } => 1,
+            View::Services | View::ServiceDetail(_) => 2,
+            View::Logs => 3,
+        }
+    }
+
     /// Lines for the `?` help overlay. Per-view so the operator only
     /// sees the keybinds that actually do something here.
     #[must_use]
@@ -1090,11 +1105,16 @@ impl App {
     }
 
     pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
-        let (breadcrumb_area, pane_area) =
-            super::ui::split_with_breadcrumb(frame.area());
+        let (header_area, pane_area) = super::ui::split_with_header(frame.area());
         let crumbs = self.view.breadcrumb();
-        let right = format!("{} hosts · {} services", self.config.hosts.len(), self.config.services.len());
-        super::ui::render_breadcrumb(frame, breadcrumb_area, &crumbs, &right);
+        let right = format!(
+            "{} hosts · {} services",
+            self.config.hosts.len(),
+            self.config.services.len()
+        );
+        let tabs = ["Dashboard", "Hosts", "Services", "Logs"];
+        let selected_tab = Some(self.view.top_section());
+        super::ui::render_header(frame, header_area, &tabs, selected_tab, &crumbs, &right);
 
         match &self.view {
             View::Dashboard => self.dashboard.render(frame, pane_area, &self.config),

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ratatui::Frame;
 use ratatui::layout::Constraint;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::config::Config;
@@ -116,7 +116,8 @@ impl ServicesState {
                 Cell::from("health").style(bold()),
                 Cell::from("hosts").style(bold()),
             ]))
-            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .row_highlight_style(super::ui::table_highlight_style())
+            .highlight_symbol(super::ui::TABLE_HIGHLIGHT_SYMBOL)
             .block(Block::default().borders(Borders::ALL).title("services"));
         frame.render_stateful_widget(table, layout[1], &mut self.table);
 
@@ -314,7 +315,8 @@ impl ServiceDetailState {
                 Cell::from("version").style(bold()),
                 Cell::from("status").style(bold()),
             ]))
-            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .row_highlight_style(super::ui::table_highlight_style())
+            .highlight_symbol(super::ui::TABLE_HIGHLIGHT_SYMBOL)
             .block(Block::default().borders(Borders::ALL).title("instances"));
         frame.render_stateful_widget(table, layout[1], &mut self.table);
 

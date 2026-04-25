@@ -38,22 +38,67 @@ pub fn state_style(state: &str) -> Style {
     }
 }
 
-/// Carve the global breadcrumb header off the top of `area`. Returns
-/// (`breadcrumb_area`, `pane_area`) so the App can render the
-/// breadcrumb row and then dispatch the active pane into the rest.
+/// Carve the global header off the top of `area`. The header is a
+/// 4-row bordered block hosting the tab bar (row 1) + breadcrumb
+/// (row 2). Returns (`header_area`, `pane_area`).
 #[must_use]
-pub fn split_with_breadcrumb(area: Rect) -> (Rect, Rect) {
+pub fn split_with_header(area: Rect) -> (Rect, Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([Constraint::Length(4), Constraint::Min(0)])
         .split(area);
     (chunks[0], chunks[1])
 }
 
-/// Render a path of crumbs as `yoink › Hosts › backtrack-eu-1` —
-/// the leaf crumb gets bold+cyan, the rest are dim. Right-aligns
-/// `right` if non-empty (used for "5 hosts · refreshed 2s ago").
-pub fn render_breadcrumb(frame: &mut Frame<'_>, area: Rect, crumbs: &[String], right: &str) {
+/// Render the global header: a bordered cyan block containing a
+/// `Tabs` row over a breadcrumb row. `tabs` is the ordered list of
+/// top-level section labels; `selected_tab` is the currently active
+/// index (or `None` to dim the whole bar — used inside drill-down
+/// views that don't map cleanly to a single top-level tab).
+#[allow(clippy::too_many_arguments)]
+pub fn render_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    tabs: &[&str],
+    selected_tab: Option<usize>,
+    crumbs: &[String],
+    right: &str,
+) {
+    use ratatui::widgets::Tabs;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Line::from(Span::styled(
+            " yoink ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    let tab_titles: Vec<Line<'_>> = tabs.iter().map(|t| Line::from(*t)).collect();
+    let tabs_widget = Tabs::new(tab_titles)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .divider(Span::styled(" │ ", Style::default().fg(Color::DarkGray)))
+        .select(selected_tab.unwrap_or(usize::MAX));
+    frame.render_widget(tabs_widget, inner_chunks[0]);
+
+    render_breadcrumb_line(frame, inner_chunks[1], crumbs, right);
+}
+
+fn render_breadcrumb_line(frame: &mut Frame<'_>, area: Rect, crumbs: &[String], right: &str) {
     let dim = Style::default().fg(Color::DarkGray);
     let leaf = Style::default()
         .fg(Color::Cyan)
@@ -84,6 +129,45 @@ pub fn render_breadcrumb(frame: &mut Frame<'_>, area: Rect, crumbs: &[String], r
             frame.render_widget(right_para, right_area);
         }
     }
+}
+
+/// Style applied to the highlighted row in selectable tables
+/// (`Hosts`, `HostDetail`, `Services`, `ServiceDetail`). Reverse-video
+/// on cyan reads as "this is the cursor" without fighting any of the
+/// per-cell colors (state/health/etc.) underneath.
+#[must_use]
+pub fn table_highlight_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// `▶ ` prefix on the highlighted row — pairs with
+/// `table_highlight_style`. Used by every selectable table.
+pub const TABLE_HIGHLIGHT_SYMBOL: &str = "▶ ";
+
+/// Render a vertical scrollbar overlay on the right edge of `area`.
+/// `position` is the index of the topmost visible item; `total` is
+/// the number of items in the underlying buffer; `viewport` is how
+/// many rows fit on screen. No-op if everything fits.
+pub fn render_vertical_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    position: usize,
+    total: usize,
+    viewport: usize,
+) {
+    use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+    if total <= viewport {
+        return;
+    }
+    let mut state = ScrollbarState::new(total.saturating_sub(viewport)).position(position);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_stateful_widget(bar, area, &mut state);
 }
 
 /// Render a centered modal overlay with `lines` of text, sized to fit
