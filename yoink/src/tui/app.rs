@@ -40,6 +40,7 @@ use super::host_detail::{self, HostDetailRefresh, HostDetailState};
 use super::hosts::{self, HostRow, HostsState};
 use super::logs::{LogsState, RenderedLine};
 use super::services::{ServiceDetailState, ServicesState};
+use super::shell::ShellState;
 
 /// Backstop polling cadence when no `docker events` push lands. The
 /// realtime updates ride on the events stream (see `subscribe_host_events`);
@@ -72,6 +73,9 @@ pub enum View {
     ServiceDetail(String),
     Logs,
     ContainerLogs { host: Host, container: String },
+    /// Embedded PTY shell for one container — k9s-style "drop into the
+    /// container" without leaving the TUI.
+    ContainerShell { host: Host, container: String },
 }
 
 impl From<Mode> for View {
@@ -234,6 +238,8 @@ pub struct App {
     pub services: ServicesState,
     pub service_detail: ServiceDetailState,
     pub logs: LogsState,
+    /// `Some` while a `ContainerShell` view is active; cleared on exit.
+    shell: Option<ShellState>,
 
     // Refresh-in-flight flags coalesce ticks: a tick that fires while the
     // previous refresh hasn't finished is dropped, so a slow daemon can
@@ -277,6 +283,7 @@ impl App {
             services: ServicesState::new(),
             service_detail: ServiceDetailState::new(),
             logs: LogsState::new(),
+            shell: None,
             hosts_in_flight: false,
             host_detail_in_flight: false,
             dashboard_in_flight: false,
@@ -358,6 +365,14 @@ impl App {
     /// Returns true when the loop should exit.
     #[allow(clippy::too_many_lines)]
     async fn on_key(&mut self, key: KeyEvent) -> bool {
+        // Embedded shell: forward everything to the PTY. The only
+        // yoink-side gestures are Ctrl-Q (exit shell) and the EOF
+        // signal from the container side; both bounce us back to
+        // host detail.
+        if matches!(self.view, View::ContainerShell { .. }) {
+            return self.handle_shell_key(key).await;
+        }
+
         // Filter input mode in either logs view captures all printable
         // input — only Ctrl-C escapes to quit.
         let logs_view = matches!(self.view, View::Logs | View::ContainerLogs { .. });
@@ -414,14 +429,29 @@ impl App {
                             .await;
                     }
                 }
+                KeyCode::Char('!') => {
+                    if let (Some(host), Some(container)) = (
+                        self.host_detail.host().cloned(),
+                        self.host_detail.selected_container(),
+                    ) {
+                        self.transition(View::ContainerShell { host, container })
+                            .await;
+                    }
+                }
                 KeyCode::Esc => self.transition(View::Hosts).await,
                 KeyCode::Char('r') => self.schedule_host_detail_refresh(),
                 _ => {}
             },
-            View::ContainerLogs { host, .. } => match key.code {
+            View::ContainerLogs { host, container } => match key.code {
                 KeyCode::Esc => {
                     let host = host.clone();
                     self.transition(View::HostDetail(host)).await;
+                }
+                KeyCode::Char('!') => {
+                    let host = host.clone();
+                    let container = container.clone();
+                    self.transition(View::ContainerShell { host, container })
+                        .await;
                 }
                 KeyCode::Char('k') => self.logs.clear(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
@@ -461,10 +491,20 @@ impl App {
                         .await;
                     }
                 }
+                KeyCode::Char('!') => {
+                    if let Some(row) = self.service_detail.selected_row() {
+                        self.transition(View::ContainerShell {
+                            host: row.host,
+                            container: row.container.name,
+                        })
+                        .await;
+                    }
+                }
                 KeyCode::Esc => self.transition(View::Services).await,
                 KeyCode::Char('r') => self.schedule_dashboard_refresh(),
                 _ => {}
             },
+            View::ContainerShell { .. } => {} // handled above
             View::Logs => match key.code {
                 KeyCode::Char('r') => {
                     self.stop_log_streams();
@@ -504,6 +544,11 @@ impl App {
         }
         self.stop_log_streams();
         self.logs.clear();
+        // Always tear down any in-flight shell when leaving its view —
+        // the spawned exec will drop its bridge task on Drop.
+        if !matches!(new_view, View::ContainerShell { .. }) {
+            self.shell = None;
+        }
 
         match &new_view {
             View::HostDetail(host) => {
@@ -513,6 +558,13 @@ impl App {
             View::ContainerLogs { host, container } => {
                 self.spawn_log_forwarder(host.clone(), container.clone())
                     .await;
+            }
+            View::ContainerShell { host, container } => {
+                let mut state = ShellState::new(host.clone(), container.clone());
+                // Pick a sensible initial size; the next render will
+                // resize to whatever the panel actually is.
+                state.start(self.ops.clone(), 24, 80).await;
+                self.shell = Some(state);
             }
             View::Logs => self.start_service_log_streams().await,
             View::Dashboard | View::Services => self.schedule_dashboard_refresh(),
@@ -525,6 +577,23 @@ impl App {
         self.view = new_view;
     }
 
+    /// Forward a key event into the embedded shell. Returns true if
+    /// the host outer loop should exit (Ctrl-Q is *intercepted* and
+    /// returns the user to the host-detail pane, not exits yoink).
+    async fn handle_shell_key(&mut self, key: KeyEvent) -> bool {
+        let exit_shell = if let Some(shell) = self.shell.as_mut() {
+            shell.handle_key(key, self.ops.clone())
+        } else {
+            true
+        };
+        if exit_shell
+            && let View::ContainerShell { host, .. } = self.view.clone()
+        {
+            self.transition(View::HostDetail(host)).await;
+        }
+        false
+    }
+
     /// 3-second tick: schedule a background refresh for whichever pane
     /// shows live container data. The fetch task runs concurrently with
     /// the event loop; the result lands via `update_rx`.
@@ -534,8 +603,31 @@ impl App {
                 self.schedule_dashboard_refresh();
             }
             View::HostDetail(_) => self.schedule_host_detail_refresh(),
+            View::ContainerShell { .. } => self.shell_tick(),
             _ => {}
         }
+    }
+
+    /// Pump bytes from the shell bridge into the vt100 parser, and
+    /// bounce back to host-detail if the shell exited (Ctrl-D / `exit`).
+    /// Synchronous because it's called from `fast_tick`; the transition
+    /// here is a direct view swap (the shell view has no log streams or
+    /// other async cleanup that the full `transition` would handle).
+    fn shell_tick(&mut self) {
+        let Some(shell) = self.shell.as_mut() else {
+            return;
+        };
+        shell.drain_output();
+        if !shell.exited() {
+            return;
+        }
+        let View::ContainerShell { host, .. } = self.view.clone() else {
+            return;
+        };
+        self.shell = None;
+        self.host_detail.set_host(host.clone());
+        self.view = View::HostDetail(host);
+        self.schedule_host_detail_refresh();
     }
 
     fn schedule_hosts_refresh(&mut self) {
@@ -717,6 +809,19 @@ impl App {
             View::Services => self.services.render(frame, &self.config),
             View::ServiceDetail(_) => self.service_detail.render(frame),
             View::Logs | View::ContainerLogs { .. } => self.logs.render(frame, &self.config),
+            View::ContainerShell { .. } => {
+                if let Some(shell) = self.shell.as_mut() {
+                    // Send the current panel size to the daemon (no-op
+                    // if unchanged) so the in-shell view re-flows on
+                    // window resize. Inside-border = panel minus the
+                    // header row + footer row + box borders (2 each).
+                    let area = frame.area();
+                    let rows = area.height.saturating_sub(4); // header+footer+2 borders
+                    let cols = area.width.saturating_sub(2);
+                    shell.apply_size(self.ops.clone(), rows, cols);
+                    shell.render(frame);
+                }
+            }
         }
     }
 }

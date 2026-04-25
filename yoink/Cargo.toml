@@ -15,21 +15,24 @@ name = "yoink"
 path = "src/main.rs"
 
 [dependencies]
-ansi-to-tui = "7"
+ansi-to-tui = "8"
 anyhow = "1"
 async-trait = "0.1"
 bollard = { version = "0.20", features = ["ssh"] }
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = "0.3"
 glob = "0.3"
 humantime-serde = "1"
-ratatui = "0.29"
+ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tabled = "0.16"
 thiserror = "2"
+tui-term = "0.3"
+vt100 = "0.16"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time", "fs", "process", "io-util"] }
 yaml_serde = "0.10"
 tracing = "0.1"

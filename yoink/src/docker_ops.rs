@@ -191,6 +191,25 @@ pub enum DockerEventKind {
     Other,
 }
 
+/// Handle to an interactive (TTY) docker exec. Output is the merged
+/// PTY byte stream (stdout+stderr combined when `tty: true`); writing
+/// to `stdin` sends keystrokes. Resize via `resize_exec(exec_id, …)`
+/// when the terminal panel changes size.
+pub struct ExecSession {
+    pub exec_id: String,
+    pub stdin: std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
+    pub output:
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, DockerError>> + Send>>,
+}
+
+impl std::fmt::Debug for ExecSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecSession")
+            .field("exec_id", &self.exec_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Result of a one-shot container run (e.g. a pre-deploy hook).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OneShotResult {
@@ -287,6 +306,32 @@ pub trait DockerOps: Send + Sync {
         container: &str,
         cmd: Vec<String>,
     ) -> Result<OneShotResult, DockerError>;
+
+    /// Start an interactive (PTY-mode) docker exec. The returned
+    /// `ExecSession` lets the caller stream raw terminal bytes both ways:
+    /// the embedded TUI shell drives `vt100::Parser` from `output` and
+    /// forwards key events into `stdin`. Initial size is set in the same
+    /// call so the in-container shell sees the right dimensions on the
+    /// first prompt.
+    async fn exec_interactive(
+        &self,
+        host: &Host,
+        container: &str,
+        cmd: Vec<String>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ExecSession, DockerError>;
+
+    /// Tell the daemon the PTY size has changed. Called whenever the
+    /// embedded shell panel is resized so applications like `top` or
+    /// `vim` re-flow.
+    async fn resize_exec(
+        &self,
+        host: &Host,
+        exec_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), DockerError>;
 
     /// TCP-only liveness probe — used for services that don't speak
     /// HTTP (redis on :6379) or where the HTTP path is impractical to
@@ -717,6 +762,97 @@ impl DockerOps for RealDockerOps {
             stdout,
             stderr,
         })
+    }
+
+    async fn exec_interactive(
+        &self,
+        host: &Host,
+        container: &str,
+        cmd: Vec<String>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ExecSession, DockerError> {
+        let docker = self.client_for(host).await?;
+        let exec = docker
+            .create_exec(
+                container,
+                bollard::exec::CreateExecOptions {
+                    cmd: Some(cmd),
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    tty: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|s| Self::err(host, s))?;
+
+        let res = docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    tty: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|s| Self::err(host, s))?;
+
+        let bollard::exec::StartExecResults::Attached { output, input } = res else {
+            return Err(DockerError::Invalid(
+                "start_exec returned Detached for an attached request".into(),
+            ));
+        };
+
+        // Initial PTY size — best-effort; the daemon may reject if the exec
+        // hasn't fully wired up, but the next render-driven resize will
+        // catch up almost immediately.
+        let _ = docker
+            .resize_exec(
+                &exec.id,
+                bollard::exec::ResizeExecOptions {
+                    height: rows,
+                    width: cols,
+                },
+            )
+            .await;
+
+        let host_for_err = host.clone();
+        let mapped = output.map(move |item| match item {
+            Ok(bollard::container::LogOutput::Console { message }
+            | bollard::container::LogOutput::StdOut { message }
+            | bollard::container::LogOutput::StdErr { message }) => Ok(message),
+            Ok(bollard::container::LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
+            Err(e) => Err(Self::err(&host_for_err, e)),
+        });
+
+        Ok(ExecSession {
+            exec_id: exec.id,
+            stdin: input,
+            output: Box::pin(mapped),
+        })
+    }
+
+    async fn resize_exec(
+        &self,
+        host: &Host,
+        exec_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), DockerError> {
+        let docker = self.client_for(host).await?;
+        docker
+            .resize_exec(
+                exec_id,
+                bollard::exec::ResizeExecOptions {
+                    height: rows,
+                    width: cols,
+                },
+            )
+            .await
+            .map_err(|s| Self::err(host, s))
     }
 
     async fn healthcheck_tcp(
@@ -1321,6 +1457,27 @@ impl DockerOps for FakeDockerOps {
         s.calls
             .push(RecordedCall::ExecOneshot(host.clone(), container.into(), cmd));
         pop(&mut s.exec_oneshot, "exec_oneshot")
+    }
+    async fn exec_interactive(
+        &self,
+        _host: &Host,
+        _container: &str,
+        _cmd: Vec<String>,
+        _rows: u16,
+        _cols: u16,
+    ) -> Result<ExecSession, DockerError> {
+        Err(DockerError::Invalid(
+            "exec_interactive not supported by FakeDockerOps".into(),
+        ))
+    }
+    async fn resize_exec(
+        &self,
+        _host: &Host,
+        _exec_id: &str,
+        _rows: u16,
+        _cols: u16,
+    ) -> Result<(), DockerError> {
+        Ok(())
     }
     async fn fetch_recent_logs(
         &self,

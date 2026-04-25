@@ -8,6 +8,7 @@ mod hosts;
 mod logs;
 mod progress;
 mod services;
+mod shell;
 mod ui;
 
 pub use app::{Mode, run};
