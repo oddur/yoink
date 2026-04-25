@@ -1,0 +1,101 @@
+# Pilot deploy: otel-collector to backtrack-eu-1, managed by yoink.
+#
+# Why now: pgAdmin proved the basic flow; otel exercises the parts that
+# pgadmin didn't — uploaded config file (`files:`), host bind mounts
+# (/proc, /sys, /, docker.sock), and a real network alias that other
+# (still-Kamal-managed) services depend on.
+#
+# Network call:
+#   `deploy.network: kamal` — the same network Kamal's caddy/api/web
+#   already use. Otherwise the alias `backtrack-otel` wouldn't resolve
+#   for the apps still being run by Kamal. Once everything is on yoink
+#   we can rename the network in one step.
+#
+# Coexistence with Kamal:
+#   service.name `yoink-otel` is distinct from Kamal's `otel`, so the
+#   `yoink.service=` filter never touches Kamal's container. Both
+#   listen on :4318 inside the network — to do a real cutover, stop
+#   Kamal's first so DNS resolves the alias to ours:
+#     ssh root@backtrack-eu-1 'docker stop backtrack-otel && docker rm backtrack-otel'
+#
+# Pre-flight: same as pgAdmin (tailscale up, infisical login).
+#
+# Smoke run from `tools/yoink/`:
+#
+#   cargo run -- preflight --config examples/backtrack-eu-1-otel.yaml
+#   cargo run -- up        --config examples/backtrack-eu-1-otel.yaml
+#   cargo run -- status    --config examples/backtrack-eu-1-otel.yaml
+#
+# Validate (from a yoink-network-attached container):
+#   ssh root@backtrack-eu-1 \
+#     'docker run --rm --network=kamal curlimages/curl:8.10.1 \
+#       -fsS http://backtrack-otel:13133/'      # otelcol's health check
+#
+# Rollback to Kamal:
+#   ssh root@backtrack-eu-1 \
+#     'docker ps -aq --filter label=yoink.service=yoink-otel | xargs -r docker rm -f'
+#   (then) kamal accessory boot otel
+
+deploy:
+  # Same network as Kamal's services so api/web (still on kamal) keep
+  # resolving `backtrack-otel` to our container via Docker's built-in
+  # DNS. yoink uses the network alias `<service-name>` automatically;
+  # we add an explicit alias below to match what api/web look up.
+  network: kamal
+
+hosts:
+  - address: backtrack-eu-1
+    user: root
+
+secrets:
+  provider: infisical
+  project_id: 0b9dd64d-b7ee-4d44-8477-0da48672a4a1
+  environment: prod
+  domain: https://infisical.story-halibut.ts.net
+
+services:
+  - name: yoink-otel
+    image: otel/opentelemetry-collector-contrib
+    # Pinned exact: otelcol-contrib ships weekly; minor-version bumps
+    # have shipped breaking config changes (otlphttp → otlp_http
+    # rename in 0.150.x). Bump deliberately.
+    tag: "0.150.1"
+    env:
+      # The bind-mounted otel-collector.yaml still references
+      # `${env:KAMAL_HOST}` (it's the host.name resource attribute).
+      # Pass it through during the transition; clean rename to
+      # YOINK_HOST or similar once Kamal is fully decommissioned.
+      KAMAL_HOST: backtrack-eu-1
+    secrets:
+      - GRAFANA_CLOUD_OTEL_AUTH_HEADER
+    run:
+      drain_timeout: 10s
+      # Operator-side config file → uploaded to backtrack-eu-1 and
+      # bind-mounted into the container at the path the image expects.
+      # Editing this file and re-running `yoink up` triggers a redeploy
+      # automatically (file content feeds into spec_hash).
+      files:
+        # Resolved relative to this config file (tools/yoink/examples/),
+        # so three ".." gets us to the repo root.
+        - "../../../backtrack-deploy/config/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro"
+      binds:
+        # Host filesystem snapshots otel uses to scrape host metrics.
+        # All read-only: we observe, never write.
+        - "/proc:/hostfs/proc:ro"
+        - "/sys:/hostfs/sys:ro"
+        - "/:/hostfs:ro"
+        # Docker socket → so otel's docker_stats receiver can pull
+        # per-container CPU/mem/IO stats. ro because we never need
+        # write access.
+        - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      options:
+        memory: 256m
+        # otelcol-contrib's host metrics receiver needs root to read
+        # /proc/<pid>/* for some processes. Same setting Kamal uses.
+        user: "0:0"
+        # `backtrack-otel` is the alias api/web hardcode in
+        # OTEL_EXPORTER_OTLP_ENDPOINT. yoink already adds the
+        # container name as an alias on the network; we add the
+        # legacy short name so existing clients keep resolving.
+        network_aliases:
+          - backtrack-otel

@@ -2,7 +2,7 @@
 //! `EventStream`. Three top-level views accessible via shortcut keys
 //! and two drill-down views reachable via Enter from a parent:
 //!
-//! - `Dashboard` (`d`) — status grid for the configured service.
+//! - `Dashboard` (`d`) — status grid for every yoink-managed service.
 //! - `Hosts` (`h`) — all configured hosts; up/down + enter opens host detail.
 //! - `HostDetail` — running containers on the host; up/down + enter opens container logs.
 //! - `ContainerLogs` — live `docker logs -f` for one container.
@@ -32,16 +32,26 @@ use tokio::time::interval;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::docker_ops::{DockerOps, Host, LogLine};
+use crate::docker_ops::{DockerEvent, DockerEventKind, DockerOps, Host, LogLine};
 use crate::status::StatusReport;
 
 use super::dashboard::{self, DashboardRefresh, DashboardState};
 use super::host_detail::{self, HostDetailRefresh, HostDetailState};
 use super::hosts::{self, HostRow, HostsState};
 use super::logs::{LogsState, RenderedLine};
+use super::services::{ServiceDetailState, ServicesState};
 
-const FAST_TICK: Duration = Duration::from_secs(3);
+/// Backstop polling cadence when no `docker events` push lands. The
+/// realtime updates ride on the events stream (see `subscribe_host_events`);
+/// this tick exists so the UI converges even if events are filtered out
+/// or the stream drops.
+const FAST_TICK: Duration = Duration::from_secs(2);
 const HOSTS_TICK: Duration = Duration::from_secs(10);
+/// How often to re-stat + re-parse the on-disk config so a `vim
+/// services/api.yaml` is reflected without restarting the TUI. Polling
+/// (vs notify/inotify) keeps the dep tree small; 2s latency is fine
+/// for an operator editing a YAML file.
+const CONFIG_RELOAD_TICK: Duration = Duration::from_secs(2);
 const LOG_BACKFILL_LINES: u32 = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -49,6 +59,7 @@ const LOG_BACKFILL_LINES: u32 = 200;
 pub enum Mode {
     Dashboard,
     Hosts,
+    Services,
     Logs,
 }
 
@@ -57,6 +68,8 @@ pub enum View {
     Dashboard,
     Hosts,
     HostDetail(Host),
+    Services,
+    ServiceDetail(String),
     Logs,
     ContainerLogs { host: Host, container: String },
 }
@@ -66,6 +79,7 @@ impl From<Mode> for View {
         match m {
             Mode::Dashboard => View::Dashboard,
             Mode::Hosts => View::Hosts,
+            Mode::Services => View::Services,
             Mode::Logs => View::Logs,
         }
     }
@@ -75,11 +89,25 @@ impl From<Mode> for View {
 /// which pane to swap in.
 enum Update {
     Hosts(Vec<HostRow>),
-    HostDetail { host: Host, data: HostDetailRefresh },
+    HostDetail {
+        host: Host,
+        data: HostDetailRefresh,
+    },
     Dashboard(DashboardRefresh),
+    /// Push notification from a host's `docker events` stream. Triggers
+    /// an immediate refresh of whichever pane is currently visible.
+    Event {
+        host: Host,
+        event: DockerEvent,
+    },
 }
 
-pub async fn run(config: &Config, ops: Arc<dyn DockerOps>, mode: Mode) -> Result<()> {
+pub async fn run(
+    config: &Config,
+    config_path: std::path::PathBuf,
+    ops: Arc<dyn DockerOps>,
+    mode: Mode,
+) -> Result<()> {
     let hl_disabled = std::env::var_os("YOINK_NO_HL").is_some();
     let hl_available = !hl_disabled && probe_hl().await;
     if hl_disabled {
@@ -93,6 +121,7 @@ pub async fn run(config: &Config, ops: Arc<dyn DockerOps>, mode: Mode) -> Result
     let result = run_loop(
         &mut terminal,
         Arc::new(config.clone()),
+        config_path,
         ops,
         mode,
         hl_available,
@@ -130,15 +159,17 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     config: Arc<Config>,
+    config_path: std::path::PathBuf,
     ops: Arc<dyn DockerOps>,
     mode: Mode,
     hl_available: bool,
 ) -> Result<()> {
-    let mut app = App::new(config, ops, View::from(mode), hl_available);
+    let mut app = App::new(config, config_path, ops, View::from(mode), hl_available);
     // Schedule the first round of background fetches so each pane has data
     // by the time the user navigates to it.
     app.schedule_hosts_refresh();
     app.schedule_dashboard_refresh();
+    app.start_event_subscriptions();
     if matches!(app.view, View::Logs) {
         app.start_service_log_streams().await;
     }
@@ -146,8 +177,10 @@ async fn run_loop(
     let mut events = EventStream::new();
     let mut fast_tick = interval(FAST_TICK);
     let mut hosts_tick = interval(HOSTS_TICK);
+    let mut config_tick = interval(CONFIG_RELOAD_TICK);
     fast_tick.tick().await;
     hosts_tick.tick().await;
+    config_tick.tick().await;
 
     loop {
         terminal.draw(|f| app.render(f))?;
@@ -177,6 +210,9 @@ async fn run_loop(
                     app.schedule_hosts_refresh();
                 }
             }
+            _ = config_tick.tick() => {
+                app.maybe_reload_config();
+            }
             Some(update) = app.update_rx.recv() => {
                 app.apply_update(update);
             }
@@ -195,6 +231,8 @@ pub struct App {
     pub dashboard: DashboardState,
     pub hosts: HostsState,
     pub host_detail: HostDetailState,
+    pub services: ServicesState,
+    pub service_detail: ServiceDetailState,
     pub logs: LogsState,
 
     // Refresh-in-flight flags coalesce ticks: a tick that fires while the
@@ -209,12 +247,20 @@ pub struct App {
     log_tasks: Vec<JoinHandle<()>>,
     log_tx: UnboundedSender<RenderedLine>,
     log_rx: UnboundedReceiver<RenderedLine>,
+    /// One per host. Subscribed at startup; aborted on Drop. Events
+    /// flow into `update_tx` and trigger an immediate refresh of
+    /// whichever pane is visible.
+    event_tasks: Vec<JoinHandle<()>>,
+    /// Path to the root `yoink.yaml`. Re-read every `CONFIG_RELOAD_TICK`
+    /// so on-disk edits flow into the running TUI.
+    config_path: std::path::PathBuf,
     hl_available: bool,
 }
 
 impl App {
     pub fn new(
         config: Arc<Config>,
+        config_path: std::path::PathBuf,
         ops: Arc<dyn DockerOps>,
         view: View,
         hl_available: bool,
@@ -228,6 +274,8 @@ impl App {
             dashboard: DashboardState::new(),
             hosts: HostsState::new(),
             host_detail: HostDetailState::new(),
+            services: ServicesState::new(),
+            service_detail: ServiceDetailState::new(),
             logs: LogsState::new(),
             hosts_in_flight: false,
             host_detail_in_flight: false,
@@ -237,11 +285,78 @@ impl App {
             log_tasks: Vec::new(),
             log_tx,
             log_rx,
+            event_tasks: Vec::new(),
+            config_path,
             hl_available,
         }
     }
 
+    /// Re-read the config from disk and swap it in if it parses + has
+    /// actually changed. Silent no-op on parse errors so a half-saved
+    /// edit doesn't blank the dashboard; the next tick will catch the
+    /// finished edit. If `hosts:` changed we tear down and respawn the
+    /// docker-events subscriptions.
+    fn maybe_reload_config(&mut self) {
+        let new_config = match Config::load_from_path(&self.config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, path = %self.config_path.display(), "config reload failed");
+                return;
+            }
+        };
+        if new_config == *self.config {
+            return;
+        }
+        let hosts_changed = new_config.hosts != self.config.hosts;
+        self.config = Arc::new(new_config);
+        if hosts_changed {
+            self.stop_event_subscriptions();
+            self.start_event_subscriptions();
+            self.schedule_hosts_refresh();
+        }
+        self.schedule_dashboard_refresh();
+    }
+
+    /// Spawn one task per configured host that subscribes to the docker
+    /// events stream and forwards each event into `update_tx`. Cheap —
+    /// one connection per host, multiplexed across all panes.
+    fn start_event_subscriptions(&mut self) {
+        for host_cfg in &self.config.hosts {
+            let host = Host::from(host_cfg);
+            let ops = self.ops.clone();
+            let tx = self.update_tx.clone();
+            let task = tokio::spawn(async move {
+                let mut rx = match ops.subscribe_events(&host).await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        warn!(host = %host.address, error = %e, "subscribe_events failed");
+                        return;
+                    }
+                };
+                while let Some(event) = rx.recv().await {
+                    if tx
+                        .send(Update::Event {
+                            host: host.clone(),
+                            event,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            self.event_tasks.push(task);
+        }
+    }
+
+    fn stop_event_subscriptions(&mut self) {
+        for task in self.event_tasks.drain(..) {
+            task.abort();
+        }
+    }
+
     /// Returns true when the loop should exit.
+    #[allow(clippy::too_many_lines)]
     async fn on_key(&mut self, key: KeyEvent) -> bool {
         // Filter input mode in either logs view captures all printable
         // input — only Ctrl-C escapes to quit.
@@ -263,6 +378,10 @@ impl App {
             }
             KeyCode::Char('h') => {
                 self.transition(View::Hosts).await;
+                return false;
+            }
+            KeyCode::Char('s') => {
+                self.transition(View::Services).await;
                 return false;
             }
             KeyCode::Char('l') => {
@@ -314,11 +433,38 @@ impl App {
                 KeyCode::Char('G') | KeyCode::End => self.logs.jump_to_bottom(),
                 _ => {}
             },
-            View::Dashboard => {
-                if matches!(key.code, KeyCode::Char('r')) {
-                    self.schedule_dashboard_refresh();
+            View::Dashboard => match key.code {
+                KeyCode::Char('r') => self.schedule_dashboard_refresh(),
+                KeyCode::Char('e') => self.dashboard.toggle_show_exited(),
+                _ => {}
+            },
+            View::Services => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.services.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.services.select_next(),
+                KeyCode::Enter => {
+                    if let Some(name) = self.services.selected_service() {
+                        self.transition(View::ServiceDetail(name)).await;
+                    }
                 }
-            }
+                KeyCode::Char('r') => self.schedule_dashboard_refresh(),
+                _ => {}
+            },
+            View::ServiceDetail(_) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.service_detail.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.service_detail.select_next(),
+                KeyCode::Enter => {
+                    if let Some(row) = self.service_detail.selected_row() {
+                        self.transition(View::ContainerLogs {
+                            host: row.host,
+                            container: row.container.name,
+                        })
+                        .await;
+                    }
+                }
+                KeyCode::Esc => self.transition(View::Services).await,
+                KeyCode::Char('r') => self.schedule_dashboard_refresh(),
+                _ => {}
+            },
             View::Logs => match key.code {
                 KeyCode::Char('r') => {
                     self.stop_log_streams();
@@ -369,8 +515,12 @@ impl App {
                     .await;
             }
             View::Logs => self.start_service_log_streams().await,
-            View::Dashboard => self.schedule_dashboard_refresh(),
+            View::Dashboard | View::Services => self.schedule_dashboard_refresh(),
             View::Hosts => self.schedule_hosts_refresh(),
+            View::ServiceDetail(name) => {
+                self.service_detail.set_service(name.clone());
+                self.schedule_dashboard_refresh();
+            }
         }
         self.view = new_view;
     }
@@ -380,7 +530,9 @@ impl App {
     /// the event loop; the result lands via `update_rx`.
     fn fast_tick(&mut self) {
         match &self.view {
-            View::Dashboard => self.schedule_dashboard_refresh(),
+            View::Dashboard | View::Services | View::ServiceDetail(_) => {
+                self.schedule_dashboard_refresh();
+            }
             View::HostDetail(_) => self.schedule_host_detail_refresh(),
             _ => {}
         }
@@ -445,9 +597,63 @@ impl App {
                 self.host_detail_in_flight = false;
             }
             Update::Dashboard(data) => {
+                // Services & ServiceDetail share the same StatusReport
+                // as Dashboard. Clone it into both before handing the
+                // original off to dashboard's apply (which moves it).
+                let report_clone = data.report.clone();
+                let service_names: Vec<String> = self
+                    .config
+                    .services
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                self.services.apply(report_clone.clone(), service_names);
+                self.service_detail
+                    .apply(report_clone.map(Arc::new), &self.config);
                 self.dashboard.apply(data);
                 self.dashboard_in_flight = false;
             }
+            Update::Event { host, event } => self.on_docker_event(&host, &event),
+        }
+    }
+
+    /// React to a `docker events` push by refreshing whichever pane is
+    /// visible. Container start/stop/die/health-status are the events
+    /// that mean what the user sees on screen has changed; we ignore
+    /// the chatty ones (`exec_create`, `exec_start`, `attach`, …) so we don't
+    /// thrash on them.
+    fn on_docker_event(&mut self, host: &Host, event: &DockerEvent) {
+        if event.kind != DockerEventKind::Container {
+            return;
+        }
+        let interesting = matches!(
+            event.action.as_str(),
+            "start"
+                | "stop"
+                | "die"
+                | "kill"
+                | "create"
+                | "destroy"
+                | "rename"
+                | "restart"
+                | "pause"
+                | "unpause"
+                | "health_status"
+                | "health_status: healthy"
+                | "health_status: unhealthy"
+                | "health_status: starting"
+                | "oom"
+        );
+        if !interesting {
+            return;
+        }
+        match &self.view {
+            View::Dashboard | View::Services | View::ServiceDetail(_) => {
+                self.schedule_dashboard_refresh();
+            }
+            View::Hosts => self.schedule_hosts_refresh(),
+            View::HostDetail(active) if active == host => self.schedule_host_detail_refresh(),
+            _ => {}
         }
     }
 
@@ -508,6 +714,8 @@ impl App {
             View::Dashboard => self.dashboard.render(frame, &self.config),
             View::Hosts => self.hosts.render(frame, &self.config),
             View::HostDetail(_) => self.host_detail.render(frame),
+            View::Services => self.services.render(frame, &self.config),
+            View::ServiceDetail(_) => self.service_detail.render(frame),
             View::Logs | View::ContainerLogs { .. } => self.logs.render(frame, &self.config),
         }
     }
@@ -516,6 +724,7 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         self.stop_log_streams();
+        self.stop_event_subscriptions();
     }
 }
 
@@ -651,16 +860,13 @@ mod tests {
         Arc::new(
             Config::parse_str(
                 r#"
-[service]
-name = "app-a"
-image = "img"
-
-[[hosts]]
-address = "host-a"
-user = "deploy"
-
-[run]
-port = 3000
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: img
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
 "#,
             )
             .unwrap(),
@@ -670,14 +876,78 @@ port = 3000
     #[tokio::test]
     async fn app_constructs_idle() {
         let ops: Arc<dyn DockerOps> = Arc::new(FakeDockerOps::new());
-        let app = App::new(config(), ops, View::Dashboard, false);
+        let app = App::new(
+            config(),
+            std::path::PathBuf::from("yoink.yaml"),
+            ops,
+            View::Dashboard,
+            false,
+        );
         assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[tokio::test]
+    async fn docker_event_schedules_dashboard_refresh() {
+        let ops: Arc<dyn DockerOps> = Arc::new(FakeDockerOps::new());
+        let mut app = App::new(
+            config(),
+            std::path::PathBuf::from("yoink.yaml"),
+            ops,
+            View::Dashboard,
+            false,
+        );
+        assert!(!app.dashboard_in_flight);
+        app.on_docker_event(
+            &Host {
+                user: "deploy".into(),
+                address: "host-a".into(),
+            },
+            &DockerEvent {
+                kind: DockerEventKind::Container,
+                action: "start".into(),
+                container: Some("app-a-deadbeef".into()),
+            },
+        );
+        assert!(app.dashboard_in_flight, "start event must schedule refresh");
+    }
+
+    #[tokio::test]
+    async fn docker_event_ignores_chatty_actions() {
+        let ops: Arc<dyn DockerOps> = Arc::new(FakeDockerOps::new());
+        let mut app = App::new(
+            config(),
+            std::path::PathBuf::from("yoink.yaml"),
+            ops,
+            View::Dashboard,
+            false,
+        );
+        app.on_docker_event(
+            &Host {
+                user: "deploy".into(),
+                address: "host-a".into(),
+            },
+            &DockerEvent {
+                kind: DockerEventKind::Container,
+                action: "exec_create".into(),
+                container: Some("c".into()),
+            },
+        );
+        assert!(
+            !app.dashboard_in_flight,
+            "exec_create is too chatty to refresh on"
+        );
     }
 
     #[tokio::test]
     async fn dashboard_renders_loading_to_test_backend() {
         let ops: Arc<dyn DockerOps> = Arc::new(FakeDockerOps::new());
-        let mut app = App::new(config(), ops, View::Dashboard, false);
+        let mut app = App::new(
+            config(),
+            std::path::PathBuf::from("yoink.yaml"),
+            ops,
+            View::Dashboard,
+            false,
+        );
 
         let backend = TestBackend::new(120, 12);
         let mut terminal = Terminal::new(backend).unwrap();

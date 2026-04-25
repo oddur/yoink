@@ -1,0 +1,50 @@
+# Throwaway test config for yoink against the production host
+# `backtrack-eu-1` (Hetzner, joined to your Tailscale tailnet, ssh as root).
+#
+# Deploys a vanilla nginx:alpine container so you can exercise the full
+# yoink lifecycle (preflight → up → status → tui) without touching
+# anything Kamal manages. Two layers of isolation:
+#
+#  - service.name "yoink-test" — distinct label set; Kamal's bt-api
+#    container is yoink.service=backtrack and won't be touched.
+#  - deploy.network "yoink-test" — separate Docker network from
+#    Kamal's `kamal` network. Caddy doesn't see this; nothing public.
+#
+# Smoke run from `tools/yoink/`:
+#
+#   cargo run -- preflight --config examples/backtrack-eu-1-nginx.yaml
+#   cargo run -- up --service yoink-test --tag alpine \
+#     --config examples/backtrack-eu-1-nginx.yaml
+#   cargo run -- status --config examples/backtrack-eu-1-nginx.yaml
+#   cargo run -- tui --mode logs --config examples/backtrack-eu-1-nginx.yaml
+#
+# Cleanup when done (one ssh):
+#
+#   ssh root@backtrack-eu-1 \
+#     'docker ps -aq --filter label=yoink.service=yoink-test \
+#       | xargs -r docker rm -f && docker network rm yoink-test 2>/dev/null'
+
+deploy:
+  network: yoink-test
+
+hosts:
+  - address: backtrack-eu-1
+    user: root
+
+services:
+  - name: yoink-test
+    image: nginx
+    tag: alpine
+    run:
+      port: 80
+      healthcheck_path: /
+      healthcheck_timeout: 30s
+      drain_timeout: 5s
+      options:
+        cap_drop: [ALL]
+        cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+        security_opt: [no-new-privileges]
+        # nginx writes to /var/cache/nginx and /var/run/nginx.pid at startup.
+        # Leaving rootfs writable for this test (the default) keeps the config
+        # minimal; flip read_only=true and add tmpfs mounts for those paths if
+        # you want to mirror bt-api's hardening.

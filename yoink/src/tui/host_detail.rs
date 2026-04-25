@@ -113,8 +113,9 @@ impl HostDetailState {
         frame.render_widget(header, layout[0]);
 
         let widths = [
+            Constraint::Length(14), // service
             Constraint::Length(28), // container
-            Constraint::Length(28), // image
+            Constraint::Length(28), // status
             Constraint::Length(10), // state
             Constraint::Length(10), // health
             Constraint::Length(11), // cpu (cores)
@@ -146,6 +147,7 @@ impl HostDetailState {
                     );
                     let health = c.health_hint().unwrap_or("-");
                     Row::new(vec![
+                        Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
                         Cell::from(c.name.clone()),
                         Cell::from(c.status_text.clone()),
                         Cell::from(c.state.clone()),
@@ -158,6 +160,7 @@ impl HostDetailState {
         };
         let table = Table::new(rows, widths)
             .header(Row::new(vec![
+                Cell::from("service").style(bold()),
                 Cell::from("container").style(bold()),
                 Cell::from("status").style(bold()),
                 Cell::from("state").style(bold()),
@@ -234,9 +237,10 @@ mod tests {
             name: name.into(),
             state: "running".into(),
             status_text: "Up 1h (healthy)".into(),
-            created_at: String::new(),
+            created_unix: None,
             yoink_service: None,
             yoink_version: None,
+            yoink_spec_hash: None,
             other_labels: BTreeMap::new(),
         }
     }

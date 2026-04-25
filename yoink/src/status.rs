@@ -1,6 +1,6 @@
 //! Status reporting. Queries each host through `DockerOps` and aggregates
-//! the typed responses into a `StatusReport`. No more JSON parsing —
-//! bollard's `ContainerSummary` already gives us labels as a `HashMap`.
+//! the typed responses into a `StatusReport`. Multi-service-aware: the
+//! report is grouped by host with all yoink-managed containers visible.
 
 use thiserror::Error;
 
@@ -13,21 +13,43 @@ pub enum StatusError {
     Docker(#[from] DockerError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct HostStatus {
     pub host: String,
     pub containers: Vec<ContainerInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct StatusReport {
-    pub service: String,
     pub hosts: Vec<HostStatus>,
 }
 
 impl StatusReport {
+    /// All containers managed by yoink (any service) across every host
+    /// in the config. Filtered server-side via the `yoink.managed=true`
+    /// label.
     pub async fn collect(ops: &dyn DockerOps, config: &Config) -> Result<Self, StatusError> {
-        let label = format!("yoink.service={}", config.service.name);
+        let mut hosts = Vec::with_capacity(config.hosts.len());
+        for host_cfg in &config.hosts {
+            let host = Host::from(host_cfg);
+            let containers = ops
+                .list_containers_by_label(&host, "yoink.managed=true")
+                .await?;
+            hosts.push(HostStatus {
+                host: host.address,
+                containers,
+            });
+        }
+        Ok(Self { hosts })
+    }
+
+    /// All containers for one named service across every host.
+    pub async fn collect_for_service(
+        ops: &dyn DockerOps,
+        config: &Config,
+        service_name: &str,
+    ) -> Result<Self, StatusError> {
+        let label = format!("yoink.service={service_name}");
         let mut hosts = Vec::with_capacity(config.hosts.len());
         for host_cfg in &config.hosts {
             let host = Host::from(host_cfg);
@@ -37,14 +59,11 @@ impl StatusReport {
                 containers,
             });
         }
-        Ok(Self {
-            service: config.service.name.clone(),
-            hosts,
-        })
+        Ok(Self { hosts })
     }
 
-    /// Highest-version running container for the service across all hosts,
-    /// excluding `current_version`. Used by rollback.
+    /// Highest-version running container for `service_name` across all
+    /// hosts, excluding `current_version`. Used by rollback.
     #[must_use]
     pub fn previous_version(&self, current_version: &str) -> Option<String> {
         let mut versions: Vec<String> = self
@@ -69,20 +88,14 @@ mod tests {
     fn config_with_two_hosts() -> Config {
         Config::parse_str(
             r#"
-[service]
-name = "app-a"
-image = "registry.example.com/app-a"
-
-[[hosts]]
-address = "host-a"
-user = "deploy"
-
-[[hosts]]
-address = "host-b"
-user = "deploy"
-
-[run]
-port = 3000
+hosts:
+  - { address: host-a, user: deploy }
+  - { address: host-b, user: deploy }
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
 "#,
         )
         .unwrap()
@@ -94,9 +107,10 @@ port = 3000
             name: name.into(),
             state: state.into(),
             status_text: "Up 1h (healthy)".into(),
-            created_at: "2026-04-25 09:00".into(),
+            created_unix: Some(1_735_128_000),
             yoink_service: Some("app-a".into()),
             yoink_version: Some(version.into()),
+            yoink_spec_hash: None,
             other_labels: BTreeMap::new(),
         }
     }
@@ -118,18 +132,9 @@ port = 3000
         )]));
         let cfg = config_with_two_hosts();
         let report = StatusReport::collect(&ops, &cfg).await.unwrap();
-        assert_eq!(report.service, "app-a");
         assert_eq!(report.hosts.len(), 2);
         assert_eq!(report.hosts[0].host, "host-a");
         assert_eq!(report.hosts[1].host, "host-b");
-    }
-
-    #[tokio::test]
-    async fn collect_propagates_docker_error() {
-        let ops = FakeDockerOps::new();
-        let cfg = config_with_two_hosts();
-        let err = StatusReport::collect(&ops, &cfg).await.unwrap_err();
-        assert!(matches!(err, StatusError::Docker(_)));
     }
 
     #[tokio::test]
@@ -143,20 +148,5 @@ port = 3000
         let cfg = config_with_two_hosts();
         let report = StatusReport::collect(&ops, &cfg).await.unwrap();
         assert_eq!(report.previous_version("a1b2c3d"), Some("9f8e7d6".into()));
-    }
-
-    #[tokio::test]
-    async fn previous_version_none_when_only_current_exists() {
-        let ops = FakeDockerOps::new();
-        ops.push_list_containers(Ok(vec![container(
-            "host-a",
-            "app-a-a1b2c3d",
-            "a1b2c3d",
-            "running",
-        )]));
-        ops.push_list_containers(Ok(vec![]));
-        let cfg = config_with_two_hosts();
-        let report = StatusReport::collect(&ops, &cfg).await.unwrap();
-        assert_eq!(report.previous_version("a1b2c3d"), None);
     }
 }

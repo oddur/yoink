@@ -22,14 +22,16 @@ bollard = { version = "0.20", features = ["ssh"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = "0.3"
+glob = "0.3"
 humantime-serde = "1"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tabled = "0.16"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time", "fs", "process", "io-util"] }
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+yaml_serde = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 

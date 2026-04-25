@@ -174,9 +174,14 @@ impl LogsState {
         // Persist clamped value so jumping past end doesn't keep accumulating.
         self.scroll = scroll;
 
+        let services = config
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         let header_text = format!(
-            "yoink logs · service={} · {} lines{} · {}",
-            config.service.name,
+            "yoink logs · services: {services} · {} lines{} · {}",
             total,
             self.filter
                 .as_deref()

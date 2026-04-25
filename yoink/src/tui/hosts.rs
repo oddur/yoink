@@ -293,20 +293,14 @@ mod tests {
     fn config_two_hosts() -> Config {
         Config::parse_str(
             r#"
-[service]
-name = "yoink-test"
-image = "nginx"
-
-[[hosts]]
-address = "host-a"
-user = "deploy"
-
-[[hosts]]
-address = "host-b"
-user = "root"
-
-[run]
-port = 80
+hosts:
+  - { address: host-a, user: deploy }
+  - { address: host-b, user: root }
+services:
+  - name: yoink-test
+    image: nginx
+    tag: alpine
+    run: { port: 80, healthcheck_path: / }
 "#,
         )
         .unwrap()
@@ -339,9 +333,10 @@ port = 80
             name: name.into(),
             state: "running".into(),
             status_text: "Up".into(),
-            created_at: String::new(),
+            created_unix: None,
             yoink_service: None,
             yoink_version: None,
+            yoink_spec_hash: None,
             other_labels: BTreeMap::new(),
         }
     }

@@ -7,6 +7,7 @@ mod host_detail;
 mod hosts;
 mod logs;
 mod progress;
+mod services;
 mod ui;
 
 pub use app::{Mode, run};

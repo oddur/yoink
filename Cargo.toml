@@ -22,6 +22,9 @@ missing_errors_doc = "allow"
 # Internal panics on poisoned mutexes / impossible states — not worth
 # documenting for every helper.
 missing_panics_doc = "allow"
+# Test fixtures use `r#"..."#` for YAML strings; the hash count
+# uniformity is more readable than per-string trimming.
+needless_raw_string_hashes = "allow"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

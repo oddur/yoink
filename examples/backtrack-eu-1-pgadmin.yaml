@@ -1,0 +1,94 @@
+# Pilot deploy: pgAdmin to backtrack-eu-1, managed by yoink instead of Kamal.
+#
+# Why pgAdmin first:
+#  - Operator-only tool (no end-user traffic), so a botched deploy doesn't
+#    page anyone. Failure mode is "Oddur can't open pgAdmin for an hour".
+#  - Single host, single container, named volume + port publish + secrets —
+#    exercises every piece of yoink (config, secrets fetch, run options,
+#    drift detection) without involving caddy / shared networks.
+#  - Mirrors the existing Kamal accessory at backtrack-deploy/config/deploy.yml
+#    almost line-for-line; if yoink's running container looks the same as
+#    Kamal's, we have functional parity for the rest of the migration.
+#
+# Coexistence with Kamal:
+#  - service.name "yoink-pgadmin" — distinct from Kamal's "pgadmin"
+#    accessory so yoink's `yoink.service=` label filter never touches it.
+#  - deploy.network "yoink" — separate from Kamal's `kamal` network. The
+#    container does not need to talk to api/web/redis; it only proxies
+#    Postgres connections that the operator types in by hand.
+#  - Both systems publish on 127.0.0.1; only one can hold port 5050 at a
+#    time. To switch over: stop the Kamal accessory first, then run this.
+#
+# Pre-flight (one-time):
+#  - Tailscale up + machine logged into the same tailnet as backtrack-eu-1.
+#  - `infisical login --domain=https://infisical.story-halibut.ts.net`
+#    OR `INFISICAL_TOKEN=<machine-identity>` exported.
+#  - Decide whether you're swapping out Kamal's pgadmin first; if yes:
+#      ssh root@backtrack-eu-1 'kamal accessory stop pgadmin || true'
+#
+# Smoke run from `tools/yoink/`:
+#
+#   cargo run -- preflight --config examples/backtrack-eu-1-pgadmin.yaml
+#   cargo run -- up        --config examples/backtrack-eu-1-pgadmin.yaml
+#   cargo run -- status    --config examples/backtrack-eu-1-pgadmin.yaml
+#   cargo run -- tui       --config examples/backtrack-eu-1-pgadmin.yaml
+#
+# Validate:
+#   ssh root@backtrack-eu-1 'curl -s -o /dev/null -w "%{http_code}\n" \
+#     http://127.0.0.1:5050/login'   # expect 200
+#   open https://pgadmin.story-halibut.ts.net  # via tailscale serve
+#
+# Rollback to Kamal:
+#   ssh root@backtrack-eu-1 \
+#     'docker ps -aq --filter label=yoink.service=yoink-pgadmin \
+#       | xargs -r docker rm -f'
+#   (then) kamal accessory boot pgadmin
+
+deploy:
+  network: yoink
+
+hosts:
+  - address: backtrack-eu-1
+    user: root
+
+secrets:
+  provider: infisical
+  project_id: 0b9dd64d-b7ee-4d44-8477-0da48672a4a1
+  environment: prod
+  domain: https://infisical.story-halibut.ts.net
+
+services:
+  - name: yoink-pgadmin
+    image: dpage/pgadmin4
+    tag: "9"
+    env:
+      # Multi-user mode (login required) instead of the desktop fallback.
+      PGADMIN_CONFIG_SERVER_MODE: "True"
+      # Single operator account — login password is already the auth factor.
+      # Saved-server creds still get encrypted at rest using login pw as KDF.
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    secrets:
+      - PGADMIN_DEFAULT_EMAIL
+      - PGADMIN_DEFAULT_PASSWORD
+    run:
+      # Plain HTTP on container port 80; we publish to loopback only so
+      # the only path in is the host's tailscaled `tailscale serve`.
+      port: 80
+      # No healthcheck_path — pgAdmin's /login responds 200 but yoink's
+      # healthchecker creates a curl probe on the shared network. Adding
+      # it later is a one-line change once we want gated rollouts.
+      drain_timeout: 10s
+      publish:
+        - "127.0.0.1:5050:80"
+      volumes:
+        # Persists pgAdmin's SQLite config DB (saved server connections,
+        # operator prefs). Same volume name Kamal uses, so swapping
+        # systems doesn't lose registered Postgres endpoints.
+        - "pgadmin-data:/var/lib/pgadmin"
+      options:
+        memory: 256m
+        # NB: deliberately NO cap_drop / no-new-privileges / read_only.
+        # pgAdmin's entrypoint runs as root and drops to the `pgadmin`
+        # user via sudo; CAP_SETUID + the ability to elevate are both
+        # required or the container crash-loops on startup. The real
+        # security boundary is the 127.0.0.1 publish above.

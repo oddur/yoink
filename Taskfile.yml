@@ -38,6 +38,31 @@ tasks:
     cmds:
       - cargo run --quiet -- {{.CLI_ARGS}}
 
+  tui:
+    desc: "Launch the yoink TUI against the repo-root yoink.yaml"
+    cmds:
+      - cargo run --quiet -- tui --config ../../yoink.yaml {{.CLI_ARGS}}
+
+  up:
+    desc: "Reconcile every service against the repo-root yoink.yaml"
+    cmds:
+      - cargo run --quiet -- up --config ../../yoink.yaml {{.CLI_ARGS}}
+
+  status:
+    desc: "Show what's running on each host (repo-root yoink.yaml)"
+    cmds:
+      - cargo run --quiet -- status --config ../../yoink.yaml
+
+  preflight:
+    desc: "Verify Docker is reachable on each host (repo-root yoink.yaml)"
+    cmds:
+      - cargo run --quiet -- preflight --config ../../yoink.yaml
+
+  prune:
+    desc: "Remove yoink-managed containers no longer in config (pass `-- --dry-run` to preview)"
+    cmds:
+      - cargo run --quiet -- prune --config ../../yoink.yaml {{.CLI_ARGS}}
+
   clean:
     desc: Clean build artifacts
     cmds:

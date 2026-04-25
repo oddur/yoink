@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::config::Config;
 use crate::docker_ops::{ContainerStats, DockerOps, Host};
-use crate::output::format_bytes;
+use crate::output::{format_bytes, format_relative_time};
 use crate::status::StatusReport;
 
 use super::ui::{bold, health_style, pane_layout};
@@ -31,6 +31,17 @@ pub struct DashboardState {
     stats: HashMap<String, ContainerStats>,
     last_error: Option<String>,
     loaded: bool,
+    /// When `true`, render also includes containers in the `exited` /
+    /// `created` / `dead` / `restarting` states alongside running ones.
+    /// Toggle with `e` from the Dashboard view. Useful for drilling
+    /// into the logs of the just-replaced container after a deploy.
+    show_exited: bool,
+}
+
+impl DashboardState {
+    pub fn toggle_show_exited(&mut self) {
+        self.show_exited = !self.show_exited;
+    }
 }
 
 impl DashboardState {
@@ -58,13 +69,20 @@ impl DashboardState {
     pub fn render(&self, frame: &mut Frame<'_>, config: &Config) {
         let layout = pane_layout(frame.area());
 
-        let header = Paragraph::new(format!("yoink dashboard · service={}", config.service.name))
-            .style(bold());
+        let services = config
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let header =
+            Paragraph::new(format!("yoink dashboard · services: {services}")).style(bold());
         frame.render_widget(header, layout[0]);
 
         let rows = self.build_rows();
         let widths = [
             Constraint::Length(18), // host
+            Constraint::Length(14), // service
             Constraint::Length(26), // container
             Constraint::Length(9),  // state
             Constraint::Length(10), // health
@@ -76,6 +94,7 @@ impl DashboardState {
         let table = Table::new(rows, widths)
             .header(Row::new(vec![
                 Cell::from("host").style(bold()),
+                Cell::from("service").style(bold()),
                 Cell::from("container").style(bold()),
                 Cell::from("state").style(bold()),
                 Cell::from("health").style(bold()),
@@ -87,10 +106,19 @@ impl DashboardState {
             .block(Block::default().borders(Borders::ALL).title("status"));
         frame.render_widget(table, layout[1]);
 
-        let footer_text = if let Some(err) = &self.last_error {
-            format!("error: {err}  ·  q quit · r refresh · d dashboard · h hosts · l logs")
+        let exited_indicator = if self.show_exited {
+            "[exited: on]"
         } else {
-            "q quit · r refresh · d dashboard · h hosts · l logs".to_string()
+            "[exited: off]"
+        };
+        let footer_text = if let Some(err) = &self.last_error {
+            format!(
+                "error: {err}  ·  q quit · r refresh · e {exited_indicator} · d dashboard · s services · h hosts · l logs"
+            )
+        } else {
+            format!(
+                "q quit · r refresh · e {exited_indicator} · d dashboard · s services · h hosts · l logs"
+            )
         };
         let footer = Paragraph::new(footer_text).style(if self.last_error.is_some() {
             Style::default().fg(Color::Red)
@@ -109,6 +137,7 @@ impl DashboardState {
             if host.containers.is_empty() {
                 rows.push(Row::new(vec![
                     Cell::from(host.host.clone()),
+                    Cell::from("-"),
                     Cell::from("(none)"),
                     Cell::from("-"),
                     Cell::from("-"),
@@ -120,6 +149,9 @@ impl DashboardState {
                 continue;
             }
             for c in &host.containers {
+                if !self.show_exited && !c.is_running() {
+                    continue;
+                }
                 let health = c.health_hint().unwrap_or("-");
                 let stats = self.stats.get(&stats_key(&host.host, &c.name));
                 let cpu = stats.map_or_else(|| "-".into(), |s| format!("{:.1}%", s.cpu_pct));
@@ -134,13 +166,14 @@ impl DashboardState {
                 );
                 rows.push(Row::new(vec![
                     Cell::from(host.host.clone()),
+                    Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
                     Cell::from(c.name.clone()),
                     Cell::from(c.state.clone()),
                     Cell::from(health.to_string()).style(health_style(health)),
                     Cell::from(c.yoink_version.clone().unwrap_or_else(|| "-".into())),
                     Cell::from(cpu),
                     Cell::from(mem),
-                    Cell::from(c.created_at.clone()),
+                    Cell::from(format_relative_time(c.created_unix)),
                 ]));
             }
         }
@@ -222,16 +255,13 @@ mod tests {
     fn config() -> Config {
         Config::parse_str(
             r#"
-[service]
-name = "app-a"
-image = "x"
-
-[[hosts]]
-address = "host-a"
-user = "deploy"
-
-[run]
-port = 3000
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: x
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
 "#,
         )
         .unwrap()
@@ -243,9 +273,10 @@ port = 3000
             name: "app-a-a1b2c3d".into(),
             state: "running".into(),
             status_text: "Up 1h (healthy)".into(),
-            created_at: "2026-04-25 09:00".into(),
+            created_unix: Some(1_735_128_000),
             yoink_service: Some("app-a".into()),
             yoink_version: Some("a1b2c3d".into()),
+            yoink_spec_hash: None,
             other_labels: BTreeMap::new(),
         }
     }

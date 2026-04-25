@@ -1,0 +1,77 @@
+# Example yoink.yaml — multi-service config.
+#
+# Every entry under `services:` is reconciled the same way. yoink hashes
+# the desired spec, compares to the running container's
+# yoink.spec_hash label, and swaps drifted ones via the
+# healthcheck-gated loop. Versioned app code (api, web) and stable
+# infrastructure (caddy, redis) live side-by-side.
+
+deploy:
+  network: yoink
+
+hosts:
+  - address: host-a
+    user: deploy
+
+secrets:
+  provider: infisical
+  project_id: PROJECT_ID
+  environment: prod
+
+# ─── pre-deploy hooks ────────────────────────────────────────────────
+# Run before any service deploys. One-shot containers; must exit 0
+# to proceed.
+hooks:
+  pre_deploy:
+    - name: schema-migrate
+      image: registry.example.com/app-a
+      tag: { service: api }   # pin to the api service's deploy tag
+      entrypoint: [/usr/local/bin/migrate]
+      secrets: [DATABASE_MIGRATE_URL]
+
+services:
+  # ─── application service (CLI `--tag <sha>` overrides) ────────────
+  - name: api
+    image: registry.example.com/app-a
+    tag: latest
+    secrets: [DATABASE_URL, AUTH_JWKS_URL]
+    env:
+      RUST_LOG: info
+      PORT: "3000"
+      REDIS_URL: redis://redis:6379
+    run:
+      port: 3000
+      healthcheck_path: /health
+      healthcheck_timeout: 60s
+      drain_timeout: 15s
+      options:
+        network_aliases: [api]
+        memory: 512m
+        cap_drop: [ALL]
+        security_opt: [no-new-privileges]
+        read_only: true
+        tmpfs:
+          /tmp: size=64m,mode=1777
+
+  # ─── stable infrastructure service ────────────────────────────────
+  - name: redis
+    image: redis
+    tag: 7-alpine
+    run:
+      cmd:
+        - redis-server
+        - --maxmemory
+        - 256mb
+        - --maxmemory-policy
+        - allkeys-lru
+        - --save
+        - ""
+        - --appendonly
+        - "no"
+      options:
+        memory: 300m
+        cap_drop: [ALL]
+        security_opt: [no-new-privileges]
+        read_only: true
+        tmpfs:
+          /data: size=32m,mode=1777

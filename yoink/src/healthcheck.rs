@@ -25,6 +25,46 @@ pub enum HealthcheckError {
     },
 }
 
+/// Poll a TCP-connect probe until it succeeds or `budget` elapses.
+/// Used for services that don't expose a useful HTTP endpoint —
+/// redis (line-protocol on :6379), caddy (TLS on :443), and so on.
+/// "Healthy" here means "the new container is accepting TCP
+/// connections" — same proxy for "the process is up + listening".
+pub async fn poll_tcp(
+    ops: &dyn DockerOps,
+    host: &Host,
+    network: &str,
+    container: &str,
+    port: u16,
+    budget: Duration,
+) -> Result<u32, HealthcheckError> {
+    let deadline = Instant::now() + budget;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match ops.healthcheck_tcp(host, network, container, port).await {
+            Ok(()) => {
+                debug!(host = %host.address, container, attempt, "tcp probe ok");
+                return Ok(attempt);
+            }
+            Err(e) => {
+                debug!(host = %host.address, container, attempt, error = %e, "tcp probe failed");
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(HealthcheckError::TimedOut {
+                        budget,
+                        attempts: attempt,
+                        last_http_status: None,
+                    });
+                }
+                let remaining = deadline - now;
+                let backoff = Duration::from_secs(u64::from(attempt)).min(remaining);
+                sleep(backoff).await;
+            }
+        }
+    }
+}
+
 /// Poll the new container's healthcheck endpoint until 200 or `budget`
 /// elapses. Returns the number of attempts on success.
 #[allow(clippy::too_many_arguments)]
@@ -150,6 +190,42 @@ mod tests {
             }
             HealthcheckError::Docker(e) => panic!("expected timeout, got {e:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_returns_ok_on_immediate_connect() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck_tcp(Ok(()));
+        let attempts = poll_tcp(&ops, &host(), "yoink", "c", 6379, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_retries_then_succeeds() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck_tcp(Err(crate::docker_ops::DockerError::Invalid("nope".into())));
+        ops.push_healthcheck_tcp(Err(crate::docker_ops::DockerError::Invalid("nope".into())));
+        ops.push_healthcheck_tcp(Ok(()));
+        let attempts = poll_tcp(&ops, &host(), "yoink", "c", 6379, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_times_out_when_never_reachable() {
+        let ops = FakeDockerOps::new();
+        for _ in 0..50 {
+            ops.push_healthcheck_tcp(Err(crate::docker_ops::DockerError::Invalid(
+                "refused".into(),
+            )));
+        }
+        let err = poll_tcp(&ops, &host(), "yoink", "c", 6379, Duration::from_secs(3))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HealthcheckError::TimedOut { .. }));
     }
 
     #[tokio::test(start_paused = true)]
