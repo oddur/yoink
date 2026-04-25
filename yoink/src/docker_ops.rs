@@ -222,6 +222,38 @@ impl std::fmt::Debug for ExecSession {
     }
 }
 
+/// Rich inspect view of one container. The fields here are what the
+/// TUI's container-detail pane renders — image + command + the
+/// runtime knobs (ports, mounts, env, networks). Mirrors what
+/// `docker inspect` would return but trimmed to the bits an operator
+/// reads at a glance.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ContainerDetail {
+    pub name: String,
+    pub image: Option<String>,
+    pub image_id: Option<String>,
+    pub command: Option<String>,
+    pub working_dir: Option<String>,
+    pub state: Option<String>,
+    pub status: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub exit_code: Option<i64>,
+    pub restart_count: Option<i64>,
+    pub pid: Option<i64>,
+    pub restart_policy: Option<String>,
+    /// Sorted KEY=VALUE pairs. The TUI redacts values whose key
+    /// contains common secret-ish substrings (TOKEN/SECRET/…).
+    pub env: Vec<String>,
+    /// `"host_port:container_port/proto"` entries.
+    pub ports: Vec<String>,
+    /// "source → target [mode]" entries.
+    pub mounts: Vec<String>,
+    /// Network names this container is attached to.
+    pub networks: Vec<String>,
+    pub labels: BTreeMap<String, String>,
+}
+
 /// Result of a one-shot container run (e.g. a pre-deploy hook).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OneShotResult {
@@ -255,6 +287,15 @@ pub trait DockerOps: Send + Sync {
     /// One-shot snapshot of CPU% + memory used for a single container.
     async fn container_stats(&self, host: &Host, name: &str)
     -> Result<ContainerStats, DockerError>;
+
+    /// Rich inspect for a single container — image, command, env,
+    /// ports, mounts, networks, restart info. Used by the TUI's
+    /// container-detail pane.
+    async fn inspect_container(
+        &self,
+        host: &Host,
+        name: &str,
+    ) -> Result<ContainerDetail, DockerError>;
 
     async fn ensure_network(&self, host: &Host, network: &str) -> Result<bool, DockerError>;
 
@@ -560,6 +601,19 @@ impl DockerOps for RealDockerOps {
             None => return Err(DockerError::Invalid("stats stream yielded no item".into())),
         };
         Ok(parse_stats(&stats))
+    }
+
+    async fn inspect_container(
+        &self,
+        host: &Host,
+        name: &str,
+    ) -> Result<ContainerDetail, DockerError> {
+        let docker = self.client_for(host).await?;
+        let resp = docker
+            .inspect_container(name, None)
+            .await
+            .map_err(|s| Self::err(host, s))?;
+        Ok(parse_inspect(name, &resp))
     }
 
     async fn ensure_network(&self, host: &Host, network: &str) -> Result<bool, DockerError> {
@@ -1283,6 +1337,129 @@ fn parse_stats(stats: &bollard::models::ContainerStatsResponse) -> ContainerStat
     }
 }
 
+/// Distill bollard's `ContainerInspectResponse` into the trimmed
+/// `ContainerDetail` the TUI renders. Pulls the bits an operator
+/// actually reads (image, command, env, ports, mounts, networks)
+/// and skips the noise (graph driver state, deeply-nested config
+/// fields nobody looks at in a dashboard).
+#[allow(clippy::too_many_lines)]
+fn parse_inspect(
+    name: &str,
+    resp: &bollard::models::ContainerInspectResponse,
+) -> ContainerDetail {
+    let config = resp.config.as_ref();
+    let state = resp.state.as_ref();
+    let host_config = resp.host_config.as_ref();
+    let network_settings = resp.network_settings.as_ref();
+
+    let command = config.and_then(|c| {
+        let parts = c.entrypoint.iter().flatten().chain(c.cmd.iter().flatten());
+        let joined: Vec<&str> = parts.map(String::as_str).collect();
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined.join(" "))
+        }
+    });
+
+    let mut env: Vec<String> = config
+        .and_then(|c| c.env.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    env.sort();
+
+    let ports: Vec<String> = network_settings
+        .and_then(|n| n.ports.as_ref())
+        .map(|map| {
+            let mut out: Vec<String> = map
+                .iter()
+                .flat_map(|(container_port, bindings)| {
+                    let bindings_vec: Vec<String> = bindings
+                        .iter()
+                        .flatten()
+                        .filter_map(|b| {
+                            let host_port = b.host_port.as_deref()?;
+                            Some(format!("{host_port}:{container_port}"))
+                        })
+                        .collect();
+                    if bindings_vec.is_empty() {
+                        vec![format!("(unpublished) {container_port}")]
+                    } else {
+                        bindings_vec
+                    }
+                })
+                .collect();
+            out.sort();
+            out
+        })
+        .unwrap_or_default();
+
+    let mounts: Vec<String> = resp
+        .mounts
+        .as_ref()
+        .map(|ms| {
+            let mut out: Vec<String> = ms
+                .iter()
+                .map(|m| {
+                    let src = m.source.as_deref().unwrap_or("?");
+                    let dst = m.destination.as_deref().unwrap_or("?");
+                    let mode = m.mode.as_deref().unwrap_or("");
+                    if mode.is_empty() {
+                        format!("{src} → {dst}")
+                    } else {
+                        format!("{src} → {dst} [{mode}]")
+                    }
+                })
+                .collect();
+            out.sort();
+            out
+        })
+        .unwrap_or_default();
+
+    let networks: Vec<String> = network_settings
+        .and_then(|n| n.networks.as_ref())
+        .map(|m| {
+            let mut out: Vec<String> = m.keys().cloned().collect();
+            out.sort();
+            out
+        })
+        .unwrap_or_default();
+
+    let labels: BTreeMap<String, String> = config
+        .and_then(|c| c.labels.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    ContainerDetail {
+        name: name.into(),
+        image: config.and_then(|c| c.image.clone()),
+        image_id: resp.image.clone(),
+        command,
+        working_dir: config.and_then(|c| c.working_dir.clone()),
+        state: state.and_then(|s| s.status.map(|st| format!("{st:?}").to_lowercase())),
+        status: state.and_then(|s| s.error.clone()),
+        started_at: state.and_then(|s| s.started_at.clone()),
+        finished_at: state
+            .and_then(|s| s.finished_at.clone())
+            .filter(|s| s != "0001-01-01T00:00:00Z" && !s.is_empty()),
+        exit_code: state.and_then(|s| s.exit_code),
+        restart_count: resp.restart_count,
+        pid: state.and_then(|s| s.pid),
+        restart_policy: host_config.and_then(|h| {
+            h.restart_policy
+                .as_ref()
+                .and_then(|p| p.name.map(|n| format!("{n:?}").to_lowercase()))
+        }),
+        env,
+        ports,
+        mounts,
+        networks,
+        labels,
+    }
+}
+
 /// Drain a stopped container's logs into separate stdout / stderr
 /// strings. Each frame in the docker log stream is tagged by source so
 /// we can split cleanly — handy for surfacing migration output.
@@ -1499,6 +1676,16 @@ impl DockerOps for FakeDockerOps {
         s.calls
             .push(RecordedCall::ContainerStats(host.clone(), name.into()));
         pop(&mut s.container_stats, "container_stats")
+    }
+    async fn inspect_container(
+        &self,
+        _host: &Host,
+        name: &str,
+    ) -> Result<ContainerDetail, DockerError> {
+        Ok(ContainerDetail {
+            name: name.into(),
+            ..Default::default()
+        })
     }
     async fn ensure_network(&self, host: &Host, network: &str) -> Result<bool, DockerError> {
         let mut s = self.lock();

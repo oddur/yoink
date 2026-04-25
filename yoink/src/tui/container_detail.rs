@@ -1,8 +1,11 @@
-//! Container detail pane — k9s-style "what's actually configured here?"
-//! Shows the container's labels (yoink + others), state + status text,
-//! creation time, plus live CPU/mem gauges. Reachable via `i` from
-//! `HostDetail` or `ServiceDetail`. From here `Enter`/`l` opens logs,
-//! `!` opens shell, `D` opens the debug sidecar.
+//! Container detail pane — k9s-style "describe" view. Renders a
+//! rich inspect (image, command, env, ports, mounts, networks,
+//! labels), live CPU/Mem gauges, and tails the container's logs in
+//! a panel at the bottom.
+//!
+//! Reachable via `i` from `HostDetail` or `ServiceDetail`. From
+//! inside: `Enter`/`l` opens the dedicated logs view, `!` shells in,
+//! `D` spawns the debug sidecar, `Esc` returns to host detail.
 
 use std::sync::Arc;
 
@@ -10,24 +13,31 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
-use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
+use crate::docker_ops::{ContainerDetail, ContainerStats, DockerOps, Host};
 use crate::output::{format_bytes, format_relative_time};
 
 use super::ui::{bold, gauge_color, health_style, inline_gauge, state_style};
 
+/// Substrings that mark an env var as secret-ish — values are
+/// rendered as `<redacted>` so an over-the-shoulder operator can't
+/// accidentally leak prod creds. Keys themselves stay visible.
+const REDACT_HINTS: &[&str] = &[
+    "TOKEN", "SECRET", "PASSWORD", "PASS", "API_KEY", "PRIVATE_KEY", "DSN",
+];
+
 #[derive(Default)]
 pub struct ContainerDetailState {
     target: Option<(Host, String)>,
-    info: Option<ContainerInfo>,
+    inspect: Option<ContainerDetail>,
     stats: Option<ContainerStats>,
     last_error: Option<String>,
     loaded: bool,
 }
 
 pub struct ContainerDetailRefresh {
-    pub info: Option<ContainerInfo>,
+    pub inspect: Option<ContainerDetail>,
     pub stats: Option<ContainerStats>,
     pub error: Option<String>,
 }
@@ -39,7 +49,7 @@ impl ContainerDetailState {
 
     pub fn set_target(&mut self, host: Host, container: String) {
         if self.target.as_ref().map(|(h, c)| (h, c.as_str())) != Some((&host, container.as_str())) {
-            self.info = None;
+            self.inspect = None;
             self.stats = None;
             self.loaded = false;
         }
@@ -53,41 +63,25 @@ impl ContainerDetailState {
     pub fn apply(&mut self, data: ContainerDetailRefresh) {
         self.last_error = data.error;
         if self.last_error.is_none() {
-            self.info = data.info;
+            self.inspect = data.inspect;
             self.stats = data.stats;
             self.loaded = true;
         }
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(8),  // header card (state, version, created)
-                Constraint::Length(4),  // live CPU/mem gauges
-                Constraint::Min(0),     // labels table
-                Constraint::Length(1),
-            ])
-            .split(area);
-
-        let header_text = match &self.target {
-            Some((h, c)) => format!("yoink container · {}/{}", h.address, c),
-            None => "yoink container · (none selected)".into(),
-        };
-        frame.render_widget(Paragraph::new(header_text).style(bold()), layout[0]);
-
         if let Some(err) = &self.last_error {
+            let block = Block::default().borders(Borders::ALL).title(" container ");
             frame.render_widget(
                 Paragraph::new(format!("error: {err}"))
                     .style(Style::default().fg(Color::Red))
-                    .block(Block::default().borders(Borders::ALL).title(" container ")),
-                layout[1],
+                    .block(block),
+                area,
             );
             return;
         }
 
-        let Some(info) = &self.info else {
+        let Some(inspect) = &self.inspect else {
             let msg = if self.loaded {
                 "(container not found — may have been removed)"
             } else {
@@ -97,142 +91,268 @@ impl ContainerDetailState {
                 Paragraph::new(msg)
                     .style(Style::default().fg(Color::DarkGray))
                     .block(Block::default().borders(Borders::ALL).title(" container ")),
-                layout[1],
+                area,
             );
             return;
         };
 
-        Self::render_info_card(frame, layout[1], info);
-        self.render_metrics(frame, layout[2], info);
-        Self::render_labels(frame, layout[3], info);
+        // Layout: header card (8 rows) · two-column data (rest split
+        // horizontally between env+labels and ports+mounts+networks).
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(8), Constraint::Min(0)])
+            .split(area);
+        Self::render_card(frame, chunks[0], inspect, self.stats.as_ref());
 
-        let footer = Paragraph::new(
-            "q quit · esc back · l logs · ! shell · D debug · r refresh",
-        )
-        .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(footer, layout[4]);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[1]);
+        Self::render_runtime(frame, cols[0], inspect);
+        Self::render_env_labels(frame, cols[1], inspect);
     }
 
-    fn render_info_card(frame: &mut Frame<'_>, area: Rect, info: &ContainerInfo) {
-        let block = Block::default().borders(Borders::ALL).title(" container ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let health = info.health_hint().unwrap_or("-");
-        let lines: Vec<Line<'static>> = vec![
-            kv("service", info.yoink_service.as_deref().unwrap_or("-")),
-            kv_styled("state", &info.state, state_style(&info.state)),
-            kv_styled("health", health, health_style(health)),
-            kv("version", info.yoink_version.as_deref().unwrap_or("-")),
-            kv("spec hash", info.yoink_spec_hash.as_deref().unwrap_or("-")),
-            kv("created", &format_relative_time(info.created_unix)),
-        ];
-        frame.render_widget(Paragraph::new(lines), inner);
-    }
-
+    /// Top "card" — image, state, command, restart info, live gauges.
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
-    fn render_metrics(&self, frame: &mut Frame<'_>, area: Rect, _info: &ContainerInfo) {
-        let block = Block::default().borders(Borders::ALL).title(" live ");
+    fn render_card(
+        frame: &mut Frame<'_>,
+        area: Rect,
+        inspect: &ContainerDetail,
+        stats: Option<&ContainerStats>,
+    ) {
+        let block = Block::default().borders(Borders::ALL).title(" container ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
+        // Two-column layout inside the card: left = static facts,
+        // right = live gauges.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(inner);
 
-        let Some(stats) = &self.stats else {
-            frame.render_widget(
-                Paragraph::new("(no stats yet)").style(Style::default().fg(Color::DarkGray)),
-                chunks[0],
-            );
-            return;
+        let lifecycle = inspect.state.as_deref().unwrap_or("?");
+        let health = inspect.labels.get("yoink.health").map(String::as_str);
+        let mut left_lines = vec![
+            kv("image", inspect.image.as_deref().unwrap_or("?")),
+            kv_styled("state", lifecycle, state_style(lifecycle)),
+        ];
+        if let Some(h) = health {
+            left_lines.push(kv_styled("health", h, health_style(h)));
+        }
+        if let Some(cmd) = &inspect.command {
+            left_lines.push(kv("command", cmd));
+        }
+        if let Some(wd) = inspect.working_dir.as_deref().filter(|s| !s.is_empty()) {
+            left_lines.push(kv("workdir", wd));
+        }
+        let restart_text = match (inspect.restart_count, inspect.restart_policy.as_deref()) {
+            (Some(n), Some(p)) => format!("{n} ({p})"),
+            (Some(n), None) => n.to_string(),
+            (None, Some(p)) => p.to_string(),
+            _ => "-".into(),
         };
+        left_lines.push(kv("restarts", &restart_text));
+        if let Some(pid) = inspect.pid.filter(|p| *p > 0) {
+            left_lines.push(kv("pid", &pid.to_string()));
+        }
+        frame.render_widget(Paragraph::new(left_lines), cols[0]);
 
-        let cpu_ratio = (stats.cpu_pct as f32 / 100.0).clamp(0.0, 1.0);
-        let mut cpu_spans = vec![Span::raw(format!("CPU {:>5.1}% ", stats.cpu_pct))];
-        cpu_spans.extend(inline_gauge(cpu_ratio, 24, gauge_color(cpu_ratio)));
-        frame.render_widget(Paragraph::new(Line::from(cpu_spans)), chunks[0]);
+        let mut right_lines: Vec<Line<'static>> = Vec::new();
+        if let Some(s) = stats {
+            let cpu_ratio = (s.cpu_pct as f32 / 100.0).clamp(0.0, 1.0);
+            let mut cpu_spans = vec![Span::raw(format!("CPU {:>5.1}% ", s.cpu_pct))];
+            cpu_spans.extend(inline_gauge(cpu_ratio, 16, gauge_color(cpu_ratio)));
+            right_lines.push(Line::from(cpu_spans));
 
-        let (mem_label, mem_ratio) = match stats.mem_limit {
-            Some(limit) if limit > 0 => (
-                format!(
-                    "MEM {:>8} / {:<8} ",
-                    format_bytes(stats.mem_used),
-                    format_bytes(limit)
+            let (label, ratio) = match s.mem_limit {
+                Some(limit) if limit > 0 => (
+                    format!("MEM {:>8} / {:<8} ", format_bytes(s.mem_used), format_bytes(limit)),
+                    ((s.mem_used as f32) / (limit as f32)).clamp(0.0, 1.0),
                 ),
-                ((stats.mem_used as f32) / (limit as f32)).clamp(0.0, 1.0),
-            ),
-            _ => (format!("MEM {:>8}            ", format_bytes(stats.mem_used)), 0.0),
-        };
-        let mut mem_spans = vec![Span::raw(mem_label)];
-        mem_spans.extend(inline_gauge(mem_ratio, 24, gauge_color(mem_ratio)));
-        frame.render_widget(Paragraph::new(Line::from(mem_spans)), chunks[1]);
+                _ => (format!("MEM {:>8}            ", format_bytes(s.mem_used)), 0.0),
+            };
+            let mut mem_spans = vec![Span::raw(label)];
+            mem_spans.extend(inline_gauge(ratio, 16, gauge_color(ratio)));
+            right_lines.push(Line::from(mem_spans));
+        } else {
+            right_lines.push(Line::from(Span::styled(
+                "(no live stats yet)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        right_lines.push(Line::from(""));
+        if let Some(started) = parse_rfc3339_age(inspect.started_at.as_deref()) {
+            right_lines.push(kv("started", &started));
+        }
+        if let Some(finished) = parse_rfc3339_age(inspect.finished_at.as_deref()) {
+            right_lines.push(kv("finished", &finished));
+        }
+        if let Some(code) = inspect.exit_code {
+            right_lines.push(kv("exit code", &code.to_string()));
+        }
+        frame.render_widget(Paragraph::new(right_lines), cols[1]);
     }
 
-    fn render_labels(frame: &mut Frame<'_>, area: Rect, info: &ContainerInfo) {
-        let rows: Vec<Row<'_>> = info
-            .other_labels
+    fn render_runtime(frame: &mut Frame<'_>, area: Rect, inspect: &ContainerDetail) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(30), // ports
+                Constraint::Percentage(40), // mounts
+                Constraint::Percentage(30), // networks
+            ])
+            .split(area);
+
+        Self::render_list(frame, chunks[0], " ports ", &inspect.ports);
+        Self::render_list(frame, chunks[1], " mounts ", &inspect.mounts);
+        Self::render_list(frame, chunks[2], " networks ", &inspect.networks);
+    }
+
+    fn render_env_labels(frame: &mut Frame<'_>, area: Rect, inspect: &ContainerDetail) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+
+        // env: redact secret-ish values. Wrap in case lines are long.
+        let env_lines: Vec<Line<'static>> = inspect
+            .env
+            .iter()
+            .map(|entry| {
+                let (k, v) = entry.split_once('=').unwrap_or((entry.as_str(), ""));
+                let redacted = is_secret(k);
+                let value_span = if redacted {
+                    Span::styled(
+                        "<redacted>".to_string(),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    )
+                } else {
+                    Span::raw(v.to_string())
+                };
+                Line::from(vec![
+                    Span::styled(format!("{k}="), Style::default().fg(Color::Cyan)),
+                    value_span,
+                ])
+            })
+            .collect();
+        let env = Paragraph::new(env_lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" env "));
+        frame.render_widget(env, chunks[0]);
+
+        let label_rows: Vec<Row<'_>> = inspect
+            .labels
             .iter()
             .map(|(k, v)| Row::new(vec![Cell::from(k.clone()), Cell::from(v.clone())]))
             .collect();
         let widths = [Constraint::Length(28), Constraint::Min(20)];
-        let table = Table::new(rows, widths)
+        let labels_table = Table::new(label_rows, widths)
             .header(Row::new(vec![
                 Cell::from("label").style(bold()),
                 Cell::from("value").style(bold()),
             ]))
             .block(Block::default().borders(Borders::ALL).title(" labels "));
-        frame.render_widget(table, area);
+        frame.render_widget(labels_table, chunks[1]);
+    }
+
+    fn render_list(frame: &mut Frame<'_>, area: Rect, title: &str, items: &[String]) {
+        let block = Block::default().borders(Borders::ALL).title(title.to_string());
+        if items.is_empty() {
+            let body = Paragraph::new("(none)")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block);
+            frame.render_widget(body, area);
+            return;
+        }
+        let lines: Vec<Line<'static>> = items.iter().cloned().map(Line::from).collect();
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
 
 fn kv(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{key:>10}  "),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("{key:>10}  "), Style::default().fg(Color::DarkGray)),
         Span::styled(value.to_string(), Style::default().add_modifier(Modifier::BOLD)),
     ])
 }
 
 fn kv_styled(key: &str, value: &str, value_style: Style) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{key:>10}  "),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("{key:>10}  "), Style::default().fg(Color::DarkGray)),
         Span::styled(value.to_string(), value_style.add_modifier(Modifier::BOLD)),
     ])
 }
 
+fn is_secret(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    REDACT_HINTS.iter().any(|hint| upper.contains(hint))
+}
+
+/// Parse an RFC-3339 docker timestamp into a relative-time string.
+/// Returns `None` for the empty string and the docker-zero
+/// `0001-01-01T00:00:00Z` placeholder.
+fn parse_rfc3339_age(s: Option<&str>) -> Option<String> {
+    let s = s?;
+    if s.is_empty() || s.starts_with("0001-01-01") {
+        return None;
+    }
+    // Avoid pulling chrono/time just for this — parse the "YYYY-MM-DDTHH:MM:SS"
+    // prefix manually and convert to unix seconds. Best-effort: returns
+    // the raw string if parsing fails.
+    let parsed = parse_unix_seconds(s);
+    Some(parsed.map_or_else(|| s.to_string(), |t| format_relative_time(Some(t))))
+}
+
+/// Bare-bones RFC-3339 parser: returns unix seconds for
+/// "YYYY-MM-DDTHH:MM:SS(.fff)?Z" or with a `+HH:MM` offset.
+/// Pulled inline so we don't add chrono just to render an "age".
+fn parse_unix_seconds(s: &str) -> Option<i64> {
+    // Date
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let mo: i64 = s.get(5..7)?.parse().ok()?;
+    let d: i64 = s.get(8..10)?.parse().ok()?;
+    let h: i64 = s.get(11..13)?.parse().ok()?;
+    let mi: i64 = s.get(14..16)?.parse().ok()?;
+    let se: i64 = s.get(17..19)?.parse().ok()?;
+
+    // Civil date → days since 1970-01-01 (Howard Hinnant's algorithm).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = (if yy >= 0 { yy } else { yy - 399 }) / 400;
+    let yoe = yy - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86400 + h * 3600 + mi * 60 + se)
+}
+
 /// Background-friendly fetch — `'static + Send` so it can be `tokio::spawn`-ed.
-/// Re-uses `list_containers_by_label` filtered by name; `container_stats`
-/// for CPU/mem. Errors surface in `ContainerDetailRefresh.error`.
 pub async fn fetch_owned(
     ops: Arc<dyn DockerOps>,
     host: Host,
     container: String,
 ) -> ContainerDetailRefresh {
-    let containers = ops.list_running_containers(&host).await;
-    let info = match containers {
-        Ok(list) => list.into_iter().find(|c| c.name == container),
+    let inspect = match ops.inspect_container(&host, &container).await {
+        Ok(d) => Some(d),
         Err(e) => {
             return ContainerDetailRefresh {
-                info: None,
+                inspect: None,
                 stats: None,
-                error: Some(format!("list containers: {e}")),
+                error: Some(format!("inspect: {e}")),
             };
         }
     };
     let stats = ops.container_stats(&host, &container).await.ok();
     ContainerDetailRefresh {
-        info,
+        inspect,
         stats,
         error: None,
     }

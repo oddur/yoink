@@ -254,7 +254,7 @@ enum Update {
     ContainerDetail {
         host: Host,
         container: String,
-        data: ContainerDetailRefresh,
+        data: Box<ContainerDetailRefresh>,
     },
     Dashboard(DashboardRefresh),
     /// Push notification from a host's `docker events` stream. Triggers
@@ -958,6 +958,11 @@ impl App {
             View::ContainerDetail { host, container } => {
                 self.container_detail.set_target(host.clone(), container.clone());
                 self.schedule_container_detail_refresh();
+                // Tail logs in the bottom panel using the same
+                // forwarder ContainerLogs uses — backfill +
+                // continuous stream.
+                self.spawn_log_forwarder(host.clone(), container.clone())
+                    .await;
             }
             View::ContainerShell {
                 host,
@@ -1135,7 +1140,7 @@ impl App {
             let _ = tx.send(Update::ContainerDetail {
                 host,
                 container,
-                data,
+                data: Box::new(data),
             });
         });
     }
@@ -1176,7 +1181,7 @@ impl App {
                 if self.container_detail.target().map(|(h, c)| (h, c.as_str()))
                     == Some((&host, container.as_str()))
                 {
-                    self.container_detail.apply(data);
+                    self.container_detail.apply(*data);
                 }
             }
             Update::Dashboard(data) => {
@@ -1308,7 +1313,18 @@ impl App {
             View::Dashboard => self.dashboard.render(frame, pane_area, &self.config),
             View::Hosts => self.hosts.render(frame, pane_area, &self.config),
             View::HostDetail(_) => self.host_detail.render(frame, pane_area),
-            View::ContainerDetail { .. } => self.container_detail.render(frame, pane_area),
+            View::ContainerDetail { .. } => {
+                // Split: top 2/3 = inspect data, bottom 1/3 = live log tail.
+                let split = ratatui::layout::Layout::default()
+                    .direction(ratatui::layout::Direction::Vertical)
+                    .constraints([
+                        ratatui::layout::Constraint::Min(0),
+                        ratatui::layout::Constraint::Length(12),
+                    ])
+                    .split(pane_area);
+                self.container_detail.render(frame, split[0]);
+                self.logs.render(frame, split[1], &self.config);
+            }
             View::Services => self.services.render(frame, pane_area, &self.config),
             View::ServiceDetail(_) => self.service_detail.render(frame, pane_area),
             View::Logs | View::ContainerLogs { .. } => {
