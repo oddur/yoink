@@ -103,6 +103,13 @@ pub struct ContainerInfo {
     pub yoink_service: Option<String>,
     pub yoink_version: Option<String>,
     pub yoink_spec_hash: Option<String>,
+    /// Operator who ran `yoink up` for this container — value of
+    /// `yoink.deployed-by`. `None` for containers from before the
+    /// label was introduced.
+    pub yoink_deployed_by: Option<String>,
+    /// Unix-seconds timestamp the container was deployed, parsed
+    /// from `yoink.deployed-at`. Used by `yoink history` to sort.
+    pub yoink_deployed_at: Option<i64>,
     pub other_labels: BTreeMap<String, String>,
 }
 
@@ -132,6 +139,10 @@ impl ContainerInfo {
         let yoink_service = labels.get("yoink.service").cloned();
         let yoink_version = labels.get("yoink.version").cloned();
         let yoink_spec_hash = labels.get("yoink.spec_hash").cloned();
+        let yoink_deployed_by = labels.get("yoink.deployed-by").cloned();
+        let yoink_deployed_at = labels
+            .get("yoink.deployed-at")
+            .and_then(|s| s.parse::<i64>().ok());
         let other_labels: BTreeMap<String, String> = labels
             .into_iter()
             .filter(|(k, _)| !k.starts_with("yoink."))
@@ -154,6 +165,8 @@ impl ContainerInfo {
             yoink_service,
             yoink_version,
             yoink_spec_hash,
+            yoink_deployed_by,
+            yoink_deployed_at,
             other_labels,
         }
     }

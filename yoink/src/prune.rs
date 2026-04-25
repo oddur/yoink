@@ -136,6 +136,8 @@ mod tests {
             yoink_service: Some(service.into()),
             yoink_version: Some("v1".into()),
             yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
             other_labels: BTreeMap::new(),
         }
     }

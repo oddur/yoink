@@ -185,6 +185,15 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Show the deploy history for a service — every yoink-managed
+    /// container (running + exited) labeled with the service, sorted
+    /// newest-first by deploy time.
+    History {
+        service: String,
+        /// Maximum entries to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Lint the config and (optionally) ping each host's docker daemon.
     /// Use this in CI before merging a yoink.yaml change.
     Validate {
@@ -309,6 +318,7 @@ async fn run(cli: Cli) -> Result<()> {
             tag,
             host,
         } => cmd_pull(&config, &service, tag.as_deref(), host.as_deref()).await,
+        Command::History { service, limit } => cmd_history(&config, &service, limit).await,
         Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
         Command::Lock { action } => cmd_lock(&config, action).await,
         Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
@@ -1028,6 +1038,56 @@ async fn cmd_pull(
     }
     if had_err {
         anyhow::bail!("one or more pulls failed");
+    }
+    Ok(())
+}
+
+async fn cmd_history(config: &Config, service: &str, limit: usize) -> Result<()> {
+    let ops = RealDockerOps::new();
+    let label = format!("yoink.service={service}");
+    // Fan out across hosts. Each call returns running + exited
+    // containers labeled with this service.
+    let probes = config.hosts.iter().map(|host_cfg| {
+        let host = Host::from(host_cfg);
+        let label = label.clone();
+        let ops = &ops;
+        async move {
+            let containers = ops.list_containers_by_label(&host, &label).await?;
+            anyhow::Ok((host.address, containers))
+        }
+    });
+    let mut entries: Vec<(i64, String, String, String, String, String)> = Vec::new();
+    for r in futures_util::future::join_all(probes).await {
+        let (host_addr, containers) = r?;
+        for c in containers {
+            // Sort key = deployed-at when present, else created_unix,
+            // else zero (puts it at the bottom).
+            let when = c.yoink_deployed_at.or(c.created_unix).unwrap_or(0);
+            entries.push((
+                when,
+                host_addr.clone(),
+                c.name,
+                c.yoink_version.unwrap_or_else(|| "?".into()),
+                c.state,
+                c.yoink_deployed_by.unwrap_or_else(|| "?".into()),
+            ));
+        }
+    }
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+    if entries.is_empty() {
+        anyhow::bail!("no yoink-managed containers found for service {service:?}");
+    }
+    println!(
+        "{:<22}  {:<28}  {:<10}  {:<10}  {:<10}  when",
+        "host", "container", "version", "state", "deployed-by"
+    );
+    for (when, host_addr, name, version, state, by) in entries.into_iter().take(limit) {
+        let when_str = if when > 0 {
+            output::format_relative_time(Some(when))
+        } else {
+            "?".into()
+        };
+        println!("{host_addr:<22}  {name:<28}  {version:<10}  {state:<10}  {by:<10}  {when_str}");
     }
     Ok(())
 }

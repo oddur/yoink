@@ -157,6 +157,22 @@ pub fn build_labels(
     labels.insert("yoink.service".into(), service.name.clone());
     labels.insert("yoink.version".into(), tag.into());
     labels.insert("yoink.spec_hash".into(), spec_hash.into());
+    // Audit trail: who ran the deploy + when. Read by `yoink history`
+    // and the TUI history pane to answer "what changed and why?".
+    // Best-effort: $USER falls back to "?" inside CI runners that
+    // don't set it; the timestamp always works.
+    labels.insert(
+        "yoink.deployed-by".into(),
+        std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "?".into()),
+    );
+    labels.insert(
+        "yoink.deployed-at".into(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or_else(|_| "0".into(), |d| d.as_secs().to_string()),
+    );
     labels
 }
 
@@ -960,6 +976,8 @@ services:
                 yoink_service: Some("app-a".into()),
                 yoink_version: Some((*version).into()),
                 yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
                 other_labels: std::collections::BTreeMap::new(),
             })
             .collect()));
@@ -1052,6 +1070,8 @@ services:
             yoink_service: Some("app-a".into()),
             yoink_version: Some("a1b2c3d".into()),
             yoink_spec_hash: Some(hash.clone()),
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
             other_labels: std::collections::BTreeMap::new(),
         }]));
 
