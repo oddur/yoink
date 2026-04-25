@@ -157,7 +157,8 @@ impl HostDetailState {
         let widths = [
             Constraint::Length(14), // service
             Constraint::Length(28), // container
-            Constraint::Length(28), // status
+            Constraint::Length(32), // image
+            Constraint::Length(22), // status
             Constraint::Length(10), // state
             Constraint::Length(10), // health
             Constraint::Length(20), // cpu (value + bracketed gauge)
@@ -185,6 +186,7 @@ impl HostDetailState {
                     Row::new(vec![
                         Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
                         Cell::from(c.name.clone()),
+                        Cell::from(short_image(&c.image)),
                         Cell::from(c.status_text.clone()),
                         Cell::from(c.state.clone()).style(state_style(&c.state)),
                         Cell::from(health.to_string()).style(health_style(health)),
@@ -198,6 +200,7 @@ impl HostDetailState {
             .header(Row::new(vec![
                 Cell::from("service").style(bold()),
                 Cell::from("container").style(bold()),
+                Cell::from("image").style(bold()),
                 Cell::from("status").style(bold()),
                 Cell::from("state").style(bold()),
                 Cell::from("health").style(bold()),
@@ -320,6 +323,32 @@ fn cell_mem(stats: Option<&ContainerStats>) -> Cell<'static> {
     }
 }
 
+/// Squeeze a docker image reference into a column-friendly form:
+/// drop the registry prefix (everything up to the last `/`) and
+/// truncate `sha256:…` digests to 12 chars. `caddy/4db05qgnlk.registry.depot.dev/…`
+/// becomes `caddy:tag`; `sha256:abcdef…` becomes `sha256:abcdef…` truncated.
+fn short_image(image: &str) -> String {
+    if image.is_empty() {
+        return "-".into();
+    }
+    if let Some(rest) = image.strip_prefix("sha256:") {
+        let head: String = rest.chars().take(12).collect();
+        return format!("sha256:{head}");
+    }
+    let (path, tag) = image.split_once('@').unwrap_or_else(|| {
+        image.rsplit_once(':').map_or((image, ""), |(p, t)| (p, t))
+    });
+    let last = path.rsplit('/').next().unwrap_or(path);
+    if tag.is_empty() {
+        last.to_string()
+    } else if tag.starts_with("sha256:") {
+        let head: String = tag.chars().take(19).collect();
+        format!("{last}@{head}…")
+    } else {
+        format!("{last}:{tag}")
+    }
+}
+
 /// Background-friendly fetch — owned inputs so the future is `'static + Send`.
 pub async fn fetch_owned(ops: Arc<dyn DockerOps>, host: Host) -> HostDetailRefresh {
     fetch(ops.as_ref(), &host).await
@@ -369,6 +398,7 @@ mod tests {
         ContainerInfo {
             host: "host-a".into(),
             name: name.into(),
+            image: String::new(),
             state: "running".into(),
             status_text: "Up 1h (healthy)".into(),
             created_unix: None,

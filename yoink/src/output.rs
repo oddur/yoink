@@ -186,6 +186,7 @@ mod tests {
                     containers: vec![ContainerInfo {
                         host: "host-a".into(),
                         name: "app-a-a1b2c3d".into(),
+                        image: String::new(),
                         state: "running".into(),
                         status_text: "Up 2 hours (healthy)".into(),
                         created_unix: Some(1_735_128_000),

@@ -421,6 +421,7 @@ services:
         ContainerInfo {
             host: host.into(),
             name: name.into(),
+            image: String::new(),
             state: state.into(),
             status_text,
             created_unix: None,

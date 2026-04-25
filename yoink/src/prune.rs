@@ -129,6 +129,7 @@ mod tests {
         ContainerInfo {
             host: "h1".into(),
             name: name.into(),
+            image: String::new(),
             state: if running { "running" } else { "exited" }.into(),
             status_text: String::new(),
             created_unix: None,

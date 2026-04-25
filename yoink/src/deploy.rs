@@ -952,6 +952,7 @@ services:
             .map(|(name, version)| ContainerInfo {
                 host: "host-a".into(),
                 name: (*name).into(),
+                image: String::new(),
                 state: "running".into(),
                 status_text: "Up".into(),
                 created_unix: None,
@@ -1043,6 +1044,7 @@ services:
         ops.push_list_containers(Ok(vec![ContainerInfo {
             host: "host-a".into(),
             name: expected_name.clone(),
+            image: String::new(),
             state: "running".into(),
             status_text: "Up 5 minutes (healthy)".into(),
             created_unix: None,

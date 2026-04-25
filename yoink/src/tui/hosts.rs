@@ -387,6 +387,7 @@ services:
         ContainerInfo {
             host: "host-a".into(),
             name: name.into(),
+            image: String::new(),
             state: "running".into(),
             status_text: "Up".into(),
             created_unix: None,

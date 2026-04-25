@@ -107,6 +107,7 @@ services:
         ContainerInfo {
             host: host.into(),
             name: name.into(),
+            image: String::new(),
             state: state.into(),
             status_text: "Up 1h (healthy)".into(),
             created_unix: Some(1_735_128_000),

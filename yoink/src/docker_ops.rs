@@ -86,6 +86,10 @@ impl From<&YoinkHost> for Host {
 pub struct ContainerInfo {
     pub host: String,
     pub name: String,
+    /// Image reference as docker reports it — usually `repo:tag` for
+    /// pulled images, sometimes `sha256:…` for content-addressed
+    /// runs, or empty when docker hasn't yet resolved the image name.
+    pub image: String,
     pub state: String,
     pub status_text: String,
     /// Container creation time as Unix epoch seconds. `None` when the
@@ -138,6 +142,7 @@ impl ContainerInfo {
         Self {
             host: host.to_string(),
             name,
+            image: summary.image.unwrap_or_default(),
             state: summary
                 .state
                 .map(|s| format!("{s:?}").to_lowercase())
