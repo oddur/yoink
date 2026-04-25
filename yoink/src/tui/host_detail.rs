@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, LineGauge, Paragraph, Row, Table, TableState};
 
-use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
+use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host, HostInfo};
 use crate::output::format_bytes;
 
 use super::ui::{
@@ -23,6 +23,7 @@ use super::ui::{
 pub struct HostDetailRefresh {
     pub containers: Vec<ContainerInfo>,
     pub stats: HashMap<String, ContainerStats>,
+    pub host_info: Option<HostInfo>,
     pub error: Option<String>,
 }
 
@@ -31,6 +32,7 @@ pub struct HostDetailState {
     host: Option<Host>,
     containers: Vec<ContainerInfo>,
     stats: HashMap<String, ContainerStats>,
+    host_info: Option<HostInfo>,
     last_error: Option<String>,
     table: TableState,
     loaded: bool,
@@ -70,6 +72,7 @@ impl HostDetailState {
         if self.last_error.is_none() {
             self.containers = data.containers;
             self.stats = data.stats;
+            self.host_info = data.host_info;
             self.loaded = true;
         }
         clamp_selection(&mut self.table, self.containers.len());
@@ -127,12 +130,12 @@ impl HostDetailState {
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-        // 4-section layout: header (1) · summary panel (4) · table (rest) · footer (1).
+        // 4-section layout: header (1) · summary panel (5) · table (rest) · footer (1).
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Length(4),
+                Constraint::Length(5),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
@@ -245,27 +248,65 @@ impl HostDetailState {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1), // CPU LineGauge
+                Constraint::Length(1), // Mem LineGauge
+                Constraint::Length(1), // System info line
+            ])
             .split(inner);
 
         let cpu_total: f32 = self.stats.values().map(|s| s.cpu_pct as f32).sum();
         let mem_total: u64 = self.stats.values().map(|s| s.mem_used.max(0) as u64).sum();
+        let n_cpu = self.host_info.as_ref().and_then(|i| i.n_cpu).unwrap_or(1).max(1);
+        let mem_total_host = self
+            .host_info
+            .as_ref()
+            .and_then(|i| i.mem_total)
+            .unwrap_or(0);
 
-        // CPU scale is one core-worth (100%) by default; if the host
-        // is busier than that the bar fills then clips — that's the
-        // signal the operator wants ("we're past one core's worth").
-        let cpu_ratio = (cpu_total / 100.0).clamp(0.0, 1.0) as f64;
-        let cpu_label = format!("CPU  {cpu_total:>6.1}%");
+        // Scale CPU against the host's actual core count when known —
+        // a single core's worth on a 16-core box should be ~6%, not
+        // 100%. Falls back to 1 core when host info hasn't loaded yet.
+        let cpu_ratio = (cpu_total / (n_cpu as f32 * 100.0)).clamp(0.0, 1.0) as f64;
+        let cpu_label = format!("CPU  {cpu_total:>6.1}% / {n_cpu} cores");
 
-        let mem_label = format!("MEM  {}", format_bytes(i64::try_from(mem_total).unwrap_or(i64::MAX)));
-        // Mem ratio needs a denominator we don't have at host level
-        // here — the per-container `mem_limit`s sum is meaningless.
-        // Show the bar against host RAM by leaving it at zero unless
-        // we surface host-total memory in a future refresh.
-        let mem_ratio: f64 = 0.0;
+        let (mem_label, mem_ratio) = if mem_total_host > 0 {
+            let ratio = (mem_total as f32 / mem_total_host as f32).clamp(0.0, 1.0) as f64;
+            (
+                format!(
+                    "MEM  {} / {}",
+                    format_bytes(i64::try_from(mem_total).unwrap_or(i64::MAX)),
+                    format_bytes(mem_total_host),
+                ),
+                ratio,
+            )
+        } else {
+            (
+                format!("MEM  {}", format_bytes(i64::try_from(mem_total).unwrap_or(i64::MAX))),
+                0.0,
+            )
+        };
 
         frame.render_widget(line_gauge(cpu_label, cpu_ratio), chunks[0]);
         frame.render_widget(line_gauge(mem_label, mem_ratio), chunks[1]);
+
+        // Third row: kernel + OS + container counts. Dim so it sits
+        // quietly under the gauges.
+        let info_text = match &self.host_info {
+            Some(i) => {
+                let os = i.operating_system.as_deref().unwrap_or("?");
+                let kernel = i.kernel.as_deref().unwrap_or("?");
+                let running = i.containers_running.unwrap_or(0);
+                let total = i.containers.unwrap_or(0);
+                let images = i.images.unwrap_or(0);
+                format!("{os} · {kernel} · {running}/{total} containers · {images} images")
+            }
+            None => "(host info loading…)".into(),
+        };
+        frame.render_widget(
+            Paragraph::new(info_text).style(Style::default().fg(Color::DarkGray)),
+            chunks[2],
+        );
     }
 }
 
@@ -329,12 +370,18 @@ pub async fn fetch_owned(ops: Arc<dyn DockerOps>, host: Host) -> HostDetailRefre
 }
 
 async fn fetch(ops: &dyn DockerOps, host: &Host) -> HostDetailRefresh {
-    let containers = match ops.list_running_containers(host).await {
+    // Containers + host info concurrently.
+    let (containers_res, host_info_res) = tokio::join!(
+        ops.list_running_containers(host),
+        ops.host_info(host),
+    );
+    let containers = match containers_res {
         Ok(c) => c,
         Err(e) => {
             return HostDetailRefresh {
                 containers: Vec::new(),
                 stats: HashMap::new(),
+                host_info: None,
                 error: Some(format!("{e:#}")),
             };
         }
@@ -351,6 +398,7 @@ async fn fetch(ops: &dyn DockerOps, host: &Host) -> HostDetailRefresh {
     HostDetailRefresh {
         containers,
         stats,
+        host_info: host_info_res.ok(),
         error: None,
     }
 }
