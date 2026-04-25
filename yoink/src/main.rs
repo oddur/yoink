@@ -194,6 +194,14 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// `htop`-style snapshot of every running yoink-managed container
+    /// across all hosts, sorted by CPU% descending. Single shot —
+    /// wrap in \`watch -n 2 yoink top\` for a live display.
+    Top {
+        /// Maximum rows to print.
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
     /// Lint the config and (optionally) ping each host's docker daemon.
     /// Use this in CI before merging a yoink.yaml change.
     Validate {
@@ -319,6 +327,7 @@ async fn run(cli: Cli) -> Result<()> {
             host,
         } => cmd_pull(&config, &service, tag.as_deref(), host.as_deref()).await,
         Command::History { service, limit } => cmd_history(&config, &service, limit).await,
+        Command::Top { limit } => cmd_top(&config, limit).await,
         Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
         Command::Lock { action } => cmd_lock(&config, action).await,
         Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
@@ -1088,6 +1097,94 @@ async fn cmd_history(config: &Config, service: &str, limit: usize) -> Result<()>
             "?".into()
         };
         println!("{host_addr:<22}  {name:<28}  {version:<10}  {state:<10}  {by:<10}  {when_str}");
+    }
+    Ok(())
+}
+
+struct TopRow {
+    cpu_pct: f64,
+    host: String,
+    service: String,
+    container: String,
+    mem_used: i64,
+    mem_limit: Option<i64>,
+    created: Option<i64>,
+}
+
+async fn cmd_top(config: &Config, limit: usize) -> Result<()> {
+    use yoink::output::{format_bytes, format_relative_time};
+    let ops = RealDockerOps::new();
+    let report = StatusReport::collect(&ops, config)
+        .await
+        .context("collect status")?;
+
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for h in &report.hosts {
+        for c in &h.containers {
+            if c.is_running() {
+                targets.push((h.host.clone(), c.name.clone()));
+            }
+        }
+    }
+    let stat_futs = targets.iter().map(|(host_addr, name)| {
+        let host = config
+            .hosts
+            .iter()
+            .find(|h| h.address == *host_addr)
+            .map(yoink::docker_ops::Host::from);
+        let ops = &ops;
+        async move {
+            let h = host?;
+            ops.container_stats(&h, name).await.ok()
+        }
+    });
+    let stats: Vec<Option<yoink::docker_ops::ContainerStats>> =
+        futures_util::future::join_all(stat_futs).await;
+
+    let mut rows: Vec<TopRow> = targets
+        .into_iter()
+        .zip(stats)
+        .filter_map(|((host_addr, name), s)| {
+            let s = s?;
+            let container_info = report
+                .hosts
+                .iter()
+                .find(|h| h.host == host_addr)
+                .and_then(|h| h.containers.iter().find(|c| c.name == name));
+            Some(TopRow {
+                cpu_pct: s.cpu_pct,
+                host: host_addr,
+                service: container_info
+                    .and_then(|c| c.yoink_service.clone())
+                    .unwrap_or_else(|| "-".into()),
+                container: name,
+                mem_used: s.mem_used,
+                mem_limit: s.mem_limit,
+                created: container_info.and_then(|c| c.created_unix),
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!(
+        "{:<22}  {:<14}  {:<28}  {:>6}  {:>20}  created",
+        "host", "service", "container", "cpu%", "mem"
+    );
+    for r in rows.into_iter().take(limit) {
+        let mem_str = match r.mem_limit {
+            Some(limit) if limit > 0 => {
+                format!("{} / {}", format_bytes(r.mem_used), format_bytes(limit))
+            }
+            _ => format_bytes(r.mem_used),
+        };
+        let created_str = format_relative_time(r.created);
+        let cpu = r.cpu_pct;
+        let host = r.host;
+        let service = r.service;
+        let container = r.container;
+        println!(
+            "{host:<22}  {service:<14}  {container:<28}  {cpu:>5.1}%  {mem_str:>20}  {created_str}"
+        );
     }
     Ok(())
 }
