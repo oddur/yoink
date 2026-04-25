@@ -18,7 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -278,6 +281,7 @@ pub async fn run(
     config_path: std::path::PathBuf,
     ops: Arc<dyn DockerOps>,
     mode: Mode,
+    mouse: bool,
 ) -> Result<()> {
     let hl_disabled = std::env::var_os("YOINK_NO_HL").is_some();
     let hl_available = !hl_disabled && probe_hl().await;
@@ -288,7 +292,7 @@ pub async fn run(
     } else {
         tracing::info!("hl not on PATH; using raw log forwarder");
     }
-    let mut terminal = setup_terminal().context("setup terminal")?;
+    let mut terminal = setup_terminal(mouse).context("setup terminal")?;
     let result = run_loop(
         &mut terminal,
         Arc::new(config.clone()),
@@ -298,7 +302,7 @@ pub async fn run(
         hl_available,
     )
     .await;
-    let restore = restore_terminal(&mut terminal);
+    let restore = restore_terminal(&mut terminal, mouse);
     result.and(restore)
 }
 
@@ -312,15 +316,26 @@ async fn probe_hl() -> bool {
     matches!(res, Ok(s) if s.success())
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+fn setup_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    if mouse {
+        // Mouse capture disables native terminal text-selection — only
+        // turn it on when the operator explicitly opts in via --mouse.
+        execute!(stdout, EnableMouseCapture).context("enable mouse capture")?;
+    }
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).context("init terminal")
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    mouse: bool,
+) -> Result<()> {
+    if mouse {
+        let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+    }
     disable_raw_mode().context("disable raw mode")?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen).context("leave alternate screen")?;
     terminal.show_cursor().context("show cursor")?;
@@ -369,6 +384,7 @@ async fn run_loop(
                             return Ok(());
                         }
                     }
+                    Some(Ok(Event::Mouse(m))) => app.on_mouse(m),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
                     None => return Ok(()),
@@ -918,6 +934,32 @@ impl App {
             },
         }
         false
+    }
+
+    /// Route mouse events. Currently only scroll wheel: maps to
+    /// `select_prev`/`select_next` on selectable views, and scroll on the logs
+    /// view. Click/drag are ignored (that would require tracking
+    /// per-render Rects we don't currently emit).
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => match &self.view {
+                View::Hosts => self.hosts.select_prev(),
+                View::HostDetail(_) => self.host_detail.select_prev(),
+                View::Services => self.services.select_prev(),
+                View::ServiceDetail(_) => self.service_detail.select_prev(),
+                View::Logs | View::ContainerLogs { .. } => self.logs.scroll_up(3),
+                _ => {}
+            },
+            MouseEventKind::ScrollDown => match &self.view {
+                View::Hosts => self.hosts.select_next(),
+                View::HostDetail(_) => self.host_detail.select_next(),
+                View::Services => self.services.select_next(),
+                View::ServiceDetail(_) => self.service_detail.select_next(),
+                View::Logs | View::ContainerLogs { .. } => self.logs.scroll_down(3),
+                _ => {}
+            },
+            _ => {}
+        }
     }
 
     /// Per-pane filter helpers — Logs has its own (older) filter that

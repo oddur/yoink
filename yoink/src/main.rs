@@ -152,6 +152,11 @@ enum Command {
         /// Initial mode to open.
         #[arg(long, value_enum, default_value_t = Mode::Dashboard)]
         mode: Mode,
+        /// Enable mouse capture — scroll wheel selects rows / scrolls
+        /// log views. Off by default because mouse capture takes the
+        /// mouse away from the host terminal's native text-selection.
+        #[arg(long)]
+        mouse: bool,
     },
     /// Bounce a service's container without re-deploying. Stops the
     /// container with the configured drain, then starts it again.
@@ -335,7 +340,7 @@ async fn run(cli: Cli) -> Result<()> {
             cmd_completions(shell);
             Ok(())
         }
-        Command::Tui { mode } => cmd_tui(&config, cli.config.clone(), mode).await,
+        Command::Tui { mode, mouse } => cmd_tui(&config, cli.config.clone(), mode, mouse).await,
     }
 }
 
@@ -900,17 +905,12 @@ async fn pty_session(
     Ok(())
 }
 
-async fn cmd_tui(config: &Config, config_path: PathBuf, mode: Mode) -> Result<()> {
+async fn cmd_tui(config: &Config, config_path: PathBuf, mode: Mode, mouse: bool) -> Result<()> {
     let mut config = config.clone();
-    // Magical local host: if a docker socket exists on this machine,
-    // append a `local` entry so the dashboard "just works" against
-    // your laptop daemon (Docker Desktop / OrbStack / rootless / k3d
-    // / colima). Read-only views only — destructive commands stay
-    // strict about what's in yoink.yaml.
     config.push_local_host_if_socket();
     let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
         std::sync::Arc::new(RealDockerOps::new());
-    tui::run(&config, config_path, ops, mode)
+    tui::run(&config, config_path, ops, mode, mouse)
         .await
         .context("run TUI")
 }
