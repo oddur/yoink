@@ -285,8 +285,8 @@ impl ShellState {
         false
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>) {
-        let layout = pane_layout(frame.area());
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let layout = pane_layout(area);
 
         let header = Paragraph::new(format!(
             "yoink shell · {} · {}{}",

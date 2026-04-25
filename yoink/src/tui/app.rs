@@ -85,6 +85,113 @@ pub enum View {
     },
 }
 
+impl View {
+    /// Lines for the `?` help overlay. Per-view so the operator only
+    /// sees the keybinds that actually do something here.
+    #[must_use]
+    pub fn help_lines(&self) -> Vec<&'static str> {
+        let global = vec![
+            "global",
+            "  q / Ctrl-C   quit yoink",
+            "  d / h / s / l   dashboard / hosts / services / logs",
+            "  ?            toggle this help overlay",
+            "",
+        ];
+        let view_specific: Vec<&'static str> = match self {
+            View::Dashboard => vec![
+                "dashboard",
+                "  r            refresh",
+                "  e            toggle exited containers",
+            ],
+            View::Hosts => vec![
+                "hosts",
+                "  ↑↓ / j k     select host",
+                "  enter        host detail",
+                "  r            refresh",
+            ],
+            View::HostDetail(_) => vec![
+                "host detail",
+                "  ↑↓ / j k     select container",
+                "  enter        live logs",
+                "  !            shell into container (bash/sh)",
+                "  D            debug sidecar (alpine, target's pid+net ns)",
+                "  r            refresh",
+                "  esc          back to hosts",
+            ],
+            View::Services => vec![
+                "services",
+                "  ↑↓ / j k     select service",
+                "  enter        service detail",
+                "  r            refresh",
+            ],
+            View::ServiceDetail(_) => vec![
+                "service detail",
+                "  ↑↓ / j k     select replica",
+                "  enter        live logs",
+                "  !            shell · D debug sidecar",
+                "  r            refresh · esc back",
+            ],
+            View::Logs => vec![
+                "logs (multiplexed)",
+                "  /            filter substring",
+                "  ↑↓ / PgUp PgDn  scroll · g top · G bottom",
+                "  k            clear · r restart streams",
+            ],
+            View::ContainerLogs { .. } => vec![
+                "container logs",
+                "  /            filter substring",
+                "  ↑↓ / PgUp PgDn  scroll · g top · G bottom",
+                "  !            shell · D debug sidecar",
+                "  k            clear · esc back",
+            ],
+            View::ContainerShell { .. } => vec![
+                "shell",
+                "  Ctrl-Q       exit shell, back to host detail",
+                "  Ctrl-C/D     forwarded into the in-shell process",
+                "  exit / Ctrl-D end the in-container shell",
+            ],
+        };
+        let mut out = global;
+        out.extend(view_specific);
+        out
+    }
+
+    /// Path of crumbs for the global breadcrumb header — e.g.
+    /// `["yoink", "Hosts", "backtrack-eu-1", "bt-api-xyz", "shell"]`.
+    /// Rendered with `›` separators by the App so the operator always
+    /// knows where they are without reading the pane title.
+    #[must_use]
+    pub fn breadcrumb(&self) -> Vec<String> {
+        let root = "yoink".to_string();
+        match self {
+            View::Dashboard => vec![root, "Dashboard".into()],
+            View::Hosts => vec![root, "Hosts".into()],
+            View::HostDetail(h) => vec![root, "Hosts".into(), h.address.clone()],
+            View::Services => vec![root, "Services".into()],
+            View::ServiceDetail(name) => vec![root, "Services".into(), name.clone()],
+            View::Logs => vec![root, "Logs".into()],
+            View::ContainerLogs { host, container } => vec![
+                root,
+                "Hosts".into(),
+                host.address.clone(),
+                container.clone(),
+                "logs".into(),
+            ],
+            View::ContainerShell {
+                host,
+                container,
+                debug,
+            } => vec![
+                root,
+                "Hosts".into(),
+                host.address.clone(),
+                container.clone(),
+                if *debug { "debug shell" } else { "shell" }.into(),
+            ],
+        }
+    }
+}
+
 impl From<Mode> for View {
     fn from(m: Mode) -> Self {
         match m {
@@ -266,6 +373,9 @@ pub struct App {
     pub logs: LogsState,
     /// `Some` while a `ContainerShell` view is active; cleared on exit.
     shell: Option<ShellState>,
+    /// `?` toggles a modal help overlay listing keybinds for the
+    /// current view. Cleared on Esc and on any view transition.
+    show_help: bool,
     /// Byte chunks from the embedded shell's exec output stream. The
     /// run loop selects on this so each chunk wakes the render
     /// immediately — without it the only drain point would be the 2 s
@@ -325,6 +435,7 @@ impl App {
             service_detail: ServiceDetailState::new(),
             logs: LogsState::new(),
             shell: None,
+            show_help: false,
             shell_bytes_tx,
             shell_bytes_rx,
             shell_session_tx,
@@ -415,7 +526,30 @@ impl App {
         // signal from the container side; both bounce us back to
         // host detail.
         if matches!(self.view, View::ContainerShell { .. }) {
+            // `?` toggles the help overlay even from inside a shell —
+            // it's the one yoink-side gesture (besides Ctrl-Q) the
+            // shell view doesn't forward.
+            if key.code == KeyCode::Char('?') {
+                self.show_help = !self.show_help;
+                return false;
+            }
+            if self.show_help && key.code == KeyCode::Esc {
+                self.show_help = false;
+                return false;
+            }
             return self.handle_shell_key(key).await;
+        }
+
+        // Help overlay: `?` toggles, Esc dismisses. Captured before
+        // any other key handling so the help can be opened/closed from
+        // any non-shell view.
+        if key.code == KeyCode::Char('?') {
+            self.show_help = !self.show_help;
+            return false;
+        }
+        if self.show_help && key.code == KeyCode::Esc {
+            self.show_help = false;
+            return false;
         }
 
         // Filter input mode in either logs view captures all printable
@@ -631,6 +765,7 @@ impl App {
         }
         self.stop_log_streams();
         self.logs.clear();
+        self.show_help = false;
         // Always tear down any in-flight shell when leaving its view —
         // the spawned exec will drop its bridge task on Drop, and a
         // sidecar shell needs an explicit force-remove of its
@@ -955,26 +1090,38 @@ impl App {
     }
 
     pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let (breadcrumb_area, pane_area) =
+            super::ui::split_with_breadcrumb(frame.area());
+        let crumbs = self.view.breadcrumb();
+        let right = format!("{} hosts · {} services", self.config.hosts.len(), self.config.services.len());
+        super::ui::render_breadcrumb(frame, breadcrumb_area, &crumbs, &right);
+
         match &self.view {
-            View::Dashboard => self.dashboard.render(frame, &self.config),
-            View::Hosts => self.hosts.render(frame, &self.config),
-            View::HostDetail(_) => self.host_detail.render(frame),
-            View::Services => self.services.render(frame, &self.config),
-            View::ServiceDetail(_) => self.service_detail.render(frame),
-            View::Logs | View::ContainerLogs { .. } => self.logs.render(frame, &self.config),
+            View::Dashboard => self.dashboard.render(frame, pane_area, &self.config),
+            View::Hosts => self.hosts.render(frame, pane_area, &self.config),
+            View::HostDetail(_) => self.host_detail.render(frame, pane_area),
+            View::Services => self.services.render(frame, pane_area, &self.config),
+            View::ServiceDetail(_) => self.service_detail.render(frame, pane_area),
+            View::Logs | View::ContainerLogs { .. } => {
+                self.logs.render(frame, pane_area, &self.config);
+            }
             View::ContainerShell { .. } => {
                 if let Some(shell) = self.shell.as_mut() {
                     // Send the current panel size to the daemon (no-op
                     // if unchanged) so the in-shell view re-flows on
                     // window resize. Inside-border = panel minus the
                     // header row + footer row + box borders (2 each).
-                    let area = frame.area();
-                    let rows = area.height.saturating_sub(4); // header+footer+2 borders
-                    let cols = area.width.saturating_sub(2);
+                    let rows = pane_area.height.saturating_sub(4);
+                    let cols = pane_area.width.saturating_sub(2);
                     shell.apply_size(self.ops.clone(), rows, cols);
-                    shell.render(frame);
+                    shell.render(frame, pane_area);
                 }
             }
+        }
+
+        if self.show_help {
+            let lines = self.view.help_lines();
+            super::ui::render_modal(frame, "yoink help (? to close)", &lines);
         }
     }
 }

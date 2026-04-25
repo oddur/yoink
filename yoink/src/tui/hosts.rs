@@ -95,8 +95,8 @@ impl HostsState {
             })
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, _config: &Config) {
-        let layout = pane_layout(frame.area());
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, _config: &Config) {
+        let layout = pane_layout(area);
 
         let header = Paragraph::new("yoink hosts · ↑↓ select · enter for detail").style(bold());
         frame.render_widget(header, layout[0]);

@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
 use crate::output::format_bytes;
 
-use super::ui::{bold, clamp_selection, health_style, pane_layout};
+use super::ui::{bold, clamp_selection, health_style, pane_layout, state_style};
 
 pub struct HostDetailRefresh {
     pub containers: Vec<ContainerInfo>,
@@ -99,8 +99,8 @@ impl HostDetailState {
         self.host.as_ref()
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>) {
-        let layout = pane_layout(frame.area());
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let layout = pane_layout(area);
 
         let header_text = match &self.host {
             Some(h) => format!(
@@ -150,7 +150,7 @@ impl HostDetailState {
                         Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
                         Cell::from(c.name.clone()),
                         Cell::from(c.status_text.clone()),
-                        Cell::from(c.state.clone()),
+                        Cell::from(c.state.clone()).style(state_style(&c.state)),
                         Cell::from(health.to_string()).style(health_style(health)),
                         Cell::from(cpu),
                         Cell::from(mem),

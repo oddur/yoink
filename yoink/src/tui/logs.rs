@@ -155,8 +155,8 @@ impl LogsState {
 
     // ─── rendering ─────────────────────────────────────────────────────
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, config: &Config) {
-        let layout = pane_layout(frame.area());
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, config: &Config) {
+        let layout = pane_layout(area);
 
         // Filter once, then render. We collect Line clones because the
         // Paragraph widget wants owned Text<'static>.

@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::docker_ops::{ContainerInfo, Host};
 use crate::status::StatusReport;
 
-use super::ui::{bold, clamp_selection, health_style, pane_layout};
+use super::ui::{bold, clamp_selection, health_style, pane_layout, state_style};
 
 #[derive(Default)]
 pub struct ServicesState {
@@ -84,8 +84,8 @@ impl ServicesState {
             .cloned()
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, config: &Config) {
-        let layout = pane_layout(frame.area());
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, config: &Config) {
+        let layout = pane_layout(area);
         let header = Paragraph::new(format!(
             "yoink services · {} declared · ↑↓ select · enter for instances",
             config.services.len()
@@ -260,8 +260,8 @@ impl ServiceDetailState {
             .cloned()
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>) {
-        let layout = pane_layout(frame.area());
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let layout = pane_layout(area);
         let header_text = match &self.service {
             Some(name) => format!(
                 "yoink service · {name} · {} container(s) · ↑↓ select · enter for logs",
@@ -292,7 +292,7 @@ impl ServiceDetailState {
                     Row::new(vec![
                         Cell::from(r.host.address.clone()),
                         Cell::from(r.container.name.clone()),
-                        Cell::from(r.container.state.clone()),
+                        Cell::from(r.container.state.clone()).style(state_style(&r.container.state)),
                         Cell::from(health.to_string()).style(health_style(health)),
                         Cell::from(
                             r.container

@@ -15,7 +15,7 @@ use crate::docker_ops::{ContainerStats, DockerOps, Host};
 use crate::output::{format_bytes, format_relative_time};
 use crate::status::StatusReport;
 
-use super::ui::{bold, health_style, pane_layout};
+use super::ui::{bold, health_style, pane_layout, state_style};
 
 pub struct DashboardRefresh {
     pub report: Option<StatusReport>,
@@ -66,8 +66,8 @@ impl DashboardState {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>, config: &Config) {
-        let layout = pane_layout(frame.area());
+    pub fn render(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, config: &Config) {
+        let layout = pane_layout(area);
 
         let services = config
             .services
@@ -168,7 +168,7 @@ impl DashboardState {
                     Cell::from(host.host.clone()),
                     Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
                     Cell::from(c.name.clone()),
-                    Cell::from(c.state.clone()),
+                    Cell::from(c.state.clone()).style(state_style(&c.state)),
                     Cell::from(health.to_string()).style(health_style(health)),
                     Cell::from(c.yoink_version.clone().unwrap_or_else(|| "-".into())),
                     Cell::from(cpu),
