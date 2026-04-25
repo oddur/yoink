@@ -697,8 +697,18 @@ impl DockerOps for RealDockerOps {
             .tag(tag)
             .build();
         let mut stream = docker.create_image(Some(opts), None, credentials);
+        // Track each layer's last-printed status so we don't spam the
+        // log with "Downloading 53%" every chunk — only when the
+        // layer crosses to a new status (e.g. → "Download complete").
+        let mut last: HashMap<String, String> = HashMap::new();
         while let Some(item) = stream.next().await {
-            item.map_err(|s| Self::err(host, s))?;
+            let info = item.map_err(|s| Self::err(host, s))?;
+            if let (Some(id), Some(status)) = (info.id.as_ref(), info.status.as_ref())
+                && last.get(id) != Some(status)
+            {
+                tracing::info!(host = %host.address, layer = %id, %status, "pull");
+                last.insert(id.clone(), status.clone());
+            }
         }
         Ok(())
     }
