@@ -118,6 +118,31 @@ enum Command {
     Version {
         service: String,
     },
+    /// Drop into an interactive PTY shell inside a service's container
+    /// (k9s-style, terminal-side). Picks `bash` when present, falls
+    /// back to `sh`. Exit with `exit` or Ctrl-D.
+    Shell {
+        /// Service name as declared in the config.
+        service: String,
+        /// Pin to a specific host when the service has replicas across
+        /// multiple hosts.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Like `shell` but spawns an `alpine` debug sidecar in the
+    /// target's pid+net namespaces — for distroless / shell-less
+    /// images. The sidecar is `--rm` and is force-removed on exit.
+    Debug {
+        /// Service name as declared in the config.
+        service: String,
+        /// Pin to a specific host when the service has replicas across
+        /// multiple hosts.
+        #[arg(long)]
+        host: Option<String>,
+        /// Image to use for the sidecar. Defaults to alpine.
+        #[arg(long, default_value = "alpine")]
+        image: String,
+    },
     /// Launch the interactive ratatui dashboard.
     Tui {
         /// Initial mode to open.
@@ -181,6 +206,14 @@ async fn run(cli: Cli) -> Result<()> {
             tail,
         } => cmd_logs(&config, &service, host.as_deref(), follow, tail).await,
         Command::Version { service } => cmd_version(&config, &service).await,
+        Command::Shell { service, host } => {
+            cmd_pty(&config, &service, host.as_deref(), PtyMode::Exec).await
+        }
+        Command::Debug {
+            service,
+            host,
+            image,
+        } => cmd_pty(&config, &service, host.as_deref(), PtyMode::Debug { image }).await,
         Command::Tui { mode } => cmd_tui(&config, cli.config.clone(), mode).await,
     }
 }
@@ -580,6 +613,164 @@ async fn cmd_version(config: &Config, service: &str) -> Result<()> {
     if !printed {
         anyhow::bail!("no running container for service {service:?}");
     }
+    Ok(())
+}
+
+/// Which flavor of PTY session `cmd_pty` opens — same byte-pump
+/// otherwise, the `Debug` arm just exec's an alpine sidecar in the
+/// target's pid+net namespaces (and gets force-removed on exit).
+enum PtyMode {
+    Exec,
+    Debug { image: String },
+}
+
+async fn cmd_pty(
+    config: &Config,
+    service: &str,
+    host_filter: Option<&str>,
+    mode: PtyMode,
+) -> Result<()> {
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+
+    let ops: std::sync::Arc<dyn DockerOps> = std::sync::Arc::new(RealDockerOps::new());
+    let (host, container) =
+        resolve_running_container(ops.as_ref(), config, service, host_filter).await?;
+
+    let (cols, rows) = size().context("query terminal size")?;
+
+    enable_raw_mode().context("enable raw mode")?;
+    let result = pty_session(ops.clone(), &host, &container, &mode, rows, cols).await;
+    let _ = disable_raw_mode();
+    // Newline so the operator's next shell prompt isn't glued to the
+    // last line of in-container output.
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(b"\r\n");
+    let _ = stdout.flush();
+    result
+}
+
+async fn pty_session(
+    ops: std::sync::Arc<dyn DockerOps>,
+    host: &Host,
+    container: &str,
+    mode: &PtyMode,
+    rows: u16,
+    cols: u16,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use yoink::docker_ops::ExecKind;
+
+    let session = match mode {
+        PtyMode::Exec => {
+            let cmd = vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "if command -v bash >/dev/null 2>&1; then exec bash; else exec /bin/sh; fi"
+                    .into(),
+            ];
+            ops.exec_interactive(host, container, cmd, rows, cols)
+                .await
+                .with_context(|| format!("exec interactive {}@{container}", host.address))?
+        }
+        PtyMode::Debug { image } => ops
+            .start_debug_sidecar(host, container, image, rows, cols)
+            .await
+            .with_context(|| format!("start debug sidecar on {}", host.address))?,
+    };
+
+    let session_id = session.id.clone();
+    let session_kind = session.kind;
+    let yoink::docker_ops::ExecSession {
+        mut stdin,
+        mut output,
+        ..
+    } = session;
+
+    // Pump exec output → terminal stdout. Runs in a background task so
+    // the main task can pump stdin → exec.stdin concurrently. Returns
+    // when the docker stream EOFs (container shell exited).
+    let output_task = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(item) = output.next().await {
+            match item {
+                Ok(bytes) if bytes.is_empty() => {}
+                Ok(bytes) => {
+                    if stdout.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                    let _ = stdout.flush().await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "exec output stream error");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Pump terminal stdin → exec.stdin. We treat stdin as raw bytes
+    // (the terminal is in raw mode already, so each keypress is the
+    // exact byte sequence the in-container shell expects).
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin_in = tokio::io::stdin();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stdin_in.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if stdin.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                    let _ = stdin.flush().await;
+                }
+            }
+        }
+    });
+
+    // SIGWINCH → resize_exec / resize_container_tty. macOS + Linux
+    // both have it; the docker daemon needs the new size so apps
+    // like `top` and `vim` re-flow.
+    let resize_ops = ops.clone();
+    let resize_host = host.clone();
+    let resize_id = session_id.clone();
+    let resize_task = tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let Ok(mut sig) = signal(SignalKind::window_change()) else {
+            return;
+        };
+        while sig.recv().await.is_some() {
+            let Ok((cols, rows)) = crossterm::terminal::size() else {
+                continue;
+            };
+            let res = match session_kind {
+                ExecKind::Exec => resize_ops.resize_exec(&resize_host, &resize_id, rows, cols).await,
+                ExecKind::Sidecar => {
+                    resize_ops
+                        .resize_container_tty(&resize_host, &resize_id, rows, cols)
+                        .await
+                }
+            };
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "resize failed");
+            }
+        }
+    });
+
+    // The output task ending means the container shell exited (Ctrl-D
+    // / `exit`). The stdin task only ends when our process's stdin is
+    // closed, which won't happen normally — abort it on output EOF.
+    let _ = output_task.await;
+    stdin_task.abort();
+    resize_task.abort();
+
+    // Sidecar cleanup — `auto_remove` should handle it but belt + braces.
+    if matches!(session_kind, ExecKind::Sidecar)
+        && let Err(e) = ops.force_remove_container(host, &session_id).await
+    {
+        tracing::debug!(error = %e, "sidecar cleanup (probably already auto-removed)");
+    }
+
     Ok(())
 }
 

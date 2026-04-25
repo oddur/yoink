@@ -33,7 +33,7 @@ tabled = "0.16"
 thiserror = "2"
 tui-term = "0.3"
 vt100 = "0.16"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time", "fs", "process", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time", "fs", "process", "io-util", "io-std"] }
 yaml_serde = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
