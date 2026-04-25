@@ -1,0 +1,696 @@
+//! TUI entry point. Async event loop driven by tokio + crossterm
+//! `EventStream`. Three top-level views accessible via shortcut keys
+//! and two drill-down views reachable via Enter from a parent:
+//!
+//! - `Dashboard` (`d`) — status grid for the configured service.
+//! - `Hosts` (`h`) — all configured hosts; up/down + enter opens host detail.
+//! - `HostDetail` — running containers on the host; up/down + enter opens container logs.
+//! - `ContainerLogs` — live `docker logs -f` for one container.
+//! - `Logs` (`l`) — multiplexed logs for every yoink-managed container.
+//!
+//! Refreshes (which talk to remote Docker over ssh) run on background
+//! tokio tasks; the event loop only awaits the channel that delivers
+//! their results, so input always feels responsive even when a refresh
+//! is in flight.
+
+use std::io::{self, Stdout};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use futures_util::StreamExt;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
+use tokio::time::interval;
+use tracing::warn;
+
+use crate::config::Config;
+use crate::docker_ops::{DockerOps, Host, LogLine};
+use crate::status::StatusReport;
+
+use super::dashboard::{self, DashboardRefresh, DashboardState};
+use super::host_detail::{self, HostDetailRefresh, HostDetailState};
+use super::hosts::{self, HostRow, HostsState};
+use super::logs::{LogsState, RenderedLine};
+
+const FAST_TICK: Duration = Duration::from_secs(3);
+const HOSTS_TICK: Duration = Duration::from_secs(10);
+const LOG_BACKFILL_LINES: u32 = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum Mode {
+    Dashboard,
+    Hosts,
+    Logs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum View {
+    Dashboard,
+    Hosts,
+    HostDetail(Host),
+    Logs,
+    ContainerLogs { host: Host, container: String },
+}
+
+impl From<Mode> for View {
+    fn from(m: Mode) -> Self {
+        match m {
+            Mode::Dashboard => View::Dashboard,
+            Mode::Hosts => View::Hosts,
+            Mode::Logs => View::Logs,
+        }
+    }
+}
+
+/// Result of a background refresh. The variant tells `App::apply_update`
+/// which pane to swap in.
+enum Update {
+    Hosts(Vec<HostRow>),
+    HostDetail { host: Host, data: HostDetailRefresh },
+    Dashboard(DashboardRefresh),
+}
+
+pub async fn run(config: &Config, ops: Arc<dyn DockerOps>, mode: Mode) -> Result<()> {
+    let hl_disabled = std::env::var_os("YOINK_NO_HL").is_some();
+    let hl_available = !hl_disabled && probe_hl().await;
+    if hl_disabled {
+        tracing::info!("YOINK_NO_HL set; skipping hl pipeline");
+    } else if hl_available {
+        tracing::info!("hl detected on PATH; piping log streams through it");
+    } else {
+        tracing::info!("hl not on PATH; using raw log forwarder");
+    }
+    let mut terminal = setup_terminal().context("setup terminal")?;
+    let result = run_loop(
+        &mut terminal,
+        Arc::new(config.clone()),
+        ops,
+        mode,
+        hl_available,
+    )
+    .await;
+    let restore = restore_terminal(&mut terminal);
+    result.and(restore)
+}
+
+async fn probe_hl() -> bool {
+    let res = tokio::process::Command::new("hl")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    matches!(res, Ok(s) if s.success())
+}
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode().context("enable raw mode")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    let backend = CrosstermBackend::new(stdout);
+    Terminal::new(backend).context("init terminal")
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    disable_raw_mode().context("disable raw mode")?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).context("leave alternate screen")?;
+    terminal.show_cursor().context("show cursor")?;
+    Ok(())
+}
+
+async fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    config: Arc<Config>,
+    ops: Arc<dyn DockerOps>,
+    mode: Mode,
+    hl_available: bool,
+) -> Result<()> {
+    let mut app = App::new(config, ops, View::from(mode), hl_available);
+    // Schedule the first round of background fetches so each pane has data
+    // by the time the user navigates to it.
+    app.schedule_hosts_refresh();
+    app.schedule_dashboard_refresh();
+    if matches!(app.view, View::Logs) {
+        app.start_service_log_streams().await;
+    }
+
+    let mut events = EventStream::new();
+    let mut fast_tick = interval(FAST_TICK);
+    let mut hosts_tick = interval(HOSTS_TICK);
+    fast_tick.tick().await;
+    hosts_tick.tick().await;
+
+    loop {
+        terminal.draw(|f| app.render(f))?;
+        tokio::select! {
+            biased;
+            input = events.next() => {
+                match input {
+                    Some(Ok(Event::Key(key))) => {
+                        if app.on_key(key).await {
+                            return Ok(());
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
+                }
+            }
+            _ = fast_tick.tick() => {
+                app.fast_tick();
+            }
+            _ = hosts_tick.tick() => {
+                // Only refresh while the Hosts pane is visible — the
+                // refresh fans out into N+1 ssh calls per configured host
+                // and there's no point doing that for a hidden pane.
+                // Re-entry to Hosts schedules a fresh refresh anyway.
+                if matches!(app.view, View::Hosts) {
+                    app.schedule_hosts_refresh();
+                }
+            }
+            Some(update) = app.update_rx.recv() => {
+                app.apply_update(update);
+            }
+            Some(line) = app.log_rx.recv() => {
+                app.logs.push_rendered(line);
+            }
+        }
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)] // Independent in-flight flags + capability flag.
+pub struct App {
+    view: View,
+    config: Arc<Config>,
+    ops: Arc<dyn DockerOps>,
+    pub dashboard: DashboardState,
+    pub hosts: HostsState,
+    pub host_detail: HostDetailState,
+    pub logs: LogsState,
+
+    // Refresh-in-flight flags coalesce ticks: a tick that fires while the
+    // previous refresh hasn't finished is dropped, so a slow daemon can
+    // never queue up a backlog.
+    hosts_in_flight: bool,
+    host_detail_in_flight: bool,
+    dashboard_in_flight: bool,
+    update_tx: UnboundedSender<Update>,
+    update_rx: UnboundedReceiver<Update>,
+
+    log_tasks: Vec<JoinHandle<()>>,
+    log_tx: UnboundedSender<RenderedLine>,
+    log_rx: UnboundedReceiver<RenderedLine>,
+    hl_available: bool,
+}
+
+impl App {
+    pub fn new(
+        config: Arc<Config>,
+        ops: Arc<dyn DockerOps>,
+        view: View,
+        hl_available: bool,
+    ) -> Self {
+        let (log_tx, log_rx) = mpsc::unbounded_channel();
+        let (update_tx, update_rx) = mpsc::unbounded_channel();
+        Self {
+            view,
+            config,
+            ops,
+            dashboard: DashboardState::new(),
+            hosts: HostsState::new(),
+            host_detail: HostDetailState::new(),
+            logs: LogsState::new(),
+            hosts_in_flight: false,
+            host_detail_in_flight: false,
+            dashboard_in_flight: false,
+            update_tx,
+            update_rx,
+            log_tasks: Vec::new(),
+            log_tx,
+            log_rx,
+            hl_available,
+        }
+    }
+
+    /// Returns true when the loop should exit.
+    async fn on_key(&mut self, key: KeyEvent) -> bool {
+        // Filter input mode in either logs view captures all printable
+        // input — only Ctrl-C escapes to quit.
+        let logs_view = matches!(self.view, View::Logs | View::ContainerLogs { .. });
+        if logs_view && self.logs.input_mode() {
+            return self.handle_filter_input_key(key);
+        }
+
+        if matches!(key.code, KeyCode::Char('q'))
+            || (matches!(key.code, KeyCode::Char('c'))
+                && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return true;
+        }
+        match key.code {
+            KeyCode::Char('d') => {
+                self.transition(View::Dashboard).await;
+                return false;
+            }
+            KeyCode::Char('h') => {
+                self.transition(View::Hosts).await;
+                return false;
+            }
+            KeyCode::Char('l') => {
+                self.transition(View::Logs).await;
+                return false;
+            }
+            _ => {}
+        }
+        match &self.view {
+            View::Hosts => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.hosts.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.hosts.select_next(),
+                KeyCode::Enter => {
+                    if let Some(host) = self.hosts.selected_host() {
+                        self.transition(View::HostDetail(host)).await;
+                    }
+                }
+                KeyCode::Char('r') => self.schedule_hosts_refresh(),
+                _ => {}
+            },
+            View::HostDetail(_) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.host_detail.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.host_detail.select_next(),
+                KeyCode::Enter => {
+                    if let (Some(host), Some(container)) = (
+                        self.host_detail.host().cloned(),
+                        self.host_detail.selected_container(),
+                    ) {
+                        self.transition(View::ContainerLogs { host, container })
+                            .await;
+                    }
+                }
+                KeyCode::Esc => self.transition(View::Hosts).await,
+                KeyCode::Char('r') => self.schedule_host_detail_refresh(),
+                _ => {}
+            },
+            View::ContainerLogs { host, .. } => match key.code {
+                KeyCode::Esc => {
+                    let host = host.clone();
+                    self.transition(View::HostDetail(host)).await;
+                }
+                KeyCode::Char('k') => self.logs.clear(),
+                KeyCode::Char('/') => self.logs.begin_filter_input(),
+                KeyCode::Up => self.logs.scroll_up(1),
+                KeyCode::Down => self.logs.scroll_down(1),
+                KeyCode::PageUp => self.logs.scroll_up(10),
+                KeyCode::PageDown => self.logs.scroll_down(10),
+                KeyCode::Char('g') => self.logs.jump_to_top(),
+                KeyCode::Char('G') | KeyCode::End => self.logs.jump_to_bottom(),
+                _ => {}
+            },
+            View::Dashboard => {
+                if matches!(key.code, KeyCode::Char('r')) {
+                    self.schedule_dashboard_refresh();
+                }
+            }
+            View::Logs => match key.code {
+                KeyCode::Char('r') => {
+                    self.stop_log_streams();
+                    self.start_service_log_streams().await;
+                }
+                KeyCode::Char('k') => self.logs.clear(),
+                KeyCode::Char('/') => self.logs.begin_filter_input(),
+                KeyCode::Up => self.logs.scroll_up(1),
+                KeyCode::Down => self.logs.scroll_down(1),
+                KeyCode::PageUp => self.logs.scroll_up(10),
+                KeyCode::PageDown => self.logs.scroll_down(10),
+                KeyCode::Char('g') => self.logs.jump_to_top(),
+                KeyCode::Char('G') | KeyCode::End => self.logs.jump_to_bottom(),
+                _ => {}
+            },
+        }
+        false
+    }
+
+    fn handle_filter_input_key(&mut self, key: KeyEvent) -> bool {
+        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc => self.logs.filter_cancel(),
+            KeyCode::Enter => self.logs.filter_apply(),
+            KeyCode::Backspace => self.logs.filter_backspace(),
+            KeyCode::Char(c) => self.logs.filter_push_char(c),
+            _ => {}
+        }
+        false
+    }
+
+    async fn transition(&mut self, new_view: View) {
+        if self.view == new_view {
+            return;
+        }
+        self.stop_log_streams();
+        self.logs.clear();
+
+        match &new_view {
+            View::HostDetail(host) => {
+                self.host_detail.set_host(host.clone());
+                self.schedule_host_detail_refresh();
+            }
+            View::ContainerLogs { host, container } => {
+                self.spawn_log_forwarder(host.clone(), container.clone())
+                    .await;
+            }
+            View::Logs => self.start_service_log_streams().await,
+            View::Dashboard => self.schedule_dashboard_refresh(),
+            View::Hosts => self.schedule_hosts_refresh(),
+        }
+        self.view = new_view;
+    }
+
+    /// 3-second tick: schedule a background refresh for whichever pane
+    /// shows live container data. The fetch task runs concurrently with
+    /// the event loop; the result lands via `update_rx`.
+    fn fast_tick(&mut self) {
+        match &self.view {
+            View::Dashboard => self.schedule_dashboard_refresh(),
+            View::HostDetail(_) => self.schedule_host_detail_refresh(),
+            _ => {}
+        }
+    }
+
+    fn schedule_hosts_refresh(&mut self) {
+        if self.hosts_in_flight {
+            return;
+        }
+        self.hosts_in_flight = true;
+        let ops = self.ops.clone();
+        let hosts = self.config.hosts.clone();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let rows = hosts::fetch_rows_owned(ops, hosts).await;
+            let _ = tx.send(Update::Hosts(rows));
+        });
+    }
+
+    fn schedule_host_detail_refresh(&mut self) {
+        let Some(host) = self.host_detail.host().cloned() else {
+            return;
+        };
+        if self.host_detail_in_flight {
+            return;
+        }
+        self.host_detail_in_flight = true;
+        let ops = self.ops.clone();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let data = host_detail::fetch_owned(ops, host.clone()).await;
+            let _ = tx.send(Update::HostDetail { host, data });
+        });
+    }
+
+    fn schedule_dashboard_refresh(&mut self) {
+        if self.dashboard_in_flight {
+            return;
+        }
+        self.dashboard_in_flight = true;
+        let ops = self.ops.clone();
+        let config = self.config.clone();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let data = dashboard::fetch_owned(ops, config).await;
+            let _ = tx.send(Update::Dashboard(data));
+        });
+    }
+
+    fn apply_update(&mut self, update: Update) {
+        match update {
+            Update::Hosts(rows) => {
+                self.hosts.apply(rows);
+                self.hosts_in_flight = false;
+            }
+            Update::HostDetail { host, data } => {
+                // Drop stale results from a prior host the user has since
+                // navigated away from.
+                if self.host_detail.host() == Some(&host) {
+                    self.host_detail.apply(data);
+                }
+                self.host_detail_in_flight = false;
+            }
+            Update::Dashboard(data) => {
+                self.dashboard.apply(data);
+                self.dashboard_in_flight = false;
+            }
+        }
+    }
+
+    async fn start_service_log_streams(&mut self) {
+        let report = match StatusReport::collect(self.ops.as_ref(), &self.config).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "failed to collect status for log streams");
+                return;
+            }
+        };
+        for host_status in report.hosts {
+            for container in host_status.containers.iter().filter(|c| c.is_running()) {
+                let host = Host {
+                    user: self
+                        .config
+                        .hosts
+                        .iter()
+                        .find(|h| h.address == host_status.host)
+                        .map(|h| h.user.clone())
+                        .unwrap_or_default(),
+                    address: host_status.host.clone(),
+                };
+                self.spawn_log_forwarder(host, container.name.clone()).await;
+            }
+        }
+    }
+
+    async fn spawn_log_forwarder(&mut self, host: Host, container: String) {
+        let docker_rx = match self
+            .ops
+            .open_log_stream(&host, &container, LOG_BACKFILL_LINES)
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                warn!(host = %host.address, container = %container, error = %e, "open_log_stream failed");
+                return;
+            }
+        };
+        let tx = self.log_tx.clone();
+        let task = if self.hl_available {
+            tokio::spawn(forward_through_hl(container, docker_rx, tx))
+        } else {
+            tokio::spawn(forward_raw(docker_rx, tx))
+        };
+        self.log_tasks.push(task);
+    }
+
+    fn stop_log_streams(&mut self) {
+        for task in self.log_tasks.drain(..) {
+            task.abort();
+        }
+    }
+
+    pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
+        match &self.view {
+            View::Dashboard => self.dashboard.render(frame, &self.config),
+            View::Hosts => self.hosts.render(frame, &self.config),
+            View::HostDetail(_) => self.host_detail.render(frame),
+            View::Logs | View::ContainerLogs { .. } => self.logs.render(frame, &self.config),
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.stop_log_streams();
+    }
+}
+
+/// Plain (non-`hl`) forwarder: emit one unstyled `RenderedLine` per log
+/// line via the shared formatter.
+async fn forward_raw(
+    mut docker_rx: mpsc::UnboundedReceiver<LogLine>,
+    out: UnboundedSender<RenderedLine>,
+) {
+    while let Some(line) = docker_rx.recv().await {
+        if out.send(RenderedLine::from_log_line(&line)).is_err() {
+            break;
+        }
+    }
+}
+
+/// `hl` forwarder: spawn `hl --color=always --paginate=never`, write each
+/// docker log message to its stdin, read the formatted (ANSI-colored)
+/// lines from its stdout, convert escapes to ratatui spans, and forward
+/// to the render channel. Owns the child via `kill_on_drop`.
+async fn forward_through_hl(
+    container: String,
+    mut docker_rx: mpsc::UnboundedReceiver<LogLine>,
+    out: UnboundedSender<RenderedLine>,
+) {
+    use ansi_to_tui::IntoText;
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command;
+
+    // pamburus/hl flag conventions:
+    //   --paging=never    pager off (it'd block our pipe otherwise)
+    //   --follow          treat stdin as a live stream and flush as
+    //                     entries arrive instead of buffering until EOF
+    //   --sync-interval-ms 100  cadence at which the follow loop drains
+    //   --input-info=none drop the leading "[in:0]" prefix hl adds when
+    //                     it thinks there could be multiple inputs
+    let mut child = match Command::new("hl")
+        .arg("--color=always")
+        .arg("--paging=never")
+        .arg("--follow")
+        .arg("--sync-interval-ms=100")
+        .arg("--input-info=none")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(container = %container, error = %e, "hl spawn failed; falling back to raw");
+            return forward_raw(docker_rx, out).await;
+        }
+    };
+    let mut stdin = child.stdin.take(); // Option<ChildStdin>; None once we close it
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stdout).lines();
+    // Drain stderr so a chatty hl can't fill its pipe; surface anything
+    // it writes via tracing.
+    let stderr_container = container.clone();
+    tokio::spawn(async move {
+        let mut err_reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = err_reader.next_line().await {
+            warn!(container = %stderr_container, hl_stderr = %line);
+        }
+    });
+    let prefix = format!("[{container}] ");
+    let prefix_style = Style::default().fg(Color::Cyan);
+
+    loop {
+        tokio::select! {
+            biased;
+            line_res = reader.next_line() => {
+                match line_res {
+                    Ok(Some(text)) => {
+                        let parsed = text.into_text().unwrap_or_default();
+                        // hl emits one input line as one output line; if it
+                        // ever splits, join the spans onto one rendered line.
+                        let mut spans: Vec<Span<'static>> =
+                            vec![Span::styled(prefix.clone(), prefix_style)];
+                        let mut plain_part = String::new();
+                        for parsed_line in parsed.lines {
+                            for span in parsed_line.spans {
+                                plain_part.push_str(&span.content);
+                                spans.push(Span::styled(span.content.into_owned(), span.style));
+                            }
+                        }
+                        let line = RenderedLine {
+                            plain: format!("{prefix}{plain_part}"),
+                            styled: Line::from(spans),
+                        };
+                        if out.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            line_opt = docker_rx.recv(), if stdin.is_some() => {
+                match line_opt {
+                    Some(line) => {
+                        if let Some(s) = stdin.as_mut()
+                            && (s.write_all(line.message.as_bytes()).await.is_err()
+                                || s.write_all(b"\n").await.is_err())
+                        {
+                            stdin = None;
+                        }
+                    }
+                    None => {
+                        // Docker stream ended; closing stdin flushes hl,
+                        // which then EOFs reader and we exit naturally.
+                        stdin = None;
+                    }
+                }
+            }
+        }
+    }
+    let _ = child.wait().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::docker_ops::FakeDockerOps;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn config() -> Arc<Config> {
+        Arc::new(
+            Config::parse_str(
+                r#"
+[service]
+name = "app-a"
+image = "img"
+
+[[hosts]]
+address = "host-a"
+user = "deploy"
+
+[run]
+port = 3000
+"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn app_constructs_idle() {
+        let ops: Arc<dyn DockerOps> = Arc::new(FakeDockerOps::new());
+        let app = App::new(config(), ops, View::Dashboard, false);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[tokio::test]
+    async fn dashboard_renders_loading_to_test_backend() {
+        let ops: Arc<dyn DockerOps> = Arc::new(FakeDockerOps::new());
+        let mut app = App::new(config(), ops, View::Dashboard, false);
+
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("yoink dashboard"));
+    }
+}

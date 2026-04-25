@@ -1,0 +1,43 @@
+[package]
+name = "yoink"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+description = "Small, opinionated container deploy CLI for a handful of services on a handful of hosts."
+
+[lib]
+name = "yoink"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yoink"
+path = "src/main.rs"
+
+[dependencies]
+ansi-to-tui = "7"
+anyhow = "1"
+async-trait = "0.1"
+bollard = { version = "0.20", features = ["ssh"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+humantime-serde = "1"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tabled = "0.16"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time", "fs", "process", "io-util"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+insta = { version = "1", features = ["yaml"] }
+pretty_assertions = "1"
+testcontainers = "0.27"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+
+[lints]
+workspace = true

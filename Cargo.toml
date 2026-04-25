@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["yoink"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+multiple_crate_versions = "allow"
+cargo_common_metadata = "allow"
+module_name_repetitions = "allow"
+# `Duration::from_secs(60)` for human-readable defaults (no `from_minutes` exists).
+duration_suboptimal_units = "allow"
+# Public surface is small and exposed types are self-explanatory; we add
+# # Errors sections where they add information.
+missing_errors_doc = "allow"
+# Internal panics on poisoned mutexes / impossible states — not worth
+# documenting for every helper.
+missing_panics_doc = "allow"
+
+[workspace.lints.rust]
+unsafe_code = "deny"

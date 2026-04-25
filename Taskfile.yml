@@ -1,0 +1,44 @@
+version: "3"
+
+# Tasks assume you're inside `devbox shell` so cargo + rustup are on PATH.
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  check:
+    desc: Check the workspace
+    cmds:
+      - cargo check --workspace
+
+  fmt:
+    desc: Check formatting
+    cmds:
+      - cargo fmt --all -- --check
+
+  clippy:
+    desc: Run clippy lints (warnings are errors)
+    cmds:
+      - cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    desc: Run unit + integration tests (DinD e2e excluded)
+    cmds:
+      - cargo test --workspace
+
+  test:e2e:
+    desc: Run end-to-end DinD tests (requires Docker daemon)
+    cmds:
+      - cargo test --workspace -- --ignored --show-output
+
+  run:
+    desc: "Run yoink (usage: task yoink:run -- deploy --tag <sha> --config examples/yoink.toml)"
+    cmds:
+      - cargo run --quiet -- {{.CLI_ARGS}}
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - cargo clean
