@@ -104,16 +104,28 @@ impl ShellState {
         rows: u16,
         cols: u16,
     ) {
-        // Try bash first (most service images), fall back to sh.
-        let session = match try_exec(&ops, &self.host, &self.container, "bash", rows, cols).await {
+        // Pick the shell *inside* the container — exec'ing `bash`
+        // directly returns OK at the API level even when the binary's
+        // missing (the daemon then reports an OCI exec failure on the
+        // output stream), so an outer bash→sh fallback never fires.
+        // Hardened/distroless/Alpine images frequently ship `sh` only;
+        // this one-liner picks bash when present and falls back to sh
+        // otherwise. If neither exists the container has no usable
+        // shell and we surface the resulting error in the panel.
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "if command -v bash >/dev/null 2>&1; then exec bash; else exec /bin/sh; fi".into(),
+        ];
+        let session = match ops
+            .exec_interactive(&self.host, &self.container, cmd, rows, cols)
+            .await
+        {
             Ok(s) => s,
-            Err(_) => match try_exec(&ops, &self.host, &self.container, "sh", rows, cols).await {
-                Ok(s) => s,
-                Err(e) => {
-                    self.error = Some(format!("failed to start shell: {e}"));
-                    return;
-                }
-            },
+            Err(e) => {
+                self.error = Some(format!("failed to start shell: {e}"));
+                return;
+            }
         };
 
         let ExecSession {
@@ -286,18 +298,6 @@ impl ShellState {
             }
         });
     }
-}
-
-async fn try_exec(
-    ops: &Arc<dyn DockerOps>,
-    host: &Host,
-    container: &str,
-    shell: &str,
-    rows: u16,
-    cols: u16,
-) -> Result<ExecSession, crate::docker_ops::DockerError> {
-    ops.exec_interactive(host, container, vec![shell.into()], rows, cols)
-        .await
 }
 
 /// Translate a crossterm `KeyEvent` into the byte sequence a PTY
