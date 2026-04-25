@@ -137,6 +137,7 @@ impl View {
                 "  i            container detail (labels, env-ish, live cpu/mem)",
                 "  !            shell into container (bash/sh)",
                 "  D            debug sidecar (alpine, target's pid+net ns)",
+                "  K            SIGKILL container (with confirmation)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh",
                 "  esc          back to hosts (when no active filter)",
@@ -145,6 +146,7 @@ impl View {
                 "container detail",
                 "  enter / l    live logs",
                 "  !            shell · D debug sidecar",
+                "  K            SIGKILL container (with confirmation)",
                 "  r            refresh",
                 "  esc          back to host detail",
             ],
@@ -161,6 +163,7 @@ impl View {
                 "  enter        live logs",
                 "  i            container detail",
                 "  !            shell · D debug sidecar",
+                "  K            SIGKILL container (with confirmation)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh · esc back",
             ],
@@ -422,6 +425,10 @@ pub struct App {
     /// `?` toggles a modal help overlay listing keybinds for the
     /// current view. Cleared on Esc and on any view transition.
     show_help: bool,
+    /// `Some` while a kill-confirmation modal is open over the
+    /// current view. The user confirms with `y` (or Enter) and
+    /// cancels with anything else. Cleared on transition.
+    kill_target: Option<(Host, String)>,
     /// Byte chunks from the embedded shell's exec output stream. The
     /// run loop selects on this so each chunk wakes the render
     /// immediately — without it the only drain point would be the 2 s
@@ -483,6 +490,7 @@ impl App {
             logs: LogsState::new(),
             shell: None,
             show_help: false,
+            kill_target: None,
             shell_bytes_tx,
             shell_bytes_rx,
             shell_session_tx,
@@ -604,6 +612,23 @@ impl App {
             return false;
         }
 
+        // Kill-confirmation modal: `y` / Enter confirms, anything else
+        // dismisses. Captured before view-specific keys so a stray `j`
+        // can't both dismiss and select-next.
+        if let Some((host, container)) = self.kill_target.clone() {
+            let confirm = matches!(key.code, KeyCode::Char('y') | KeyCode::Enter);
+            self.kill_target = None;
+            if confirm {
+                let ops = self.ops.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = ops.kill_container(&host, &container).await {
+                        warn!(host = %host.address, container, error = %e, "kill failed");
+                    }
+                });
+            }
+            return false;
+        }
+
         // Filter input mode in either logs view captures all printable
         // input — only Ctrl-C escapes to quit.
         let logs_view = matches!(self.view, View::Logs | View::ContainerLogs { .. });
@@ -715,11 +740,22 @@ impl App {
                             .await;
                     }
                 }
+                KeyCode::Char('K') => {
+                    if let (Some(host), Some(container)) = (
+                        self.host_detail.host().cloned(),
+                        self.host_detail.selected_container(),
+                    ) {
+                        self.kill_target = Some((host, container));
+                    }
+                }
                 KeyCode::Esc => self.transition(View::Hosts).await,
                 KeyCode::Char('r') => self.schedule_host_detail_refresh(),
                 _ => {}
             },
             View::ContainerDetail { host, container } => match key.code {
+                KeyCode::Char('K') => {
+                    self.kill_target = Some((host.clone(), container.clone()));
+                }
                 KeyCode::Esc => {
                     let host = host.clone();
                     self.transition(View::HostDetail(host)).await;
@@ -845,6 +881,11 @@ impl App {
                         .await;
                     }
                 }
+                KeyCode::Char('K') => {
+                    if let Some(row) = self.service_detail.selected_row() {
+                        self.kill_target = Some((row.host, row.container.name));
+                    }
+                }
                 KeyCode::Esc => self.transition(View::Services).await,
                 KeyCode::Char('r') => self.schedule_dashboard_refresh(),
                 _ => {}
@@ -941,6 +982,7 @@ impl App {
         self.stop_log_streams();
         self.logs.clear();
         self.show_help = false;
+        self.kill_target = None;
         // Always tear down any in-flight shell when leaving its view —
         // the spawned exec will drop its bridge task on Drop, and a
         // sidecar shell needs an explicit force-remove of its
@@ -1352,6 +1394,22 @@ impl App {
         if self.show_help {
             let lines = self.view.help_lines();
             super::ui::render_modal(frame, "yoink help (? to close)", &lines);
+        }
+        if let Some((host, container)) = &self.kill_target {
+            let host_line = format!("host:        {}", host.address);
+            let container_line = format!("container:   {container}");
+            let lines = vec![
+                "About to send SIGKILL.",
+                "",
+                host_line.as_str(),
+                container_line.as_str(),
+                "",
+                "Container stays around for `docker logs` / `inspect`.",
+                "",
+                "[y] / Enter   confirm",
+                "[any]         cancel",
+            ];
+            super::ui::render_modal(frame, "kill container?", &lines);
         }
     }
 }
