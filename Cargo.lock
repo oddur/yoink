@@ -3942,6 +3942,7 @@ dependencies = [
  "ansi-to-tui",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bollard",
  "bytes",
  "clap",

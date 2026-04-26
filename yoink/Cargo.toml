@@ -19,6 +19,7 @@ ansi-to-tui = "8"
 anyhow = "1"
 async-trait = "0.1"
 bollard = { version = "0.20", features = ["ssh"] }
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
