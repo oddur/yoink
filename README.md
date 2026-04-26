@@ -11,14 +11,6 @@ yoink history api         # who deployed what, when
 yoink rollback api        # roll back to the previous version
 ```
 
-## Screenshots
-
-<img width="1435" height="789" alt="image" src="https://github.com/user-attachments/assets/bcf956b1-937a-43d7-92f6-0f24a1d0cd98" />
-
-<img width="2862" height="1820" alt="image" src="https://github.com/user-attachments/assets/36d3cc00-355c-482b-addc-454a0070b58e" />
-
-
-
 ## Why it exists
 
 Kamal is a lovely fit for "one app, one binary per host" but starts to creak the moment you want a second app on the same box, replicas of the same service, or any kind of network isolation between containers. Kubernetes solves all that — and a hundred other problems you don't have, in exchange for a control plane to operate, a YAML schema with a learning curve, and a vocabulary you have to teach every new operator.
@@ -279,6 +271,12 @@ All commands take `--config <path>` (default: `./yoink.yaml`). `-v` for structur
 ```
 yoink tui
 ```
+
+<img width="1435" height="789" alt="image" src="https://github.com/user-attachments/assets/bcf956b1-937a-43d7-92f6-0f24a1d0cd98" />
+
+<img width="2862" height="1820" alt="image" src="https://github.com/user-attachments/assets/36d3cc00-355c-482b-addc-454a0070b58e" />
+
+
 
 Heavily inspired by [k9s](https://k9scli.io/). Keyboard-driven panes for dashboard (drift across all services), hosts (per-host detail with live CPU/mem), services (per-service detail with replica info), container logs (live tail with `/` filter), per-container detail (env, mounts, healthcheck, networks).
 
