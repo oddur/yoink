@@ -153,13 +153,19 @@ pub struct SecretsConfig {
 pub struct ServiceConfig {
     pub name: String,
     pub image: String,
-    /// Image tag. Optional: when omitted from the config the operator
+    /// Image tag, OR a content digest `sha256:<hex>` for digest-pinned
+    /// deploys. Optional: when omitted from the config the operator
     /// MUST pass `--tag <name>=<value>` (or per-service `--service x
     /// --tag <value>`) at deploy time. Useful for code-versioned
     /// services (api, web) where the right answer is "whatever CI
     /// just built" and a hard-coded tag in the file rots immediately.
     /// Stable infrastructure (caddy, redis, etc.) keeps a literal
     /// tag here so `task yoink:up` works without arguments.
+    ///
+    /// Operators may also write the digest inline as
+    /// `image: repo@sha256:<hex>`; `Config::load_from_path` normalizes
+    /// that into separate `image` (repo) + `tag` (`sha256:<hex>`)
+    /// fields so the runtime never sees the combined form.
     #[serde(default)]
     pub tag: Option<String>,
     /// Restrict to a subset of `[[hosts]]`. None = every configured host.
@@ -398,6 +404,7 @@ impl Config {
         let mut cfg: Self = yaml_serde::from_str(&text)?;
         cfg.config_dir = path.parent().map(std::path::Path::to_path_buf);
         cfg.merge_includes()?;
+        cfg.normalize_image_references()?;
         cfg.validate()?;
         cfg.topo_sort_services()?;
         Ok(cfg)
@@ -405,9 +412,40 @@ impl Config {
 
     pub fn parse_str(text: &str) -> Result<Self, ConfigError> {
         let mut config: Self = yaml_serde::from_str(text)?;
+        config.normalize_image_references()?;
         config.validate()?;
         config.topo_sort_services()?;
         Ok(config)
+    }
+
+    /// Split inline `image: repo@sha256:<hex>` into separate
+    /// `image: repo` + `tag: sha256:<hex>` so the runtime always sees
+    /// the components in well-known fields. Conflicts (operator wrote
+    /// both `image: repo@sha256:x` AND a `tag:` field) are rejected.
+    fn normalize_image_references(&mut self) -> Result<(), ConfigError> {
+        for service in &mut self.services {
+            if let Some((repo, digest)) = service.image.split_once('@') {
+                if !digest.starts_with("sha256:") {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.image references `@{}`; only `@sha256:<hex>` digest \
+                         references are supported (got {})",
+                        service.name, digest, digest
+                    )));
+                }
+                if let Some(existing) = &service.tag
+                    && existing != digest
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?} pins both an inline digest ({digest}) and a separate \
+                         `tag: {existing}` — pick one form",
+                        service.name
+                    )));
+                }
+                service.tag = Some(digest.to_string());
+                service.image = repo.to_string();
+            }
+        }
+        Ok(())
     }
 
     /// Add a synthetic `local` host pointing at the local docker
@@ -1210,6 +1248,56 @@ services:
             }
         }
         Config::parse_str(&s).expect("config must parse")
+    }
+
+    #[test]
+    fn normalize_splits_inline_digest_into_image_and_tag() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: api
+    image: registry.example.com/bt-api@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    run: { port: 1 }
+"#;
+        let cfg = Config::parse_str(s).expect("config must parse");
+        let svc = &cfg.services[0];
+        assert_eq!(svc.image, "registry.example.com/bt-api");
+        assert_eq!(
+            svc.tag.as_deref(),
+            Some(
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_inline_digest_when_tag_already_set() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: api
+    image: registry.example.com/bt-api@sha256:abcd
+    tag: sha256:ef01
+    run: { port: 1 }
+"#;
+        let err = Config::parse_str(s).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("pick one form")));
+    }
+
+    #[test]
+    fn normalize_rejects_non_sha256_inline_digest() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: api
+    image: registry.example.com/bt-api@latest
+    run: { port: 1 }
+"#;
+        let err = Config::parse_str(s).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("only `@sha256:")));
     }
 
     #[test]

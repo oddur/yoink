@@ -156,7 +156,10 @@ fn build_service_row<'a>(
     let cfg_service = config.services.iter().find(|s| s.name == name);
     let image_tag = cfg_service.map_or_else(
         || "?".into(),
-        |s| format!("{}:{}", s.image, s.tag.as_deref().unwrap_or("(per --tag)")),
+        |s| match s.tag.as_deref() {
+            Some(t) => crate::docker::image_reference(&s.image, t),
+            None => format!("{}:(per --tag)", s.image),
+        },
     );
     let containers: Vec<&ContainerInfo> = report.map_or_else(Vec::new, |r| {
         r.hosts

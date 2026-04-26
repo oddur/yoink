@@ -19,6 +19,19 @@ use crate::config::RunOptions;
 /// chance of collision (we'll never get close).
 pub const SHORT_HASH_LEN: usize = 8;
 
+/// Build the canonical OCI image reference from `repo` + `tag`. Tags
+/// that look like content digests (`sha256:<hex>`) get separated by
+/// `@`; everything else by `:`. Used everywhere yoink hands an image
+/// reference to docker (container create, pull, image-present check).
+#[must_use]
+pub fn image_reference(image: &str, tag: &str) -> String {
+    if tag.starts_with("sha256:") {
+        format!("{image}@{tag}")
+    } else {
+        format!("{image}:{tag}")
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum BuildError {
     #[error("invalid memory value {0:?}: expected like \"512m\" or \"1g\"")]
@@ -79,7 +92,7 @@ pub fn build_container(spec: &RunSpec) -> Result<ContainerCreateBody, BuildError
         build_networking_config(&spec.networks, &spec.container_name, &spec.options);
 
     Ok(ContainerCreateBody {
-        image: Some(format!("{}:{}", spec.image, spec.tag)),
+        image: Some(image_reference(&spec.image, &spec.tag)),
         env: Some(env),
         labels: Some(labels),
         entrypoint: spec.entrypoint.clone(),
@@ -401,6 +414,18 @@ mod tests {
     use super::*;
     use crate::config::RunOptions;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn image_reference_uses_colon_for_tags_at_for_digests() {
+        assert_eq!(
+            image_reference("registry.example.com/bt-api", "v1.2.3"),
+            "registry.example.com/bt-api:v1.2.3",
+        );
+        assert_eq!(
+            image_reference("registry.example.com/bt-api", "sha256:abc123"),
+            "registry.example.com/bt-api@sha256:abc123",
+        );
+    }
 
     fn sample_spec() -> RunSpec {
         let mut labels = BTreeMap::new();

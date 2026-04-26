@@ -836,10 +836,18 @@ impl DockerOps for RealDockerOps {
         credentials: Option<bollard::auth::DockerCredentials>,
     ) -> Result<(), DockerError> {
         let docker = self.client_for(host).await?;
-        let opts = CreateImageOptionsBuilder::new()
-            .from_image(image)
-            .tag(tag)
-            .build();
+        // Digest pulls go through `from_image=repo@sha256:...` with no
+        // separate tag. Tag-pulls keep the conventional split.
+        let opts = if tag.starts_with("sha256:") {
+            CreateImageOptionsBuilder::new()
+                .from_image(&format!("{image}@{tag}"))
+                .build()
+        } else {
+            CreateImageOptionsBuilder::new()
+                .from_image(image)
+                .tag(tag)
+                .build()
+        };
         let mut stream = docker.create_image(Some(opts), None, credentials);
         // Track each layer's last-printed status so we don't spam the
         // log with "Downloading 53%" every chunk — only when the
@@ -864,7 +872,7 @@ impl DockerOps for RealDockerOps {
         tag: &str,
     ) -> Result<bool, DockerError> {
         let docker = self.client_for(host).await?;
-        let reference = format!("{image}:{tag}");
+        let reference = crate::docker::image_reference(image, tag);
         match docker.inspect_image(&reference).await {
             Ok(_) => Ok(true),
             // bollard surfaces "no such image" as DockerResponseServerError

@@ -1021,7 +1021,11 @@ fn print_dry_run_plan(
             .cloned()
             .or_else(|| svc.tag.clone())
             .unwrap_or_else(|| "<git>".into());
-        println!("  - {}: {}:{}", svc.name, svc.image, tag);
+        println!(
+            "  - {}: {}",
+            svc.name,
+            yoink::docker::image_reference(&svc.image, &tag)
+        );
     }
     if !any {
         anyhow::bail!("no services match the --service filter");
@@ -1105,7 +1109,11 @@ async fn cmd_pull(
             let credentials = credentials.clone();
             let ops = &ops;
             async move {
-                eprintln!("→ {}: pulling {image}:{tag}", host.address);
+                eprintln!(
+                    "→ {}: pulling {}",
+                    host.address,
+                    yoink::docker::image_reference(&image, &tag),
+                );
                 ops.pull_image(&host, &image, &tag, credentials)
                     .await
                     .with_context(|| format!("pull on {}", host.address))
@@ -1744,8 +1752,8 @@ async fn cmd_diff(config: &Config, service: &str, tag_override: Option<&str>) ->
         );
     }
     println!(
-        "\nspec: {}:{} (env, ports, mounts compared at deploy time via spec hash)",
-        svc_cfg.image, target_tag
+        "\nspec: {} (env, ports, mounts compared at deploy time via spec hash)",
+        yoink::docker::image_reference(&svc_cfg.image, &target_tag),
     );
     Ok(())
 }
