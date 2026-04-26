@@ -219,6 +219,16 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Dense JSON dump of everything yoink can observe — config,
+    /// per-host docker info, every yoink-managed container with
+    /// inspect data, stats, log tail, and drift status. Designed to
+    /// be piped into an LLM/agent for diagnosis: `yoink dump | pbcopy`.
+    /// Env values containing secret-ish substrings are redacted.
+    Dump {
+        /// Lines of recent logs to include per container.
+        #[arg(long, default_value_t = 50)]
+        log_tail: u32,
+    },
     /// Lint the config and (optionally) ping each host's docker daemon.
     /// Use this in CI before merging a yoink.yaml change.
     Validate {
@@ -388,6 +398,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Top { limit } => cmd_top(&config, limit).await,
         Command::Networks { host } => cmd_networks(&config, host.as_deref()).await,
         Command::Volumes { host } => cmd_volumes(&config, host.as_deref()).await,
+        Command::Dump { log_tail } => cmd_dump(&config, log_tail).await,
         Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
         Command::Lock { action } => cmd_lock(&config, action).await,
         Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
@@ -1307,6 +1318,271 @@ async fn cmd_volumes(config: &Config, host_filter: Option<&str>) -> Result<()> {
         let mp = v.mountpoint;
         println!("{host:<22}  {name:<40}  {driver:<10}  {mp}");
     }
+    Ok(())
+}
+
+/// Substrings in env-var keys that mark the value as secret-ish —
+/// those values render as `"<redacted>"` in the dump. Same heuristic
+/// the TUI's container-detail pane uses; mirrored here so the dump
+/// stays paste-safe.
+const SECRET_KEY_HINTS: &[&str] = &[
+    "TOKEN", "SECRET", "PASSWORD", "PASS", "API_KEY", "PRIVATE_KEY", "DSN",
+];
+
+fn is_secret_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    SECRET_KEY_HINTS.iter().any(|h| upper.contains(h))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
+    use serde_json::json;
+    use yoink::deploy;
+    use yoink::docker;
+    use yoink::lock::LOCK_NAME;
+
+    let ops = std::sync::Arc::new(RealDockerOps::new()) as std::sync::Arc<dyn DockerOps>;
+    // Best-effort secrets load — drift hashes are accurate when it
+    // succeeds, marked "?" otherwise. Failure is logged via tracing
+    // (silenced inside dump output).
+    let secrets = yoink::secrets::load_bundle(config).await.ok().flatten();
+
+    let mut hosts_json = Vec::new();
+    let mut issues: Vec<String> = Vec::new();
+
+    for host_cfg in &config.hosts {
+        let host = Host::from(host_cfg);
+        let address = host.address.clone();
+        let mut host_obj = json!({
+            "address": address,
+            "user": host.user,
+            "is_local": host.is_local(),
+        });
+
+        match ops.version(&host).await {
+            Ok(v) => {
+                host_obj["docker"] = json!({
+                    "server_version": v.server_version,
+                    "api_version": v.api_version,
+                    "os": v.os,
+                    "arch": v.arch,
+                });
+                host_obj["reachable"] = json!(true);
+            }
+            Err(e) => {
+                host_obj["reachable"] = json!(false);
+                host_obj["unreachable_error"] = json!(format!("{e:#}"));
+                issues.push(format!("host {address} unreachable: {e}"));
+                hosts_json.push(host_obj);
+                continue;
+            }
+        }
+
+        host_obj["host_info"] = match ops.host_info(&host).await {
+            Ok(i) => json!({
+                "n_cpu": i.n_cpu,
+                "mem_total": i.mem_total,
+                "containers": i.containers,
+                "containers_running": i.containers_running,
+                "images": i.images,
+                "kernel": i.kernel,
+                "operating_system": i.operating_system,
+            }),
+            Err(_) => serde_json::Value::Null,
+        };
+        host_obj["networks"] = serde_json::to_value(
+            ops.list_networks(&host).await.unwrap_or_default(),
+        )
+        .unwrap_or(serde_json::Value::Null);
+        host_obj["volumes"] = serde_json::to_value(
+            ops.list_volumes(&host).await.unwrap_or_default(),
+        )
+        .unwrap_or(serde_json::Value::Null);
+
+        // Lock state — find the sentinel by name.
+        let lock_state = ops
+            .list_running_containers(&host)
+            .await
+            .ok()
+            .and_then(|cs| cs.into_iter().find(|c| c.name == LOCK_NAME))
+            .map(|c| {
+                json!({
+                    "held": true,
+                    "acquired_unix": c.created_unix,
+                })
+            })
+            .unwrap_or(json!({ "held": false }));
+        host_obj["deploy_lock"] = lock_state;
+
+        // All yoink-managed containers (running + exited).
+        let containers = ops
+            .list_containers_by_label(&host, "yoink.managed=true")
+            .await
+            .unwrap_or_default();
+        let mut container_objs = Vec::new();
+        for c in containers {
+            // Per-container stats (skip if not running).
+            let stats = if c.is_running() {
+                ops.container_stats(&host, &c.name).await.ok().map(|s| {
+                    json!({
+                        "cpu_pct": s.cpu_pct,
+                        "mem_used": s.mem_used,
+                        "mem_limit": s.mem_limit,
+                    })
+                })
+            } else {
+                None
+            };
+            let inspect = ops.inspect_container(&host, &c.name).await.ok();
+            let log_tail_lines = ops
+                .fetch_recent_logs(&host, &c.name, log_tail)
+                .await
+                .ok()
+                .map(|ls| {
+                    ls.into_iter()
+                        .map(|l| l.trim_end_matches('\n').to_string())
+                        .collect::<Vec<_>>()
+                });
+
+            // Drift hash for yoink-managed containers we have a config
+            // for. Tag fallback: config's tag if set, else the
+            // container's own yoink_version.
+            let drift = c.yoink_service.as_deref().and_then(|name| {
+                let svc = config.services.iter().find(|s| s.name == name)?;
+                let tag = svc
+                    .tag
+                    .clone()
+                    .or_else(|| c.yoink_version.clone())?;
+                let desired = deploy::build_desired_spec(config, svc, &tag, secrets.as_ref())
+                    .ok()?;
+                let desired_hash = docker::compute_spec_hash(&desired);
+                let running_hash = c.yoink_spec_hash.clone()?;
+                Some(json!({
+                    "status": if desired_hash == running_hash { "sync" } else { "drift" },
+                    "desired_spec_hash": desired_hash,
+                    "running_spec_hash": running_hash,
+                    "tag_used_for_desired": tag,
+                }))
+            });
+            if let Some(d) = &drift
+                && d["status"] == "drift"
+            {
+                issues.push(format!(
+                    "container {} ({}) is drifted from current config",
+                    c.name,
+                    c.yoink_service.as_deref().unwrap_or("?")
+                ));
+            }
+            if !c.is_running() {
+                issues.push(format!(
+                    "container {} state={} (status: {})",
+                    c.name, c.state, c.status_text
+                ));
+            }
+
+            // Inspect with env redacted.
+            let inspect_json = inspect.map(|i| {
+                let env: Vec<serde_json::Value> = i
+                    .env
+                    .iter()
+                    .map(|kv| {
+                        let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+                        if is_secret_key(k) {
+                            json!({"key": k, "value": "<redacted>"})
+                        } else {
+                            json!({"key": k, "value": v})
+                        }
+                    })
+                    .collect();
+                json!({
+                    "image": i.image,
+                    "image_id": i.image_id,
+                    "command": i.command,
+                    "working_dir": i.working_dir,
+                    "state": i.state,
+                    "status": i.status,
+                    "started_at": i.started_at,
+                    "finished_at": i.finished_at,
+                    "exit_code": i.exit_code,
+                    "restart_count": i.restart_count,
+                    "restart_policy": i.restart_policy,
+                    "pid": i.pid,
+                    "ports": i.ports,
+                    "mounts": i.mounts,
+                    "networks": i.networks,
+                    "labels": i.labels,
+                    "env": env,
+                })
+            });
+
+            container_objs.push(json!({
+                "name": c.name,
+                "image": c.image,
+                "state": c.state,
+                "status_text": c.status_text,
+                "created_unix": c.created_unix,
+                "yoink_service": c.yoink_service,
+                "yoink_version": c.yoink_version,
+                "yoink_spec_hash": c.yoink_spec_hash,
+                "yoink_deployed_by": c.yoink_deployed_by,
+                "yoink_deployed_at": c.yoink_deployed_at,
+                "networks": c.networks,
+                "other_labels": c.other_labels,
+                "stats": stats,
+                "inspect": inspect_json,
+                "log_tail": log_tail_lines,
+                "drift": drift,
+            }));
+        }
+        host_obj["containers"] = json!(container_objs);
+
+        hosts_json.push(host_obj);
+    }
+
+    let dump = json!({
+        "yoink": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "generated_at_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            "secrets_bundle_loaded": secrets.is_some(),
+        },
+        "config": {
+            "deploy": {
+                "networks": config.deploy.networks,
+            },
+            "hosts": config.hosts.iter().map(|h| {
+                json!({"address": h.address, "user": h.user})
+            }).collect::<Vec<_>>(),
+            "services": config.services.iter().map(|s| {
+                let networks = s.networks.clone().unwrap_or_else(|| config.deploy.networks.clone());
+                json!({
+                    "name": s.name,
+                    "image": s.image,
+                    "tag_pinned": s.tag,
+                    "networks": networks,
+                    "env_keys": s.env.keys().collect::<Vec<_>>(),
+                    "secret_keys": s.secrets,
+                    "env_from_secret_keys": s.env_from_secrets.keys().collect::<Vec<_>>(),
+                    "host_filter": s.hosts,
+                    "replicas": s.run.replicas,
+                    "port": s.run.port,
+                    "healthcheck_path": s.run.healthcheck_path,
+                    "publish": s.run.publish,
+                    "binds": s.run.binds,
+                    "volumes": s.run.volumes,
+                    "files": s.run.files,
+                    "labels": s.labels,
+                })
+            }).collect::<Vec<_>>(),
+            "registry_server": config.registry.as_ref().map(|r| r.server.clone()),
+            "secrets_provider": config.secrets.as_ref().map(|s| s.provider.clone()),
+        },
+        "hosts": hosts_json,
+        "issues": issues,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&dump)?);
     Ok(())
 }
 
