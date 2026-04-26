@@ -281,28 +281,123 @@ pub struct ServiceRun {
     pub files: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+/// Per-container runtime options. **All security-relevant fields
+/// default to a hardened profile** — drop every Linux capability,
+/// disallow setuid escalation, immutable rootfs. Operators who need
+/// looser settings opt out explicitly:
+///
+/// ```yaml
+/// run:
+///   cap_drop: []                  # opt out of capability drop
+///   security_opt: []              # opt out of no-new-privileges
+///   read_only: false              # opt out of immutable rootfs
+/// ```
+///
+/// `cpus` + `pids_limit` are uncapped by default; both are sane
+/// knobs to bound a runaway container without tuning the whole host.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunOptions {
     #[serde(default)]
     pub network_aliases: Vec<String>,
+    /// Memory limit. K8s-style strings accepted: `"512Mi"`, `"1Gi"`,
+    /// `"512m"`, `"1g"`. Lowercase suffixes are binary
+    /// (`m` = `Mi` = 2²⁰); k8s `Ki`/`Mi`/`Gi` are also binary;
+    /// uppercase `K`/`M`/`G` are binary too (matches docker, not k8s
+    /// — k8s `K`/`M`/`G` are decimal but we follow docker convention).
+    /// `None` → uncapped.
     #[serde(default)]
     pub memory: Option<String>,
+    /// CPU limit, k8s-style. Absolute cores' worth of CPU time —
+    /// **not** a fraction of host CPU. `"2"` on a 32-core box still
+    /// caps this container at 2 cores. Suffixes: `"500m"` =
+    /// 500 millicores = ½ core; bare numbers like `"1.5"` are also
+    /// accepted. `None` → uncapped. Translates to docker's
+    /// `nano_cpus` (1 core = 1e9 ns/sec).
     #[serde(default)]
+    pub cpus: Option<String>,
+    /// Maximum number of pids/threads the container can create.
+    /// **Default: `1024`** — bounds the fork-bomb class of exploits
+    /// while staying well above what most workloads need (Rust
+    /// async, Node, Redis, Caddy all stay under ~50). JVM apps with
+    /// large thread pools may need to bump this; set to `None` for
+    /// unlimited.
+    #[serde(default = "default_pids_limit")]
+    pub pids_limit: Option<i64>,
+    /// Linux capabilities to drop. **Default: `["ALL"]`** — every
+    /// privileged operation is blocked unless re-enabled via
+    /// `cap_add`. Set to `[]` to opt out (only when you know you need
+    /// the full default capability set).
+    #[serde(default = "default_cap_drop")]
     pub cap_drop: Vec<String>,
+    /// Linux capabilities to add back after `cap_drop`. Common
+    /// example: `[NET_BIND_SERVICE]` for a reverse proxy that needs
+    /// :80/:443.
     #[serde(default)]
     pub cap_add: Vec<String>,
-    #[serde(default)]
+    /// Container security options. **Default:
+    /// `["no-new-privileges:true"]`** — blocks setuid binaries inside
+    /// the container from gaining new caps via execve. Set to `[]`
+    /// to opt out (almost never needed).
+    #[serde(default = "default_security_opt")]
     pub security_opt: Vec<String>,
-    #[serde(default)]
+    /// Mount the rootfs read-only. **Default: `true`** — combine
+    /// with `tmpfs:` for any directories the app needs to write to.
+    /// Set to `false` to opt out for images that scribble all over
+    /// their rootfs at runtime (legacy webapps, the pgadmin image,
+    /// etc.).
+    #[serde(default = "default_read_only")]
     pub read_only: bool,
+    /// In-memory mount points (path → mount options). Pairs with
+    /// `read_only: true` to give the app *some* writable space
+    /// without giving up immutability of the rootfs.
     #[serde(default)]
     pub tmpfs: BTreeMap<String, String>,
     #[serde(default)]
     pub restart: Option<String>,
-    /// Override the container's effective user (e.g. `"0:0"` for otel).
+    /// Override the container's effective user (e.g. `"0:0"` for an
+    /// image that genuinely needs root, or `"1000:1000"` for a
+    /// non-root unprivileged uid). When unset, docker honors the
+    /// image's `USER` directive.
     #[serde(default)]
     pub user: Option<String>,
+}
+
+fn default_cap_drop() -> Vec<String> {
+    vec!["ALL".to_string()]
+}
+
+fn default_security_opt() -> Vec<String> {
+    vec!["no-new-privileges:true".to_string()]
+}
+
+fn default_read_only() -> bool {
+    true
+}
+
+// Wrapped in `Option<i64>` because that's what the field expects;
+// clippy's `unnecessary_wraps` lint is wrong here.
+#[allow(clippy::unnecessary_wraps)]
+fn default_pids_limit() -> Option<i64> {
+    Some(1024)
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            network_aliases: Vec::new(),
+            memory: None,
+            cpus: None,
+            pids_limit: default_pids_limit(),
+            cap_drop: default_cap_drop(),
+            cap_add: Vec::new(),
+            security_opt: default_security_opt(),
+            read_only: default_read_only(),
+            tmpfs: BTreeMap::new(),
+            restart: None,
+            user: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]

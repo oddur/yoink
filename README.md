@@ -218,12 +218,69 @@ services:
       healthcheck_timeout: 60s
       drain_timeout: 30s
       options:
-        memory: 512m
-        cap_drop: [ALL]
-        read_only: true
+        memory: "512Mi"
+        cpus: "1.5"
+        # cap_drop / security_opt / read_only / pids_limit all default
+        # to the hardened profile (see "Sane security defaults" below).
+        # Just give the app some scratch space:
         tmpfs: { /tmp: "size=64m,mode=1777" }
         network_aliases: [api]           # caddy-docker-proxy upstream key
 ```
+
+### Sane security defaults
+
+Compose's defaults are dev-friendly, not prod-friendly: every container runs with the full Linux capability set, a writable rootfs, no `pids` cgroup limit, no protection against setuid escalation. Yoink flips those — every service yoink creates is hardened by default. **The only knobs that opt *into* less safety are explicit:**
+
+| field | yoink default | what it gives you | how to opt out |
+|---|---|---|---|
+| `cap_drop` | `["ALL"]` | every Linux capability dropped (no `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, …) | `cap_drop: []` (full default cap set), or surgically re-add via `cap_add` |
+| `security_opt` | `["no-new-privileges:true"]` | setuid binaries inside the container can't escalate via `execve` | `security_opt: []` |
+| `read_only` | `true` | rootfs mounted read-only — exploits can't drop binaries on disk | `read_only: false` |
+| `pids_limit` | `1024` | bounds the fork-bomb class of exploits | `pids_limit: null` (unlimited), or any positive int |
+| `cpus` | `null` (uncapped) | — | set to `"2"`, `"500m"`, `"1.5"`, etc. — k8s style |
+| `memory` | `null` (uncapped) | — | set to `"512Mi"`, `"1Gi"`, `"512m"`, `"1g"` — k8s + docker styles both accepted |
+
+Surgical opt-outs in practice (from a real prod config):
+
+```yaml
+# caddy needs to bind :80/:443 — re-add NET_BIND_SERVICE only.
+- name: caddy
+  run:
+    cap_drop: [ALL]
+    cap_add:  [NET_BIND_SERVICE]
+    cpus: "0.5"
+    memory: "64Mi"
+
+# pgadmin's image scribbles all over its rootfs at startup — back out
+# of read_only, keep the rest of the hardened defaults.
+- name: pgadmin
+  run:
+    read_only: false
+    cpus: "1"
+    memory: "256Mi"
+
+# Image with stubborn legacy code that needs root + writable /etc.
+- name: legacy-thing
+  run:
+    user: "0:0"
+    read_only: false
+    cap_drop: []
+    security_opt: []
+```
+
+**Read-only rootfs in practice**: the app still needs *somewhere* to write — `/tmp`, sometimes `/run`, occasionally a cache directory. Pair `read_only: true` with `tmpfs:` to give it scratch space without letting it persist:
+
+```yaml
+run:
+  read_only: true
+  tmpfs:
+    /tmp: "size=64m,mode=1777"
+    /var/cache/app: "size=128m,mode=0755"
+```
+
+What yoink **doesn't** do automatically (for now): seccomp/AppArmor profiles beyond docker's defaults, user-namespace remapping (`--userns-remap`), gVisor / Kata runtime selection. Those are host-wide concerns, not per-service config — set them on the docker daemon and yoink containers inherit.
+
+The TUI's container detail (`i` from any container row) shows the effective security profile for each running container under "security & limits" — easy to spot when something's accidentally lax.
 
 ### Authenticating with Infisical
 
@@ -291,8 +348,15 @@ Operator gestures from the dashboard:
 - `P` — prune
 - `!` — shell into container
 - `D` — debug sidecar (alpine in target's pid+net ns)
+- `H` — service deploy history; on a stopped row press `r` to roll back
 - `?` — help overlay
 - `q` — quit
+
+### Pretty logs
+
+Structured log lines (JSON, logfmt, etc.) are hard to scan as raw text. The TUI's logs pane auto-detects [`hl`](https://github.com/pamburus/hl) (`brew install pamburus/tap/hl`) on the operator's `PATH` and transparently pipes every container's log stream through it before rendering — so JSON keys are colored, timestamps are dim, levels are highlighted, and stack traces stay readable. Falls back to raw output when `hl` isn't installed; no config knob to toggle.
+
+The `yoink logs <svc> -f` CLI doesn't auto-pipe (the operator decides their own shell pipeline), but `yoink logs api -f | hl` works the same way.
 
 ## Build & test
 

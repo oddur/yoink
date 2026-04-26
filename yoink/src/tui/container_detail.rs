@@ -215,15 +215,77 @@ impl ContainerDetailState {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(30), // ports
-                Constraint::Percentage(40), // mounts
-                Constraint::Percentage(30), // networks
+                Constraint::Percentage(20), // ports
+                Constraint::Percentage(30), // mounts
+                Constraint::Percentage(20), // networks
+                Constraint::Percentage(30), // security & limits
             ])
             .split(area);
 
         Self::render_list(frame, chunks[0], " ports ", &inspect.ports);
         Self::render_list(frame, chunks[1], " mounts ", &inspect.mounts);
         Self::render_list(frame, chunks[2], " networks ", &inspect.networks);
+        Self::render_security(frame, chunks[3], inspect);
+    }
+
+    /// Surface the secure-by-default profile + any override the
+    /// operator opted into (`memory`, `cpus`, `pids_limit`,
+    /// `cap_drop`/`cap_add`, `security_opt`, `read_only`, `user`).
+    /// When all knobs are uncapped / at default this section is small
+    /// but still useful — it tells you "yes, this container is
+    /// hardened" at a glance.
+    fn render_security(frame: &mut Frame<'_>, area: Rect, inspect: &ContainerDetail) {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        // Resource caps row.
+        let mem = inspect
+            .memory_bytes
+            .map_or_else(|| "uncapped".into(), format_bytes);
+        #[allow(clippy::cast_precision_loss)]
+        let cpus = inspect.nano_cpus.map_or_else(
+            || "uncapped".into(),
+            |n| format!("{:.2}", n as f64 / 1_000_000_000.0),
+        );
+        let pids = inspect
+            .pids_limit
+            .map_or_else(|| "unlimited".into(), |n| n.to_string());
+        lines.push(kv("memory", &mem));
+        lines.push(kv("cpus", &cpus));
+        lines.push(kv("pids_limit", &pids));
+        lines.push(kv(
+            "user",
+            inspect.user.as_deref().unwrap_or("(image default)"),
+        ));
+        // Security knobs. Each rendered with a marker so the operator
+        // can scan for "is this hardened?" at a glance.
+        let cap_drop = if inspect.cap_drop.is_empty() {
+            "(none — capabilities NOT dropped)".to_string()
+        } else {
+            inspect.cap_drop.join(",")
+        };
+        lines.push(kv("cap_drop", &cap_drop));
+        if !inspect.cap_add.is_empty() {
+            lines.push(kv("cap_add", &inspect.cap_add.join(",")));
+        }
+        let secopt = if inspect.security_opt.is_empty() {
+            "(none — setuid escalation NOT blocked)".to_string()
+        } else {
+            inspect.security_opt.join(",")
+        };
+        lines.push(kv("security_opt", &secopt));
+        lines.push(kv(
+            "read_only",
+            if inspect.read_only {
+                "true (immutable rootfs)"
+            } else {
+                "false (writable rootfs)"
+            },
+        ));
+        let block = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" security & limits "),
+        );
+        frame.render_widget(block, area);
     }
 
     fn render_env_labels(frame: &mut Frame<'_>, area: Rect, inspect: &ContainerDetail) {
