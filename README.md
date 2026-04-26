@@ -348,8 +348,19 @@ Operator gestures from the dashboard:
 - `P` — prune
 - `!` — shell into container
 - `D` — debug sidecar (alpine in target's pid+net ns)
+- `H` — service deploy history; on a stopped row press `r` to roll back
 - `?` — help overlay
 - `q` — quit
+
+### Pretty logs
+
+Yoink doesn't try to format logs — it just streams whatever the container writes. Pipe it through [`hl`](https://github.com/pamburus/hl) (`brew install pamburus/tap/hl`) for human-friendly highlighting of structured logs (JSON, logfmt, key=value, etc.):
+
+```sh
+yoink logs api -f | hl
+```
+
+In the TUI's per-container logs pane the same trick works — `hl` reads from any pipe, so `yoink tui` users typically keep a side terminal for the noisy services with `yoink logs <svc> -f | hl`.
 
 ## Build & test
 
