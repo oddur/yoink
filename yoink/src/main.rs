@@ -687,7 +687,7 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
     };
     let bundle = secrets::fetch_secrets(cfg, cfg.domain.as_deref())
         .await
-        .context("fetch secrets via infisical CLI")?;
+        .context("fetch secrets from Infisical")?;
     Ok(Some(bundle))
 }
 

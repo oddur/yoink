@@ -142,8 +142,8 @@ pub struct SecretsConfig {
     /// Optional path within the project (Infisical "folder").
     #[serde(default)]
     pub path: Option<String>,
-    /// Self-hosted Infisical instance URL. When unset, the CLI default
-    /// (the cloud `SaaS` at `app.infisical.com`) is used.
+    /// Self-hosted Infisical instance URL. When unset, the cloud `SaaS`
+    /// at `app.infisical.com` is used.
     #[serde(default)]
     pub domain: Option<String>,
 }

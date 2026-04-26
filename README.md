@@ -83,7 +83,7 @@ The split:
 | **operator → host connectivity** | Tailscale |
 | **CI → host connectivity** | Tailscale |
 | **stateful services** (postgres, etc.) | docker compose on the host |
-| **secrets** | Infisical (yoink calls the CLI) |
+| **secrets** | Infisical (REST API, no CLI install needed) |
 
 ## Running the same stack twice on the same hosts (staging alongside prod)
 
@@ -188,9 +188,10 @@ hosts:
   - { address: my-server, user: deploy } # reachable via tailnet hostname
 
 secrets:
-  provider: infisical                    # optional; yoink shells out to the CLI at deploy time
+  provider: infisical                    # optional; yoink talks to Infisical's REST API directly
   project_id: <your-infisical-project>
   environment: prod
+  # domain: https://infisical.example.com  # only for self-hosted Infisical instances
 
 include:
   - services/*.yaml
@@ -222,6 +223,19 @@ services:
         tmpfs: { /tmp: "size=64m,mode=1777" }
         network_aliases: [api]           # caddy-docker-proxy upstream key
 ```
+
+### Authenticating with Infisical
+
+When `secrets.provider: infisical` is set, yoink resolves a bearer token in this order:
+
+1. **Universal Auth** (machine identity) — `INFISICAL_CLIENT_ID` + `INFISICAL_CLIENT_SECRET`. The CI path; create a machine identity in Infisical's UI and expose the pair as repo secrets.
+2. **Raw bearer token** — `INFISICAL_TOKEN`. For one-off runs where you already have a token in hand.
+3. **Cached browser-flow login** — yoink reads the session that the `infisical` CLI persists after `infisical login`. Run it once on your laptop:
+   ```sh
+   brew install infisical/get-cli/infisical
+   infisical login                        # add --domain=… for self-hosted
+   ```
+   yoink then reuses that session — the CLI binary itself is not invoked at deploy time, only its keychain entry is read.
 
 ## CLI
 

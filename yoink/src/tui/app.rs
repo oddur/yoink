@@ -566,7 +566,7 @@ pub struct App {
     job_rx: UnboundedReceiver<JobUpdate>,
     /// Cached secrets bundle for drift detection in the Dashboard
     /// pane. Populated lazily by a background task at startup so the
-    /// TUI doesn't block on `infisical export` (which can take 2–5 s).
+    /// TUI doesn't block on the Infisical fetch (which can take 1–3 s).
     /// `None` means "not loaded yet" — drift cells render as `?`
     /// until the loader finishes.
     secrets: Arc<tokio::sync::RwLock<Option<Arc<crate::secrets::SecretsBundle>>>>,
@@ -894,7 +894,7 @@ impl App {
         }
     }
 
-    /// Kick off `infisical export` in the background. The Dashboard
+    /// Kick off the Infisical secrets fetch in the background. The Dashboard
     /// drift column needs the bundle to compute `spec_hashes` that
     /// match what `yoink up` would produce. We don't block startup
     /// on it — the column shows `?` for the few seconds the loader
