@@ -243,8 +243,9 @@ pub struct ExecSession {
     pub id: String,
     pub kind: ExecKind,
     pub stdin: std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
-    pub output:
-        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, DockerError>> + Send>>,
+    pub output: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, DockerError>> + Send>,
+    >,
 }
 
 /// Whether an `ExecSession` is backed by a docker exec (resize via
@@ -398,12 +399,8 @@ pub trait DockerOps: Send + Sync {
     /// image cache (no pull needed). Used to skip redundant pulls
     /// after a prefetch pass. Errors degrade to `false` so a flaky
     /// docker daemon doesn't silently elide pulls.
-    async fn image_present(
-        &self,
-        host: &Host,
-        image: &str,
-        tag: &str,
-    ) -> Result<bool, DockerError>;
+    async fn image_present(&self, host: &Host, image: &str, tag: &str)
+    -> Result<bool, DockerError>;
 
     async fn list_containers_by_label(
         &self,
@@ -1154,9 +1151,11 @@ impl DockerOps for RealDockerOps {
 
         let host_for_err = host.clone();
         let mapped = output.map(move |item| match item {
-            Ok(bollard::container::LogOutput::Console { message }
-            | bollard::container::LogOutput::StdOut { message }
-            | bollard::container::LogOutput::StdErr { message }) => Ok(message),
+            Ok(
+                bollard::container::LogOutput::Console { message }
+                | bollard::container::LogOutput::StdOut { message }
+                | bollard::container::LogOutput::StdErr { message },
+            ) => Ok(message),
             Ok(bollard::container::LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
             Err(e) => Err(Self::err(&host_for_err, e)),
         });
@@ -1255,7 +1254,10 @@ impl DockerOps for RealDockerOps {
                 [
                     ("yoink.managed".to_string(), "true".to_string()),
                     ("yoink.debug-sidecar".to_string(), "true".to_string()),
-                    ("yoink.debug-target".to_string(), target_container.to_string()),
+                    (
+                        "yoink.debug-target".to_string(),
+                        target_container.to_string(),
+                    ),
                 ]
                 .into(),
             ),
@@ -1302,9 +1304,11 @@ impl DockerOps for RealDockerOps {
 
         let host_for_err = host.clone();
         let mapped = attached.output.map(move |item| match item {
-            Ok(bollard::container::LogOutput::Console { message }
-            | bollard::container::LogOutput::StdOut { message }
-            | bollard::container::LogOutput::StdErr { message }) => Ok(message),
+            Ok(
+                bollard::container::LogOutput::Console { message }
+                | bollard::container::LogOutput::StdOut { message }
+                | bollard::container::LogOutput::StdErr { message },
+            ) => Ok(message),
             Ok(bollard::container::LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
             Err(e) => Err(Self::err(&host_for_err, e)),
         });
@@ -1590,10 +1594,7 @@ fn parse_stats(stats: &bollard::models::ContainerStatsResponse) -> ContainerStat
 /// and skips the noise (graph driver state, deeply-nested config
 /// fields nobody looks at in a dashboard).
 #[allow(clippy::too_many_lines)]
-fn parse_inspect(
-    name: &str,
-    resp: &bollard::models::ContainerInspectResponse,
-) -> ContainerDetail {
+fn parse_inspect(name: &str, resp: &bollard::models::ContainerInspectResponse) -> ContainerDetail {
     let config = resp.config.as_ref();
     let state = resp.state.as_ref();
     let host_config = resp.host_config.as_ref();
@@ -1763,11 +1764,7 @@ fn probe_body(network: &str, cmd: Vec<String>) -> ContainerCreateBody {
     probe_body_with_image(HEALTHCHECK_CURL_IMAGE, network, cmd)
 }
 
-fn probe_body_with_image(
-    image: &str,
-    network: &str,
-    cmd: Vec<String>,
-) -> ContainerCreateBody {
+fn probe_body_with_image(image: &str, network: &str, cmd: Vec<String>) -> ContainerCreateBody {
     let mut endpoints = HashMap::new();
     endpoints.insert(network.to_string(), EndpointSettings::default());
     ContainerCreateBody {
@@ -2092,8 +2089,11 @@ impl DockerOps for FakeDockerOps {
         cmd: Vec<String>,
     ) -> Result<OneShotResult, DockerError> {
         let mut s = self.lock();
-        s.calls
-            .push(RecordedCall::ExecOneshot(host.clone(), container.into(), cmd));
+        s.calls.push(RecordedCall::ExecOneshot(
+            host.clone(),
+            container.into(),
+            cmd,
+        ));
         pop(&mut s.exec_oneshot, "exec_oneshot")
     }
     async fn exec_interactive(

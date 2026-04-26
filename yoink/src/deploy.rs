@@ -344,15 +344,11 @@ pub async fn reconcile(
                     // Pre-flight skip: every applicable host has the
                     // expected replicas at desired_hash → emit
                     // AlreadyAtSpec events + synthesize a report.
-                    let desired =
-                        build_desired_spec(config_ref, service, &tag, secrets_ref)?;
+                    let desired = build_desired_spec(config_ref, service, &tag, secrets_ref)?;
                     let desired_hash = docker::compute_spec_hash(&desired);
-                    if let Some(host_results) = service_already_at_spec(
-                        snapshot_ref,
-                        config_ref,
-                        service,
-                        &desired_hash,
-                    ) {
+                    if let Some(host_results) =
+                        service_already_at_spec(snapshot_ref, config_ref, service, &desired_hash)
+                    {
                         let mut g = sink_ref.lock().expect("sink poisoned");
                         for r in &host_results {
                             for index in 0..service.run.replicas {
@@ -422,8 +418,7 @@ fn service_already_at_spec(
         let containers = snapshot.get(&host_cfg.address)?;
         let mut primary: Option<String> = None;
         for index in 0..service.run.replicas {
-            let name =
-                container_name(&service.name, desired_hash, index, service.run.replicas);
+            let name = container_name(&service.name, desired_hash, index, service.run.replicas);
             let found = containers.iter().any(|c| {
                 c.name == name
                     && c.is_running()
@@ -911,12 +906,13 @@ pub async fn ensure_host_networks(
 ) -> Result<(), DeployError> {
     let host = Host::from(host_cfg);
     for net in networks {
-        let created = network::ensure(ops, &host, net)
-            .await
-            .map_err(|source| DeployError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
+        let created =
+            network::ensure(ops, &host, net)
+                .await
+                .map_err(|source| DeployError::Docker {
+                    host: host.address.clone(),
+                    source,
+                })?;
         on_event(DeployEvent::NetworkReady {
             host: host.address.clone(),
             network: net.clone(),
@@ -1394,9 +1390,9 @@ services:
                 yoink_service: Some("app-a".into()),
                 yoink_version: Some((*version).into()),
                 yoink_spec_hash: None,
-            yoink_deployed_by: None,
-            yoink_deployed_at: None,
-            networks: Vec::new(),
+                yoink_deployed_by: None,
+                yoink_deployed_at: None,
+                networks: Vec::new(),
                 other_labels: std::collections::BTreeMap::new(),
             })
             .collect()));

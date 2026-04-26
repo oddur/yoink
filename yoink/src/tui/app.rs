@@ -38,12 +38,12 @@ use crate::config::Config;
 use crate::docker_ops::{DockerEvent, DockerEventKind, DockerOps, Host, LogLine};
 use crate::status::StatusReport;
 
+use super::container_detail::{self, ContainerDetailRefresh, ContainerDetailState};
 use super::dashboard::{self, DashboardRefresh, DashboardState};
 use super::host_detail::{self, HostDetailRefresh, HostDetailState};
 use super::hosts::{self, HostRow, HostsState};
 use super::logs::{LogsState, RenderedLine};
 use super::services::{ServiceDetailState, ServicesState};
-use super::container_detail::{self, ContainerDetailRefresh, ContainerDetailState};
 use super::shell::{SessionResult, ShellState};
 
 /// Backstop polling cadence when no `docker events` push lands. The
@@ -81,9 +81,15 @@ pub enum View {
     Services,
     ServiceDetail(String),
     Logs,
-    ContainerLogs { host: Host, container: String },
+    ContainerLogs {
+        host: Host,
+        container: String,
+    },
     /// Container detail: labels, state, version, live CPU/mem.
-    ContainerDetail { host: Host, container: String },
+    ContainerDetail {
+        host: Host,
+        container: String,
+    },
     /// Embedded PTY shell for one container — k9s-style "drop into the
     /// container" without leaving the TUI.
     ContainerShell {
@@ -303,7 +309,10 @@ enum JobUpdate {
 /// Which long-running job is feeding the progress modal. Drives
 /// the modal title and the "X failed" wording in the done line.
 enum JobKind {
-    Reconcile { service: String, tag: String },
+    Reconcile {
+        service: String,
+        tag: String,
+    },
     ReconcileAll {
         statuses: std::collections::BTreeMap<String, ReconcileServiceStatus>,
     },
@@ -415,10 +424,7 @@ fn setup_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Terminal::new(backend).context("init terminal")
 }
 
-fn restore_terminal(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    mouse: bool,
-) -> Result<()> {
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) -> Result<()> {
     if mouse {
         let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
     }
@@ -754,11 +760,7 @@ impl App {
         });
         let config = (*self.config).clone();
         let ops = self.ops.clone();
-        let secrets = self
-            .secrets
-            .try_read()
-            .ok()
-            .and_then(|g| g.clone());
+        let secrets = self.secrets.try_read().ok().and_then(|g| g.clone());
         let tx = self.job_tx.clone();
         tokio::spawn(reconcile_one(config, ops, secrets, service, tag, tx));
     }
@@ -1195,19 +1197,17 @@ impl App {
                     self.kill_target = Some((host.clone(), container.clone()));
                 }
                 KeyCode::Char('U') => {
-                    let svc = self
-                        .container_detail
-                        .target()
-                        .and_then(|(_, name)| {
-                            self.dashboard
-                                .report_ref()
-                                .and_then(|r| {
-                                    r.hosts.iter().flat_map(|h| h.containers.iter()).find(|c| {
-                                        &c.name == name
-                                    })
-                                })
-                                .and_then(|c| c.yoink_service.clone())
-                        });
+                    let svc = self.container_detail.target().and_then(|(_, name)| {
+                        self.dashboard
+                            .report_ref()
+                            .and_then(|r| {
+                                r.hosts
+                                    .iter()
+                                    .flat_map(|h| h.containers.iter())
+                                    .find(|c| &c.name == name)
+                            })
+                            .and_then(|c| c.yoink_service.clone())
+                    });
                     if let Some(name) = svc {
                         self.open_reconcile_modal(&name);
                     }
@@ -1286,8 +1286,10 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.dashboard.select_next(),
                 KeyCode::Enter => {
                     if let Some(row) = self.dashboard.selected() {
-                        let host = config_host(&self.config, &row.host)
-                            .unwrap_or(Host { user: String::new(), address: row.host });
+                        let host = config_host(&self.config, &row.host).unwrap_or(Host {
+                            user: String::new(),
+                            address: row.host,
+                        });
                         self.transition(View::ContainerDetail {
                             host,
                             container: row.container,
@@ -1297,8 +1299,10 @@ impl App {
                 }
                 KeyCode::Char('K') => {
                     if let Some(row) = self.dashboard.selected() {
-                        let host = config_host(&self.config, &row.host)
-                            .unwrap_or(Host { user: String::new(), address: row.host });
+                        let host = config_host(&self.config, &row.host).unwrap_or(Host {
+                            user: String::new(),
+                            address: row.host,
+                        });
                         self.kill_target = Some((host, row.container));
                     }
                 }
@@ -1462,9 +1466,7 @@ impl App {
     }
 
     fn handle_pane_filter_input_key(&mut self, key: KeyEvent) -> bool {
-        if matches!(key.code, KeyCode::Char('c'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
             return true;
         }
         if let Some(f) = self.pane_filter() {
@@ -1527,7 +1529,8 @@ impl App {
                     .await;
             }
             View::ContainerDetail { host, container } => {
-                self.container_detail.set_target(host.clone(), container.clone());
+                self.container_detail
+                    .set_target(host.clone(), container.clone());
                 self.schedule_container_detail_refresh();
                 // Tail logs in the bottom panel using the same
                 // forwarder ContainerLogs uses — backfill +
@@ -1595,12 +1598,7 @@ impl App {
     /// the matching shell view (sidecar is `auto_remove` so it'll get
     /// reaped on its own); otherwise wire it into the shell panel or
     /// surface the error.
-    fn apply_shell_session(
-        &mut self,
-        origin_view: &View,
-        result: SessionResult,
-        banner: &str,
-    ) {
+    fn apply_shell_session(&mut self, origin_view: &View, result: SessionResult, banner: &str) {
         if &self.view != origin_view {
             return;
         }
@@ -1624,9 +1622,7 @@ impl App {
         } else {
             true
         };
-        if exit_shell
-            && let View::ContainerShell { host, .. } = self.view.clone()
-        {
+        if exit_shell && let View::ContainerShell { host, .. } = self.view.clone() {
             self.transition(View::HostDetail(host)).await;
         }
         false
@@ -1706,8 +1702,7 @@ impl App {
         let ops = self.ops.clone();
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
-            let data =
-                container_detail::fetch_owned(ops, host.clone(), container.clone()).await;
+            let data = container_detail::fetch_owned(ops, host.clone(), container.clone()).await;
             let _ = tx.send(Update::ContainerDetail {
                 host,
                 container,
@@ -1904,15 +1899,14 @@ impl App {
         let secrets = self.secrets.try_read().ok().and_then(|g| g.clone());
         match &self.view {
             View::Dashboard => {
-                self.dashboard.render(frame, pane_area, &self.config, secrets.as_deref());
+                self.dashboard
+                    .render(frame, pane_area, &self.config, secrets.as_deref());
             }
             View::Hosts => self.hosts.render(frame, pane_area, &self.config),
-            View::HostDetail(_) => self.host_detail.render(
-                frame,
-                pane_area,
-                &self.config,
-                secrets.as_deref(),
-            ),
+            View::HostDetail(_) => {
+                self.host_detail
+                    .render(frame, pane_area, &self.config, secrets.as_deref());
+            }
             View::ContainerDetail { .. } => {
                 // Split: top 2/3 = inspect data, bottom 1/3 = live log tail.
                 let split = ratatui::layout::Layout::default()
@@ -1926,12 +1920,10 @@ impl App {
                 self.logs.render(frame, split[1], &self.config);
             }
             View::Services => self.services.render(frame, pane_area, &self.config),
-            View::ServiceDetail(_) => self.service_detail.render(
-                frame,
-                pane_area,
-                &self.config,
-                secrets.as_deref(),
-            ),
+            View::ServiceDetail(_) => {
+                self.service_detail
+                    .render(frame, pane_area, &self.config, secrets.as_deref());
+            }
             View::Logs | View::ContainerLogs { .. } => {
                 self.logs.render(frame, pane_area, &self.config);
             }
@@ -2091,11 +2083,9 @@ fn update_service_status(
             ReconcileServiceStatus::Pulling
         }
         DeployEvent::PullFinished { .. } => ReconcileServiceStatus::Pulled,
-        DeployEvent::ContainerStarted { container, .. } => {
-            ReconcileServiceStatus::Healthchecking {
-                container: container.clone(),
-            }
-        }
+        DeployEvent::ContainerStarted { container, .. } => ReconcileServiceStatus::Healthchecking {
+            container: container.clone(),
+        },
         DeployEvent::HealthcheckHealthy { .. } | DeployEvent::HealthcheckSkipped { .. } => {
             ReconcileServiceStatus::Swapping
         }
@@ -2150,7 +2140,9 @@ async fn reconcile_one(
     // yoink.yaml — that entry survives because it was on disk.
     config.hosts.retain(|h| h.address != Host::LOCAL_ADDRESS);
     if config.hosts.is_empty() {
-        send_done(Err("no real hosts to deploy to (only the synthetic local host exists)".into()));
+        send_done(Err(
+            "no real hosts to deploy to (only the synthetic local host exists)".into(),
+        ));
         return;
     }
 
@@ -2222,7 +2214,9 @@ async fn reconcile_all(
 
     config.hosts.retain(|h| h.address != Host::LOCAL_ADDRESS);
     if config.hosts.is_empty() {
-        send_done(Err("no real hosts to deploy to (only the synthetic local host exists)".into()));
+        send_done(Err(
+            "no real hosts to deploy to (only the synthetic local host exists)".into(),
+        ));
         return;
     }
 
@@ -2253,11 +2247,12 @@ async fn reconcile_all(
     // into max-of-pulls. Inline pulls during the per-service
     // reconcile then become docker-cache no-ops.
     let tx_prefetch = tx.clone();
-    let prefetch_cb: std::sync::Arc<
-        dyn Fn(crate::deploy::DeployEvent) + Send + Sync,
-    > = std::sync::Arc::new(move |e| {
-        let _ = tx_prefetch.send(JobUpdate::Event(crate::output::format_deploy_event(None, &e)));
-    });
+    let prefetch_cb: std::sync::Arc<dyn Fn(crate::deploy::DeployEvent) + Send + Sync> =
+        std::sync::Arc::new(move |e| {
+            let _ = tx_prefetch.send(JobUpdate::Event(crate::output::format_deploy_event(
+                None, &e,
+            )));
+        });
     if let Err(e) = crate::deploy::prefetch_images(
         ops.clone(),
         &config,
@@ -2284,15 +2279,9 @@ async fn reconcile_all(
         }
         send_event(crate::output::format_deploy_event(svc, &e));
     };
-    let result = crate::deploy::reconcile(
-        &*ops,
-        &config,
-        &overrides,
-        None,
-        secrets_ref,
-        &mut on_event,
-    )
-    .await;
+    let result =
+        crate::deploy::reconcile(&*ops, &config, &overrides, None, secrets_ref, &mut on_event)
+            .await;
     for lock in locks {
         lock.release(&*ops).await;
     }
@@ -2310,11 +2299,7 @@ async fn reconcile_all(
 
 /// Background prune task. Mirrors `cmd_prune` but pipes each removed
 /// container into the progress modal as a streamed event line.
-async fn prune_all(
-    mut config: Config,
-    ops: Arc<dyn DockerOps>,
-    tx: UnboundedSender<JobUpdate>,
-) {
+async fn prune_all(mut config: Config, ops: Arc<dyn DockerOps>, tx: UnboundedSender<JobUpdate>) {
     use crate::prune::{self, PruneReason};
 
     let send_event = |line: String| {

@@ -16,8 +16,8 @@ use crate::secrets::SecretsBundle;
 use crate::status::StatusReport;
 
 use super::ui::{
-    bold, clamp_selection, filter_footer, health_style, pane_layout, render_drift_cell,
-    state_style, FilterState,
+    FilterState, bold, clamp_selection, filter_footer, health_style, pane_layout,
+    render_drift_cell, state_style,
 };
 
 #[derive(Default)]
@@ -381,7 +381,8 @@ impl ServiceDetailState {
                     Row::new(vec![
                         Cell::from(r.host.address.clone()),
                         Cell::from(r.container.name.clone()),
-                        Cell::from(r.container.state.clone()).style(state_style(&r.container.state)),
+                        Cell::from(r.container.state.clone())
+                            .style(state_style(&r.container.state)),
                         Cell::from(health.to_string()).style(health_style(health)),
                         Cell::from(
                             r.container

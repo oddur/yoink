@@ -18,8 +18,8 @@ use crate::secrets::SecretsBundle;
 use crate::status::StatusReport;
 
 use super::ui::{
-    bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge, pane_layout,
-    render_drift_cell, state_style, FilterState,
+    FilterState, bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge,
+    pane_layout, render_drift_cell, state_style,
 };
 
 pub struct DashboardRefresh {
@@ -137,16 +137,19 @@ impl DashboardState {
     #[must_use]
     pub fn running_tag_for_service(&self, service: &str) -> Option<String> {
         self.report.as_ref().and_then(|r| {
-            r.hosts.iter().flat_map(|h| h.containers.iter()).find_map(|c| {
-                if c.is_running()
-                    && c.yoink_service.as_deref() == Some(service)
-                    && c.yoink_version.is_some()
-                {
-                    c.yoink_version.clone()
-                } else {
-                    None
-                }
-            })
+            r.hosts
+                .iter()
+                .flat_map(|h| h.containers.iter())
+                .find_map(|c| {
+                    if c.is_running()
+                        && c.yoink_service.as_deref() == Some(service)
+                        && c.yoink_version.is_some()
+                    {
+                        c.yoink_version.clone()
+                    } else {
+                        None
+                    }
+                })
         })
     }
 }
@@ -377,7 +380,6 @@ fn render_mem_cell(stats: Option<&ContainerStats>) -> Cell<'static> {
         _ => Cell::from(format_bytes(s.mem_used)),
     }
 }
-
 
 /// Background-friendly fetch — owned inputs so the future is `'static + Send`.
 pub async fn fetch_owned(ops: Arc<dyn DockerOps>, config: Arc<Config>) -> DashboardRefresh {

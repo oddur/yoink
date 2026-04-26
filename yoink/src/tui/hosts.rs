@@ -17,7 +17,7 @@ use crate::docker_ops::{DockerOps, DockerVersion, Host, HostInfo};
 use crate::output::format_bytes;
 
 use super::ui::{
-    bold, clamp_selection, filter_footer, gauge_color, inline_gauge, pane_layout, FilterState,
+    FilterState, bold, clamp_selection, filter_footer, gauge_color, inline_gauge, pane_layout,
 };
 
 #[derive(Default)]
@@ -312,11 +312,7 @@ fn cell_mem(info: Option<&HostInfo>, usage: Option<&HostUsage>) -> Cell<'static>
     match (usage, total) {
         (Some(u), Some(t)) => {
             let ratio = ((u.mem_used as f32) / (t as f32)).clamp(0.0, 1.0);
-            let label = format!(
-                "{:>8} / {:<8} ",
-                format_bytes(u.mem_used),
-                format_bytes(t)
-            );
+            let label = format!("{:>8} / {:<8} ", format_bytes(u.mem_used), format_bytes(t));
             let mut spans = vec![Span::raw(label)];
             spans.extend(inline_gauge(ratio, 10, gauge_color(ratio)));
             Cell::from(Line::from(spans))
@@ -326,7 +322,6 @@ fn cell_mem(info: Option<&HostInfo>, usage: Option<&HostUsage>) -> Cell<'static>
         (None, None) => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
     }
 }
-
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

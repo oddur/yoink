@@ -1,10 +1,10 @@
 //! Style + layout helpers shared by all panes.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, TableState};
-use ratatui::Frame;
 
 use crate::config::Config;
 use crate::deploy;
@@ -56,8 +56,7 @@ pub fn render_drift_cell(
     };
     let desired_hash = docker::compute_spec_hash(&desired);
 
-    let has_secrets = !service_cfg.secrets.is_empty()
-        || !service_cfg.env_from_secrets.is_empty();
+    let has_secrets = !service_cfg.secrets.is_empty() || !service_cfg.env_from_secrets.is_empty();
     if has_secrets && secrets.is_none() {
         return unknown();
     }
@@ -109,9 +108,9 @@ pub fn short_image(image: &str) -> String {
         let head: String = rest.chars().take(12).collect();
         return format!("sha256:{head}");
     }
-    let (path, tag) = image.split_once('@').unwrap_or_else(|| {
-        image.rsplit_once(':').map_or((image, ""), |(p, t)| (p, t))
-    });
+    let (path, tag) = image
+        .split_once('@')
+        .unwrap_or_else(|| image.rsplit_once(':').map_or((image, ""), |(p, t)| (p, t)));
     let last = path.rsplit('/').next().unwrap_or(path);
     if tag.is_empty() {
         last.to_string()
@@ -129,7 +128,10 @@ pub fn short_image(image: &str) -> String {
 pub fn kv(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{key:>10}  "), Style::default().fg(Color::DarkGray)),
-        Span::styled(value.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            value.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 
@@ -234,8 +236,7 @@ fn render_breadcrumb_line(frame: &mut Frame<'_>, area: Rect, crumbs: &[String], 
                 width: right_width,
                 height: 1,
             };
-            let right_para =
-                Paragraph::new(Line::from(Span::styled(right.to_string(), dim)));
+            let right_para = Paragraph::new(Line::from(Span::styled(right.to_string(), dim)));
             frame.render_widget(right_para, right_area);
         }
     }
@@ -264,7 +265,7 @@ pub const TABLE_HIGHLIGHT_SYMBOL: &str = "▶ ";
 /// and crucially works over SSH if the local terminal honors
 /// OSC-52. Returns the byte count copied (caller toasts it).
 pub fn copy_to_clipboard(text: &str) -> std::io::Result<usize> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::io::Write;
     let encoded = STANDARD.encode(text.as_bytes());
     let payload = format!("\x1b]52;c;{encoded}\x07");
@@ -559,18 +560,11 @@ pub fn render_status_log_modal(
         .min(inner.height.saturating_sub(3));
     let split = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(table_height),
-            Constraint::Min(3),
-        ])
+        .constraints([Constraint::Length(table_height), Constraint::Min(3)])
         .split(inner);
 
     // Status table — name padded to align the labels.
-    let name_width = statuses
-        .iter()
-        .map(|(n, _, _)| n.len())
-        .max()
-        .unwrap_or(8);
+    let name_width = statuses.iter().map(|(n, _, _)| n.len()).max().unwrap_or(8);
     let status_lines: Vec<Line<'static>> = statuses
         .iter()
         .map(|(name, label, color)| {

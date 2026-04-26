@@ -119,9 +119,7 @@ enum Command {
     },
     /// Print the currently-running tag(s) for a service across hosts.
     /// One line per replica.
-    Version {
-        service: String,
-    },
+    Version { service: String },
     /// Drop into an interactive PTY shell inside a service's container
     /// (k9s-style, terminal-side). Picks `bash` when present, falls
     /// back to `sh`. Exit with `exit` or Ctrl-D.
@@ -361,11 +359,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Status { json } => cmd_status(&config, json).await,
         Command::Rollback { service, tag } => cmd_rollback(&config, service, tag).await,
         Command::Prune { dry_run } => cmd_prune(&config, dry_run).await,
-        Command::Exec {
-            service,
-            host,
-            cmd,
-        } => cmd_exec(&config, &service, host.as_deref(), cmd).await,
+        Command::Exec { service, host, cmd } => {
+            cmd_exec(&config, &service, host.as_deref(), cmd).await
+        }
         Command::Logs {
             service,
             host,
@@ -381,19 +377,13 @@ async fn run(cli: Cli) -> Result<()> {
             host,
             image,
         } => cmd_pty(&config, &service, host.as_deref(), PtyMode::Debug { image }).await,
-        Command::Restart { service, host } => {
-            cmd_restart(&config, &service, host.as_deref()).await
+        Command::Restart { service, host } => cmd_restart(&config, &service, host.as_deref()).await,
+        Command::Kill { service, host, yes } => {
+            cmd_kill(&config, &service, host.as_deref(), yes).await
         }
-        Command::Kill {
-            service,
-            host,
-            yes,
-        } => cmd_kill(&config, &service, host.as_deref(), yes).await,
-        Command::Pull {
-            service,
-            tag,
-            host,
-        } => cmd_pull(&config, &service, tag.as_deref(), host.as_deref()).await,
+        Command::Pull { service, tag, host } => {
+            cmd_pull(&config, &service, tag.as_deref(), host.as_deref()).await
+        }
         Command::History { service, limit } => cmd_history(&config, &service, limit).await,
         Command::Top { limit } => cmd_top(&config, limit).await,
         Command::Networks { host } => cmd_networks(&config, host.as_deref()).await,
@@ -494,11 +484,10 @@ async fn cmd_up(
     // a "deploy everything" run. Single-service deploys would gain
     // nothing (one image to pull) so skip the wrapper.
     if services_filter.is_none() {
-        let prefetch_cb: std::sync::Arc<
-            dyn Fn(deploy::DeployEvent) + Send + Sync,
-        > = std::sync::Arc::new(|e| {
-            eprintln!("{}", output::format_deploy_event(None, &e));
-        });
+        let prefetch_cb: std::sync::Arc<dyn Fn(deploy::DeployEvent) + Send + Sync> =
+            std::sync::Arc::new(|e| {
+                eprintln!("{}", output::format_deploy_event(None, &e));
+            });
         if let Err(e) = deploy::prefetch_images(
             ops.clone(),
             config,
@@ -887,8 +876,7 @@ async fn pty_session(
             let cmd = vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "if command -v bash >/dev/null 2>&1; then exec bash; else exec /bin/sh; fi"
-                    .into(),
+                "if command -v bash >/dev/null 2>&1; then exec bash; else exec /bin/sh; fi".into(),
             ];
             ops.exec_interactive(host, container, cmd, rows, cols)
                 .await
@@ -956,7 +944,7 @@ async fn pty_session(
     let resize_host = host.clone();
     let resize_id = session_id.clone();
     let resize_task = tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let Ok(mut sig) = signal(SignalKind::window_change()) else {
             return;
         };
@@ -965,7 +953,11 @@ async fn pty_session(
                 continue;
             };
             let res = match session_kind {
-                ExecKind::Exec => resize_ops.resize_exec(&resize_host, &resize_id, rows, cols).await,
+                ExecKind::Exec => {
+                    resize_ops
+                        .resize_exec(&resize_host, &resize_id, rows, cols)
+                        .await
+                }
                 ExecKind::Sidecar => {
                     resize_ops
                         .resize_container_tty(&resize_host, &resize_id, rows, cols)
@@ -1041,11 +1033,7 @@ fn print_dry_run_plan(
     Ok(())
 }
 
-async fn cmd_restart(
-    config: &Config,
-    service: &str,
-    host_filter: Option<&str>,
-) -> Result<()> {
+async fn cmd_restart(config: &Config, service: &str, host_filter: Option<&str>) -> Result<()> {
     let ops = RealDockerOps::new();
     let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
     let drain = std::time::Duration::from_secs(10);
@@ -1254,7 +1242,11 @@ async fn cmd_top(config: &Config, limit: usize) -> Result<()> {
             })
         })
         .collect();
-    rows.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.cpu_pct
+            .partial_cmp(&a.cpu_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     println!(
         "{:<22}  {:<14}  {:<28}  {:>6}  {:>20}  created",
@@ -1387,7 +1379,12 @@ fn redact_value(value: &str) -> String {
     let host_part = &after[at..];
     let userinfo = &after[..at];
     let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
-    format!("{}://{}:<redacted>{}", &value[..scheme_end], user, host_part)
+    format!(
+        "{}://{}:<redacted>{}",
+        &value[..scheme_end],
+        user,
+        host_part
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1446,14 +1443,12 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
             }),
             Err(_) => serde_json::Value::Null,
         };
-        host_obj["networks"] = serde_json::to_value(
-            ops.list_networks(&host).await.unwrap_or_default(),
-        )
-        .unwrap_or(serde_json::Value::Null);
-        host_obj["volumes"] = serde_json::to_value(
-            ops.list_volumes(&host).await.unwrap_or_default(),
-        )
-        .unwrap_or(serde_json::Value::Null);
+        host_obj["networks"] =
+            serde_json::to_value(ops.list_networks(&host).await.unwrap_or_default())
+                .unwrap_or(serde_json::Value::Null);
+        host_obj["volumes"] =
+            serde_json::to_value(ops.list_volumes(&host).await.unwrap_or_default())
+                .unwrap_or(serde_json::Value::Null);
 
         // Lock state — find the sentinel by name.
         let lock_state = ops
@@ -1505,12 +1500,9 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
             // container's own yoink_version.
             let drift = c.yoink_service.as_deref().and_then(|name| {
                 let svc = config.services.iter().find(|s| s.name == name)?;
-                let tag = svc
-                    .tag
-                    .clone()
-                    .or_else(|| c.yoink_version.clone())?;
-                let desired = deploy::build_desired_spec(config, svc, &tag, secrets.as_ref())
-                    .ok()?;
+                let tag = svc.tag.clone().or_else(|| c.yoink_version.clone())?;
+                let desired =
+                    deploy::build_desired_spec(config, svc, &tag, secrets.as_ref()).ok()?;
                 let desired_hash = docker::compute_spec_hash(&desired);
                 let running_hash = c.yoink_spec_hash.clone()?;
                 Some(json!({

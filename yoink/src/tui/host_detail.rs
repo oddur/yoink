@@ -18,8 +18,8 @@ use crate::output::format_bytes;
 use crate::secrets::SecretsBundle;
 
 use super::ui::{
-    bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge,
-    render_drift_cell, short_image, state_style, FilterState,
+    FilterState, bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge,
+    render_drift_cell, short_image, state_style,
 };
 
 pub struct HostDetailRefresh {
@@ -287,7 +287,12 @@ impl HostDetailState {
 
         let cpu_total: f32 = self.stats.values().map(|s| s.cpu_pct as f32).sum();
         let mem_total: u64 = self.stats.values().map(|s| s.mem_used.max(0) as u64).sum();
-        let n_cpu = self.host_info.as_ref().and_then(|i| i.n_cpu).unwrap_or(1).max(1);
+        let n_cpu = self
+            .host_info
+            .as_ref()
+            .and_then(|i| i.n_cpu)
+            .unwrap_or(1)
+            .max(1);
         let mem_total_host = self
             .host_info
             .as_ref()
@@ -312,7 +317,10 @@ impl HostDetailState {
             )
         } else {
             (
-                format!("MEM  {}", format_bytes(i64::try_from(mem_total).unwrap_or(i64::MAX))),
+                format!(
+                    "MEM  {}",
+                    format_bytes(i64::try_from(mem_total).unwrap_or(i64::MAX))
+                ),
                 0.0,
             )
         };
@@ -401,10 +409,8 @@ pub async fn fetch_owned(ops: Arc<dyn DockerOps>, host: Host) -> HostDetailRefre
 
 async fn fetch(ops: &dyn DockerOps, host: &Host) -> HostDetailRefresh {
     // Containers + host info concurrently.
-    let (containers_res, host_info_res) = tokio::join!(
-        ops.list_running_containers(host),
-        ops.host_info(host),
-    );
+    let (containers_res, host_info_res) =
+        tokio::join!(ops.list_running_containers(host), ops.host_info(host),);
     let containers = match containers_res {
         Ok(c) => c,
         Err(e) => {

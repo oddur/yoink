@@ -214,7 +214,9 @@ impl ServiceConfig {
     /// declared list when set, else every network in `deploy.networks`.
     #[must_use]
     pub fn effective_networks(&self, deploy: &DeployDefaults) -> Vec<String> {
-        self.networks.clone().unwrap_or_else(|| deploy.networks.clone())
+        self.networks
+            .clone()
+            .unwrap_or_else(|| deploy.networks.clone())
     }
 }
 
@@ -1221,11 +1223,7 @@ services:
     fn topo_sort_orders_dependents_after_dependencies() {
         // Declared order: api, redis, otel; api depends on the other two.
         // Sort should place redis + otel BEFORE api.
-        let cfg = cfg_with_services(&[
-            ("api", &["redis", "otel"]),
-            ("redis", &[]),
-            ("otel", &[]),
-        ]);
+        let cfg = cfg_with_services(&[("api", &["redis", "otel"]), ("redis", &[]), ("otel", &[])]);
         let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names[2], "api");
         assert!(names[..2].contains(&"redis"));
@@ -1236,11 +1234,7 @@ services:
     fn topo_sort_is_stable_for_independent_services() {
         // pgadmin and redis have no deps; pgadmin appears first in
         // config, so it must stay first.
-        let cfg = cfg_with_services(&[
-            ("pgadmin", &[]),
-            ("redis", &[]),
-            ("api", &["redis"]),
-        ]);
+        let cfg = cfg_with_services(&[("pgadmin", &[]), ("redis", &[]), ("api", &["redis"])]);
         let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["pgadmin", "redis", "api"]);
     }
@@ -1248,9 +1242,7 @@ services:
     #[test]
     fn topo_sort_rejects_cycles() {
         // a → b → a
-        let err = std::panic::catch_unwind(|| {
-            cfg_with_services(&[("a", &["b"]), ("b", &["a"])])
-        });
+        let err = std::panic::catch_unwind(|| cfg_with_services(&[("a", &["b"]), ("b", &["a"])]));
         assert!(err.is_err(), "expected parse failure for cycle");
     }
 

@@ -146,10 +146,7 @@ fn build_host_config(
     // Docker requires a single primary `network_mode`; we use the
     // first declared network and attach the rest via the
     // networking_config endpoints map.
-    let network = spec
-        .networks
-        .first()
-        .map_or("bridge", String::as_str);
+    let network = spec.networks.first().map_or("bridge", String::as_str);
     let memory = options.memory.as_deref().map(parse_memory).transpose()?;
 
     let restart_policy = match options.restart.as_deref().unwrap_or("unless-stopped") {

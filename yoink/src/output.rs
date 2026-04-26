@@ -158,10 +158,17 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
         DeployEvent::AlreadyAtSpec { host, container } => {
             format!("[{host}] {container} already at spec — no-op")
         }
-        DeployEvent::ContainerLogTail { host, container, lines } => {
+        DeployEvent::ContainerLogTail {
+            host,
+            container,
+            lines,
+        } => {
             // Multi-line: header + each log line indented so it
             // stands out from the surrounding deploy events.
-            let mut out = format!("[{host}] {container} log tail (last {} lines):", lines.len());
+            let mut out = format!(
+                "[{host}] {container} log tail (last {} lines):",
+                lines.len()
+            );
             for l in lines {
                 out.push_str("\n    ");
                 out.push_str(l.trim_end_matches('\n'));
@@ -216,9 +223,9 @@ mod tests {
                         yoink_service: Some("app-a".into()),
                         yoink_version: Some("a1b2c3d".into()),
                         yoink_spec_hash: None,
-            yoink_deployed_by: None,
-            yoink_deployed_at: None,
-            networks: Vec::new(),
+                        yoink_deployed_by: None,
+                        yoink_deployed_at: None,
+                        networks: Vec::new(),
                         other_labels: BTreeMap::new(),
                     }],
                 },
@@ -251,39 +258,51 @@ mod tests {
     #[test]
     fn deploy_event_format_started() {
         assert_eq!(
-            format_deploy_event(None, &DeployEvent::Started {
-                service: "app-a".into(),
-                tag: "a1b2c3d".into(),
-                host: "host-a".into(),
-            }),
+            format_deploy_event(
+                None,
+                &DeployEvent::Started {
+                    service: "app-a".into(),
+                    tag: "a1b2c3d".into(),
+                    host: "host-a".into(),
+                }
+            ),
             "[host-a] deploying app-a:a1b2c3d"
         );
     }
 
     #[test]
     fn deploy_event_format_network_created_vs_exists() {
-        let created = format_deploy_event(None, &DeployEvent::NetworkReady {
-            host: "h".into(),
-            network: "yoink".into(),
-            created: true,
-        });
+        let created = format_deploy_event(
+            None,
+            &DeployEvent::NetworkReady {
+                host: "h".into(),
+                network: "yoink".into(),
+                created: true,
+            },
+        );
         assert!(created.contains("(created)"));
-        let existed = format_deploy_event(None, &DeployEvent::NetworkReady {
-            host: "h".into(),
-            network: "yoink".into(),
-            created: false,
-        });
+        let existed = format_deploy_event(
+            None,
+            &DeployEvent::NetworkReady {
+                host: "h".into(),
+                network: "yoink".into(),
+                created: false,
+            },
+        );
         assert!(existed.contains("(exists)"));
     }
 
     #[test]
     fn deploy_event_format_healthcheck_healthy() {
         assert_eq!(
-            format_deploy_event(None, &DeployEvent::HealthcheckHealthy {
-                host: "h".into(),
-                container: "c".into(),
-                attempts: 3,
-            }),
+            format_deploy_event(
+                None,
+                &DeployEvent::HealthcheckHealthy {
+                    host: "h".into(),
+                    container: "c".into(),
+                    attempts: 3,
+                }
+            ),
             "[h] c healthy (3 attempt(s))"
         );
     }

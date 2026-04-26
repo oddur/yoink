@@ -460,12 +460,18 @@ mod tests {
 
     #[test]
     fn encode_plain_char() {
-        assert_eq!(encode_key(ke(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap(), b"a");
+        assert_eq!(
+            encode_key(ke(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap(),
+            b"a"
+        );
     }
 
     #[test]
     fn encode_enter_is_cr() {
-        assert_eq!(encode_key(ke(KeyCode::Enter, KeyModifiers::NONE)).unwrap(), b"\r");
+        assert_eq!(
+            encode_key(ke(KeyCode::Enter, KeyModifiers::NONE)).unwrap(),
+            b"\r"
+        );
     }
 
     #[test]

@@ -24,7 +24,13 @@ use super::ui::{bold, gauge_color, health_style, inline_gauge, kv, kv_styled, st
 /// rendered as `<redacted>` so an over-the-shoulder operator can't
 /// accidentally leak prod creds. Keys themselves stay visible.
 const REDACT_HINTS: &[&str] = &[
-    "TOKEN", "SECRET", "PASSWORD", "PASS", "API_KEY", "PRIVATE_KEY", "DSN",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASS",
+    "API_KEY",
+    "PRIVATE_KEY",
+    "DSN",
 ];
 
 #[derive(Default)]
@@ -171,10 +177,17 @@ impl ContainerDetailState {
 
             let (label, ratio) = match s.mem_limit {
                 Some(limit) if limit > 0 => (
-                    format!("MEM {:>8} / {:<8} ", format_bytes(s.mem_used), format_bytes(limit)),
+                    format!(
+                        "MEM {:>8} / {:<8} ",
+                        format_bytes(s.mem_used),
+                        format_bytes(limit)
+                    ),
                     ((s.mem_used as f32) / (limit as f32)).clamp(0.0, 1.0),
                 ),
-                _ => (format!("MEM {:>8}            ", format_bytes(s.mem_used)), 0.0),
+                _ => (
+                    format!("MEM {:>8}            ", format_bytes(s.mem_used)),
+                    0.0,
+                ),
             };
             let mut mem_spans = vec![Span::raw(label)];
             mem_spans.extend(inline_gauge(ratio, 16, gauge_color(ratio)));
@@ -229,7 +242,9 @@ impl ContainerDetailState {
                 let value_span = if redacted {
                     Span::styled(
                         "<redacted>".to_string(),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
                     )
                 } else {
                     Span::raw(v.to_string())
@@ -261,7 +276,9 @@ impl ContainerDetailState {
     }
 
     fn render_list(frame: &mut Frame<'_>, area: Rect, title: &str, items: &[String]) {
-        let block = Block::default().borders(Borders::ALL).title(title.to_string());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_string());
         if items.is_empty() {
             let body = Paragraph::new("(none)")
                 .style(Style::default().fg(Color::DarkGray))
