@@ -32,6 +32,8 @@ use tokio::task::JoinHandle;
 
 use crate::docker_ops::{DockerError, DockerOps, Host};
 
+const LOCK_IMAGE_REPO: &str = "alpine";
+const LOCK_IMAGE_TAG: &str = "3.20";
 const LOCK_IMAGE: &str = "alpine:3.20";
 pub const LOCK_NAME: &str = "yoink-deploy-lock";
 const HEARTBEAT_FILE: &str = "/tmp/heartbeat";
@@ -91,6 +93,16 @@ impl HostLock {
         // Either nothing exists or a stopped orphan from a crashed
         // deploy whose heartbeat task died. Sweep + start fresh.
         let _ = ops.force_remove_container(&host, LOCK_NAME).await;
+
+        // Pull is idempotent — no-op when the image is already
+        // cached. Daemons without alpine pre-pulled (laptops, fresh
+        // hosts) would otherwise 404 on create_container below.
+        ops.pull_image(&host, LOCK_IMAGE_REPO, LOCK_IMAGE_TAG, None)
+            .await
+            .map_err(|source| LockError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
 
         let body = ContainerCreateBody {
             image: Some(LOCK_IMAGE.to_string()),

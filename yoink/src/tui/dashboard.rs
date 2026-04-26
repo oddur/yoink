@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::config::Config;
 use crate::deploy;
@@ -20,8 +20,8 @@ use crate::secrets::SecretsBundle;
 use crate::status::StatusReport;
 
 use super::ui::{
-    bold, filter_footer, gauge_color, health_style, inline_gauge, pane_layout, state_style,
-    FilterState,
+    bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge, pane_layout,
+    state_style, FilterState,
 };
 
 pub struct DashboardRefresh {
@@ -44,6 +44,20 @@ pub struct DashboardState {
     /// into the logs of the just-replaced container after a deploy.
     show_exited: bool,
     pub filter: FilterState,
+    /// Cursor over the rendered (host, container, service) tuples,
+    /// in the same order `build_rows` produces them. Persists across
+    /// refreshes — survives a list reorder by clamping to len.
+    table: TableState,
+}
+
+/// One selectable Dashboard row — what `selected_*` accessors return
+/// to the App for routing K / U / Enter actions to the right
+/// container.
+#[derive(Debug, Clone)]
+pub struct DashboardRow {
+    pub host: String,
+    pub container: String,
+    pub service: Option<String>,
 }
 
 impl DashboardState {
@@ -54,6 +68,67 @@ impl DashboardState {
     #[must_use]
     pub fn report_ref(&self) -> Option<&StatusReport> {
         self.report.as_ref()
+    }
+
+    /// Selectable rows in the same order `build_rows` would render
+    /// them: filtered, exited-included-or-not, sorted by host then
+    /// container. Empty-host placeholder rows are excluded since
+    /// there's nothing useful to act on there.
+    fn selectable(&self) -> Vec<DashboardRow> {
+        let Some(report) = &self.report else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for host in &report.hosts {
+            for c in &host.containers {
+                if !self.show_exited && !c.is_running() {
+                    continue;
+                }
+                let searchable = format!(
+                    "{} {} {} {} {}",
+                    host.host,
+                    c.yoink_service.as_deref().unwrap_or(""),
+                    c.name,
+                    c.state,
+                    c.yoink_version.as_deref().unwrap_or(""),
+                );
+                if !self.filter.matches(&searchable) {
+                    continue;
+                }
+                out.push(DashboardRow {
+                    host: host.host.clone(),
+                    container: c.name.clone(),
+                    service: c.yoink_service.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    pub fn select_next(&mut self) {
+        let n = self.selectable().len();
+        if n == 0 {
+            return;
+        }
+        let i = self.table.selected().unwrap_or(0);
+        self.table.select(Some((i + 1).min(n - 1)));
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.selectable().is_empty() {
+            return;
+        }
+        let i = self.table.selected().unwrap_or(0);
+        self.table.select(Some(i.saturating_sub(1)));
+    }
+
+    /// Currently-highlighted row, if any. App routes Enter / U / K
+    /// through this.
+    #[must_use]
+    pub fn selected(&self) -> Option<DashboardRow> {
+        self.table
+            .selected()
+            .and_then(|i| self.selectable().into_iter().nth(i))
     }
 
     /// First non-empty `yoink_version` found for any running
@@ -100,7 +175,7 @@ impl DashboardState {
     }
 
     pub fn render(
-        &self,
+        &mut self,
         frame: &mut Frame<'_>,
         area: ratatui::layout::Rect,
         config: &Config,
@@ -131,6 +206,8 @@ impl DashboardState {
             Constraint::Length(34), // mem (value / limit + bracketed gauge)
             Constraint::Min(20),    // created
         ];
+        let selectable_count = self.selectable().len();
+        clamp_selection(&mut self.table, selectable_count);
         let table = Table::new(rows, widths)
             .header(Row::new(vec![
                 Cell::from("host").style(bold()),
@@ -144,8 +221,10 @@ impl DashboardState {
                 Cell::from("mem").style(bold()),
                 Cell::from("created").style(bold()),
             ]))
+            .row_highlight_style(super::ui::table_highlight_style())
+            .highlight_symbol(super::ui::TABLE_HIGHLIGHT_SYMBOL)
             .block(Block::default().borders(Borders::ALL).title("status"));
-        frame.render_widget(table, layout[1]);
+        frame.render_stateful_widget(table, layout[1], &mut self.table);
 
         let exited_indicator = if self.show_exited {
             "[exited: on]"
@@ -163,7 +242,7 @@ impl DashboardState {
         frame.render_widget(footer, layout[2]);
     }
 
-    fn build_rows(&self, config: &Config, secrets: Option<&SecretsBundle>) -> Vec<Row<'_>> {
+    fn build_rows(&self, config: &Config, secrets: Option<&SecretsBundle>) -> Vec<Row<'static>> {
         let Some(report) = &self.report else {
             return vec![Row::new(vec![Cell::from("(loading…)")])];
         };

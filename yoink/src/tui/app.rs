@@ -127,6 +127,10 @@ impl View {
         let view_specific: Vec<&'static str> = match self {
             View::Dashboard => vec![
                 "dashboard",
+                "  ↑↓ / j k     select row",
+                "  enter        container detail",
+                "  K            SIGKILL container (with confirmation)",
+                "  U            reconcile this service (with confirmation)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh",
                 "  e            toggle exited containers",
@@ -1005,6 +1009,33 @@ impl App {
                 _ => {}
             },
             View::Dashboard => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.dashboard.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.dashboard.select_next(),
+                KeyCode::Enter => {
+                    if let Some(row) = self.dashboard.selected() {
+                        let host = config_host(&self.config, &row.host)
+                            .unwrap_or(Host { user: String::new(), address: row.host });
+                        self.transition(View::ContainerDetail {
+                            host,
+                            container: row.container,
+                        })
+                        .await;
+                    }
+                }
+                KeyCode::Char('K') => {
+                    if let Some(row) = self.dashboard.selected() {
+                        let host = config_host(&self.config, &row.host)
+                            .unwrap_or(Host { user: String::new(), address: row.host });
+                        self.kill_target = Some((host, row.container));
+                    }
+                }
+                KeyCode::Char('U') => {
+                    if let Some(row) = self.dashboard.selected()
+                        && let Some(svc) = row.service
+                    {
+                        self.open_reconcile_modal(&svc);
+                    }
+                }
                 KeyCode::Char('r') => self.schedule_dashboard_refresh(),
                 KeyCode::Char('e') => self.dashboard.toggle_show_exited(),
                 _ => {}
@@ -1675,6 +1706,17 @@ impl Drop for App {
         self.stop_log_streams();
         self.stop_event_subscriptions();
     }
+}
+
+/// Look up `(user, address)` from the loaded config by address —
+/// used so Dashboard's host names resolve to a full `Host` for
+/// transitions that need the ssh user (`HostDetail`, kill modal).
+fn config_host(config: &Config, address: &str) -> Option<Host> {
+    config
+        .hosts
+        .iter()
+        .find(|h| h.address == address)
+        .map(Host::from)
 }
 
 /// Background reconcile task. Acquires the per-host advisory lock,
