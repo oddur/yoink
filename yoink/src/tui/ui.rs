@@ -117,7 +117,7 @@ pub fn render_header(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(Color::Gray))
         .title(Line::from(Span::styled(
             " yoink ",
             Style::default()
@@ -132,15 +132,17 @@ pub fn render_header(
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(inner);
 
+    // Inactive tabs at Color::White stay readable on dark and light
+    // terminals; the active tab pops via reverse-video cyan.
     let tab_titles: Vec<Line<'_>> = tabs.iter().map(|t| Line::from(*t)).collect();
     let tabs_widget = Tabs::new(tab_titles)
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::White))
         .highlight_style(
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         )
-        .divider(Span::styled(" │ ", Style::default().fg(Color::DarkGray)))
+        .divider(Span::styled(" │ ", Style::default().fg(Color::Gray)))
         .select(selected_tab.unwrap_or(usize::MAX));
     frame.render_widget(tabs_widget, inner_chunks[0]);
 
@@ -148,7 +150,9 @@ pub fn render_header(
 }
 
 fn render_breadcrumb_line(frame: &mut Frame<'_>, area: Rect, crumbs: &[String], right: &str) {
-    let dim = Style::default().fg(Color::DarkGray);
+    // Color::Gray (bright on dark terminals, dark on light) reads
+    // cleanly in both directions where DarkGray fades into the bg.
+    let dim = Style::default().fg(Color::Gray);
     let leaf = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);

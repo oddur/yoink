@@ -269,7 +269,8 @@ enum LockAction {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    init_logging(cli.verbose);
+    let is_tui = matches!(cli.command, Command::Tui { .. });
+    init_logging(cli.verbose, is_tui);
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -280,7 +281,7 @@ async fn main() -> ExitCode {
     }
 }
 
-fn init_logging(verbose: u8) {
+fn init_logging(verbose: u8, is_tui: bool) {
     let default_level = match verbose {
         0 => Level::WARN,
         1 => Level::INFO,
@@ -289,10 +290,50 @@ fn init_logging(verbose: u8) {
     };
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_level.to_string()));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(io::stderr)
-        .try_init();
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if is_tui {
+        // The TUI takes over the alt-screen; tracing on stderr would
+        // scribble straight onto the rendered widgets. Send logs to
+        // a file under XDG state dir so the operator can `tail -f`
+        // them in another terminal during a TUI session.
+        let path = log_file_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+        match writer {
+            Some(file) => {
+                let _ = builder.with_writer(std::sync::Mutex::new(file)).try_init();
+            }
+            None => {
+                // Fall back to a no-op writer — anything's better
+                // than letting tracing scribble over the TUI.
+                let _ = builder.with_writer(io::sink).try_init();
+            }
+        }
+        eprintln!("yoink tui: logs → {}", path.display());
+    } else {
+        let _ = builder.with_writer(io::stderr).try_init();
+    }
+}
+
+/// Per-OS state directory for the TUI log file. Falls back to
+/// `/tmp/yoink-tui.log` if neither `XDG_STATE_HOME` nor `HOME` are
+/// set.
+fn log_file_path() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(xdg).join("yoink").join("tui.log");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local/state/yoink")
+            .join("tui.log");
+    }
+    PathBuf::from("/tmp/yoink-tui.log")
 }
 
 async fn run(cli: Cli) -> Result<()> {
