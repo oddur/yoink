@@ -4,6 +4,7 @@
 mod app;
 mod container_detail;
 mod dashboard;
+mod history;
 mod host_detail;
 mod hosts;
 mod logs;
