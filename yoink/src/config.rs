@@ -1265,9 +1265,7 @@ services:
         assert_eq!(svc.image, "registry.example.com/bt-api");
         assert_eq!(
             svc.tag.as_deref(),
-            Some(
-                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-            )
+            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
     }
 
