@@ -53,10 +53,19 @@ enum Command {
         /// Allow operating with a dirty git working tree.
         #[arg(long)]
         allow_dirty: bool,
-        /// Print the planned actions (per-host: image to pull, what
-        /// would be swapped/created/removed) without executing.
+        /// Print the planned actions (per-host: which services would
+        /// be created, updated, or left untouched, plus orphans) and
+        /// exit. Connects to each host to inspect current state, but
+        /// never mutates anything.
         #[arg(long)]
         dry_run: bool,
+        /// Output format for `--dry-run`. `text` is the default
+        /// human-readable form; `markdown` is suitable for posting as
+        /// a sticky PR comment from CI; `json` is for machine
+        /// consumers (e.g. assert with `jq` that no service would be
+        /// updated). Ignored when `--dry-run` isn't set.
+        #[arg(long, value_enum, default_value_t = DryRunFormat::Text)]
+        format: DryRunFormat,
     },
     /// Show what's running where (across all services).
     Status {
@@ -355,7 +364,8 @@ async fn run(cli: Cli) -> Result<()> {
             tag,
             allow_dirty,
             dry_run,
-        } => cmd_up(&config, &services, &tag, allow_dirty, dry_run).await,
+            format,
+        } => cmd_up(&config, &services, &tag, allow_dirty, dry_run, format).await,
         Command::Status { json } => cmd_status(&config, json).await,
         Command::Rollback { service, tag } => cmd_rollback(&config, service, tag).await,
         Command::Prune { dry_run } => cmd_prune(&config, dry_run).await,
@@ -432,6 +442,7 @@ async fn cmd_up(
     tag_args: &[String],
     allow_dirty: bool,
     dry_run: bool,
+    format: DryRunFormat,
 ) -> Result<()> {
     use yoink::docker_ops::Host;
     use yoink::lock::HostLock;
@@ -449,7 +460,15 @@ async fn cmd_up(
     };
 
     if dry_run {
-        return print_dry_run_plan(config, &tag_overrides, services_filter);
+        return run_dry_run(
+            ops.as_ref(),
+            config,
+            &tag_overrides,
+            services_filter,
+            bundle.as_ref(),
+            format,
+        )
+        .await;
     }
 
     // Per-host advisory locks. Sentinel container holds the lock; a
@@ -650,7 +669,15 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
     let services_arg = std::slice::from_ref(&service);
     let tag_arg = format!("{service}={resolved_tag}");
     let tag_args = std::slice::from_ref(&tag_arg);
-    cmd_up(config, services_arg, tag_args, true, false).await
+    cmd_up(
+        config,
+        services_arg,
+        tag_args,
+        true,
+        false,
+        DryRunFormat::Text,
+    )
+    .await
 }
 
 async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
@@ -997,43 +1024,39 @@ async fn cmd_tui(config: &Config, config_path: PathBuf, mode: Mode, mouse: bool)
         .context("run TUI")
 }
 
-fn print_dry_run_plan(
+/// Output format for `yoink up --dry-run`. Mirrors `diff::Format` but
+/// is `clap::ValueEnum`-derivable so the CLI surface stays at the
+/// binary boundary.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum DryRunFormat {
+    #[default]
+    Text,
+    Markdown,
+    Json,
+}
+
+impl From<DryRunFormat> for yoink::diff::Format {
+    fn from(f: DryRunFormat) -> Self {
+        match f {
+            DryRunFormat::Text => Self::Text,
+            DryRunFormat::Markdown => Self::Markdown,
+            DryRunFormat::Json => Self::Json,
+        }
+    }
+}
+
+async fn run_dry_run(
+    ops: &dyn DockerOps,
     config: &Config,
     tag_overrides: &std::collections::BTreeMap<String, String>,
     services_filter: Option<&[String]>,
+    secrets: Option<&yoink::secrets::SecretsBundle>,
+    format: DryRunFormat,
 ) -> Result<()> {
-    println!("yoink up — dry run (no changes will be made)\n");
-    println!("hosts:");
-    for h in &config.hosts {
-        println!("  - {}@{}", h.user, h.address);
-    }
-    println!("\nservices that would be reconciled:");
-    let mut any = false;
-    for svc in &config.services {
-        if let Some(filter) = services_filter
-            && !filter.iter().any(|s| s == &svc.name)
-        {
-            continue;
-        }
-        any = true;
-        let tag = tag_overrides
-            .get(&svc.name)
-            .cloned()
-            .or_else(|| svc.tag.clone())
-            .unwrap_or_else(|| "<git>".into());
-        println!(
-            "  - {}: {}",
-            svc.name,
-            yoink::docker::image_reference(&svc.image, &tag)
-        );
-    }
-    if !any {
-        anyhow::bail!("no services match the --service filter");
-    }
-    println!(
-        "\nrun without --dry-run to actually pull, swap, and run hooks. \
-         Existing containers whose spec matches will be left running."
-    );
+    let report = yoink::diff::compute(ops, config, tag_overrides, services_filter, secrets)
+        .await
+        .context("compute dry-run diff")?;
+    print!("{}", report.render(format.into()));
     Ok(())
 }
 

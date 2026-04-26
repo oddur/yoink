@@ -1,5 +1,6 @@
 pub mod config;
 pub mod deploy;
+pub mod diff;
 pub mod docker;
 pub mod docker_ops;
 pub mod files;
