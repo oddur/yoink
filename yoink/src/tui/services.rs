@@ -166,8 +166,14 @@ fn build_service_row<'a>(
             .collect()
     });
     let running = containers.iter().filter(|c| c.is_running()).count();
-    let total_hosts = report.map_or(0, |r| r.hosts.len());
-    let running_str = format!("{running}/{total_hosts}");
+    // Expected = replicas × hosts the service is configured to run on.
+    // Using `report.hosts.len()` as the denominator double-counts the
+    // synthetic `local` host the TUI injects for read-only browsing
+    // (a single-replica service on one real host would read "1/2").
+    let expected = cfg_service.map_or(running, |s| {
+        s.applicable_hosts(&config.hosts).len() * s.run.replicas as usize
+    });
+    let running_str = format!("{running}/{expected}");
     let health = summarize_health(&containers);
     let hosts: Vec<&str> = containers
         .iter()
