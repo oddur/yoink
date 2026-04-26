@@ -218,7 +218,7 @@ impl View {
     }
 
     /// Path of crumbs for the global breadcrumb header — e.g.
-    /// `["yoink", "Hosts", "backtrack-eu-1", "bt-api-xyz", "shell"]`.
+    /// `["yoink", "Hosts", "my-server", "api-xyz", "shell"]`.
     /// Rendered with `›` separators by the App so the operator always
     /// knows where they are without reading the pane title.
     #[must_use]

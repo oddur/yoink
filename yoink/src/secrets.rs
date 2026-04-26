@@ -254,7 +254,7 @@ mod tests {
 
 DATABASE_URL=fake-test-fixture-not-a-real-url
 QUOTED=\"with spaces\"
-SINGLE='o@backtrack.studio'
+SINGLE='user@example.com'
 EMPTY=
 ";
         let map = parse_dotenv(input).unwrap();
@@ -265,7 +265,7 @@ EMPTY=
         assert_eq!(map.get("QUOTED").map(String::as_str), Some("with spaces"));
         assert_eq!(
             map.get("SINGLE").map(String::as_str),
-            Some("o@backtrack.studio")
+            Some("user@example.com")
         );
         assert_eq!(map.get("EMPTY").map(String::as_str), Some(""));
         assert_eq!(map.len(), 4);

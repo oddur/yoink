@@ -1,42 +1,162 @@
 # yoink
 
-A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of hosts and want a deploy story that fits in their head.
+A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts. Sits between Kamal and Kubernetes — opinionated about the same things Kamal is, borrowing the few Kubernetes ideas that actually pay off at this scale.
 
 ```
 yoink up                  # reconcile every service in dep order
-yoink tui                 # interactive dashboard, drift, logs, shell-into
+yoink tui                 # k9s-style dashboard, drift, logs, shell-into
 yoink prune               # clean up stale containers
 yoink history api         # who deployed what, when
 yoink rollback api        # roll back to the previous version
 ```
 
-## What it is
+## Why it exists
 
-`yoink` drives Docker on remote hosts via the SSH transport (`ssh://user@host`). One config file describes your services, dependencies, networks, secrets, and healthchecks; `yoink up` reconciles the cluster to that spec via dep-ordered, healthcheck-gated rolling deploys. There is a `ratatui`-based TUI for the day-to-day operator experience: drift detection across hosts, live logs, shell into containers, one-key reconcile + prune.
+Kamal is a lovely fit for "one app, one binary per host" but starts to creak the moment you want a second app on the same box, replicas of the same service, or any kind of network isolation between containers. Kubernetes solves all that — and a hundred other problems you don't have, in exchange for a control plane to operate, a YAML schema with a learning curve, and a vocabulary you have to teach every new operator.
 
-It is not Kubernetes. It is not Nomad. It is not trying to be Kamal. It is the smallest tool that solves "deploy N services across N hosts without breaking traffic, with an operator UX that doesn't suck".
+`yoink` is the thinnest tool that gives you the Kubernetes ideas that actually matter at small scale, while keeping Kamal's "one binary, ssh into the host, drive Docker directly" simplicity:
 
-## Design choices
+- **Multiple services per host.** Declare them, deploy them, prune the ones that fall out of config.
+- **Replicas.** Want two `api` containers behind a reverse proxy? Set `replicas: 2`. Healthcheck-gated rolling swap.
+- **Per-service network tiers.** Each service joins a named network; only services on the same network can dial each other. Basic blast-radius isolation without a CNI plugin.
+- **Dependency-ordered deploys.** Services declare `depends_on:` and `yoink up` runs them in topological-sort waves (independent services in parallel). No more "I redeployed `api` before `redis` was on the new network".
+- **Drift detection.** Every effective spec (image, env, networks, mounts, options, file content) hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
+- **k9s-style TUI.** A `ratatui` dashboard with one-key reconcile, prune, kill, shell-into, debug-sidecar, log filter. Keyboard-only. Survives offline and slow links because it's just talking docker over ssh.
 
-- **No agent on the hosts.** yoink is a single Rust binary that talks to remote Docker via the bollard `ssh://` transport. Nothing runs on the hosts you don't already run.
-- **Config is the source of truth.** State of the world is queried from Docker (containers labeled `yoink.service=<name>` and `yoink.spec_hash=<hex>`); no local state files.
-- **Spec hashing for drift detection.** Every service's effective spec (image, env, networks, mounts, options, file content hashes) hashes deterministically. Drift is a label compare, not guessing.
-- **Dependency-ordered deploys.** Services declare `depends_on:` and `yoink up` runs them in a topological-sort wave (independent services in parallel). No more "I redeployed api before redis was up".
-- **Healthcheck-gated swap.** New container starts; HTTP or TCP probe must pass before the old one is stopped. Configurable timeout, drain.
-- **Image digest support.** `image: repo@sha256:abc…` deploys by digest, eliminating tag drift. Build-once-promote-many works.
-- **Per-service network tiers.** Declare what each service can dial; `yoink` attaches it to those networks at deploy time.
-- **Pre-deploy hooks.** Migrations run as one-shot containers (same image, different entrypoint) right before the new runtime container starts.
-- **Secrets from Infisical.** Optional. `yoink` invokes the Infisical CLI to fetch the bundle at deploy time and injects into env. Supports rename via `env_from_secrets:`.
+What it deliberately doesn't do:
 
-## Talking to Docker on remote hosts
+- No control plane, no agent on the hosts. yoink is a single Rust binary on your laptop or in CI.
+- No service discovery, no scheduling — Docker's network alias DNS is plenty for a few services on a host.
+- No multi-cluster, no HA, no auto-scaling. One operator, one config, one deploy at a time.
+- No reverse proxy, secret store, load balancer, or stateful-accessory orchestration. Use the right tool for each.
 
-`yoink` never installs an agent, daemon, or any code on the target hosts. It opens an SSH tunnel and speaks the Docker Engine API over the remote daemon's Unix socket. The SSH user must be able to read `/var/run/docker.sock` — in practice, root or a member of the `docker` group.
+## How it pairs with Tailscale + caddy-docker-proxy
+
+`yoink` doesn't try to solve "how do I reach my hosts" or "how do I route HTTPS to the right container". It expects you to bring two off-the-shelf tools that solve those completely:
+
+### Tailscale for SSH (the connectivity layer)
+
+yoink's transport is `ssh://user@host` via [bollard's SSH transport](https://docs.rs/bollard/), which opens an SSH tunnel and speaks the Docker Engine API over the remote daemon's Unix socket. Pairing this with **Tailscale SSH**:
+
+- **Hostnames work everywhere.** MagicDNS gives every host a stable name (`my-server`) reachable from your laptop, CI runner, anywhere on the tailnet. No `ssh_config` to maintain, no jump hosts, no bastion.
+- **Auth without keys.** Tailscale SSH issues short-lived certs based on tailnet membership and ACLs. Onboard a new operator: invite to the tailnet, grant ACL access to the `tag:server` group. Done. Off-board: revoke from tailnet. Their key is gone everywhere, immediately.
+- **CI authentication is the same flow.** A GH Actions runner with `tailscale/github-action` joins the tailnet under `tag:ci`; ACL grants `tag:ci → tag:server` SSH; yoink connects without ever touching `~/.ssh/`.
+- **No port forwarding.** The Docker daemon never listens on a TCP port. The SSH transport handles auth + transport in one hop. Surface area: `:22` accessible only from the tailnet.
+
+The deploy user on each host is in the `docker` group (functionally root, scope your tailnet ACLs accordingly).
+
+### caddy-docker-proxy for the public surface
+
+yoink owns the container lifecycle. **It does not own routing.** Public traffic landing on your hosts wants:
+
+- TLS termination (with auto-renewing certs)
+- Hostname → container routing
+- Per-route headers, redirects, rate limits
+
+[caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy) is a Caddy plugin that watches the Docker socket for container labels and reconfigures itself live. The pairing:
+
+```yaml
+services:
+  - name: api
+    image: ghcr.io/you/api
+    labels:
+      caddy: api.example.com
+      caddy.reverse_proxy: "{{upstreams 8080}}"
+    run:
+      port: 8080
+      replicas: 2
+      networks: [public, api]
+```
+
+`yoink up` deploys the api container with those labels; the caddy container (also yoink-managed, but separately) reads them via the docker socket and routes `https://api.example.com` to the api containers, automatically picking up new replicas and dropping retired ones. Cert issuance is Caddy's job (Let's Encrypt or Cloudflare origin); yoink doesn't know it's happening.
+
+Replicas plug into this naturally: `caddy.reverse_proxy: "{{upstreams 8080}}"` resolves all containers with the same network alias and round-robins between them. yoink's healthcheck-gated rolling swap means the caddy upstream pool is always traffic-ready.
+
+The split:
+
+| concern | tool |
+|---|---|
+| **container lifecycle** (pull, start, healthcheck, drain, replace) | yoink |
+| **dep-ordered deploys** (redis before api before caddy) | yoink |
+| **per-tier network isolation** | yoink |
+| **HTTPS / hostname routing / cert renewal** | caddy-docker-proxy |
+| **operator → host connectivity** | Tailscale |
+| **CI → host connectivity** | Tailscale |
+| **stateful services** (postgres, etc.) | docker compose on the host |
+| **secrets** | Infisical (yoink calls the CLI) |
+
+## Running the same stack twice on the same hosts (staging alongside prod)
+
+Common scenario: you want a `staging` environment that mirrors `prod` for pre-merge verification, ideally on the same hardware to avoid paying for a second machine. yoink doesn't have a built-in `environment` concept — instead you use **two config files** that don't collide.
+
+The two things that have to differ between envs:
+
+1. **Service names** — Docker container names are unique per host. `api` and `api-staging` can both run; `api` and `api` cannot.
+2. **Network names** — `api` (prod tier) and `api-staging` (staging tier) keep traffic separated even though both stacks live on the same docker daemon.
+
+Everything else (volumes, hostnames, secrets, ports) follows from those two namespaces.
+
+### Layout
 
 ```
-yoink preflight    # verifies Docker is reachable on each host
+yoink.prod.yaml             # prod entry; includes services/prod/*.yaml
+yoink.staging.yaml          # staging entry; includes services/staging/*.yaml
+services/prod/api.yaml
+services/prod/web.yaml
+services/staging/api.yaml   # name: api-staging, networks: [api-staging, redis-staging, ...]
+services/staging/web.yaml   # name: web-staging
 ```
 
-> **Important.** Membership in the `docker` group is functionally equivalent to passwordless root on the host. The deploy user's SSH key should be treated as a root credential and scoped accordingly (Tailscale ACLs, `authorized_keys` `from=`, etc.).
+Each config is operated independently:
+
+```bash
+yoink up --config yoink.prod.yaml          # prod deploy
+yoink up --config yoink.staging.yaml       # staging deploy
+yoink dump --config yoink.staging.yaml     # staging snapshot
+yoink tui --config yoink.staging.yaml      # TUI scoped to staging containers
+```
+
+The TUI's drift detection, `prune`, and reconcile are all scoped to whatever `--config` references — `yoink prune --config staging.yaml` won't touch prod containers because their `yoink.service` labels don't match anything declared in the staging config.
+
+### Public surface (caddy-docker-proxy)
+
+The reverse proxy is the one shared piece of infra: caddy serves both envs from the same `:443` listener. Routing is by hostname:
+
+- `api.example.com` → containers labeled with that hostname (the prod api)
+- `staging-api.example.com` → containers labeled with the staging hostname (the staging api)
+
+Use the host network alias to keep it clean:
+
+```yaml
+# services/staging/api.yaml
+- name: api-staging
+  image: ghcr.io/you/api
+  labels:
+    caddy: staging-api.example.com
+    caddy.reverse_proxy: "{{upstreams 8080}}"
+  run:
+    network_aliases: [api-staging]    # different alias from prod's `api`
+```
+
+caddy-docker-proxy picks both up and routes by `Host:` header. No collision.
+
+### Stateful accessories (redis, postgres, etc.)
+
+Two options, pick per service:
+
+- **Separate instances per env**: `redis` and `redis-staging` containers, both yoink-managed, on their own networks. Cheap; full isolation.
+- **Shared instance, namespaced data**: one `redis`, but staging uses key prefix `staging:` (app-side responsibility). Half the memory; no data isolation.
+
+For SQL — typically a managed Postgres with separate databases (`myapp` and `myapp_staging`) under the same cluster. Yoink doesn't deploy the database; the connection strings live in env vars / secrets per env.
+
+### Tag overrides
+
+Staging usually wants to deploy whatever's on `main`, while prod tracks `live`. Either:
+
+- Keep `tag:` empty in the service yaml; supply via `--tag api-staging=$MAIN_SHA` from CI when deploying staging
+- Or commit a digest pointer in `yoink.staging.yaml` (build-once-promote-many) — same image, different deploy targets
+
+The image identity is the same across envs; only the runtime configuration differs.
 
 ## Install
 
@@ -58,22 +178,19 @@ Download from the [latest release](https://github.com/oddur/yoink/releases/lates
 
 ## Configuration
 
-One YAML file per project, by convention `yoink.yaml`. Service fragments can be split into per-service files via an `include:` glob. See [`examples/yoink.yaml`](examples/yoink.yaml) and the per-service examples (`backtrack-eu-1-*.yaml`).
-
-Schema highlights:
+One YAML file per project, by convention `yoink.yaml`. Service fragments can be split per-service via an `include:` glob. See [`examples/`](examples/) for the full shape.
 
 ```yaml
 deploy:
-  networks: [api, web, redis, otel]      # named tiers — services join the ones they need
+  networks: [public, api, redis, otel]   # named tiers — services join the ones they need
 
 hosts:
-  - { address: my-server, user: deploy }
+  - { address: my-server, user: deploy } # reachable via tailnet hostname
 
 secrets:
-  provider: infisical
+  provider: infisical                    # optional; yoink shells out to the CLI at deploy time
   project_id: <your-infisical-project>
   environment: prod
-  domain: https://infisical.example.com  # self-hosted; omit for SaaS
 
 include:
   - services/*.yaml
@@ -84,12 +201,12 @@ services:
     image: ghcr.io/you/api
     # tag: <required at deploy time via --tag api=<sha>, or set here>
     depends_on: [redis]
-    networks: [api, redis]
+    networks: [api, redis]               # can dial only services on these networks
     secrets: [DATABASE_URL]
     pre_deploy:
       - name: api-migrate
         image: ghcr.io/you/api
-        tag: { service: api }            # mirror the runtime image tag
+        tag: { service: api }            # mirror the runtime tag
         cmd: ["migrate"]
         secrets: [DATABASE_MIGRATE_URL]
     run:
@@ -103,7 +220,7 @@ services:
         cap_drop: [ALL]
         read_only: true
         tmpfs: { /tmp: "size=64m,mode=1777" }
-        network_aliases: [api]
+        network_aliases: [api]           # caddy-docker-proxy upstream key
 ```
 
 ## CLI
@@ -132,7 +249,7 @@ yoink validate                           parse config + check for errors without
 yoink tui [--mode dashboard|hosts|…]     interactive ratatui dashboard
 ```
 
-All commands take `--config <path>` (default: `./yoink.yaml`). `-v` / `--verbose` for structured logs to stderr (`info`, `debug`, `trace`).
+All commands take `--config <path>` (default: `./yoink.yaml`). `-v` for structured logs to stderr.
 
 ## TUI
 
@@ -140,7 +257,7 @@ All commands take `--config <path>` (default: `./yoink.yaml`). `-v` / `--verbose
 yoink tui
 ```
 
-A keyboard-driven dashboard for the day-to-day. Multiple panes: dashboard (drift across all services), hosts (per-host detail with live CPU/mem), services (per-service detail with replica info), container logs (live tail with `/` filter), per-container detail (env, mounts, healthcheck, networks).
+Heavily inspired by [k9s](https://k9scli.io/). Keyboard-driven panes for dashboard (drift across all services), hosts (per-host detail with live CPU/mem), services (per-service detail with replica info), container logs (live tail with `/` filter), per-container detail (env, mounts, healthcheck, networks).
 
 Operator gestures from the dashboard:
 
@@ -159,16 +276,14 @@ Operator gestures from the dashboard:
 ## Build & test
 
 ```bash
-cargo build --release           # binary lands at target/release/yoink
-cargo test --workspace          # unit + integration tests
+cargo build --release                # binary lands at target/release/yoink
+cargo test --workspace               # unit + integration tests
 cargo clippy --all-targets -- -D warnings
 ```
 
-A `Taskfile.yml` is included for convenience (`task --list` to see).
-
 ## Status
 
-In production use. Driven by a small operator team. Not (yet) widely adopted, no semver-stability promise pre-1.0 — but the core surface (`up`, `status`, `rollback`, the YAML schema) is unlikely to break.
+In production use on a small fleet. Pre-1.0 and not (yet) widely adopted, so no semver-stability promise — but the core surface (`up`, `status`, `rollback`, the YAML schema) is unlikely to break.
 
 ## License
 

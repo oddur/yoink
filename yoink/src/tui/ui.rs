@@ -97,8 +97,7 @@ pub fn state_style(state: &str) -> Style {
 /// Compact a docker image reference for table-cell display: drop
 /// the registry prefix (everything up to the last `/`) and truncate
 /// `sha256:…` digests so the cell stays readable.
-/// `4db05qgnlk.registry.depot.dev/backtrack-api:e0a6c4ef` becomes
-/// `backtrack-api:e0a6c4ef`.
+/// `ghcr.io/you/api:abcd1234` becomes `api:abcd1234`.
 #[must_use]
 pub fn short_image(image: &str) -> String {
     if image.is_empty() {
