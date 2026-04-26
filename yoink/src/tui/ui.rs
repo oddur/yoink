@@ -386,6 +386,57 @@ pub fn render_vertical_scrollbar(
     frame.render_stateful_widget(bar, area, &mut state);
 }
 
+/// Big centered modal that displays a streaming log, auto-scrolled
+/// so the newest line is always visible. `success` / `failure` tint
+/// the border (green / red) once the producing task is done — both
+/// false means "still running".
+pub fn render_log_modal(
+    frame: &mut Frame<'_>,
+    title: &str,
+    lines: &[String],
+    success: bool,
+    failure: bool,
+) {
+    let area = frame.area();
+    // 90% of the available area, capped at 120×40 so the modal feels
+    // like a focused panel rather than the whole screen.
+    let modal_width = (area.width.saturating_sub(4)).clamp(40, 120);
+    let modal_height = (area.height.saturating_sub(4)).clamp(10, 40);
+    let x = (area.width.saturating_sub(modal_width)) / 2;
+    let y = (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect {
+        x,
+        y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    let border_color = if success {
+        Color::Green
+    } else if failure {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(title.to_string());
+
+    // Auto-scroll: keep the newest line glued to the bottom.
+    let inner_height = modal_area.height.saturating_sub(2) as usize;
+    let total = lines.len();
+    let skip = total.saturating_sub(inner_height);
+    let visible: Vec<Line<'static>> = lines
+        .iter()
+        .skip(skip)
+        .map(|l| Line::from(l.clone()))
+        .collect();
+
+    frame.render_widget(Clear, modal_area);
+    frame.render_widget(Paragraph::new(visible).block(block), modal_area);
+}
+
 /// Render a centered modal overlay with `lines` of text, sized to fit
 /// the longest line. Used for the `?` help overlay; could host other
 /// modal dialogs later. Caller is responsible for matching key

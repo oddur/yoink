@@ -282,13 +282,27 @@ enum Update {
     },
 }
 
-/// Reconcile-task → run-loop messages. The deploy code emits a
-/// `DeployEvent` per step; we render those as toasts. `Done`
-/// signals the task is over and the modal can close.
+/// Reconcile-task → run-loop messages. Events stream into the
+/// progress modal as they fire; `Done` flips the modal into a
+/// dismissible "finished" state with the final ✓/✗ summary.
 enum ReconcileUpdate {
     Event(String),
     Done(Result<String, String>),
 }
+
+/// Live state for the reconcile progress modal. `lines` is the
+/// streamed event log (capped so a hung deploy doesn't grow
+/// unbounded). `finished` is `None` while the deploy task is
+/// still running; once it's `Some`, the operator can press Esc
+/// to dismiss the modal.
+struct ReconcileProgress {
+    service: String,
+    tag: String,
+    lines: std::collections::VecDeque<String>,
+    finished: Option<Result<String, String>>,
+}
+
+const RECONCILE_LINE_CAP: usize = 200;
 
 pub async fn run(
     config: &Config,
@@ -471,9 +485,10 @@ pub struct App {
     /// `Some((service, tag))` while a reconcile-confirmation modal
     /// is open. `y` / Enter confirms; anything else cancels.
     reconcile_target: Option<(String, String)>,
-    /// `Some(service)` while a reconcile is in flight — used to
-    /// block concurrent triggers and display a header indicator.
-    reconcile_running: Option<String>,
+    /// `Some` while a reconcile is in flight or its progress modal
+    /// is still on screen. Owns the streaming event log; cleared
+    /// when the operator presses Esc after completion.
+    reconcile_progress: Option<ReconcileProgress>,
     /// Channel for the spawned reconcile task to push progress and
     /// completion back to the run loop.
     reconcile_tx: UnboundedSender<ReconcileUpdate>,
@@ -552,7 +567,7 @@ impl App {
             show_help: false,
             kill_target: None,
             reconcile_target: None,
-            reconcile_running: None,
+            reconcile_progress: None,
             reconcile_tx,
             reconcile_rx,
             secrets: Arc::new(tokio::sync::RwLock::new(None)),
@@ -611,7 +626,7 @@ impl App {
     /// tag if present, else the running container's tag — so the
     /// confirm prompt shows what would actually deploy.
     fn open_reconcile_modal(&mut self, service: &str) {
-        if self.reconcile_running.is_some() {
+        if self.reconcile_progress.is_some() {
             return;
         }
         let Some(svc) = self.config.services.iter().find(|s| s.name == service) else {
@@ -632,7 +647,12 @@ impl App {
         let Some((service, tag)) = self.reconcile_target.take() else {
             return;
         };
-        self.reconcile_running = Some(service.clone());
+        self.reconcile_progress = Some(ReconcileProgress {
+            service: service.clone(),
+            tag: tag.clone(),
+            lines: std::collections::VecDeque::new(),
+            finished: None,
+        });
         let config = (*self.config).clone();
         let ops = self.ops.clone();
         let secrets = self
@@ -645,25 +665,23 @@ impl App {
     }
 
     fn apply_reconcile_update(&mut self, update: ReconcileUpdate) {
+        let Some(progress) = self.reconcile_progress.as_mut() else {
+            return;
+        };
         match update {
             ReconcileUpdate::Event(line) => {
-                self.toasts.push_back((std::time::Instant::now() + TOAST_TTL, line));
-                while self.toasts.len() > TOAST_CAP {
-                    self.toasts.pop_front();
+                progress.lines.push_back(line);
+                while progress.lines.len() > RECONCILE_LINE_CAP {
+                    progress.lines.pop_front();
                 }
             }
             ReconcileUpdate::Done(result) => {
-                self.reconcile_running = None;
-                let line = match result {
+                let line = match &result {
                     Ok(s) => format!("✓ {s}"),
                     Err(e) => format!("✗ {e}"),
                 };
-                // Longer TTL for the final result so it doesn't
-                // scroll past the operator before they look up.
-                self.toasts.push_back((
-                    std::time::Instant::now() + TOAST_TTL.saturating_mul(2),
-                    line,
-                ));
+                progress.lines.push_back(line);
+                progress.finished = Some(result);
                 // Refresh the dashboard now that things have moved.
                 self.schedule_dashboard_refresh();
             }
@@ -791,6 +809,18 @@ impl App {
                 self.confirm_reconcile();
             } else {
                 self.reconcile_target = None;
+            }
+            return false;
+        }
+
+        // Reconcile-progress modal: while running, eat all keys
+        // (Ctrl-C/Q already handled above) so a stray j/k can't
+        // navigate the underlying view. Once finished, Esc dismisses;
+        // any other key is also eaten so the operator doesn't
+        // accidentally fire something else off.
+        if let Some(progress) = self.reconcile_progress.as_ref() {
+            if progress.finished.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.reconcile_progress = None;
             }
             return false;
         }
@@ -1226,6 +1256,9 @@ impl App {
         self.show_help = false;
         self.kill_target = None;
         self.reconcile_target = None;
+        // Don't clear reconcile_progress on transition — operator
+        // may want to navigate around with the deploy still in flight.
+        // It clears itself on Esc-after-finished.
         // Always tear down any in-flight shell when leaving its view —
         // the spawned exec will drop its bridge task on Drop, and a
         // sidecar shell needs an explicit force-remove of its
@@ -1595,6 +1628,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let (header_area, pane_area) = super::ui::split_with_header(frame.area());
         let crumbs = self.view.breadcrumb();
@@ -1680,7 +1714,10 @@ impl App {
         if let Some((service, tag)) = &self.reconcile_target {
             let svc_line = format!("service:  {service}");
             let tag_line = format!("tag:      {tag}");
-            let host_count = format!("hosts:    {}", self.config.hosts.len());
+            let host_count = format!(
+                "hosts:    {} (synthetic local skipped)",
+                self.config.hosts.len(),
+            );
             let lines = vec![
                 "About to run `yoink up` for one service.",
                 "",
@@ -1697,6 +1734,22 @@ impl App {
                 "[any]         cancel",
             ];
             super::ui::render_modal(frame, "reconcile service?", &lines);
+        }
+        if let Some(progress) = self.reconcile_progress.as_ref() {
+            let lines: Vec<String> = progress.lines.iter().cloned().collect();
+            let title = format!(
+                " reconcile · {}:{}{} ",
+                progress.service,
+                progress.tag,
+                match &progress.finished {
+                    None => " (running…)".to_string(),
+                    Some(Ok(_)) => " (done — esc to close)".to_string(),
+                    Some(Err(_)) => " (failed — esc to close)".to_string(),
+                },
+            );
+            let success = matches!(progress.finished, Some(Ok(_)));
+            let failure = matches!(progress.finished, Some(Err(_)));
+            super::ui::render_log_modal(frame, &title, &lines, success, failure);
         }
     }
 }
