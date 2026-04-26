@@ -166,20 +166,28 @@ fn build_service_row<'a>(
             .collect()
     });
     let running = containers.iter().filter(|c| c.is_running()).count();
-    // Expected = replicas × hosts the service is configured to run on.
-    // Using `report.hosts.len()` as the denominator double-counts the
-    // synthetic `local` host the TUI injects for read-only browsing
-    // (a single-replica service on one real host would read "1/2").
+    // Expected = replicas × real hosts the service is configured to
+    // run on. The synthetic `local` host the TUI injects for
+    // read-only browsing must be excluded — including it inflates
+    // every service's denominator (e.g. 1-replica on 1 host → 1/2).
     let expected = cfg_service.map_or(running, |s| {
-        s.applicable_hosts(&config.hosts).len() * s.run.replicas as usize
+        s.applicable_hosts(&config.hosts)
+            .iter()
+            .filter(|h| h.address != crate::docker_ops::Host::LOCAL_ADDRESS)
+            .count()
+            * s.run.replicas as usize
     });
     let running_str = format!("{running}/{expected}");
     let health = summarize_health(&containers);
-    let hosts: Vec<&str> = containers
+    // Dedup hosts: with replicas > 1 every replica reports the same
+    // host, so the column would otherwise read "host-a, host-a".
+    let mut hosts: Vec<&str> = containers
         .iter()
         .filter(|c| c.is_running())
         .map(|c| c.host.as_str())
         .collect();
+    hosts.sort_unstable();
+    hosts.dedup();
     let hosts_str = if hosts.is_empty() {
         "-".into()
     } else {
