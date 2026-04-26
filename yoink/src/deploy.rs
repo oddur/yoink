@@ -107,6 +107,14 @@ pub enum DeployEvent {
         host: String,
         container: String,
     },
+    /// Last N log lines from a failed container — fired right
+    /// before a healthcheck-failed deploy errors out so the caller
+    /// can surface "why did it die?" without separate fetch.
+    ContainerLogTail {
+        host: String,
+        container: String,
+        lines: Vec<String>,
+    },
     Done {
         host: String,
         container: String,
@@ -794,6 +802,17 @@ async fn wait_until_healthy(
             let _ = ops
                 .stop_container(host, new_name, Duration::from_secs(5))
                 .await;
+            // Pull the tail of its logs so the operator gets the
+            // "why did it die?" answer in the same pane the
+            // reconcile is running in. Best-effort: a fetch error
+            // here just means no log preview, not deploy retry.
+            if let Ok(lines) = ops.fetch_recent_logs(host, new_name, 30).await {
+                on_event(DeployEvent::ContainerLogTail {
+                    host: host.address.clone(),
+                    container: new_name.to_string(),
+                    lines,
+                });
+            }
             Err(DeployError::Healthcheck {
                 host: host.address.clone(),
                 container: new_name.to_string(),

@@ -670,9 +670,13 @@ impl App {
         };
         match update {
             ReconcileUpdate::Event(line) => {
-                progress.lines.push_back(line);
-                while progress.lines.len() > RECONCILE_LINE_CAP {
-                    progress.lines.pop_front();
+                // Some events (container log tail) are multi-line —
+                // split so each render row is one line.
+                for one in line.split('\n') {
+                    progress.lines.push_back(one.to_string());
+                    while progress.lines.len() > RECONCILE_LINE_CAP {
+                        progress.lines.pop_front();
+                    }
                 }
             }
             ReconcileUpdate::Done(result) => {

@@ -145,6 +145,16 @@ pub fn format_deploy_event(event: &DeployEvent) -> String {
         DeployEvent::AlreadyAtSpec { host, container } => {
             format!("[{host}] {container} already at spec — no-op")
         }
+        DeployEvent::ContainerLogTail { host, container, lines } => {
+            // Multi-line: header + each log line indented so it
+            // stands out from the surrounding deploy events.
+            let mut out = format!("[{host}] {container} log tail (last {} lines):", lines.len());
+            for l in lines {
+                out.push_str("\n    ");
+                out.push_str(l.trim_end_matches('\n'));
+            }
+            out
+        }
         DeployEvent::Done { host, container } => format!("[{host}] done — {container}"),
     }
 }
