@@ -80,6 +80,11 @@ pub enum View {
     HostDetail(Host),
     Services,
     ServiceDetail(String),
+    /// Per-service deploy history (every yoink-managed container with
+    /// `yoink.service=<name>` across every host, sorted newest-first).
+    /// `r` on a row triggers the reconcile-confirm modal pinned to
+    /// that row's tag — same flow as `yoink rollback --tag <value>`.
+    ServiceHistory(String),
     Logs,
     ContainerLogs {
         host: Host,
@@ -114,7 +119,7 @@ impl View {
             | View::ContainerLogs { .. }
             | View::ContainerShell { .. }
             | View::ContainerDetail { .. } => 1,
-            View::Services | View::ServiceDetail(_) => 2,
+            View::Services | View::ServiceDetail(_) | View::ServiceHistory(_) => 2,
             View::Logs => 3,
         }
     }
@@ -185,10 +190,18 @@ impl View {
                 "  enter        live logs",
                 "  i            container detail",
                 "  !            shell · D debug sidecar",
+                "  H            deploy history (with rollback)",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh · esc back",
+            ],
+            View::ServiceHistory(_) => vec![
+                "service history",
+                "  ↑↓ / j k     select past deploy",
+                "  r            rollback to selected (with confirmation)",
+                "  R            refresh",
+                "  esc          back to service detail",
             ],
             View::Logs => vec![
                 "logs (multiplexed)",
@@ -230,6 +243,9 @@ impl View {
             View::HostDetail(h) => vec![root, "Hosts".into(), h.address.clone()],
             View::Services => vec![root, "Services".into()],
             View::ServiceDetail(name) => vec![root, "Services".into(), name.clone()],
+            View::ServiceHistory(name) => {
+                vec![root, "Services".into(), name.clone(), "history".into()]
+            }
             View::Logs => vec![root, "Logs".into()],
             View::ContainerLogs { host, container } => vec![
                 root,
@@ -285,6 +301,12 @@ enum Update {
         data: Box<ContainerDetailRefresh>,
     },
     Dashboard(DashboardRefresh),
+    /// Result of `schedule_history_refresh` — per-service container
+    /// list across every host, drives the History pane's table.
+    ServiceHistory {
+        service: String,
+        rows: Vec<super::history::HistoryRow>,
+    },
     /// Push notification from a host's `docker events` stream. Triggers
     /// an immediate refresh of whichever pane is currently visible.
     Event {
@@ -535,6 +557,7 @@ pub struct App {
     pub host_detail: HostDetailState,
     pub services: ServicesState,
     pub service_detail: ServiceDetailState,
+    pub history: super::history::HistoryState,
     pub container_detail: ContainerDetailState,
     pub logs: LogsState,
     /// `Some` while a `ContainerShell` view is active; cleared on exit.
@@ -632,6 +655,7 @@ impl App {
             host_detail: HostDetailState::new(),
             services: ServicesState::new(),
             service_detail: ServiceDetailState::new(),
+            history: super::history::HistoryState::new(),
             container_detail: ContainerDetailState::new(),
             logs: LogsState::new(),
             shell: None,
@@ -1381,10 +1405,33 @@ impl App {
                         self.open_reconcile_modal(&name);
                     }
                 }
+                KeyCode::Char('H') => {
+                    if let Some(name) = self.service_detail.current_service().map(str::to_string) {
+                        self.transition(View::ServiceHistory(name)).await;
+                    }
+                }
                 KeyCode::Esc => self.transition(View::Services).await,
                 KeyCode::Char('r') => self.schedule_dashboard_refresh(),
                 _ => {}
             },
+            View::ServiceHistory(name) => {
+                let svc = name.clone();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => self.history.select_prev(),
+                    KeyCode::Down | KeyCode::Char('j') => self.history.select_next(),
+                    KeyCode::Char('r') => {
+                        // Rollback the selected row by hijacking the
+                        // existing reconcile-confirm flow with an
+                        // explicit (service, tag) target.
+                        if let Some((service, tag)) = self.history.selected_rollback_target() {
+                            self.reconcile_target = Some((service, tag));
+                        }
+                    }
+                    KeyCode::Esc => self.transition(View::ServiceDetail(svc)).await,
+                    KeyCode::Char('R') => self.schedule_history_refresh(svc),
+                    _ => {}
+                }
+            }
             View::ContainerShell { .. } => {} // handled above
             View::Logs => match key.code {
                 KeyCode::Char('r') => {
@@ -1589,8 +1636,37 @@ impl App {
                 self.service_detail.set_service(name.clone());
                 self.schedule_dashboard_refresh();
             }
+            View::ServiceHistory(name) => {
+                self.history.set_service(name.clone());
+                self.schedule_history_refresh(name.clone());
+            }
         }
         self.view = new_view;
+    }
+
+    /// Fan out across hosts and collect every container labeled
+    /// `yoink.service=<name>` (running + exited). Posts an
+    /// `Update::ServiceHistory` back to the run loop. Mirrors the CLI
+    /// `cmd_history` query.
+    fn schedule_history_refresh(&mut self, service: String) {
+        let ops = self.ops.clone();
+        let hosts: Vec<Host> = self.config.hosts.iter().map(Host::from).collect();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let label = format!("yoink.service={service}");
+            let mut rows: Vec<super::history::HistoryRow> = Vec::new();
+            for host in hosts {
+                if let Ok(containers) = ops.list_containers_by_label(&host, &label).await {
+                    for c in containers {
+                        rows.push(super::history::HistoryRow::from_container(
+                            &host.address,
+                            &c,
+                        ));
+                    }
+                }
+            }
+            let _ = tx.send(Update::ServiceHistory { service, rows });
+        });
     }
 
     /// The background `start_debug_sidecar` / `exec_interactive` task
@@ -1767,6 +1843,9 @@ impl App {
                 self.dashboard.apply(data);
                 self.dashboard_in_flight = false;
             }
+            Update::ServiceHistory { service, rows } => {
+                self.history.apply(&service, rows);
+            }
             Update::Event { host, event } => self.on_docker_event(&host, &event),
         }
     }
@@ -1923,6 +2002,9 @@ impl App {
             View::ServiceDetail(_) => {
                 self.service_detail
                     .render(frame, pane_area, &self.config, secrets.as_deref());
+            }
+            View::ServiceHistory(_) => {
+                self.history.render(frame, pane_area);
             }
             View::Logs | View::ContainerLogs { .. } => {
                 self.logs.render(frame, pane_area, &self.config);
