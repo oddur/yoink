@@ -211,7 +211,7 @@ pub async fn reconcile(
     tag_overrides: &BTreeMap<String, String>,
     services_filter: Option<&[String]>,
     secrets: Option<&SecretsBundle>,
-    on_event: &mut dyn FnMut(DeployEvent),
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<Vec<ServiceDeployReport>, DeployError> {
     // Run pre-deploy hooks first; one failure halts the whole reconcile.
     for hook in &config.hooks.pre_deploy {
@@ -251,7 +251,7 @@ pub async fn deploy_service(
     service: &ServiceConfig,
     tag: &str,
     secrets: Option<&SecretsBundle>,
-    on_event: &mut dyn FnMut(DeployEvent),
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<ServiceDeployReport, DeployError> {
     let hosts = service.applicable_hosts(&config.hosts);
 
@@ -336,7 +336,7 @@ async fn prepare_one_host(
     tag: &str,
     secrets: Option<&SecretsBundle>,
     host_cfg: &crate::config::HostConfig,
-    on_event: &mut dyn FnMut(DeployEvent),
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<HostPrep, DeployError> {
     let host = Host::from(host_cfg);
     on_event(DeployEvent::Started {
@@ -442,7 +442,7 @@ async fn finalize_one_host(
     config: &Config,
     service: &ServiceConfig,
     prep: HostPrep,
-    on_event: &mut dyn FnMut(DeployEvent),
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<HostDeployResult, DeployError> {
     let HostPrep {
         host,
@@ -659,7 +659,7 @@ async fn pull_image(
     image: &str,
     tag: &str,
     credentials: Option<bollard::auth::DockerCredentials>,
-    on_event: &mut dyn FnMut(DeployEvent),
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<(), DeployError> {
     on_event(DeployEvent::PullStarted {
         host: host.address.clone(),
@@ -739,7 +739,7 @@ async fn wait_until_healthy(
     config: &Config,
     service: &ServiceConfig,
     new_name: &str,
-    on_event: &mut dyn FnMut(DeployEvent),
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<u32, DeployError> {
     let Some(port) = service.run.port else {
         // No port at all → no probe possible.
@@ -813,7 +813,7 @@ async fn swap_out_old_containers_by_set(
     drain: Duration,
     existing: &[ContainerInfo],
     keep: &std::collections::BTreeSet<String>,
-    on_event: &mut dyn FnMut(DeployEvent),
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<Vec<String>, DeployError> {
     let mut stopped = Vec::new();
     for old in existing

@@ -283,6 +283,30 @@ impl ServiceDetailState {
             .cloned()
     }
 
+    /// Currently-selected service name, if any. Used by the
+    /// reconcile flow which acts on the service this view targets.
+    #[must_use]
+    pub fn current_service(&self) -> Option<&str> {
+        self.service.as_deref()
+    }
+
+    /// First running container's tag for this view's service —
+    /// used as the fallback tag for reconcile when no
+    /// config-pinned tag exists.
+    #[must_use]
+    pub fn running_tag_for_service(&self, service: &str) -> Option<String> {
+        if self.service.as_deref() != Some(service) {
+            return None;
+        }
+        self.rows.iter().find_map(|r| {
+            if r.container.is_running() {
+                r.container.yoink_version.clone()
+            } else {
+                None
+            }
+        })
+    }
+
     fn visible_indices(&self) -> Vec<usize> {
         self.rows
             .iter()

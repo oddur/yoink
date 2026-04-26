@@ -434,10 +434,8 @@ async fn cmd_up(
         lock.spawn_heartbeat(ops.clone());
     }
 
-    let stderr = io::stderr();
-    let mut handle = stderr.lock();
     let mut sink = |event: deploy::DeployEvent| {
-        let _ = writeln!(handle, "{}", output::format_deploy_event(&event));
+        eprintln!("{}", output::format_deploy_event(&event));
     };
 
     let reconcile_result = deploy::reconcile(

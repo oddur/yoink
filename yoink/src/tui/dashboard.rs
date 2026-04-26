@@ -50,6 +50,31 @@ impl DashboardState {
     pub fn toggle_show_exited(&mut self) {
         self.show_exited = !self.show_exited;
     }
+
+    #[must_use]
+    pub fn report_ref(&self) -> Option<&StatusReport> {
+        self.report.as_ref()
+    }
+
+    /// First non-empty `yoink_version` found for any running
+    /// container of `service` across the latest report. Used by the
+    /// reconcile flow to fall back to "what's currently deployed"
+    /// when the config doesn't pin a tag.
+    #[must_use]
+    pub fn running_tag_for_service(&self, service: &str) -> Option<String> {
+        self.report.as_ref().and_then(|r| {
+            r.hosts.iter().flat_map(|h| h.containers.iter()).find_map(|c| {
+                if c.is_running()
+                    && c.yoink_service.as_deref() == Some(service)
+                    && c.yoink_version.is_some()
+                {
+                    c.yoink_version.clone()
+                } else {
+                    None
+                }
+            })
+        })
+    }
 }
 
 impl DashboardState {

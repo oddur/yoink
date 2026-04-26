@@ -155,6 +155,7 @@ impl View {
                 "  enter / l    live logs",
                 "  !            shell · D debug sidecar",
                 "  K            SIGKILL container (with confirmation)",
+                "  U            reconcile this service (with confirmation)",
                 "  r            refresh",
                 "  esc          back to host detail",
             ],
@@ -172,6 +173,7 @@ impl View {
                 "  i            container detail",
                 "  !            shell · D debug sidecar",
                 "  K            SIGKILL container (with confirmation)",
+                "  U            reconcile this service (with confirmation)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh · esc back",
             ],
@@ -274,6 +276,14 @@ enum Update {
         host: Host,
         event: DockerEvent,
     },
+}
+
+/// Reconcile-task → run-loop messages. The deploy code emits a
+/// `DeployEvent` per step; we render those as toasts. `Done`
+/// signals the task is over and the modal can close.
+enum ReconcileUpdate {
+    Event(String),
+    Done(Result<String, String>),
 }
 
 pub async fn run(
@@ -420,6 +430,9 @@ async fn run_loop(
             Some((origin_view, res, banner)) = app.shell_session_rx.recv() => {
                 app.apply_shell_session(&origin_view, res, &banner);
             }
+            Some(update) = app.reconcile_rx.recv() => {
+                app.apply_reconcile_update(update);
+            }
             _ = shell_spin_tick.tick() => {
                 // Tick exists purely to wake the loop so the spinner
                 // animates while the shell is still spinning up.
@@ -451,6 +464,16 @@ pub struct App {
     /// current view. The user confirms with `y` (or Enter) and
     /// cancels with anything else. Cleared on transition.
     kill_target: Option<(Host, String)>,
+    /// `Some((service, tag))` while a reconcile-confirmation modal
+    /// is open. `y` / Enter confirms; anything else cancels.
+    reconcile_target: Option<(String, String)>,
+    /// `Some(service)` while a reconcile is in flight — used to
+    /// block concurrent triggers and display a header indicator.
+    reconcile_running: Option<String>,
+    /// Channel for the spawned reconcile task to push progress and
+    /// completion back to the run loop.
+    reconcile_tx: UnboundedSender<ReconcileUpdate>,
+    reconcile_rx: UnboundedReceiver<ReconcileUpdate>,
     /// Cached secrets bundle for drift detection in the Dashboard
     /// pane. Populated lazily by a background task at startup so the
     /// TUI doesn't block on `infisical export` (which can take 2–5 s).
@@ -509,6 +532,7 @@ impl App {
         let (update_tx, update_rx) = mpsc::unbounded_channel();
         let (shell_bytes_tx, shell_bytes_rx) = mpsc::unbounded_channel();
         let (shell_session_tx, shell_session_rx) = mpsc::unbounded_channel();
+        let (reconcile_tx, reconcile_rx) = mpsc::unbounded_channel();
         Self {
             view,
             config,
@@ -523,6 +547,10 @@ impl App {
             shell: None,
             show_help: false,
             kill_target: None,
+            reconcile_target: None,
+            reconcile_running: None,
+            reconcile_tx,
+            reconcile_rx,
             secrets: Arc::new(tokio::sync::RwLock::new(None)),
             toasts: std::collections::VecDeque::new(),
             shell_bytes_tx,
@@ -572,6 +600,70 @@ impl App {
             self.schedule_hosts_refresh();
         }
         self.schedule_dashboard_refresh();
+    }
+
+    /// Open the reconcile-confirm modal for `service`. Resolves the
+    /// tag the same way the dashboard's drift cell does — config
+    /// tag if present, else the running container's tag — so the
+    /// confirm prompt shows what would actually deploy.
+    fn open_reconcile_modal(&mut self, service: &str) {
+        if self.reconcile_running.is_some() {
+            return;
+        }
+        let Some(svc) = self.config.services.iter().find(|s| s.name == service) else {
+            return;
+        };
+        let tag = svc.tag.clone().or_else(|| {
+            self.dashboard
+                .running_tag_for_service(service)
+                .or_else(|| self.service_detail.running_tag_for_service(service))
+        });
+        let Some(tag) = tag else {
+            return;
+        };
+        self.reconcile_target = Some((service.to_string(), tag));
+    }
+
+    fn confirm_reconcile(&mut self) {
+        let Some((service, tag)) = self.reconcile_target.take() else {
+            return;
+        };
+        self.reconcile_running = Some(service.clone());
+        let config = (*self.config).clone();
+        let ops = self.ops.clone();
+        let secrets = self
+            .secrets
+            .try_read()
+            .ok()
+            .and_then(|g| g.clone());
+        let tx = self.reconcile_tx.clone();
+        tokio::spawn(reconcile_one(config, ops, secrets, service, tag, tx));
+    }
+
+    fn apply_reconcile_update(&mut self, update: ReconcileUpdate) {
+        match update {
+            ReconcileUpdate::Event(line) => {
+                self.toasts.push_back((std::time::Instant::now() + TOAST_TTL, line));
+                while self.toasts.len() > TOAST_CAP {
+                    self.toasts.pop_front();
+                }
+            }
+            ReconcileUpdate::Done(result) => {
+                self.reconcile_running = None;
+                let line = match result {
+                    Ok(s) => format!("✓ {s}"),
+                    Err(e) => format!("✗ {e}"),
+                };
+                // Longer TTL for the final result so it doesn't
+                // scroll past the operator before they look up.
+                self.toasts.push_back((
+                    std::time::Instant::now() + TOAST_TTL.saturating_mul(2),
+                    line,
+                ));
+                // Refresh the dashboard now that things have moved.
+                self.schedule_dashboard_refresh();
+            }
+        }
     }
 
     /// Kick off `infisical export` in the background. The Dashboard
@@ -684,6 +776,17 @@ impl App {
                         warn!(host = %host.address, container, error = %e, "kill failed");
                     }
                 });
+            }
+            return false;
+        }
+
+        // Reconcile-confirmation modal: same shape as kill.
+        if self.reconcile_target.is_some() {
+            let confirm = matches!(key.code, KeyCode::Char('y') | KeyCode::Enter);
+            if confirm {
+                self.confirm_reconcile();
+            } else {
+                self.reconcile_target = None;
             }
             return false;
         }
@@ -815,6 +918,24 @@ impl App {
                 KeyCode::Char('K') => {
                     self.kill_target = Some((host.clone(), container.clone()));
                 }
+                KeyCode::Char('U') => {
+                    let svc = self
+                        .container_detail
+                        .target()
+                        .and_then(|(_, name)| {
+                            self.dashboard
+                                .report_ref()
+                                .and_then(|r| {
+                                    r.hosts.iter().flat_map(|h| h.containers.iter()).find(|c| {
+                                        &c.name == name
+                                    })
+                                })
+                                .and_then(|c| c.yoink_service.clone())
+                        });
+                    if let Some(name) = svc {
+                        self.open_reconcile_modal(&name);
+                    }
+                }
                 KeyCode::Esc => {
                     let host = host.clone();
                     self.transition(View::HostDetail(host)).await;
@@ -945,6 +1066,11 @@ impl App {
                         self.kill_target = Some((row.host, row.container.name));
                     }
                 }
+                KeyCode::Char('U') => {
+                    if let Some(name) = self.service_detail.current_service().map(str::to_string) {
+                        self.open_reconcile_modal(&name);
+                    }
+                }
                 KeyCode::Esc => self.transition(View::Services).await,
                 KeyCode::Char('r') => self.schedule_dashboard_refresh(),
                 _ => {}
@@ -1068,6 +1194,7 @@ impl App {
         self.logs.clear();
         self.show_help = false;
         self.kill_target = None;
+        self.reconcile_target = None;
         // Always tear down any in-flight shell when leaving its view —
         // the spawned exec will drop its bridge task on Drop, and a
         // sidecar shell needs an explicit force-remove of its
@@ -1519,6 +1646,27 @@ impl App {
             ];
             super::ui::render_modal(frame, "kill container?", &lines);
         }
+        if let Some((service, tag)) = &self.reconcile_target {
+            let svc_line = format!("service:  {service}");
+            let tag_line = format!("tag:      {tag}");
+            let host_count = format!("hosts:    {}", self.config.hosts.len());
+            let lines = vec![
+                "About to run `yoink up` for one service.",
+                "",
+                svc_line.as_str(),
+                tag_line.as_str(),
+                host_count.as_str(),
+                "",
+                "Acquires the deploy lock per host. Drift-only",
+                "containers (matching spec already running) are no-ops;",
+                "anything that needs swapping goes through the",
+                "healthcheck-gated rolling deploy.",
+                "",
+                "[y] / Enter   confirm",
+                "[any]         cancel",
+            ];
+            super::ui::render_modal(frame, "reconcile service?", &lines);
+        }
     }
 }
 
@@ -1526,6 +1674,75 @@ impl Drop for App {
     fn drop(&mut self) {
         self.stop_log_streams();
         self.stop_event_subscriptions();
+    }
+}
+
+/// Background reconcile task. Acquires the per-host advisory lock,
+/// runs `deploy::reconcile` filtered to one service, pipes each
+/// `DeployEvent` back to the run loop as a `ReconcileUpdate::Event`,
+/// then sends a final `ReconcileUpdate::Done` regardless of outcome.
+/// Same shape as `cmd_up` in main.rs but without the printlns.
+async fn reconcile_one(
+    config: Config,
+    ops: Arc<dyn DockerOps>,
+    secrets: Option<Arc<crate::secrets::SecretsBundle>>,
+    service: String,
+    tag: String,
+    tx: UnboundedSender<ReconcileUpdate>,
+) {
+    use crate::lock::HostLock;
+
+    let send_event = |line: String| {
+        let _ = tx.send(ReconcileUpdate::Event(line));
+    };
+    let send_done = |result: Result<String, String>| {
+        let _ = tx.send(ReconcileUpdate::Done(result));
+    };
+
+    // Acquire one lock per configured host. Per-host parallel like
+    // cmd_up; on any failure release whatever we already grabbed and
+    // bail.
+    let acquire_futs = config.hosts.iter().map(|host_cfg| {
+        let host = Host::from(host_cfg);
+        let ops = ops.clone();
+        async move { HostLock::acquire(&*ops, host.clone()).await }
+    });
+    let mut locks = match futures_util::future::try_join_all(acquire_futs).await {
+        Ok(ls) => ls,
+        Err(e) => {
+            send_done(Err(format!("acquire deploy lock: {e}")));
+            return;
+        }
+    };
+    for lock in &mut locks {
+        lock.spawn_heartbeat(ops.clone());
+    }
+
+    let mut overrides = std::collections::BTreeMap::new();
+    overrides.insert(service.clone(), tag.clone());
+    let services_filter = vec![service.clone()];
+    let secrets_ref = secrets.as_deref();
+    let mut on_event = |e: crate::deploy::DeployEvent| {
+        send_event(crate::output::format_deploy_event(&e));
+    };
+    let result = crate::deploy::reconcile(
+        &*ops,
+        &config,
+        &overrides,
+        Some(&services_filter),
+        secrets_ref,
+        &mut on_event,
+    )
+    .await;
+    for lock in locks {
+        lock.release(&*ops).await;
+    }
+    match result {
+        Ok(reports) => {
+            let n = reports.first().map_or(0, |r| r.hosts.len());
+            send_done(Ok(format!("reconciled {service}:{tag} on {n} host(s)")));
+        }
+        Err(e) => send_done(Err(format!("reconcile {service}: {e}"))),
     }
 }
 
