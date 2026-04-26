@@ -34,8 +34,12 @@ pub fn image_reference(image: &str, tag: &str) -> String {
 
 #[derive(Debug, Error)]
 pub enum BuildError {
-    #[error("invalid memory value {0:?}: expected like \"512m\" or \"1g\"")]
+    #[error("invalid memory value {0:?}: expected like \"512m\", \"512Mi\", or \"1Gi\"")]
     Memory(String),
+    #[error(
+        "invalid cpus value {0:?}: expected an absolute core count like \"2\", \"1.5\", or \"500m\""
+    )]
+    Cpus(String),
     #[error("unknown restart policy {0:?}: expected one of no|always|unless-stopped|on-failure")]
     RestartPolicy(String),
     #[error(
@@ -196,8 +200,12 @@ fn build_host_config(
         Some(port_bindings)
     };
 
+    let nano_cpus = options.cpus.as_deref().map(parse_cpus).transpose()?;
+
     Ok(HostConfig {
         memory,
+        nano_cpus,
+        pids_limit: options.pids_limit,
         cap_drop,
         cap_add,
         security_opt,
@@ -256,19 +264,80 @@ pub fn parse_memory(s: &str) -> Result<i64, BuildError> {
     if s.is_empty() {
         return Err(BuildError::Memory(s.to_string()));
     }
-    let (num, mult) = match s.as_bytes().last() {
-        Some(b'b' | b'B') => (&s[..s.len() - 1], 1_i64),
-        Some(b'k' | b'K') => (&s[..s.len() - 1], 1_024_i64),
-        Some(b'm' | b'M') => (&s[..s.len() - 1], 1_024 * 1_024),
-        Some(b'g' | b'G') => (&s[..s.len() - 1], 1_024 * 1_024 * 1_024),
-        Some(c) if c.is_ascii_digit() => (s, 1_i64),
-        _ => return Err(BuildError::Memory(s.to_string())),
+    // K8s-style binary suffixes (Ki/Mi/Gi/Ti) are checked first so a
+    // bare `m` or `M` doesn't shadow them. Docker-style single-letter
+    // suffixes follow.
+    let (num, mult) = if let Some(rest) = strip_suffix_ci(s, "ki") {
+        (rest, 1_024_i64)
+    } else if let Some(rest) = strip_suffix_ci(s, "mi") {
+        (rest, 1_024_i64.pow(2))
+    } else if let Some(rest) = strip_suffix_ci(s, "gi") {
+        (rest, 1_024_i64.pow(3))
+    } else if let Some(rest) = strip_suffix_ci(s, "ti") {
+        (rest, 1_024_i64.pow(4))
+    } else {
+        match s.as_bytes().last() {
+            Some(b'b' | b'B') => (&s[..s.len() - 1], 1_i64),
+            Some(b'k' | b'K') => (&s[..s.len() - 1], 1_024_i64),
+            Some(b'm' | b'M') => (&s[..s.len() - 1], 1_024 * 1_024),
+            Some(b'g' | b'G') => (&s[..s.len() - 1], 1_024 * 1_024 * 1_024),
+            Some(c) if c.is_ascii_digit() => (s, 1_i64),
+            _ => return Err(BuildError::Memory(s.to_string())),
+        }
     };
     let n: i64 = num
         .trim()
         .parse()
         .map_err(|_| BuildError::Memory(s.to_string()))?;
     Ok(n.saturating_mul(mult))
+}
+
+/// Case-insensitive `strip_suffix` that returns the prefix when the
+/// suffix matches at the tail (case-folded ASCII compare). Used by
+/// the memory parser so `Mi`, `MI`, and `mi` all mean the same thing.
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    if s.len() < suffix.len() {
+        return None;
+    }
+    let (head, tail) = s.split_at(s.len() - suffix.len());
+    if tail.eq_ignore_ascii_case(suffix) {
+        Some(head)
+    } else {
+        None
+    }
+}
+
+/// Parse a k8s-style CPU string into nano-CPUs (the unit
+/// `bollard::HostConfig::nano_cpus` expects). 1 core = 1e9.
+///
+/// Accepted forms:
+///   - `"2"` / `"1.5"` — bare number, absolute cores' worth.
+///   - `"500m"` — millicores (k8s convention; 1000m = 1 core).
+///
+/// Non-positive values are rejected so the operator's intent isn't
+/// silently turned into "uncapped" by the daemon.
+pub fn parse_cpus(s: &str) -> Result<i64, BuildError> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(BuildError::Cpus(s.to_string()));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let nano = if let Some(rest) = s.strip_suffix('m').or_else(|| s.strip_suffix('M')) {
+        let millis: f64 = rest
+            .trim()
+            .parse()
+            .map_err(|_| BuildError::Cpus(s.to_string()))?;
+        (millis * 1_000_000.0) as i64
+    } else {
+        let cores: f64 = s
+            .parse()
+            .map_err(|_| BuildError::Cpus(s.to_string()))?;
+        (cores * 1_000_000_000.0) as i64
+    };
+    if nano <= 0 {
+        return Err(BuildError::Cpus(s.to_string()));
+    }
+    Ok(nano)
 }
 
 /// Parse docker-cli `--publish` strings into a port-bindings map keyed
@@ -350,6 +419,19 @@ pub fn compute_spec_hash(spec: &RunSpec) -> String {
         &mut h,
         "memory",
         opts.memory.as_deref().unwrap_or("").as_bytes(),
+    );
+    feed(
+        &mut h,
+        "cpus",
+        opts.cpus.as_deref().unwrap_or("").as_bytes(),
+    );
+    feed(
+        &mut h,
+        "pids_limit",
+        opts.pids_limit
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+            .as_bytes(),
     );
     feed_list(&mut h, "cap_drop", &opts.cap_drop);
     feed_list(&mut h, "cap_add", &opts.cap_add);
@@ -445,6 +527,8 @@ mod tests {
             env,
             options: RunOptions {
                 memory: Some("512m".into()),
+                cpus: Some("1.5".into()),
+                pids_limit: Some(512),
                 cap_drop: vec!["ALL".into()],
                 cap_add: vec![],
                 security_opt: vec!["no-new-privileges".into()],
@@ -495,17 +579,44 @@ mod tests {
     }
 
     #[test]
-    fn build_container_minimal_spec() {
+    fn build_container_default_options_yields_secure_host_config() {
+        // RunOptions::default() encodes the secure-by-default profile:
+        // every cap dropped, no-new-privileges set, immutable rootfs,
+        // pids_limit bounded; memory + cpus stay uncapped.
         let mut spec = sample_spec();
         spec.options = RunOptions::default();
         let body = build_container(&spec).unwrap();
         let host = body.host_config.unwrap();
         assert_eq!(host.memory, None);
-        assert_eq!(host.cap_drop, None);
+        assert_eq!(host.nano_cpus, None);
+        assert_eq!(host.pids_limit, Some(1024));
+        assert_eq!(host.cap_drop, Some(vec!["ALL".to_string()]));
         assert_eq!(host.cap_add, None);
+        assert_eq!(
+            host.security_opt,
+            Some(vec!["no-new-privileges:true".to_string()])
+        );
+        assert_eq!(host.readonly_rootfs, Some(true));
+        assert_eq!(host.tmpfs, None);
+    }
+
+    #[test]
+    fn build_container_explicit_opt_outs_yield_lax_host_config() {
+        // Operators with a stubborn legacy image opt out per knob.
+        let mut spec = sample_spec();
+        spec.options = RunOptions {
+            cap_drop: vec![],
+            security_opt: vec![],
+            read_only: false,
+            pids_limit: None,
+            ..RunOptions::default()
+        };
+        let body = build_container(&spec).unwrap();
+        let host = body.host_config.unwrap();
+        assert_eq!(host.cap_drop, None);
         assert_eq!(host.security_opt, None);
         assert_eq!(host.readonly_rootfs, Some(false));
-        assert_eq!(host.tmpfs, None);
+        assert_eq!(host.pids_limit, None);
     }
 
     #[test]
@@ -514,6 +625,33 @@ mod tests {
         assert_eq!(parse_memory("512m").unwrap(), 512 * 1024 * 1024);
         assert_eq!(parse_memory("1G").unwrap(), 1024 * 1024 * 1024);
         assert_eq!(parse_memory("64k").unwrap(), 64 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_accepts_k8s_suffixes() {
+        assert_eq!(parse_memory("512Mi").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory("1Gi").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory("64Ki").unwrap(), 64 * 1024);
+        // Case-insensitive
+        assert_eq!(parse_memory("2gi").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_cpus_accepts_bare_and_millicores() {
+        assert_eq!(parse_cpus("2").unwrap(), 2_000_000_000);
+        assert_eq!(parse_cpus("1.5").unwrap(), 1_500_000_000);
+        assert_eq!(parse_cpus("0.5").unwrap(), 500_000_000);
+        assert_eq!(parse_cpus("500m").unwrap(), 500_000_000);
+        assert_eq!(parse_cpus("1500m").unwrap(), 1_500_000_000);
+    }
+
+    #[test]
+    fn parse_cpus_rejects_non_positive_and_garbage() {
+        assert!(parse_cpus("0").is_err());
+        assert!(parse_cpus("-1").is_err());
+        assert!(parse_cpus("0m").is_err());
+        assert!(parse_cpus("abc").is_err());
+        assert!(parse_cpus("").is_err());
     }
 
     #[test]

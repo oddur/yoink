@@ -296,6 +296,23 @@ pub struct ContainerDetail {
     /// Network names this container is attached to.
     pub networks: Vec<String>,
     pub labels: BTreeMap<String, String>,
+    /// Effective user (`container.config.user`). Empty string when
+    /// the image's USER is in effect.
+    pub user: Option<String>,
+    /// Memory limit in bytes. `None` → uncapped.
+    pub memory_bytes: Option<i64>,
+    /// CPU limit in nano-CPUs (1 core = 1e9). `None` → uncapped.
+    pub nano_cpus: Option<i64>,
+    /// pids cgroup limit. `None` → unlimited.
+    pub pids_limit: Option<i64>,
+    /// Linux capabilities dropped (`["ALL"]` is yoink's secure default).
+    pub cap_drop: Vec<String>,
+    /// Linux capabilities re-added on top of `cap_drop`.
+    pub cap_add: Vec<String>,
+    /// `--security-opt` entries (e.g. `no-new-privileges:true`).
+    pub security_opt: Vec<String>,
+    /// `--read-only` (immutable rootfs).
+    pub read_only: bool,
 }
 
 /// One docker network as the dashboard / `yoink networks` show it.
@@ -1712,6 +1729,24 @@ fn parse_inspect(name: &str, resp: &bollard::models::ContainerInspectResponse) -
         ports,
         mounts,
         networks,
+        user: config
+            .and_then(|c| c.user.clone())
+            .filter(|u| !u.is_empty()),
+        memory_bytes: host_config.and_then(|h| h.memory).filter(|n| *n > 0),
+        nano_cpus: host_config.and_then(|h| h.nano_cpus).filter(|n| *n > 0),
+        pids_limit: host_config.and_then(|h| h.pids_limit).filter(|n| *n > 0),
+        cap_drop: host_config
+            .and_then(|h| h.cap_drop.clone())
+            .unwrap_or_default(),
+        cap_add: host_config
+            .and_then(|h| h.cap_add.clone())
+            .unwrap_or_default(),
+        security_opt: host_config
+            .and_then(|h| h.security_opt.clone())
+            .unwrap_or_default(),
+        read_only: host_config
+            .and_then(|h| h.readonly_rootfs)
+            .unwrap_or(false),
         labels,
     }
 }
