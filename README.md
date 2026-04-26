@@ -2,6 +2,7 @@
 
 A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts. Sits between Kamal and Kubernetes — opinionated about the same things Kamal is, borrowing the few Kubernetes ideas that actually pay off at this scale.
 
+
 ```
 yoink up                  # reconcile every service in dep order
 yoink tui                 # k9s-style dashboard, drift, logs, shell-into
@@ -9,6 +10,14 @@ yoink prune               # clean up stale containers
 yoink history api         # who deployed what, when
 yoink rollback api        # roll back to the previous version
 ```
+
+## Screenshots
+
+<img width="1435" height="789" alt="image" src="https://github.com/user-attachments/assets/bcf956b1-937a-43d7-92f6-0f24a1d0cd98" />
+
+<img width="2862" height="1820" alt="image" src="https://github.com/user-attachments/assets/36d3cc00-355c-482b-addc-454a0070b58e" />
+
+
 
 ## Why it exists
 
