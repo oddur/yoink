@@ -3,13 +3,70 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, TableState};
 use ratatui::Frame;
+
+use crate::config::Config;
+use crate::deploy;
+use crate::docker;
+use crate::docker_ops::ContainerInfo;
+use crate::secrets::SecretsBundle;
 
 /// Bold style for table headers and pane titles.
 #[must_use]
 pub fn bold() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
+}
+
+/// Drift cell shared by every list view (dashboard, host detail,
+/// service detail). ✓ in-sync (green), ⚠ drift (yellow), ? unknown
+/// (dim — container has no `yoink.spec_hash`, isn't yoink-managed,
+/// secrets bundle hasn't loaded, or the desired-spec build failed).
+#[must_use]
+pub fn render_drift_cell(
+    container: &ContainerInfo,
+    config: &Config,
+    secrets: Option<&SecretsBundle>,
+) -> Cell<'static> {
+    let unknown = || Cell::from("?").style(Style::default().fg(Color::DarkGray));
+
+    let Some(service_name) = container.yoink_service.as_deref() else {
+        return unknown();
+    };
+    let Some(running_hash) = container.yoink_spec_hash.as_deref() else {
+        return unknown();
+    };
+    let Some(service_cfg) = config.services.iter().find(|s| s.name == service_name) else {
+        return unknown();
+    };
+    // For services with a config-pinned tag, use it. Otherwise fall
+    // back to the running container's tag — measures config-spec-only
+    // drift (env / network / options / mounts) instead of pretending
+    // we know what tag would be deployed.
+    let tag = service_cfg
+        .tag
+        .clone()
+        .or_else(|| container.yoink_version.clone());
+    let Some(tag) = tag else {
+        return unknown();
+    };
+
+    let Ok(desired) = deploy::build_desired_spec(config, service_cfg, &tag, secrets) else {
+        return unknown();
+    };
+    let desired_hash = docker::compute_spec_hash(&desired);
+
+    let has_secrets = !service_cfg.secrets.is_empty()
+        || !service_cfg.env_from_secrets.is_empty();
+    if has_secrets && secrets.is_none() {
+        return unknown();
+    }
+
+    if desired_hash == running_hash {
+        Cell::from("✓ sync").style(Style::default().fg(Color::Green))
+    } else {
+        Cell::from("⚠ drift").style(Style::default().fg(Color::Yellow))
+    }
 }
 
 /// Color for the "health" column based on docker's status text hint.
@@ -452,6 +509,92 @@ pub fn render_log_modal(
 
     frame.render_widget(Clear, modal_area);
     frame.render_widget(Paragraph::new(visible).block(block), modal_area);
+}
+
+/// Same shape as `render_log_modal` but with a per-service status
+/// table at the top (one row per service, colored by state) and the
+/// scrolling event log below. Used for `JobKind::ReconcileAll` so
+/// concurrent waves are legible at a glance — the status table is the
+/// "where is everyone right now?" overview, the log is the detail.
+pub fn render_status_log_modal(
+    frame: &mut Frame<'_>,
+    title: &str,
+    statuses: &[(String, String, Color)],
+    lines: &[String],
+    success: bool,
+    failure: bool,
+) {
+    let area = frame.area();
+    let modal_width = (area.width.saturating_sub(4)).clamp(40, 120);
+    let modal_height = (area.height.saturating_sub(4)).clamp(10, 40);
+    let x = (area.width.saturating_sub(modal_width)) / 2;
+    let y = (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect {
+        x,
+        y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    let border_color = if success {
+        Color::Green
+    } else if failure {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(title.to_string());
+    frame.render_widget(Clear, modal_area);
+    frame.render_widget(&outer, modal_area);
+
+    // Inside the outer block, split vertically: top = status table
+    // (height = N services + 2 for borders, capped), bottom = log.
+    let inner = outer.inner(modal_area);
+    let table_height = u16::try_from(statuses.len())
+        .unwrap_or(0)
+        .saturating_add(2)
+        .min(inner.height.saturating_sub(3));
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(table_height),
+            Constraint::Min(3),
+        ])
+        .split(inner);
+
+    // Status table — name padded to align the labels.
+    let name_width = statuses
+        .iter()
+        .map(|(n, _, _)| n.len())
+        .max()
+        .unwrap_or(8);
+    let status_lines: Vec<Line<'static>> = statuses
+        .iter()
+        .map(|(name, label, color)| {
+            Line::from(vec![
+                Span::raw(format!(" {name:<name_width$}  ")),
+                Span::styled(label.clone(), Style::default().fg(*color)),
+            ])
+        })
+        .collect();
+    let status_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(Paragraph::new(status_lines).block(status_block), split[0]);
+
+    // Scrolling event log — auto-scroll, newest at bottom.
+    let log_inner_height = split[1].height as usize;
+    let total = lines.len();
+    let skip = total.saturating_sub(log_inner_height);
+    let visible: Vec<Line<'static>> = lines
+        .iter()
+        .skip(skip)
+        .map(|l| Line::from(l.clone()))
+        .collect();
+    frame.render_widget(Paragraph::new(visible), split[1]);
 }
 
 /// Render a centered modal overlay with `lines` of text, sized to fit

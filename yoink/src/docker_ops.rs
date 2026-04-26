@@ -394,6 +394,17 @@ pub trait DockerOps: Send + Sync {
         credentials: Option<bollard::auth::DockerCredentials>,
     ) -> Result<(), DockerError>;
 
+    /// `true` if `image:tag` is already present in the host's local
+    /// image cache (no pull needed). Used to skip redundant pulls
+    /// after a prefetch pass. Errors degrade to `false` so a flaky
+    /// docker daemon doesn't silently elide pulls.
+    async fn image_present(
+        &self,
+        host: &Host,
+        image: &str,
+        tag: &str,
+    ) -> Result<bool, DockerError>;
+
     async fn list_containers_by_label(
         &self,
         host: &Host,
@@ -847,6 +858,29 @@ impl DockerOps for RealDockerOps {
             }
         }
         Ok(())
+    }
+
+    async fn image_present(
+        &self,
+        host: &Host,
+        image: &str,
+        tag: &str,
+    ) -> Result<bool, DockerError> {
+        let docker = self.client_for(host).await?;
+        let reference = format!("{image}:{tag}");
+        match docker.inspect_image(&reference).await {
+            Ok(_) => Ok(true),
+            // bollard surfaces "no such image" as DockerResponseServerError
+            // with status 404. Anything else is a real error worth
+            // surfacing — but for an "is it cached" check, treating ALL
+            // errors as "not present" is also safe (worst case: we
+            // re-pull, which is the existing behavior). Pick the safe
+            // form so a flaky daemon doesn't hide pull failures.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(source) => Err(Self::err(host, source)),
+        }
     }
 
     async fn list_containers_by_label(
@@ -1943,6 +1977,16 @@ impl DockerOps for FakeDockerOps {
             tag.into(),
         ));
         pop(&mut s.pull_image, "pull_image")
+    }
+    async fn image_present(
+        &self,
+        _host: &Host,
+        _image: &str,
+        _tag: &str,
+    ) -> Result<bool, DockerError> {
+        // Tests want pulls to actually fire by default; presence-check
+        // returning false keeps existing test expectations intact.
+        Ok(false)
     }
     async fn list_containers_by_label(
         &self,

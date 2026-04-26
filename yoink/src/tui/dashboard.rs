@@ -12,16 +12,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::config::Config;
-use crate::deploy;
-use crate::docker;
-use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
+use crate::docker_ops::{ContainerStats, DockerOps, Host};
 use crate::output::{format_bytes, format_relative_time};
 use crate::secrets::SecretsBundle;
 use crate::status::StatusReport;
 
 use super::ui::{
     bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge, pane_layout,
-    state_style, FilterState,
+    render_drift_cell, state_style, FilterState,
 };
 
 pub struct DashboardRefresh {
@@ -85,12 +83,13 @@ impl DashboardState {
                     continue;
                 }
                 let searchable = format!(
-                    "{} {} {} {} {}",
+                    "{} {} {} {} {} {}",
                     host.host,
                     c.yoink_service.as_deref().unwrap_or(""),
                     c.name,
                     c.state,
                     c.yoink_version.as_deref().unwrap_or(""),
+                    c.networks.join(","),
                 );
                 if !self.filter.matches(&searchable) {
                     continue;
@@ -201,6 +200,7 @@ impl DashboardState {
             Constraint::Length(9),  // state
             Constraint::Length(10), // health
             Constraint::Length(10), // version
+            Constraint::Length(18), // networks
             Constraint::Length(7),  // drift
             Constraint::Length(20), // cpu% (value + bracketed gauge)
             Constraint::Length(34), // mem (value / limit + bracketed gauge)
@@ -216,6 +216,7 @@ impl DashboardState {
                 Cell::from("state").style(bold()),
                 Cell::from("health").style(bold()),
                 Cell::from("version").style(bold()),
+                Cell::from("networks").style(bold()),
                 Cell::from("drift").style(bold()),
                 Cell::from("cpu").style(bold()),
                 Cell::from("mem").style(bold()),
@@ -260,6 +261,7 @@ impl DashboardState {
                     Cell::from("-"),
                     Cell::from("-"),
                     Cell::from("-"),
+                    Cell::from("-"),
                 ]));
                 continue;
             }
@@ -268,12 +270,13 @@ impl DashboardState {
                     continue;
                 }
                 let searchable = format!(
-                    "{} {} {} {} {}",
+                    "{} {} {} {} {} {}",
                     host.host,
                     c.yoink_service.as_deref().unwrap_or(""),
                     c.name,
                     c.state,
                     c.yoink_version.as_deref().unwrap_or(""),
+                    c.networks.join(","),
                 );
                 if !self.filter.matches(&searchable) {
                     continue;
@@ -293,6 +296,7 @@ impl DashboardState {
                     Cell::from(c.state.clone()).style(state_style(&c.state)),
                     Cell::from(health.to_string()).style(health_style(health)),
                     Cell::from(c.yoink_version.clone().unwrap_or_else(|| "-".into())),
+                    Cell::from(format_networks(&c.networks)),
                     drift_cell,
                     cpu_cell,
                     mem_cell,
@@ -306,6 +310,25 @@ impl DashboardState {
 
 fn stats_key(host: &str, container: &str) -> String {
     format!("{host}/{container}")
+}
+
+/// Comma-joined network list for the dashboard cell. Truncates with
+/// `…` when the joined string would overflow the column width so
+/// row alignment stays put on services with many attachments.
+const NETWORKS_CELL_MAX: usize = 17;
+
+fn format_networks(networks: &[String]) -> String {
+    if networks.is_empty() {
+        return "-".into();
+    }
+    let joined = networks.join(", ");
+    if joined.chars().count() <= NETWORKS_CELL_MAX {
+        joined
+    } else {
+        let mut s: String = joined.chars().take(NETWORKS_CELL_MAX - 1).collect();
+        s.push('…');
+        s
+    }
 }
 
 /// CPU cell: percentage + bracketed inline gauge. Empty/no-stats
@@ -355,62 +378,6 @@ fn render_mem_cell(stats: Option<&ContainerStats>) -> Cell<'static> {
     }
 }
 
-
-/// Drift cell: ✓ in-sync (green), ⚠ drift (yellow), ? unknown
-/// (dim — container has no `yoink.spec_hash`, isn't yoink-managed,
-/// secrets bundle hasn't loaded, or the desired-spec build failed).
-fn render_drift_cell(
-    container: &ContainerInfo,
-    config: &Config,
-    secrets: Option<&SecretsBundle>,
-) -> Cell<'static> {
-    let unknown = || Cell::from("?").style(Style::default().fg(Color::DarkGray));
-
-    let Some(service_name) = container.yoink_service.as_deref() else {
-        return unknown();
-    };
-    let Some(running_hash) = container.yoink_spec_hash.as_deref() else {
-        return unknown();
-    };
-    let Some(service_cfg) = config.services.iter().find(|s| s.name == service_name) else {
-        return unknown();
-    };
-    // For services with a config-pinned tag (caddy, redis, otel,
-    // pgadmin) use it. For code-versioned services without one,
-    // fall back to the running container's tag — measures
-    // config-spec-only drift (env / network / options / mounts)
-    // instead of pretending we know what tag would be deployed.
-    let tag = service_cfg
-        .tag
-        .clone()
-        .or_else(|| container.yoink_version.clone());
-    let Some(tag) = tag else {
-        return unknown();
-    };
-
-    // build_desired_spec resolves run.files from local disk too;
-    // skip silently on error (caddy/otel/etc. can't drift-check
-    // when their files aren't readable from where yoink runs).
-    let Ok(desired) = deploy::build_desired_spec(config, service_cfg, &tag, secrets) else {
-        return unknown();
-    };
-    let desired_hash = docker::compute_spec_hash(&desired);
-
-    // If the container needs secrets and we don't have them, the
-    // hash will always differ — flag as ? rather than ⚠ to avoid
-    // false-positive drift while the loader is in flight.
-    let has_secrets = !service_cfg.secrets.is_empty()
-        || !service_cfg.env_from_secrets.is_empty();
-    if has_secrets && secrets.is_none() {
-        return unknown();
-    }
-
-    if desired_hash == running_hash {
-        Cell::from("✓ sync").style(Style::default().fg(Color::Green))
-    } else {
-        Cell::from("⚠ drift").style(Style::default().fg(Color::Yellow))
-    }
-}
 
 /// Background-friendly fetch — owned inputs so the future is `'static + Send`.
 pub async fn fetch_owned(ops: Arc<dyn DockerOps>, config: Arc<Config>) -> DashboardRefresh {

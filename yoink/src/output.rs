@@ -108,8 +108,21 @@ pub fn format_status_table(report: &StatusReport) -> String {
 }
 
 /// One-line summary of a `DeployEvent`, suitable for `eprintln!`.
+/// `service` is the optional service-context tag the reconcile loop
+/// supplies for events emitted while deploying a specific service —
+/// used to prefix lines with `[svc]` so concurrent-wave logs stay
+/// visually separable. `None` for top-level events (network setup,
+/// global hooks, prefetch).
 #[must_use]
-pub fn format_deploy_event(event: &DeployEvent) -> String {
+pub fn format_deploy_event(service: Option<&str>, event: &DeployEvent) -> String {
+    let line = format_deploy_event_body(event);
+    match service {
+        Some(s) => format!("[{s}] {line}"),
+        None => line,
+    }
+}
+
+fn format_deploy_event_body(event: &DeployEvent) -> String {
     match event {
         DeployEvent::Started { service, tag, host } => {
             format!("[{host}] deploying {service}:{tag}")
@@ -238,7 +251,7 @@ mod tests {
     #[test]
     fn deploy_event_format_started() {
         assert_eq!(
-            format_deploy_event(&DeployEvent::Started {
+            format_deploy_event(None, &DeployEvent::Started {
                 service: "app-a".into(),
                 tag: "a1b2c3d".into(),
                 host: "host-a".into(),
@@ -249,13 +262,13 @@ mod tests {
 
     #[test]
     fn deploy_event_format_network_created_vs_exists() {
-        let created = format_deploy_event(&DeployEvent::NetworkReady {
+        let created = format_deploy_event(None, &DeployEvent::NetworkReady {
             host: "h".into(),
             network: "yoink".into(),
             created: true,
         });
         assert!(created.contains("(created)"));
-        let existed = format_deploy_event(&DeployEvent::NetworkReady {
+        let existed = format_deploy_event(None, &DeployEvent::NetworkReady {
             host: "h".into(),
             network: "yoink".into(),
             created: false,
@@ -266,7 +279,7 @@ mod tests {
     #[test]
     fn deploy_event_format_healthcheck_healthy() {
         assert_eq!(
-            format_deploy_event(&DeployEvent::HealthcheckHealthy {
+            format_deploy_event(None, &DeployEvent::HealthcheckHealthy {
                 host: "h".into(),
                 container: "c".into(),
                 attempts: 3,

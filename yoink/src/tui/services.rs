@@ -12,10 +12,12 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::config::Config;
 use crate::docker_ops::{ContainerInfo, Host};
+use crate::secrets::SecretsBundle;
 use crate::status::StatusReport;
 
 use super::ui::{
-    bold, clamp_selection, filter_footer, health_style, pane_layout, state_style, FilterState,
+    bold, clamp_selection, filter_footer, health_style, pane_layout, render_drift_cell,
+    state_style, FilterState,
 };
 
 #[derive(Default)]
@@ -321,7 +323,13 @@ impl ServiceDetailState {
             .collect()
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    pub fn render(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        config: &Config,
+        secrets: Option<&SecretsBundle>,
+    ) {
         let layout = pane_layout(area);
         let header_text = match &self.service {
             Some(name) => format!(
@@ -339,6 +347,7 @@ impl ServiceDetailState {
             Constraint::Length(10), // state
             Constraint::Length(10), // health
             Constraint::Length(10), // version
+            Constraint::Length(7),  // drift
             Constraint::Min(20),    // status text
         ];
         let visible = self.visible_indices();
@@ -366,6 +375,7 @@ impl ServiceDetailState {
                                 .clone()
                                 .unwrap_or_else(|| "-".into()),
                         ),
+                        render_drift_cell(&r.container, config, secrets),
                         Cell::from(r.container.status_text.clone()),
                     ])
                 })
@@ -378,6 +388,7 @@ impl ServiceDetailState {
                 Cell::from("state").style(bold()),
                 Cell::from("health").style(bold()),
                 Cell::from("version").style(bold()),
+                Cell::from("drift").style(bold()),
                 Cell::from("status").style(bold()),
             ]))
             .row_highlight_style(super::ui::table_highlight_style())

@@ -189,6 +189,15 @@ pub struct ServiceConfig {
     /// (so `yoink up --service api` does NOT run web's migrations).
     #[serde(default)]
     pub pre_deploy: Vec<HookSpec>,
+    /// Other services this one needs deployed FIRST. Drives the per-
+    /// service deploy order in `yoink up` (a topological sort over the
+    /// graph). Most useful with per-service tier networks: a caller
+    /// has to wait until the callee is on its shared network before
+    /// its container can resolve the callee's name. Empty = no
+    /// ordering constraint. Names must reference declared services;
+    /// cycles are rejected at config load.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     /// Docker networks this service attaches to. When unset (the
     /// common single-network case), the service attaches to every
     /// network declared under `deploy.networks`. When set, must be
@@ -388,12 +397,14 @@ impl Config {
         cfg.config_dir = path.parent().map(std::path::Path::to_path_buf);
         cfg.merge_includes()?;
         cfg.validate()?;
+        cfg.topo_sort_services()?;
         Ok(cfg)
     }
 
     pub fn parse_str(text: &str) -> Result<Self, ConfigError> {
-        let config: Self = yaml_serde::from_str(text)?;
+        let mut config: Self = yaml_serde::from_str(text)?;
         config.validate()?;
+        config.topo_sort_services()?;
         Ok(config)
     }
 
@@ -588,6 +599,36 @@ impl Config {
                     service.name
                 )));
             }
+            // depends_on validation (refs + duplicates + self). Cycle
+            // detection lives in `topo_sort_services` since it needs
+            // the full graph anyway.
+            let mut seen_deps = std::collections::HashSet::new();
+            for dep in &service.depends_on {
+                if dep == &service.name {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.depends_on lists itself",
+                        service.name
+                    )));
+                }
+                if !seen_deps.insert(dep.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.depends_on contains duplicate {dep:?}",
+                        service.name
+                    )));
+                }
+                // Forward references are fine — every name has been
+                // collected into `seen_names` already (this loop's
+                // earlier branch).
+                if !seen_names.contains(dep.as_str())
+                    && !self.services.iter().any(|s| s.name == *dep)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.depends_on references unknown service {dep:?}",
+                        service.name
+                    )));
+                }
+            }
+
             if let Some(nets) = &service.networks {
                 if nets.is_empty() {
                     return Err(ConfigError::Invalid(format!(
@@ -624,6 +665,9 @@ impl Config {
             )));
         }
 
+        // (depends_on cycle detection deferred to topo_sort_services
+        //  which has the full graph in front of it.)
+
         // Hook tag refs must point at a real service.
         for hook in &self.hooks.pre_deploy {
             if hook.image.trim().is_empty() {
@@ -643,6 +687,117 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Reorder `self.services` so every service appears AFTER every
+    /// service in its `depends_on`. Stable: among services whose deps
+    /// are all already emitted, the one earliest in the original order
+    /// wins. Detects cycles and surfaces them with the names involved.
+    ///
+    /// Called once at the end of `load_from_path` / `parse_str`, so
+    /// every downstream consumer (`reconcile`, `prefetch_images`, the
+    /// dashboard, etc.) sees `config.services` in deploy order without
+    /// having to know the graph exists.
+    fn topo_sort_services(&mut self) -> Result<(), ConfigError> {
+        let n = self.services.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        // Original index for stable tie-breaking.
+        let original: std::collections::BTreeMap<String, usize> = self
+            .services
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.name.clone(), i))
+            .collect();
+
+        // Outstanding deps per service (mutated as we emit).
+        let mut remaining: Vec<std::collections::BTreeSet<String>> = self
+            .services
+            .iter()
+            .map(|s| s.depends_on.iter().cloned().collect())
+            .collect();
+        let mut emitted = vec![false; n];
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+
+        loop {
+            // Pick the earliest-in-original-order service whose deps
+            // are all already emitted.
+            let next = (0..n).find(|&i| !emitted[i] && remaining[i].is_empty());
+            let Some(i) = next else {
+                break;
+            };
+            emitted[i] = true;
+            order.push(i);
+            let name = self.services[i].name.clone();
+            for set in &mut remaining {
+                set.remove(&name);
+            }
+        }
+
+        if order.len() != n {
+            // Anything still unemitted is in a cycle. Report the
+            // first cycle we can walk so the operator gets a useful
+            // pointer instead of "there's a cycle somewhere".
+            let stuck: Vec<&str> = (0..n)
+                .filter(|&i| !emitted[i])
+                .map(|i| self.services[i].name.as_str())
+                .collect();
+            let cycle = walk_cycle(&self.services, &stuck);
+            return Err(ConfigError::Invalid(format!(
+                "depends_on cycle detected: {} (services in cycle: {})",
+                cycle.join(" → "),
+                stuck.join(", "),
+            )));
+        }
+
+        // Apply the new order.
+        let mut sorted: Vec<ServiceConfig> = Vec::with_capacity(n);
+        let mut taken = vec![None; n];
+        for (slot, src) in self.services.drain(..).enumerate() {
+            taken[slot] = Some(src);
+        }
+        for i in &order {
+            sorted.push(taken[*i].take().expect("each index emitted once"));
+        }
+        self.services = sorted;
+        // `original` map is captured for debug-symbol pretty-printing
+        // only; binding kept to avoid a "unused" warning loop in case
+        // someone later wants to log the before/after.
+        let _ = original;
+        Ok(())
+    }
+}
+
+/// Walk one concrete cycle through the `depends_on` graph among a set of
+/// services known to be involved in some cycle. Returns names in the
+/// order visited, with the start name appearing twice (start … start)
+/// so the printed cycle reads naturally.
+fn walk_cycle(all: &[ServiceConfig], stuck: &[&str]) -> Vec<String> {
+    let stuck_set: std::collections::HashSet<&str> = stuck.iter().copied().collect();
+    let by_name: std::collections::HashMap<&str, &ServiceConfig> =
+        all.iter().map(|s| (s.name.as_str(), s)).collect();
+    let Some(&start) = stuck.first() else {
+        return Vec::new();
+    };
+    let mut path: Vec<String> = vec![start.into()];
+    let mut current = start;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(start.into());
+    loop {
+        let svc = by_name.get(current).copied();
+        let next = svc
+            .and_then(|s| s.depends_on.iter().find(|d| stuck_set.contains(d.as_str())))
+            .map(String::as_str);
+        let Some(next) = next else {
+            return path;
+        };
+        path.push(next.into());
+        if !seen.insert(next.into()) {
+            return path;
+        }
+        current = next;
     }
 }
 
@@ -1036,6 +1191,99 @@ services:
         let applicable = c.services[0].applicable_hosts(&c.hosts);
         assert_eq!(applicable.len(), 1);
         assert_eq!(applicable[0].address, "host-a");
+    }
+
+    fn cfg_with_services(spec: &[(&str, &[&str])]) -> Config {
+        use std::fmt::Write as _;
+        let mut s = String::from("hosts:\n  - { address: h, user: u }\nservices:\n");
+        for (name, deps) in spec {
+            let _ = write!(
+                s,
+                "  - name: {name}\n    image: i\n    tag: v\n    run: {{ port: 1 }}\n",
+            );
+            if !deps.is_empty() {
+                s.push_str("    depends_on: [");
+                s.push_str(&deps.join(", "));
+                s.push_str("]\n");
+            }
+        }
+        Config::parse_str(&s).expect("config must parse")
+    }
+
+    #[test]
+    fn topo_sort_preserves_order_when_no_deps() {
+        let cfg = cfg_with_services(&[("a", &[]), ("b", &[]), ("c", &[])]);
+        let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn topo_sort_orders_dependents_after_dependencies() {
+        // Declared order: api, redis, otel; api depends on the other two.
+        // Sort should place redis + otel BEFORE api.
+        let cfg = cfg_with_services(&[
+            ("api", &["redis", "otel"]),
+            ("redis", &[]),
+            ("otel", &[]),
+        ]);
+        let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names[2], "api");
+        assert!(names[..2].contains(&"redis"));
+        assert!(names[..2].contains(&"otel"));
+    }
+
+    #[test]
+    fn topo_sort_is_stable_for_independent_services() {
+        // pgadmin and redis have no deps; pgadmin appears first in
+        // config, so it must stay first.
+        let cfg = cfg_with_services(&[
+            ("pgadmin", &[]),
+            ("redis", &[]),
+            ("api", &["redis"]),
+        ]);
+        let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["pgadmin", "redis", "api"]);
+    }
+
+    #[test]
+    fn topo_sort_rejects_cycles() {
+        // a → b → a
+        let err = std::panic::catch_unwind(|| {
+            cfg_with_services(&[("a", &["b"]), ("b", &["a"])])
+        });
+        assert!(err.is_err(), "expected parse failure for cycle");
+    }
+
+    #[test]
+    fn rejects_unknown_depends_on_reference() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: a
+    image: i
+    tag: v
+    depends_on: [ghost]
+    run: { port: 1 }
+"#;
+        let err = Config::parse_str(s).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("unknown service")));
+    }
+
+    #[test]
+    fn rejects_self_dependency() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: a
+    image: i
+    tag: v
+    depends_on: [a]
+    run: { port: 1 }
+"#;
+        let err = Config::parse_str(s).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("itself")));
     }
 
     #[test]

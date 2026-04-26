@@ -131,6 +131,8 @@ impl View {
                 "  enter        container detail",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
+                "  A            reconcile ALL services (with confirmation)",
+                "  P            prune stale + orphan containers (with confirmation)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh",
                 "  e            toggle exited containers",
@@ -150,6 +152,7 @@ impl View {
                 "  !            shell into container (bash/sh)",
                 "  D            debug sidecar (alpine, target's pid+net ns)",
                 "  K            SIGKILL container (with confirmation)",
+                "  U            reconcile this service (with confirmation)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh",
                 "  esc          back to hosts (when no active filter)",
@@ -284,27 +287,80 @@ enum Update {
     },
 }
 
-/// Reconcile-task → run-loop messages. Events stream into the
+/// Background-task → run-loop messages. Events stream into the
 /// progress modal as they fire; `Done` flips the modal into a
 /// dismissible "finished" state with the final ✓/✗ summary.
-enum ReconcileUpdate {
+enum JobUpdate {
     Event(String),
+    /// Per-service event from a wave-parallel reconcile. Drives the
+    /// status table at the top of the progress modal — the operator
+    /// gets a quick "where are all 6 services right now?" view in
+    /// addition to the interleaved scrolling log.
+    ServiceEvent(String, crate::deploy::DeployEvent),
     Done(Result<String, String>),
 }
 
-/// Live state for the reconcile progress modal. `lines` is the
-/// streamed event log (capped so a hung deploy doesn't grow
-/// unbounded). `finished` is `None` while the deploy task is
-/// still running; once it's `Some`, the operator can press Esc
-/// to dismiss the modal.
-struct ReconcileProgress {
-    service: String,
-    tag: String,
+/// Which long-running job is feeding the progress modal. Drives
+/// the modal title and the "X failed" wording in the done line.
+enum JobKind {
+    Reconcile { service: String, tag: String },
+    ReconcileAll {
+        statuses: std::collections::BTreeMap<String, ReconcileServiceStatus>,
+    },
+    Prune,
+}
+
+/// Per-service state machine for the reconcile-all status table.
+/// Driven by `DeployEvent`s — see `update_service_status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReconcileServiceStatus {
+    Pending,
+    Pulling,
+    Pulled,
+    Healthchecking { container: String },
+    Swapping,
+    Synced,
+    Done,
+    Failed(String),
+}
+
+impl ReconcileServiceStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Pending => "· waiting".into(),
+            Self::Pulling => "⏵ pulling".into(),
+            Self::Pulled => "⏵ pulled".into(),
+            Self::Healthchecking { .. } => "⏵ healthcheck".into(),
+            Self::Swapping => "⏵ swapping old container".into(),
+            Self::Synced => "✓ synced (no-op)".into(),
+            Self::Done => "✓ done".into(),
+            Self::Failed(why) => format!("✗ failed: {why}"),
+        }
+    }
+
+    fn color(&self) -> ratatui::style::Color {
+        use ratatui::style::Color;
+        match self {
+            Self::Pending => Color::Gray,
+            Self::Pulling | Self::Pulled => Color::Cyan,
+            Self::Healthchecking { .. } | Self::Swapping => Color::Yellow,
+            Self::Synced | Self::Done => Color::Green,
+            Self::Failed(_) => Color::Red,
+        }
+    }
+}
+
+/// Live state for the job progress modal (reconcile or prune).
+/// `lines` is the streamed event log (capped so a hung job doesn't
+/// grow unbounded). `finished` is `None` while the task is still
+/// running; once it's `Some`, the operator can press Esc to dismiss.
+struct JobProgress {
+    kind: JobKind,
     lines: std::collections::VecDeque<String>,
     finished: Option<Result<String, String>>,
 }
 
-const RECONCILE_LINE_CAP: usize = 200;
+const JOB_LINE_CAP: usize = 200;
 
 pub async fn run(
     config: &Config,
@@ -450,8 +506,8 @@ async fn run_loop(
             Some((origin_view, res, banner)) = app.shell_session_rx.recv() => {
                 app.apply_shell_session(&origin_view, res, &banner);
             }
-            Some(update) = app.reconcile_rx.recv() => {
-                app.apply_reconcile_update(update);
+            Some(update) = app.job_rx.recv() => {
+                app.apply_job_update(update);
             }
             _ = shell_spin_tick.tick() => {
                 // Tick exists purely to wake the loop so the spinner
@@ -487,14 +543,21 @@ pub struct App {
     /// `Some((service, tag))` while a reconcile-confirmation modal
     /// is open. `y` / Enter confirms; anything else cancels.
     reconcile_target: Option<(String, String)>,
+    /// `true` while a prune-confirmation modal is open. `y` / Enter
+    /// confirms; anything else cancels.
+    prune_target: bool,
+    /// `true` while a reconcile-all confirmation modal is open.
+    /// Equivalent of `yoink up` (no `--service` filter): every service
+    /// in config order across every host. `y` / Enter confirms.
+    reconcile_all_target: bool,
     /// `Some` while a reconcile is in flight or its progress modal
     /// is still on screen. Owns the streaming event log; cleared
     /// when the operator presses Esc after completion.
-    reconcile_progress: Option<ReconcileProgress>,
+    job_progress: Option<JobProgress>,
     /// Channel for the spawned reconcile task to push progress and
     /// completion back to the run loop.
-    reconcile_tx: UnboundedSender<ReconcileUpdate>,
-    reconcile_rx: UnboundedReceiver<ReconcileUpdate>,
+    job_tx: UnboundedSender<JobUpdate>,
+    job_rx: UnboundedReceiver<JobUpdate>,
     /// Cached secrets bundle for drift detection in the Dashboard
     /// pane. Populated lazily by a background task at startup so the
     /// TUI doesn't block on `infisical export` (which can take 2–5 s).
@@ -553,7 +616,7 @@ impl App {
         let (update_tx, update_rx) = mpsc::unbounded_channel();
         let (shell_bytes_tx, shell_bytes_rx) = mpsc::unbounded_channel();
         let (shell_session_tx, shell_session_rx) = mpsc::unbounded_channel();
-        let (reconcile_tx, reconcile_rx) = mpsc::unbounded_channel();
+        let (job_tx, job_rx) = mpsc::unbounded_channel();
         Self {
             view,
             config,
@@ -569,9 +632,11 @@ impl App {
             show_help: false,
             kill_target: None,
             reconcile_target: None,
-            reconcile_progress: None,
-            reconcile_tx,
-            reconcile_rx,
+            prune_target: false,
+            reconcile_all_target: false,
+            job_progress: None,
+            job_tx,
+            job_rx,
             secrets: Arc::new(tokio::sync::RwLock::new(None)),
             toasts: std::collections::VecDeque::new(),
             shell_bytes_tx,
@@ -658,7 +723,7 @@ impl App {
     /// tag if present, else the running container's tag — so the
     /// confirm prompt shows what would actually deploy.
     fn open_reconcile_modal(&mut self, service: &str) {
-        if self.reconcile_progress.is_some() {
+        if self.job_progress.is_some() {
             return;
         }
         let Some(svc) = self.config.services.iter().find(|s| s.name == service) else {
@@ -679,9 +744,11 @@ impl App {
         let Some((service, tag)) = self.reconcile_target.take() else {
             return;
         };
-        self.reconcile_progress = Some(ReconcileProgress {
-            service: service.clone(),
-            tag: tag.clone(),
+        self.job_progress = Some(JobProgress {
+            kind: JobKind::Reconcile {
+                service: service.clone(),
+                tag: tag.clone(),
+            },
             lines: std::collections::VecDeque::new(),
             finished: None,
         });
@@ -692,33 +759,134 @@ impl App {
             .try_read()
             .ok()
             .and_then(|g| g.clone());
-        let tx = self.reconcile_tx.clone();
+        let tx = self.job_tx.clone();
         tokio::spawn(reconcile_one(config, ops, secrets, service, tag, tx));
     }
 
-    fn apply_reconcile_update(&mut self, update: ReconcileUpdate) {
-        let Some(progress) = self.reconcile_progress.as_mut() else {
+    fn open_prune_modal(&mut self) {
+        if self.job_progress.is_some() {
+            return;
+        }
+        self.prune_target = true;
+    }
+
+    fn open_reconcile_all_modal(&mut self) {
+        if self.job_progress.is_some() {
+            return;
+        }
+        self.reconcile_all_target = true;
+    }
+
+    fn confirm_reconcile_all(&mut self) {
+        if !self.reconcile_all_target {
+            return;
+        }
+        self.reconcile_all_target = false;
+
+        // Tag overrides: services without a config-pinned tag (api,
+        // web) need a `--tag` override to deploy. Fall back to the
+        // running container's tag — same heuristic as the per-service
+        // reconcile modal — so this gesture is "redeploy what's
+        // currently live, with the current config".
+        let mut overrides: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for svc in &self.config.services {
+            if svc.tag.is_some() {
+                continue;
+            }
+            if let Some(tag) = self
+                .dashboard
+                .running_tag_for_service(&svc.name)
+                .or_else(|| self.service_detail.running_tag_for_service(&svc.name))
+            {
+                overrides.insert(svc.name.clone(), tag);
+            }
+            // If still no tag, the deploy will fail loudly — caller
+            // sees the per-service error in the streaming log.
+        }
+
+        // Seed the per-service status map: every configured service
+        // starts as Pending; the wave loop flips them to Pulling /
+        // Done / etc. as events arrive. Using BTreeMap keeps the
+        // table render order stable (alphabetical by service name).
+        let statuses = self
+            .config
+            .services
+            .iter()
+            .map(|s| (s.name.clone(), ReconcileServiceStatus::Pending))
+            .collect();
+        self.job_progress = Some(JobProgress {
+            kind: JobKind::ReconcileAll { statuses },
+            lines: std::collections::VecDeque::new(),
+            finished: None,
+        });
+        let config = (*self.config).clone();
+        let ops = self.ops.clone();
+        let secrets = self.secrets.try_read().ok().and_then(|g| g.clone());
+        let tx = self.job_tx.clone();
+        tokio::spawn(reconcile_all(config, ops, secrets, overrides, tx));
+    }
+
+    fn confirm_prune(&mut self) {
+        if !self.prune_target {
+            return;
+        }
+        self.prune_target = false;
+        self.job_progress = Some(JobProgress {
+            kind: JobKind::Prune,
+            lines: std::collections::VecDeque::new(),
+            finished: None,
+        });
+        let config = (*self.config).clone();
+        let ops = self.ops.clone();
+        let tx = self.job_tx.clone();
+        tokio::spawn(prune_all(config, ops, tx));
+    }
+
+    fn apply_job_update(&mut self, update: JobUpdate) {
+        let Some(progress) = self.job_progress.as_mut() else {
             return;
         };
         match update {
-            ReconcileUpdate::Event(line) => {
+            JobUpdate::Event(line) => {
                 // Some events (container log tail) are multi-line —
                 // split so each render row is one line.
                 for one in line.split('\n') {
                     progress.lines.push_back(one.to_string());
-                    while progress.lines.len() > RECONCILE_LINE_CAP {
+                    while progress.lines.len() > JOB_LINE_CAP {
                         progress.lines.pop_front();
                     }
                 }
             }
-            ReconcileUpdate::Done(result) => {
+            JobUpdate::ServiceEvent(name, event) => {
+                if let JobKind::ReconcileAll { statuses } = &mut progress.kind {
+                    update_service_status(statuses, &name, &event);
+                }
+            }
+            JobUpdate::Done(result) => {
                 let line = match &result {
                     Ok(s) => format!("✓ {s}"),
                     Err(e) => format!("✗ {e}"),
                 };
                 progress.lines.push_back(line);
+                if result.is_err()
+                    && let JobKind::ReconcileAll { statuses } = &mut progress.kind
+                {
+                    // Mark every still-running service as failed so
+                    // the status table reflects the abort, not its
+                    // last seen mid-flight state.
+                    for status in statuses.values_mut() {
+                        if !matches!(
+                            status,
+                            ReconcileServiceStatus::Done
+                                | ReconcileServiceStatus::Synced
+                                | ReconcileServiceStatus::Failed(_)
+                        ) {
+                            *status = ReconcileServiceStatus::Failed("aborted".into());
+                        }
+                    }
+                }
                 progress.finished = Some(result);
-                // Refresh the dashboard now that things have moved.
                 self.schedule_dashboard_refresh();
             }
         }
@@ -849,13 +1017,35 @@ impl App {
             return false;
         }
 
+        // Prune-confirmation modal.
+        if self.prune_target {
+            let confirm = matches!(key.code, KeyCode::Char('y') | KeyCode::Enter);
+            if confirm {
+                self.confirm_prune();
+            } else {
+                self.prune_target = false;
+            }
+            return false;
+        }
+
+        // Reconcile-all confirmation modal.
+        if self.reconcile_all_target {
+            let confirm = matches!(key.code, KeyCode::Char('y') | KeyCode::Enter);
+            if confirm {
+                self.confirm_reconcile_all();
+            } else {
+                self.reconcile_all_target = false;
+            }
+            return false;
+        }
+
         // Reconcile-progress modal: while running, eat all keys
         // (Ctrl-C/Q already handled above) so a stray j/k can't
         // navigate the underlying view. `y` always works to yank
         // the current log to the clipboard. Once finished, Esc
         // dismisses; any other key is also eaten so the operator
         // doesn't accidentally fire something else off.
-        if let Some(progress) = self.reconcile_progress.as_ref() {
+        if let Some(progress) = self.job_progress.as_ref() {
             if matches!(key.code, KeyCode::Char('y')) {
                 let text: String = progress
                     .lines
@@ -867,7 +1057,7 @@ impl App {
                 return false;
             }
             if progress.finished.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                self.reconcile_progress = None;
+                self.job_progress = None;
             }
             return false;
         }
@@ -989,6 +1179,11 @@ impl App {
                         self.host_detail.selected_container(),
                     ) {
                         self.kill_target = Some((host, container));
+                    }
+                }
+                KeyCode::Char('U') => {
+                    if let Some(service) = self.host_detail.selected_service() {
+                        self.open_reconcile_modal(&service);
                     }
                 }
                 KeyCode::Esc => self.transition(View::Hosts).await,
@@ -1116,6 +1311,8 @@ impl App {
                 }
                 KeyCode::Char('r') => self.schedule_dashboard_refresh(),
                 KeyCode::Char('e') => self.dashboard.toggle_show_exited(),
+                KeyCode::Char('P') => self.open_prune_modal(),
+                KeyCode::Char('A') => self.open_reconcile_all_modal(),
                 _ => {}
             },
             View::Services => match key.code {
@@ -1305,7 +1502,9 @@ impl App {
         self.show_help = false;
         self.kill_target = None;
         self.reconcile_target = None;
-        // Don't clear reconcile_progress on transition — operator
+        self.prune_target = false;
+        self.reconcile_all_target = false;
+        // Don't clear job_progress on transition — operator
         // may want to navigate around with the deploy still in flight.
         // It clears itself on Esc-after-finished.
         // Always tear down any in-flight shell when leaving its view —
@@ -1702,13 +1901,18 @@ impl App {
         let selected_tab = Some(self.view.top_section());
         super::ui::render_header(frame, header_area, &tabs, selected_tab, &crumbs, &right);
 
+        let secrets = self.secrets.try_read().ok().and_then(|g| g.clone());
         match &self.view {
             View::Dashboard => {
-                let secrets = self.secrets.try_read().ok().and_then(|g| g.clone());
                 self.dashboard.render(frame, pane_area, &self.config, secrets.as_deref());
             }
             View::Hosts => self.hosts.render(frame, pane_area, &self.config),
-            View::HostDetail(_) => self.host_detail.render(frame, pane_area),
+            View::HostDetail(_) => self.host_detail.render(
+                frame,
+                pane_area,
+                &self.config,
+                secrets.as_deref(),
+            ),
             View::ContainerDetail { .. } => {
                 // Split: top 2/3 = inspect data, bottom 1/3 = live log tail.
                 let split = ratatui::layout::Layout::default()
@@ -1722,7 +1926,12 @@ impl App {
                 self.logs.render(frame, split[1], &self.config);
             }
             View::Services => self.services.render(frame, pane_area, &self.config),
-            View::ServiceDetail(_) => self.service_detail.render(frame, pane_area),
+            View::ServiceDetail(_) => self.service_detail.render(
+                frame,
+                pane_area,
+                &self.config,
+                secrets.as_deref(),
+            ),
             View::Logs | View::ContainerLogs { .. } => {
                 self.logs.render(frame, pane_area, &self.config);
             }
@@ -1784,12 +1993,52 @@ impl App {
             ];
             super::ui::render_modal(frame, "reconcile service?", &lines);
         }
-        if let Some(progress) = self.reconcile_progress.as_ref() {
+        if self.reconcile_all_target {
+            let svc_count = format!("services: {}", self.config.services.len());
+            let host_count = format!("hosts:    {}", self.config.hosts.len());
+            let lines = vec![
+                "About to run `yoink up` for every service.",
+                "",
+                svc_count.as_str(),
+                host_count.as_str(),
+                "",
+                "Reconciles each service in config order. Services",
+                "without a config-pinned tag fall back to the running",
+                "container's tag (no version bump). Drift-free services",
+                "are no-ops; anything that needs swapping goes through",
+                "the per-host healthcheck-gated rolling deploy.",
+                "",
+                "[y] / Enter   confirm",
+                "[any]         cancel",
+            ];
+            super::ui::render_modal(frame, "reconcile ALL services?", &lines);
+        }
+        if self.prune_target {
+            let host_count = format!("hosts:    {}", self.config.hosts.len());
+            let lines = vec![
+                "About to run `yoink prune`.",
+                "",
+                host_count.as_str(),
+                "",
+                "Removes yoink-managed containers whose service is no",
+                "longer in config (renamed/deleted) and stale exited",
+                "containers from previous deploys. Running containers",
+                "of known services are kept.",
+                "",
+                "[y] / Enter   confirm",
+                "[any]         cancel",
+            ];
+            super::ui::render_modal(frame, "prune containers?", &lines);
+        }
+        if let Some(progress) = self.job_progress.as_ref() {
             let lines: Vec<String> = progress.lines.iter().cloned().collect();
+            let header = match &progress.kind {
+                JobKind::Reconcile { service, tag } => format!("reconcile · {service}:{tag}"),
+                JobKind::ReconcileAll { .. } => "reconcile · all services".to_string(),
+                JobKind::Prune => "prune".to_string(),
+            };
             let title = format!(
-                " reconcile · {}:{}{} ",
-                progress.service,
-                progress.tag,
+                " {header}{} ",
                 match &progress.finished {
                     None => " (running…)".to_string(),
                     Some(Ok(_)) => " (done — esc to close)".to_string(),
@@ -1798,7 +2047,25 @@ impl App {
             );
             let success = matches!(progress.finished, Some(Ok(_)));
             let failure = matches!(progress.finished, Some(Err(_)));
-            super::ui::render_log_modal(frame, &title, &lines, success, failure);
+            // ReconcileAll gets a status table on top of the scrolling
+            // log so concurrent waves don't make the operator hunt for
+            // "where is service X right now?".
+            if let JobKind::ReconcileAll { statuses } = &progress.kind {
+                let status_rows: Vec<(String, String, ratatui::style::Color)> = statuses
+                    .iter()
+                    .map(|(name, status)| (name.clone(), status.label(), status.color()))
+                    .collect();
+                super::ui::render_status_log_modal(
+                    frame,
+                    &title,
+                    &status_rows,
+                    &lines,
+                    success,
+                    failure,
+                );
+            } else {
+                super::ui::render_log_modal(frame, &title, &lines, success, failure);
+            }
         }
     }
 }
@@ -1808,6 +2075,40 @@ impl Drop for App {
         self.stop_log_streams();
         self.stop_event_subscriptions();
     }
+}
+
+/// Step the per-service status machine in response to one `DeployEvent`.
+/// Events that don't carry a status implication (`NetworkReady`, hooks,
+/// `ContainerLogTail`) are no-ops here.
+fn update_service_status(
+    map: &mut std::collections::BTreeMap<String, ReconcileServiceStatus>,
+    service: &str,
+    event: &crate::deploy::DeployEvent,
+) {
+    use crate::deploy::DeployEvent;
+    let next = match event {
+        DeployEvent::Started { .. } | DeployEvent::PullStarted { .. } => {
+            ReconcileServiceStatus::Pulling
+        }
+        DeployEvent::PullFinished { .. } => ReconcileServiceStatus::Pulled,
+        DeployEvent::ContainerStarted { container, .. } => {
+            ReconcileServiceStatus::Healthchecking {
+                container: container.clone(),
+            }
+        }
+        DeployEvent::HealthcheckHealthy { .. } | DeployEvent::HealthcheckSkipped { .. } => {
+            ReconcileServiceStatus::Swapping
+        }
+        DeployEvent::OldContainerStopped { .. } => ReconcileServiceStatus::Swapping,
+        DeployEvent::AlreadyAtSpec { .. } => ReconcileServiceStatus::Synced,
+        DeployEvent::Done { .. } => ReconcileServiceStatus::Done,
+        // Top-level / non-service events leave the status alone.
+        DeployEvent::HookStarted { .. }
+        | DeployEvent::HookFinished { .. }
+        | DeployEvent::NetworkReady { .. }
+        | DeployEvent::ContainerLogTail { .. } => return,
+    };
+    map.insert(service.to_string(), next);
 }
 
 /// Look up `(user, address)` from the loaded config by address —
@@ -1823,8 +2124,8 @@ fn config_host(config: &Config, address: &str) -> Option<Host> {
 
 /// Background reconcile task. Acquires the per-host advisory lock,
 /// runs `deploy::reconcile` filtered to one service, pipes each
-/// `DeployEvent` back to the run loop as a `ReconcileUpdate::Event`,
-/// then sends a final `ReconcileUpdate::Done` regardless of outcome.
+/// `DeployEvent` back to the run loop as a `JobUpdate::Event`,
+/// then sends a final `JobUpdate::Done` regardless of outcome.
 /// Same shape as `cmd_up` in main.rs but without the printlns.
 async fn reconcile_one(
     mut config: Config,
@@ -1832,15 +2133,15 @@ async fn reconcile_one(
     secrets: Option<Arc<crate::secrets::SecretsBundle>>,
     service: String,
     tag: String,
-    tx: UnboundedSender<ReconcileUpdate>,
+    tx: UnboundedSender<JobUpdate>,
 ) {
     use crate::lock::HostLock;
 
     let send_event = |line: String| {
-        let _ = tx.send(ReconcileUpdate::Event(line));
+        let _ = tx.send(JobUpdate::Event(line));
     };
     let send_done = |result: Result<String, String>| {
-        let _ = tx.send(ReconcileUpdate::Done(result));
+        let _ = tx.send(JobUpdate::Done(result));
     };
 
     // Drop the synthetic `local` host (auto-injected for read-only
@@ -1876,8 +2177,8 @@ async fn reconcile_one(
     overrides.insert(service.clone(), tag.clone());
     let services_filter = vec![service.clone()];
     let secrets_ref = secrets.as_deref();
-    let mut on_event = |e: crate::deploy::DeployEvent| {
-        send_event(crate::output::format_deploy_event(&e));
+    let mut on_event = |svc: Option<&str>, e: crate::deploy::DeployEvent| {
+        send_event(crate::output::format_deploy_event(svc, &e));
     };
     let result = crate::deploy::reconcile(
         &*ops,
@@ -1897,6 +2198,160 @@ async fn reconcile_one(
             send_done(Ok(format!("reconciled {service}:{tag} on {n} host(s)")));
         }
         Err(e) => send_done(Err(format!("reconcile {service}: {e}"))),
+    }
+}
+
+/// Background "reconcile every service" task — equivalent of
+/// `yoink up` with no `--service` filter. Per-service errors stream
+/// in but the run continues; the final Done line summarizes counts.
+async fn reconcile_all(
+    mut config: Config,
+    ops: Arc<dyn DockerOps>,
+    secrets: Option<Arc<crate::secrets::SecretsBundle>>,
+    overrides: std::collections::BTreeMap<String, String>,
+    tx: UnboundedSender<JobUpdate>,
+) {
+    use crate::lock::HostLock;
+
+    let send_event = |line: String| {
+        let _ = tx.send(JobUpdate::Event(line));
+    };
+    let send_done = |result: Result<String, String>| {
+        let _ = tx.send(JobUpdate::Done(result));
+    };
+
+    config.hosts.retain(|h| h.address != Host::LOCAL_ADDRESS);
+    if config.hosts.is_empty() {
+        send_done(Err("no real hosts to deploy to (only the synthetic local host exists)".into()));
+        return;
+    }
+
+    let acquire_futs = config.hosts.iter().map(|host_cfg| {
+        let host = Host::from(host_cfg);
+        let ops = ops.clone();
+        async move { HostLock::acquire(&*ops, host.clone()).await }
+    });
+    let mut locks = match futures_util::future::try_join_all(acquire_futs).await {
+        Ok(ls) => ls,
+        Err(e) => {
+            send_done(Err(format!("acquire deploy lock: {e}")));
+            return;
+        }
+    };
+    for lock in &mut locks {
+        lock.spawn_heartbeat(ops.clone());
+    }
+
+    let secrets_ref = secrets.as_deref();
+
+    // services are already in deploy order — Config::topo_sort_services
+    // ran at load time using each service's depends_on. Reconcile
+    // walks them in that order; prefetch can fan out independently
+    // since pulls don't care about ordering.
+    // Phase 0: parallel image prefetch. Pulls dominate reconcile
+    // time; doing them concurrently up-front turns sum-of-pulls
+    // into max-of-pulls. Inline pulls during the per-service
+    // reconcile then become docker-cache no-ops.
+    let tx_prefetch = tx.clone();
+    let prefetch_cb: std::sync::Arc<
+        dyn Fn(crate::deploy::DeployEvent) + Send + Sync,
+    > = std::sync::Arc::new(move |e| {
+        let _ = tx_prefetch.send(JobUpdate::Event(crate::output::format_deploy_event(None, &e)));
+    });
+    if let Err(e) = crate::deploy::prefetch_images(
+        ops.clone(),
+        &config,
+        &overrides,
+        None,
+        secrets_ref,
+        prefetch_cb,
+    )
+    .await
+    {
+        for lock in locks {
+            lock.release(&*ops).await;
+        }
+        send_done(Err(format!("prefetch images: {e}")));
+        return;
+    }
+
+    // Forward each event through the per-service status tracker
+    // (so the modal's table reflects live state) AND into the
+    // scrolling log buffer prefixed with `[svc]` for readability.
+    let mut on_event = |svc: Option<&str>, e: crate::deploy::DeployEvent| {
+        if let Some(name) = svc {
+            let _ = tx.send(JobUpdate::ServiceEvent(name.to_string(), e.clone()));
+        }
+        send_event(crate::output::format_deploy_event(svc, &e));
+    };
+    let result = crate::deploy::reconcile(
+        &*ops,
+        &config,
+        &overrides,
+        None,
+        secrets_ref,
+        &mut on_event,
+    )
+    .await;
+    for lock in locks {
+        lock.release(&*ops).await;
+    }
+    match result {
+        Ok(reports) => {
+            let svc_count = reports.len();
+            let host_count = reports.first().map_or(0, |r| r.hosts.len());
+            send_done(Ok(format!(
+                "reconciled {svc_count} service(s) on {host_count} host(s)"
+            )));
+        }
+        Err(e) => send_done(Err(format!("reconcile all: {e}"))),
+    }
+}
+
+/// Background prune task. Mirrors `cmd_prune` but pipes each removed
+/// container into the progress modal as a streamed event line.
+async fn prune_all(
+    mut config: Config,
+    ops: Arc<dyn DockerOps>,
+    tx: UnboundedSender<JobUpdate>,
+) {
+    use crate::prune::{self, PruneReason};
+
+    let send_event = |line: String| {
+        let _ = tx.send(JobUpdate::Event(line));
+    };
+    let send_done = |result: Result<String, String>| {
+        let _ = tx.send(JobUpdate::Done(result));
+    };
+
+    config.hosts.retain(|h| h.address != Host::LOCAL_ADDRESS);
+    if config.hosts.is_empty() {
+        send_done(Err("no real hosts to prune".into()));
+        return;
+    }
+
+    send_event(format!("scanning {} host(s)…", config.hosts.len()));
+    match prune::run(&*ops, &config, false).await {
+        Ok(report) => {
+            if report.removed.is_empty() {
+                send_event("nothing to prune".into());
+                send_done(Ok("nothing to prune".into()));
+                return;
+            }
+            for item in &report.removed {
+                let svc = item.service.as_deref().unwrap_or("?");
+                let reason = match item.reason {
+                    PruneReason::ServiceNotInConfig => "service not in config",
+                    PruneReason::StaleExited => "stale exited",
+                };
+                send_event(format!(
+                    "[{}] removed {} (service={svc}, {reason})",
+                    item.host, item.container,
+                ));
+            }
+            send_done(Ok(format!("removed {} container(s)", report.removed.len())));
+        }
+        Err(e) => send_done(Err(format!("prune: {e}"))),
     }
 }
 

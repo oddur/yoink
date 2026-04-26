@@ -16,6 +16,7 @@
 //! that service; already-deployed hosts keep the new version.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -165,10 +166,18 @@ pub fn build_labels(
     labels.insert("yoink.service".into(), service.name.clone());
     labels.insert("yoink.version".into(), tag.into());
     labels.insert("yoink.spec_hash".into(), spec_hash.into());
-    // Audit trail: who ran the deploy + when. Read by `yoink history`
-    // and the TUI history pane to answer "what changed and why?".
-    // Best-effort: $USER falls back to "?" inside CI runners that
-    // don't set it; the timestamp always works.
+    labels
+}
+
+/// Audit-trail labels added at create-container time. Deliberately
+/// kept OUT of `build_labels` (and therefore out of `compute_spec_hash`)
+/// so the deploy timestamp doesn't poison drift detection on every
+/// reconcile. Read by `yoink history` and the TUI history pane.
+/// Best-effort: $USER falls back to "?" inside CI runners that don't
+/// set it; the timestamp always works.
+#[must_use]
+pub fn audit_labels() -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
     labels.insert(
         "yoink.deployed-by".into(),
         std::env::var("USER")
@@ -213,43 +222,228 @@ pub fn build_env(
 /// Reconcile every service in the config to the spec. Top-level entry
 /// point for `yoink up`. `tag_overrides` lets the CLI override the tag
 /// for specific services (`yoink up --service api --tag a1b2c3d`).
+#[allow(clippy::too_many_lines)]
 pub async fn reconcile(
     ops: &dyn DockerOps,
     config: &Config,
     tag_overrides: &BTreeMap<String, String>,
     services_filter: Option<&[String]>,
     secrets: Option<&SecretsBundle>,
-    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+    on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
 ) -> Result<Vec<ServiceDeployReport>, DeployError> {
+    // Ensure every declared network exists on every host, once. Top-
+    // level event: no service context.
+    {
+        let mut none_sink = |e: DeployEvent| on_event(None, e);
+        for host_cfg in &config.hosts {
+            ensure_host_networks(ops, host_cfg, &config.deploy.networks, &mut none_sink).await?;
+        }
+    }
+
     // Run pre-deploy hooks first; one failure halts the whole reconcile.
     for hook in &config.hooks.pre_deploy {
         let tag = resolve_hook_tag(hook, tag_overrides, &config.services);
-        on_event(DeployEvent::HookStarted {
-            name: hook.name.clone(),
-        });
+        on_event(
+            None,
+            DeployEvent::HookStarted {
+                name: hook.name.clone(),
+            },
+        );
         run_hook(ops, config, hook, &tag, secrets).await?;
-        on_event(DeployEvent::HookFinished {
-            name: hook.name.clone(),
-        });
+        on_event(
+            None,
+            DeployEvent::HookFinished {
+                name: hook.name.clone(),
+            },
+        );
     }
 
-    let mut reports = Vec::with_capacity(config.services.len());
-    for service in &config.services {
-        if let Some(filter) = services_filter
-            && !filter.iter().any(|n| n == &service.name)
-        {
-            continue;
-        }
-        let tag = match tag_overrides.get(&service.name).cloned() {
-            Some(t) => t,
-            None => service.tag.clone().ok_or_else(|| DeployError::TagMissing {
-                service: service.name.clone(),
-            })?,
-        };
-        let report = deploy_service(ops, config, service, &tag, secrets, on_event).await?;
-        reports.push(report);
+    // Pre-flight snapshot: read every host's yoink-managed containers
+    // once. Lets the per-service path short-circuit fully-converged
+    // services without doing the file resolve / upload / create-and-
+    // discover-it's-a-noop dance.
+    let mut snapshot: std::collections::HashMap<String, Vec<ContainerInfo>> =
+        std::collections::HashMap::new();
+    for host_cfg in &config.hosts {
+        let host = Host::from(host_cfg);
+        let containers = ops
+            .list_containers_by_label(&host, "yoink.managed=true")
+            .await
+            .map_err(|source| DeployError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
+        snapshot.insert(host.address.clone(), containers);
     }
+
+    // Build the wave plan. config.services is already in topo order
+    // from Config::topo_sort_services; within a wave we run services
+    // concurrently. depends_on edges within `services_filter` define
+    // the constraint; deps that fall outside the filter are treated
+    // as "already satisfied" (operator opted to skip them).
+    let dep_set: BTreeMap<String, std::collections::HashSet<String>> = config
+        .services
+        .iter()
+        .map(|s| (s.name.clone(), s.depends_on.iter().cloned().collect()))
+        .collect();
+    let selected_names: std::collections::HashSet<String> = match services_filter {
+        Some(filter) => filter.iter().cloned().collect(),
+        None => config.services.iter().map(|s| s.name.clone()).collect(),
+    };
+    let mut remaining: Vec<&ServiceConfig> = config
+        .services
+        .iter()
+        .filter(|s| selected_names.contains(&s.name))
+        .collect();
+    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reports: Vec<ServiceDeployReport> = Vec::with_capacity(remaining.len());
+
+    // Wrap the user-supplied sink so wave-parallel futures can each
+    // emit through it. Lock duration is one event push (microseconds);
+    // contention is irrelevant at our scale (≤ tens of services).
+    let sink = std::sync::Mutex::new(on_event);
+
+    let snapshot_ref = &snapshot;
+    let sink_ref = &sink;
+    let ops_ref = ops;
+    let config_ref = config;
+    let secrets_ref = secrets;
+    let overrides_ref = tag_overrides;
+
+    while !remaining.is_empty() {
+        // A service is wave-ready when every depends_on entry that's
+        // also in the selected set is already in `done`.
+        let (wave, rest): (Vec<&ServiceConfig>, Vec<&ServiceConfig>) =
+            remaining.into_iter().partition(|s| {
+                dep_set.get(&s.name).is_none_or(|deps| {
+                    deps.iter()
+                        .all(|d| !selected_names.contains(d) || done.contains(d))
+                })
+            });
+        if wave.is_empty() {
+            // Should be impossible — Config::topo_sort_services rejected
+            // cycles at load time. Belt-and-suspenders.
+            return Err(DeployError::Hook {
+                name: "internal".into(),
+                message: "no service in remaining wave is ready; dependency graph is stuck".into(),
+            });
+        }
+        remaining = rest;
+
+        let wave_results: Vec<Result<ServiceDeployReport, DeployError>> =
+            futures_util::future::join_all(wave.iter().map(|service| {
+                let svc_name = service.name.clone();
+                async move {
+                    let tag = match overrides_ref.get(&service.name).cloned() {
+                        Some(t) => t,
+                        None => service.tag.clone().ok_or_else(|| DeployError::TagMissing {
+                            service: service.name.clone(),
+                        })?,
+                    };
+
+                    // Pre-flight skip: every applicable host has the
+                    // expected replicas at desired_hash → emit
+                    // AlreadyAtSpec events + synthesize a report.
+                    let desired =
+                        build_desired_spec(config_ref, service, &tag, secrets_ref)?;
+                    let desired_hash = docker::compute_spec_hash(&desired);
+                    if let Some(host_results) = service_already_at_spec(
+                        snapshot_ref,
+                        config_ref,
+                        service,
+                        &desired_hash,
+                    ) {
+                        let mut g = sink_ref.lock().expect("sink poisoned");
+                        for r in &host_results {
+                            for index in 0..service.run.replicas {
+                                let name = container_name(
+                                    &service.name,
+                                    &desired_hash,
+                                    index,
+                                    service.run.replicas,
+                                );
+                                g(
+                                    Some(&svc_name),
+                                    DeployEvent::AlreadyAtSpec {
+                                        host: r.host.clone(),
+                                        container: name,
+                                    },
+                                );
+                            }
+                        }
+                        return Ok(ServiceDeployReport {
+                            service: service.name.clone(),
+                            tag,
+                            hosts: host_results,
+                        });
+                    }
+                    drop(desired);
+
+                    // Lock-per-event sink that injects the service tag.
+                    let mut local_sink = |e: DeployEvent| {
+                        let mut g = sink_ref.lock().expect("sink poisoned");
+                        g(Some(&svc_name), e);
+                    };
+                    deploy_service(
+                        ops_ref,
+                        config_ref,
+                        service,
+                        &tag,
+                        secrets_ref,
+                        &mut local_sink,
+                    )
+                    .await
+                }
+            }))
+            .await;
+
+        for (svc, result) in wave.iter().zip(wave_results) {
+            let report = result?;
+            done.insert(svc.name.clone());
+            reports.push(report);
+        }
+    }
+
     Ok(reports)
+}
+
+/// Pre-flight equality check: returns `Some(host_results)` when every
+/// applicable host already runs the expected replicas with matching
+/// `yoink.spec_hash`. `None` means "needs deploy" — at least one host
+/// has missing/extra/mismatched replicas.
+fn service_already_at_spec(
+    snapshot: &std::collections::HashMap<String, Vec<ContainerInfo>>,
+    config: &Config,
+    service: &ServiceConfig,
+    desired_hash: &str,
+) -> Option<Vec<HostDeployResult>> {
+    let mut results = Vec::new();
+    for host_cfg in service.applicable_hosts(&config.hosts) {
+        let containers = snapshot.get(&host_cfg.address)?;
+        let mut primary: Option<String> = None;
+        for index in 0..service.run.replicas {
+            let name =
+                container_name(&service.name, desired_hash, index, service.run.replicas);
+            let found = containers.iter().any(|c| {
+                c.name == name
+                    && c.is_running()
+                    && c.yoink_spec_hash.as_deref() == Some(desired_hash)
+            });
+            if !found {
+                return None;
+            }
+            if primary.is_none() {
+                primary = Some(name);
+            }
+        }
+        results.push(HostDeployResult {
+            host: host_cfg.address.clone(),
+            container: primary.unwrap_or_default(),
+            healthcheck_attempts: 0,
+            stopped_old: vec![],
+        });
+    }
+    Some(results)
 }
 
 /// Reconcile a single service across its applicable hosts.
@@ -353,22 +547,10 @@ async fn prepare_one_host(
         host: host.address.clone(),
     });
 
-    // Ensure every declared network exists on this host. Each
-    // ensure_network call is idempotent (returns whether it had to
-    // create) — emit one NetworkReady event per network.
-    for net in &config.deploy.networks {
-        let created = network::ensure(ops, &host, net)
-            .await
-            .map_err(|source| DeployError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
-        on_event(DeployEvent::NetworkReady {
-            host: host.address.clone(),
-            network: net.clone(),
-            created,
-        });
-    }
+    // Networks are ensured once per host at the start of reconcile
+    // (`ensure_host_networks`), not per-service — every service on
+    // the same host needs the same set, so 6 services × 6 networks
+    // would emit 36 redundant "ready" lines otherwise.
 
     let credentials = registry_credentials(config, secrets);
     pull_image(ops, &host, &service.image, tag, credentials, on_event).await?;
@@ -684,6 +866,22 @@ async fn pull_image(
     credentials: Option<bollard::auth::DockerCredentials>,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<(), DeployError> {
+    // Cache check: if the image is already in the local daemon's
+    // store, skip both the pull and the surrounding event noise.
+    // Lets the prefetch pass cover N images once instead of having
+    // each per-service reconcile re-poll the registry. A stat-only
+    // call to the docker daemon, no network I/O.
+    if ops
+        .image_present(host, image, tag)
+        .await
+        .map_err(|source| DeployError::Docker {
+            host: host.address.clone(),
+            source,
+        })?
+    {
+        return Ok(());
+    }
+
     on_event(DeployEvent::PullStarted {
         host: host.address.clone(),
         image: image.to_string(),
@@ -698,6 +896,113 @@ async fn pull_image(
     on_event(DeployEvent::PullFinished {
         host: host.address.clone(),
     });
+    Ok(())
+}
+
+/// Ensure every named network exists on `host`. Idempotent (safe to
+/// call repeatedly; existing networks are no-ops). Emits one
+/// `NetworkReady` event per network so operators see the
+/// already-exists / created status.
+pub async fn ensure_host_networks(
+    ops: &dyn DockerOps,
+    host_cfg: &crate::config::HostConfig,
+    networks: &[String],
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<(), DeployError> {
+    let host = Host::from(host_cfg);
+    for net in networks {
+        let created = network::ensure(ops, &host, net)
+            .await
+            .map_err(|source| DeployError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
+        on_event(DeployEvent::NetworkReady {
+            host: host.address.clone(),
+            network: net.clone(),
+            created,
+        });
+    }
+    Ok(())
+}
+
+/// Pull every (service, host) image in parallel before reconcile starts.
+///
+/// Worth doing for "deploy everything" gestures (`yoink up` with no
+/// `--service`, TUI's reconcile-all): on a single host this turns
+/// `sum(pull_time)` into ~`max(pull_time)`, since the docker daemon
+/// happily handles many concurrent pulls and registries serve them in
+/// parallel. Single-service deploys don't benefit (only one image to
+/// pull) so callers shouldn't bother invoking this for them.
+///
+/// `pull_image` itself is idempotent — the inline pulls during the
+/// per-service reconcile become no-ops once this completes, so this
+/// is purely additive: safe to skip, safe to run, never wrong.
+///
+/// Errors here are returned to the caller; the inline per-service
+/// `pull_image` would have failed identically anyway.
+pub async fn prefetch_images(
+    ops: Arc<dyn DockerOps>,
+    config: &Config,
+    tag_overrides: &BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
+    secrets: Option<&SecretsBundle>,
+    on_event: Arc<dyn Fn(DeployEvent) + Send + Sync>,
+) -> Result<(), DeployError> {
+    let credentials = registry_credentials(config, secrets);
+
+    let mut futs = Vec::new();
+    for service in &config.services {
+        if let Some(filter) = services_filter
+            && !filter.iter().any(|n| n == &service.name)
+        {
+            continue;
+        }
+        let tag = match tag_overrides.get(&service.name).cloned() {
+            Some(t) => t,
+            None => match service.tag.clone() {
+                Some(t) => t,
+                // Skip silently — reconcile will surface the same
+                // error per-service with a useful service name.
+                None => continue,
+            },
+        };
+        for host_cfg in service.applicable_hosts(&config.hosts) {
+            let host = Host::from(host_cfg);
+            let ops = ops.clone();
+            let on_event = on_event.clone();
+            let creds = credentials.clone();
+            let image = service.image.clone();
+            let tag = tag.clone();
+            futs.push(async move {
+                on_event(DeployEvent::PullStarted {
+                    host: host.address.clone(),
+                    image: image.clone(),
+                    tag: tag.clone(),
+                });
+                let res = ops
+                    .pull_image(&host, &image, &tag, creds)
+                    .await
+                    .map_err(|source| DeployError::Docker {
+                        host: host.address.clone(),
+                        source,
+                    });
+                if res.is_ok() {
+                    on_event(DeployEvent::PullFinished {
+                        host: host.address.clone(),
+                    });
+                }
+                res
+            });
+        }
+    }
+
+    // First-error wins; the rest of the join_all completes anyway so
+    // we don't strand half-started pulls.
+    let results = futures_util::future::join_all(futs).await;
+    for r in results {
+        r?;
+    }
     Ok(())
 }
 
@@ -737,7 +1042,7 @@ async fn create_pending_container(
     spec_hash: &str,
     extra_binds: &[String],
 ) -> Result<(), DeployError> {
-    let spec = build_run_spec(
+    let mut spec = build_run_spec(
         config,
         service,
         tag,
@@ -746,6 +1051,11 @@ async fn create_pending_container(
         spec_hash,
         extra_binds,
     );
+    // Audit labels are added here, *after* the spec_hash was computed
+    // off `spec.labels`, so they never enter the hash and the
+    // deploy-time timestamp doesn't masquerade as drift on the next
+    // reconcile.
+    spec.labels.extend(audit_labels());
     let body = docker::build_container(&spec)?;
     ops.create_container(host, new_name, body)
         .await
@@ -1006,6 +1316,31 @@ services:
     }
 
     #[test]
+    fn build_labels_excludes_audit_fields() {
+        // Regression: deployed-by/deployed-at must NOT be in the
+        // hashable label set — a per-call timestamp would make every
+        // running container look drifted on the next reconcile.
+        let cfg = config_one_service();
+        let labels = build_labels(&cfg.services[0], "abc1234", "0123456789abcdef");
+        assert!(!labels.contains_key("yoink.deployed-by"));
+        assert!(!labels.contains_key("yoink.deployed-at"));
+    }
+
+    #[test]
+    fn desired_spec_hash_is_stable_across_calls() {
+        // The bug this guards against: build_labels used to inject
+        // SystemTime::now(), so two calls a few microseconds apart
+        // produced different hashes and drift detection always fired.
+        let cfg = config_one_service();
+        let a = build_desired_spec(&cfg, &cfg.services[0], "abc1234", None).unwrap();
+        let b = build_desired_spec(&cfg, &cfg.services[0], "abc1234", None).unwrap();
+        assert_eq!(
+            crate::docker::compute_spec_hash(&a),
+            crate::docker::compute_spec_hash(&b),
+        );
+    }
+
+    #[test]
     fn build_labels_includes_yoink_management_and_spec_hash() {
         let cfg = config_one_service();
         let labels = build_labels(&cfg.services[0], "abc1234", "0123456789abcdef");
@@ -1097,13 +1432,50 @@ services:
         );
     }
 
+    /// `happy_ops` flavoured for the reconcile entry point: prepends
+    /// the per-host pre-flight `list_containers` snapshot (returns
+    /// empty so the snapshot doesn't trick the pre-flight check into
+    /// claiming the service is already at spec).
+    fn happy_reconcile_ops(existing_running: &[(&str, &str)]) -> FakeDockerOps {
+        let ops = FakeDockerOps::new();
+        ops.push_ensure_network(Ok(false));
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(existing_running
+            .iter()
+            .map(|(name, version)| ContainerInfo {
+                host: "host-a".into(),
+                name: (*name).into(),
+                image: String::new(),
+                state: "running".into(),
+                status_text: "Up".into(),
+                created_unix: None,
+                yoink_service: Some("app-a".into()),
+                yoink_version: Some((*version).into()),
+                yoink_spec_hash: None,
+                yoink_deployed_by: None,
+                yoink_deployed_at: None,
+                networks: Vec::new(),
+                other_labels: std::collections::BTreeMap::new(),
+            })
+            .collect()));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+        ops.push_start_container(Ok(()));
+        ops.push_healthcheck(Ok(200));
+        for _ in existing_running {
+            ops.push_stop_container(Ok(()));
+        }
+        ops
+    }
+
     #[tokio::test(start_paused = true)]
     async fn reconcile_loops_over_services() {
         // Single service still works through the reconcile entry point.
-        let ops = happy_ops(&[]);
+        let ops = happy_reconcile_ops(&[]);
         let cfg = config_one_service();
         let mut events: Vec<DeployEvent> = Vec::new();
-        let mut sink = |e: DeployEvent| events.push(e);
+        let mut sink = |_svc: Option<&str>, e: DeployEvent| events.push(e);
         let reports = reconcile(&ops, &cfg, &BTreeMap::new(), None, None, &mut sink)
             .await
             .unwrap();
@@ -1113,10 +1485,10 @@ services:
 
     #[tokio::test(start_paused = true)]
     async fn reconcile_applies_tag_override() {
-        let ops = happy_ops(&[]);
+        let ops = happy_reconcile_ops(&[]);
         let cfg = config_one_service();
         let mut events: Vec<DeployEvent> = Vec::new();
-        let mut sink = |e: DeployEvent| events.push(e);
+        let mut sink = |_svc: Option<&str>, e: DeployEvent| events.push(e);
         let mut overrides = BTreeMap::new();
         overrides.insert("app-a".into(), "a1b2c3d".into());
         let reports = reconcile(&ops, &cfg, &overrides, None, None, &mut sink)
@@ -1194,7 +1566,7 @@ hooks:
         )
         .unwrap();
 
-        let ops = happy_ops(&[]);
+        let ops = happy_reconcile_ops(&[]);
         ops.push_pull_image(Ok(()));
         ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
             exit_code: 0,
@@ -1203,7 +1575,7 @@ hooks:
         }));
 
         let mut events: Vec<DeployEvent> = Vec::new();
-        let mut sink = |e: DeployEvent| events.push(e);
+        let mut sink = |_svc: Option<&str>, e: DeployEvent| events.push(e);
         let _ = reconcile(&ops, &cfg, &BTreeMap::new(), None, None, &mut sink)
             .await
             .unwrap();
@@ -1239,6 +1611,10 @@ hooks:
         .unwrap();
 
         let ops = FakeDockerOps::new();
+        // ensure_host_networks runs once at the top of reconcile,
+        // followed by a pre-flight `list_containers` per host.
+        ops.push_ensure_network(Ok(false));
+        ops.push_list_containers(Ok(Vec::new()));
         ops.push_pull_image(Ok(()));
         ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
             exit_code: 1,
@@ -1247,7 +1623,7 @@ hooks:
         }));
 
         let mut events: Vec<DeployEvent> = Vec::new();
-        let mut sink = |e: DeployEvent| events.push(e);
+        let mut sink = |_svc: Option<&str>, e: DeployEvent| events.push(e);
         let err = reconcile(&ops, &cfg, &BTreeMap::new(), None, None, &mut sink)
             .await
             .unwrap_err();
@@ -1261,10 +1637,15 @@ hooks:
 
     #[tokio::test(start_paused = true)]
     async fn services_filter_skips_unselected() {
-        let ops = FakeDockerOps::new(); // no responses needed; should be no-op
+        let ops = FakeDockerOps::new();
+        // Networks are ensured before the per-service loop, so even
+        // when the filter excludes everything the host-level setup
+        // still runs (plus the pre-flight container snapshot).
+        ops.push_ensure_network(Ok(false));
+        ops.push_list_containers(Ok(Vec::new()));
         let cfg = config_one_service();
         let mut events: Vec<DeployEvent> = Vec::new();
-        let mut sink = |e: DeployEvent| events.push(e);
+        let mut sink = |_svc: Option<&str>, e: DeployEvent| events.push(e);
         let reports = reconcile(
             &ops,
             &cfg,

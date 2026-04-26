@@ -486,9 +486,35 @@ async fn cmd_up(
         lock.spawn_heartbeat(ops.clone());
     }
 
-    let mut sink = |event: deploy::DeployEvent| {
-        eprintln!("{}", output::format_deploy_event(&event));
+    let mut sink = |service: Option<&str>, event: deploy::DeployEvent| {
+        eprintln!("{}", output::format_deploy_event(service, &event));
     };
+
+    // Phase 0: prefetch all service images in parallel when this is
+    // a "deploy everything" run. Single-service deploys would gain
+    // nothing (one image to pull) so skip the wrapper.
+    if services_filter.is_none() {
+        let prefetch_cb: std::sync::Arc<
+            dyn Fn(deploy::DeployEvent) + Send + Sync,
+        > = std::sync::Arc::new(|e| {
+            eprintln!("{}", output::format_deploy_event(None, &e));
+        });
+        if let Err(e) = deploy::prefetch_images(
+            ops.clone(),
+            config,
+            &tag_overrides,
+            services_filter,
+            bundle.as_ref(),
+            prefetch_cb,
+        )
+        .await
+        {
+            for lock in locks {
+                lock.release(&*ops).await;
+            }
+            return Err(e).context("prefetch images");
+        }
+    }
 
     let reconcile_result = deploy::reconcile(
         &*ops,
@@ -1326,12 +1352,42 @@ async fn cmd_volumes(config: &Config, host_filter: Option<&str>) -> Result<()> {
 /// the TUI's container-detail pane uses; mirrored here so the dump
 /// stays paste-safe.
 const SECRET_KEY_HINTS: &[&str] = &[
-    "TOKEN", "SECRET", "PASSWORD", "PASS", "API_KEY", "PRIVATE_KEY", "DSN",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASS",
+    "KEY",
+    "DSN",
+    "CREDENTIAL",
+    "SIGNING",
+    "JWT",
+    "COOKIE",
+    "WEBHOOK",
+    "BEARER",
+    "PRIVATE",
+    "SALT",
 ];
 
 fn is_secret_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
     SECRET_KEY_HINTS.iter().any(|h| upper.contains(h))
+}
+
+/// Redact userinfo (`user:password@`) from URL-shaped values so a
+/// credential-bearing URL doesn't leak the password when the env var
+/// name itself doesn't trip `is_secret_key`.
+fn redact_value(value: &str) -> String {
+    let Some(scheme_end) = value.find("://") else {
+        return value.to_string();
+    };
+    let after = &value[scheme_end + 3..];
+    let Some(at) = after.find('@') else {
+        return value.to_string();
+    };
+    let host_part = &after[at..];
+    let userinfo = &after[..at];
+    let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
+    format!("{}://{}:<redacted>{}", &value[..scheme_end], user, host_part)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1490,7 +1546,7 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
                         if is_secret_key(k) {
                             json!({"key": k, "value": "<redacted>"})
                         } else {
-                            json!({"key": k, "value": v})
+                            json!({"key": k, "value": redact_value(v)})
                         }
                     })
                     .collect();

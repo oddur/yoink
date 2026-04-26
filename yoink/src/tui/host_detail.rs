@@ -12,12 +12,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, LineGauge, Paragraph, Row, Table, TableState};
 
+use crate::config::Config;
 use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host, HostInfo};
 use crate::output::format_bytes;
+use crate::secrets::SecretsBundle;
 
 use super::ui::{
-    bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge, short_image,
-    state_style, FilterState,
+    bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge,
+    render_drift_cell, short_image, state_style, FilterState,
 };
 
 pub struct HostDetailRefresh {
@@ -105,6 +107,17 @@ impl HostDetailState {
             .map(|c| c.name.clone())
     }
 
+    /// `yoink.service` label of the currently-selected container.
+    /// `None` for non-yoink-managed containers (no label).
+    pub fn selected_service(&self) -> Option<String> {
+        let visible = self.visible_indices();
+        self.table
+            .selected()
+            .and_then(|i| visible.get(i).copied())
+            .and_then(|src| self.containers.get(src))
+            .and_then(|c| c.yoink_service.clone())
+    }
+
     /// Indices into `self.containers` that pass the current filter
     /// (by index so the borrow ends with the call — needed because
     /// `render_stateful_widget` later wants `&mut self.table`).
@@ -129,7 +142,14 @@ impl HostDetailState {
         self.host.as_ref()
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    #[allow(clippy::too_many_lines)]
+    pub fn render(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        config: &Config,
+        secrets: Option<&SecretsBundle>,
+    ) {
         // 4-section layout: header (1) · summary panel (5) · table (rest) · footer (1).
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -162,6 +182,7 @@ impl HostDetailState {
             Constraint::Length(28), // container
             Constraint::Length(28), // image
             Constraint::Length(22), // networks
+            Constraint::Length(7),  // drift
             Constraint::Length(20), // status
             Constraint::Length(10), // state
             Constraint::Length(10), // health
@@ -196,6 +217,7 @@ impl HostDetailState {
                         } else {
                             c.networks.join(", ")
                         }),
+                        render_drift_cell(c, config, secrets),
                         Cell::from(c.status_text.clone()),
                         Cell::from(c.state.clone()).style(state_style(&c.state)),
                         Cell::from(health.to_string()).style(health_style(health)),
@@ -211,6 +233,7 @@ impl HostDetailState {
                 Cell::from("container").style(bold()),
                 Cell::from("image").style(bold()),
                 Cell::from("networks").style(bold()),
+                Cell::from("drift").style(bold()),
                 Cell::from("status").style(bold()),
                 Cell::from("state").style(bold()),
                 Cell::from("health").style(bold()),
