@@ -85,6 +85,19 @@ impl LogsState {
         }
     }
 
+    /// Plain-text snapshot of the currently-visible (filtered) lines,
+    /// joined by newline — what the `y` key copies to the system
+    /// clipboard.
+    #[must_use]
+    pub fn copy_text(&self) -> String {
+        let mut out = String::new();
+        for line in self.filter_iter() {
+            out.push_str(&line.plain);
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn clear(&mut self) {
         self.lines.clear();
         self.scroll = 0;

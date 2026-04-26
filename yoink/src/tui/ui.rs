@@ -200,6 +200,23 @@ pub fn table_highlight_style() -> Style {
 /// `table_highlight_style`. Used by every selectable table.
 pub const TABLE_HIGHLIGHT_SYMBOL: &str = "▶ ";
 
+/// Copy `text` to the host terminal's system clipboard via the
+/// OSC-52 escape sequence — works in iTerm2, Kitty, Alacritty,
+/// `WezTerm`, Ghostty, modern Terminal.app, and tmux (with
+/// `set -g set-clipboard on`). No external `pbcopy` / `xclip` dep,
+/// and crucially works over SSH if the local terminal honors
+/// OSC-52. Returns the byte count copied (caller toasts it).
+pub fn copy_to_clipboard(text: &str) -> std::io::Result<usize> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use std::io::Write;
+    let encoded = STANDARD.encode(text.as_bytes());
+    let payload = format!("\x1b]52;c;{encoded}\x07");
+    let mut stdout = std::io::stdout();
+    stdout.write_all(payload.as_bytes())?;
+    stdout.flush()?;
+    Ok(text.len())
+}
+
 /// Green / yellow / red threshold for a 0..=1 gauge — the convention
 /// matches what the real `Gauge` widget uses by default. <60% green,
 /// <85% yellow, otherwise red.

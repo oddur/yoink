@@ -185,6 +185,7 @@ impl View {
                 "logs (multiplexed)",
                 "  /            filter substring",
                 "  ↑↓ / PgUp PgDn  scroll · g top · G bottom",
+                "  y            yank visible buffer to system clipboard",
                 "  k            clear · r restart streams",
             ],
             View::ContainerLogs { .. } => vec![
@@ -192,6 +193,7 @@ impl View {
                 "  /            filter substring",
                 "  ↑↓ / PgUp PgDn  scroll · g top · G bottom",
                 "  !            shell · D debug sidecar",
+                "  y            yank visible buffer to system clipboard",
                 "  k            clear · esc back",
             ],
             View::ContainerShell { .. } => vec![
@@ -621,6 +623,36 @@ impl App {
         self.schedule_dashboard_refresh();
     }
 
+    /// Copy the currently-visible log buffer (filtered, in render
+    /// order) to the host terminal's clipboard via OSC-52. Toasts
+    /// the result so the operator knows it worked. Bound to `y`
+    /// from Logs / `ContainerLogs`.
+    fn copy_logs_to_clipboard(&mut self) {
+        let text = self.logs.copy_text();
+        self.copy_text_to_clipboard(&text, "logs");
+    }
+
+    fn copy_text_to_clipboard(&mut self, text: &str, label: &str) {
+        if text.is_empty() {
+            self.push_toast(format!("nothing to copy ({label} buffer empty)"));
+            return;
+        }
+        match super::ui::copy_to_clipboard(text) {
+            Ok(n) => self.push_toast(format!("✓ copied {label} ({n} bytes)")),
+            Err(e) => self.push_toast(format!("✗ copy failed: {e}")),
+        }
+    }
+
+    /// Push a toast onto the ring with the standard TTL — used by
+    /// the various copy / one-off action paths.
+    fn push_toast(&mut self, line: String) {
+        self.toasts
+            .push_back((std::time::Instant::now() + TOAST_TTL, line));
+        while self.toasts.len() > TOAST_CAP {
+            self.toasts.pop_front();
+        }
+    }
+
     /// Open the reconcile-confirm modal for `service`. Resolves the
     /// tag the same way the dashboard's drift cell does — config
     /// tag if present, else the running container's tag — so the
@@ -819,10 +851,21 @@ impl App {
 
         // Reconcile-progress modal: while running, eat all keys
         // (Ctrl-C/Q already handled above) so a stray j/k can't
-        // navigate the underlying view. Once finished, Esc dismisses;
-        // any other key is also eaten so the operator doesn't
-        // accidentally fire something else off.
+        // navigate the underlying view. `y` always works to yank
+        // the current log to the clipboard. Once finished, Esc
+        // dismisses; any other key is also eaten so the operator
+        // doesn't accidentally fire something else off.
         if let Some(progress) = self.reconcile_progress.as_ref() {
+            if matches!(key.code, KeyCode::Char('y')) {
+                let text: String = progress
+                    .lines
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.copy_text_to_clipboard(&text, "reconcile log");
+                return false;
+            }
             if progress.finished.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                 self.reconcile_progress = None;
             }
@@ -1033,6 +1076,7 @@ impl App {
                     .await;
                 }
                 KeyCode::Char('k') => self.logs.clear(),
+                KeyCode::Char('y') => self.copy_logs_to_clipboard(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
                 KeyCode::Up => self.logs.scroll_up(1),
                 KeyCode::Down => self.logs.scroll_down(1),
@@ -1146,6 +1190,7 @@ impl App {
                     self.stop_log_streams();
                     self.start_service_log_streams().await;
                 }
+                KeyCode::Char('y') => self.copy_logs_to_clipboard(),
                 KeyCode::Char('k') => self.logs.clear(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
                 KeyCode::Up => self.logs.scroll_up(1),
