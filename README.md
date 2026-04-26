@@ -354,13 +354,9 @@ Operator gestures from the dashboard:
 
 ### Pretty logs
 
-Yoink doesn't try to format logs — it just streams whatever the container writes. Pipe it through [`hl`](https://github.com/pamburus/hl) (`brew install pamburus/tap/hl`) for human-friendly highlighting of structured logs (JSON, logfmt, key=value, etc.):
+Structured log lines (JSON, logfmt, etc.) are hard to scan as raw text. The TUI's logs pane auto-detects [`hl`](https://github.com/pamburus/hl) (`brew install pamburus/tap/hl`) on the operator's `PATH` and transparently pipes every container's log stream through it before rendering — so JSON keys are colored, timestamps are dim, levels are highlighted, and stack traces stay readable. Falls back to raw output when `hl` isn't installed; no config knob to toggle.
 
-```sh
-yoink logs api -f | hl
-```
-
-In the TUI's per-container logs pane the same trick works — `hl` reads from any pipe, so `yoink tui` users typically keep a side terminal for the noisy services with `yoink logs <svc> -f | hl`.
+The `yoink logs <svc> -f` CLI doesn't auto-pipe (the operator decides their own shell pipeline), but `yoink logs api -f | hl` works the same way.
 
 ## Build & test
 
