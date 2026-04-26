@@ -356,6 +356,7 @@ async fn run_loop(
     app.schedule_hosts_refresh();
     app.schedule_dashboard_refresh();
     app.start_event_subscriptions();
+    app.spawn_secrets_loader();
     if matches!(app.view, View::Logs) {
         app.start_service_log_streams().await;
     }
@@ -450,6 +451,12 @@ pub struct App {
     /// current view. The user confirms with `y` (or Enter) and
     /// cancels with anything else. Cleared on transition.
     kill_target: Option<(Host, String)>,
+    /// Cached secrets bundle for drift detection in the Dashboard
+    /// pane. Populated lazily by a background task at startup so the
+    /// TUI doesn't block on `infisical export` (which can take 2–5 s).
+    /// `None` means "not loaded yet" — drift cells render as `?`
+    /// until the loader finishes.
+    secrets: Arc<tokio::sync::RwLock<Option<Arc<crate::secrets::SecretsBundle>>>>,
     /// Ring of recent docker-event toasts: `(deadline, line)`. The
     /// most-recent line displaces the right-side host/service count
     /// in the breadcrumb header for `TOAST_TTL`.
@@ -516,6 +523,7 @@ impl App {
             shell: None,
             show_help: false,
             kill_target: None,
+            secrets: Arc::new(tokio::sync::RwLock::new(None)),
             toasts: std::collections::VecDeque::new(),
             shell_bytes_tx,
             shell_bytes_rx,
@@ -564,6 +572,31 @@ impl App {
             self.schedule_hosts_refresh();
         }
         self.schedule_dashboard_refresh();
+    }
+
+    /// Kick off `infisical export` in the background. The Dashboard
+    /// drift column needs the bundle to compute `spec_hashes` that
+    /// match what `yoink up` would produce. We don't block startup
+    /// on it — the column shows `?` for the few seconds the loader
+    /// takes, then resolves to ✓/⚠ once the bundle lands.
+    fn spawn_secrets_loader(&self) {
+        let config = self.config.clone();
+        let slot = self.secrets.clone();
+        tokio::spawn(async move {
+            match crate::secrets::load_bundle(&config).await {
+                Ok(Some(bundle)) => {
+                    *slot.write().await = Some(Arc::new(bundle));
+                }
+                Ok(None) => {
+                    // No `[secrets]` block — nothing to load. Drift
+                    // detection still works for services without
+                    // secrets-derived env.
+                }
+                Err(e) => {
+                    warn!(error = %e, "secrets load for drift detection failed; column will stay '?'");
+                }
+            }
+        });
     }
 
     /// Spawn one task per configured host that subscribes to the docker
@@ -1429,7 +1462,10 @@ impl App {
         super::ui::render_header(frame, header_area, &tabs, selected_tab, &crumbs, &right);
 
         match &self.view {
-            View::Dashboard => self.dashboard.render(frame, pane_area, &self.config),
+            View::Dashboard => {
+                let secrets = self.secrets.try_read().ok().and_then(|g| g.clone());
+                self.dashboard.render(frame, pane_area, &self.config, secrets.as_deref());
+            }
             View::Hosts => self.hosts.render(frame, pane_area, &self.config),
             View::HostDetail(_) => self.host_detail.render(frame, pane_area),
             View::ContainerDetail { .. } => {

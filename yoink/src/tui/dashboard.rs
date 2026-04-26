@@ -12,8 +12,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::config::Config;
-use crate::docker_ops::{ContainerStats, DockerOps, Host};
+use crate::deploy;
+use crate::docker;
+use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host};
 use crate::output::{format_bytes, format_relative_time};
+use crate::secrets::SecretsBundle;
 use crate::status::StatusReport;
 
 use super::ui::{
@@ -71,7 +74,13 @@ impl DashboardState {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, config: &Config) {
+    pub fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        config: &Config,
+        secrets: Option<&SecretsBundle>,
+    ) {
         let layout = pane_layout(area);
 
         let services = config
@@ -84,7 +93,7 @@ impl DashboardState {
             Paragraph::new(format!("yoink dashboard · services: {services}")).style(bold());
         frame.render_widget(header, layout[0]);
 
-        let rows = self.build_rows();
+        let rows = self.build_rows(config, secrets);
         let widths = [
             Constraint::Length(18), // host
             Constraint::Length(14), // service
@@ -92,6 +101,7 @@ impl DashboardState {
             Constraint::Length(9),  // state
             Constraint::Length(10), // health
             Constraint::Length(10), // version
+            Constraint::Length(7),  // drift
             Constraint::Length(20), // cpu% (value + bracketed gauge)
             Constraint::Length(34), // mem (value / limit + bracketed gauge)
             Constraint::Min(20),    // created
@@ -104,6 +114,7 @@ impl DashboardState {
                 Cell::from("state").style(bold()),
                 Cell::from("health").style(bold()),
                 Cell::from("version").style(bold()),
+                Cell::from("drift").style(bold()),
                 Cell::from("cpu").style(bold()),
                 Cell::from("mem").style(bold()),
                 Cell::from("created").style(bold()),
@@ -127,7 +138,7 @@ impl DashboardState {
         frame.render_widget(footer, layout[2]);
     }
 
-    fn build_rows(&self) -> Vec<Row<'_>> {
+    fn build_rows(&self, config: &Config, secrets: Option<&SecretsBundle>) -> Vec<Row<'_>> {
         let Some(report) = &self.report else {
             return vec![Row::new(vec![Cell::from("(loading…)")])];
         };
@@ -138,6 +149,7 @@ impl DashboardState {
                     Cell::from(host.host.clone()),
                     Cell::from("-"),
                     Cell::from("(none)"),
+                    Cell::from("-"),
                     Cell::from("-"),
                     Cell::from("-"),
                     Cell::from("-"),
@@ -168,6 +180,7 @@ impl DashboardState {
 
                 let cpu_cell = render_cpu_cell(stats);
                 let mem_cell = render_mem_cell(stats);
+                let drift_cell = render_drift_cell(c, config, secrets);
 
                 rows.push(Row::new(vec![
                     Cell::from(host.host.clone()),
@@ -176,6 +189,7 @@ impl DashboardState {
                     Cell::from(c.state.clone()).style(state_style(&c.state)),
                     Cell::from(health.to_string()).style(health_style(health)),
                     Cell::from(c.yoink_version.clone().unwrap_or_else(|| "-".into())),
+                    drift_cell,
                     cpu_cell,
                     mem_cell,
                     Cell::from(format_relative_time(c.created_unix)),
@@ -237,6 +251,62 @@ fn render_mem_cell(stats: Option<&ContainerStats>) -> Cell<'static> {
     }
 }
 
+
+/// Drift cell: ✓ in-sync (green), ⚠ drift (yellow), ? unknown
+/// (dim — container has no `yoink.spec_hash`, isn't yoink-managed,
+/// secrets bundle hasn't loaded, or the desired-spec build failed).
+fn render_drift_cell(
+    container: &ContainerInfo,
+    config: &Config,
+    secrets: Option<&SecretsBundle>,
+) -> Cell<'static> {
+    let unknown = || Cell::from("?").style(Style::default().fg(Color::DarkGray));
+
+    let Some(service_name) = container.yoink_service.as_deref() else {
+        return unknown();
+    };
+    let Some(running_hash) = container.yoink_spec_hash.as_deref() else {
+        return unknown();
+    };
+    let Some(service_cfg) = config.services.iter().find(|s| s.name == service_name) else {
+        return unknown();
+    };
+    // For services with a config-pinned tag (caddy, redis, otel,
+    // pgadmin) use it. For code-versioned services without one,
+    // fall back to the running container's tag — measures
+    // config-spec-only drift (env / network / options / mounts)
+    // instead of pretending we know what tag would be deployed.
+    let tag = service_cfg
+        .tag
+        .clone()
+        .or_else(|| container.yoink_version.clone());
+    let Some(tag) = tag else {
+        return unknown();
+    };
+
+    // build_desired_spec resolves run.files from local disk too;
+    // skip silently on error (caddy/otel/etc. can't drift-check
+    // when their files aren't readable from where yoink runs).
+    let Ok(desired) = deploy::build_desired_spec(config, service_cfg, &tag, secrets) else {
+        return unknown();
+    };
+    let desired_hash = docker::compute_spec_hash(&desired);
+
+    // If the container needs secrets and we don't have them, the
+    // hash will always differ — flag as ? rather than ⚠ to avoid
+    // false-positive drift while the loader is in flight.
+    let has_secrets = !service_cfg.secrets.is_empty()
+        || !service_cfg.env_from_secrets.is_empty();
+    if has_secrets && secrets.is_none() {
+        return unknown();
+    }
+
+    if desired_hash == running_hash {
+        Cell::from("✓ sync").style(Style::default().fg(Color::Green))
+    } else {
+        Cell::from("⚠ drift").style(Style::default().fg(Color::Yellow))
+    }
+}
 
 /// Background-friendly fetch — owned inputs so the future is `'static + Send`.
 pub async fn fetch_owned(ops: Arc<dyn DockerOps>, config: Arc<Config>) -> DashboardRefresh {

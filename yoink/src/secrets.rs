@@ -114,6 +114,20 @@ impl fmt::Debug for SecretsBundle {
 /// into a `SecretsBundle`. The `INFISICAL_TOKEN` env var (machine
 /// identity) is honored if set in the parent shell — otherwise the CLI
 /// uses a cached `infisical login` session.
+/// Convenience wrapper for the common "load whatever the operator
+/// configured" path. Returns `Ok(None)` when no `[secrets]` block is
+/// declared (services that don't need secrets). Any other error
+/// surfaces — the deploy + drift-detection paths both surface it.
+pub async fn load_bundle(
+    config: &crate::config::Config,
+) -> Result<Option<SecretsBundle>, SecretsError> {
+    let Some(cfg) = &config.secrets else {
+        return Ok(None);
+    };
+    let bundle = fetch_secrets(cfg, cfg.domain.as_deref()).await?;
+    Ok(Some(bundle))
+}
+
 pub async fn fetch_secrets(
     cfg: &SecretsConfig,
     domain: Option<&str>,

@@ -534,6 +534,37 @@ async fn finalize_one_host(
 /// create the container (with the derived name + hash baked into the
 /// labels). `extra_binds` is appended to `service.run.binds` — used to
 /// inject the host-side paths of resolved `files:` entries.
+/// Build the `RunSpec` that `yoink up` *would* produce for this
+/// service+tag, suitable for hashing via `docker::compute_spec_hash`
+/// and comparing against a running container's `yoink.spec_hash`.
+/// Resolves `service.run.files` so the spec includes the same
+/// content-hashed bind strings deploy-time uses. The TUI's
+/// dashboard drift column calls this.
+#[allow(clippy::result_large_err)]
+pub fn build_desired_spec(
+    config: &Config,
+    service: &ServiceConfig,
+    tag: &str,
+    secrets: Option<&SecretsBundle>,
+) -> Result<RunSpec, DeployError> {
+    let resolved_files = resolve_files(config, service)?;
+    let file_binds: Vec<String> = resolved_files
+        .iter()
+        .map(|(m, hash)| m.as_bind_string(hash))
+        .collect();
+    // container_name and spec_hash don't affect compute_spec_hash —
+    // see docker.rs::compute_spec_hash_ignores_container_name.
+    Ok(build_run_spec(
+        config,
+        service,
+        tag,
+        secrets,
+        String::new(),
+        "",
+        &file_binds,
+    ))
+}
+
 fn build_run_spec(
     config: &Config,
     service: &ServiceConfig,
@@ -565,7 +596,7 @@ fn build_run_spec(
 /// read a local file aborts the whole deploy — there's no point
 /// uploading a partial set of mounts.
 #[allow(clippy::result_large_err)]
-fn resolve_files(
+pub fn resolve_files(
     config: &Config,
     service: &ServiceConfig,
 ) -> Result<Vec<(FileMount, String)>, DeployError> {
