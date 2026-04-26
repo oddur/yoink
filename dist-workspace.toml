@@ -16,7 +16,9 @@ formula = "yoink"
 # aarch64-linux variant (less common; add when an arm64 server use
 # case appears).
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
-# Publishers run after the artifacts are uploaded. `homebrew` pushes
-# the formula to the tap repo configured above.
-publish-jobs = ["homebrew"]
+# Tap auto-publish is intentionally not in publish-jobs yet: it needs
+# a HOMEBREW_TAP_TOKEN secret with write access to oddur/homebrew-yoink.
+# The formula is still generated as a release asset; users can either
+# install it manually, or (once the secret is set) re-enable here:
+#   publish-jobs = ["homebrew"]
 install-updater = false
