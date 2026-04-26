@@ -181,7 +181,7 @@ fn build_host_config(
             options
                 .tmpfs
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| (k.clone(), harden_tmpfs_options(v)))
                 .collect(),
         )
     };
@@ -191,7 +191,7 @@ fn build_host_config(
     let security_opt = vec_opt(&options.security_opt);
 
     let mut binds: Vec<String> = Vec::new();
-    binds.extend(spec.binds.iter().cloned());
+    binds.extend(spec.binds.iter().map(|b| default_bind_to_ro(b)));
     binds.extend(spec.volumes.iter().cloned());
     let binds = vec_opt(&binds);
     let port_bindings = if port_bindings.is_empty() {
@@ -219,6 +219,7 @@ fn build_host_config(
         }),
         network_mode: Some(network.to_string()),
         auto_remove: Some(false),
+        init: Some(options.init),
         ..Default::default()
     })
 }
@@ -340,6 +341,53 @@ pub fn parse_cpus(s: &str) -> Result<i64, BuildError> {
     Ok(nano)
 }
 
+/// Append `noexec`, `nosuid`, and `nodev` to a tmpfs option string
+/// unless the operator explicitly opts out by including the positive
+/// form (`exec`, `suid`, `dev`). Existing options are preserved
+/// verbatim. The hardening blocks the "drop a binary on writable
+/// scratch + exec it" escape chain — a tmpfs is a great place for an
+/// attacker with code execution to land a payload, and `noexec`
+/// renders that payload unrunnable; `nosuid` prevents setuid
+/// elevation off the same surface; `nodev` blocks creating device
+/// nodes.
+#[must_use]
+pub fn harden_tmpfs_options(opts: &str) -> String {
+    let parts: Vec<&str> = opts
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let has = |needle: &str| parts.iter().any(|p| p.eq_ignore_ascii_case(needle));
+    let mut out: Vec<String> = parts.iter().map(|s| (*s).to_string()).collect();
+    for (positive, negative) in [("exec", "noexec"), ("suid", "nosuid"), ("dev", "nodev")] {
+        if !has(positive) && !has(negative) {
+            out.push(negative.to_string());
+        }
+    }
+    out.join(",")
+}
+
+/// Append `:ro` to a bind-mount string unless it already specifies a
+/// mode (`:ro` or `:rw` as a colon-delimited token, possibly followed
+/// by `SELinux` flags like `:Z`). Operator opts in to writable bind
+/// mounts with explicit `:rw`. Removes the "I bind-mounted a config
+/// dir and the app started scribbling on /etc on the host" footgun.
+#[must_use]
+pub fn default_bind_to_ro(bind: &str) -> String {
+    // A bind has the shape "src:dst" or "src:dst:mode[,opt,opt]".
+    // The mode token (when present) is the third colon-separated
+    // field; on the bare two-field form, append `:ro`.
+    let colon_count = bind.matches(':').count();
+    if colon_count >= 2 {
+        // Already has a mode (or SELinux options) — leave verbatim.
+        // We DON'T inspect for `:ro`/`:rw` explicitly; any third
+        // field counts as the operator having decided.
+        bind.to_string()
+    } else {
+        format!("{bind}:ro")
+    }
+}
+
 /// Parse docker-cli `--publish` strings into a port-bindings map keyed
 /// by `"<container_port>/<proto>"` (the format bollard expects). Accepts:
 ///   - `"8080:80"`
@@ -437,6 +485,7 @@ pub fn compute_spec_hash(spec: &RunSpec) -> String {
     feed_list(&mut h, "cap_add", &opts.cap_add);
     feed_list(&mut h, "security_opt", &opts.security_opt);
     feed(&mut h, "read_only", &[u8::from(opts.read_only)]);
+    feed(&mut h, "init", &[u8::from(opts.init)]);
     feed_map(&mut h, "tmpfs", &opts.tmpfs);
     feed(
         &mut h,
@@ -537,6 +586,7 @@ mod tests {
                 network_aliases: vec!["api".into()],
                 restart: None,
                 user: None,
+                init: true,
             },
             entrypoint: None,
             command: vec![],
@@ -568,10 +618,13 @@ mod tests {
         );
         assert_eq!(host.readonly_rootfs, Some(true));
         let tmpfs = host.tmpfs.unwrap();
-        assert_eq!(
-            tmpfs.get("/tmp").map(String::as_str),
-            Some("size=64m,mode=1777")
-        );
+        // tmpfs options get auto-hardened with noexec/nosuid/nodev.
+        let opts = tmpfs.get("/tmp").unwrap();
+        assert!(opts.contains("size=64m"));
+        assert!(opts.contains("mode=1777"));
+        assert!(opts.contains("noexec"));
+        assert!(opts.contains("nosuid"));
+        assert!(opts.contains("nodev"));
         assert_eq!(host.network_mode.as_deref(), Some("yoink"));
         assert_eq!(host.auto_remove, Some(false));
         let rp = host.restart_policy.unwrap();
@@ -643,6 +696,87 @@ mod tests {
         assert_eq!(parse_cpus("0.5").unwrap(), 500_000_000);
         assert_eq!(parse_cpus("500m").unwrap(), 500_000_000);
         assert_eq!(parse_cpus("1500m").unwrap(), 1_500_000_000);
+    }
+
+    #[test]
+    fn harden_tmpfs_appends_safe_flags_when_missing() {
+        // Operator-provided options preserved + the three negatives appended.
+        let out = harden_tmpfs_options("size=64m,mode=1777");
+        // Order is preserved (operator's first, ours appended).
+        let parts: std::collections::BTreeSet<&str> = out.split(',').collect();
+        assert!(parts.contains("size=64m"));
+        assert!(parts.contains("mode=1777"));
+        assert!(parts.contains("noexec"));
+        assert!(parts.contains("nosuid"));
+        assert!(parts.contains("nodev"));
+    }
+
+    #[test]
+    fn harden_tmpfs_respects_explicit_opt_outs() {
+        // If the operator specifically wants exec/suid/dev, we don't
+        // override them. Each negative is independent.
+        let out = harden_tmpfs_options("size=64m,exec");
+        assert!(out.contains("exec"));
+        assert!(!out.contains("noexec"));
+        assert!(out.contains("nosuid"));
+        assert!(out.contains("nodev"));
+    }
+
+    #[test]
+    fn harden_tmpfs_idempotent_on_already_hardened_string() {
+        let out = harden_tmpfs_options("size=64m,noexec,nosuid,nodev");
+        // Hardening a string that already has the negatives shouldn't
+        // duplicate them.
+        assert_eq!(out.matches("noexec").count(), 1);
+        assert_eq!(out.matches("nosuid").count(), 1);
+        assert_eq!(out.matches("nodev").count(), 1);
+    }
+
+    #[test]
+    fn default_bind_appends_ro_when_no_mode_set() {
+        assert_eq!(
+            default_bind_to_ro("/host/path:/container/path"),
+            "/host/path:/container/path:ro"
+        );
+    }
+
+    #[test]
+    fn default_bind_leaves_explicit_modes_alone() {
+        assert_eq!(
+            default_bind_to_ro("/host:/container:ro"),
+            "/host:/container:ro"
+        );
+        assert_eq!(
+            default_bind_to_ro("/host:/container:rw"),
+            "/host:/container:rw"
+        );
+        // Multi-option mode strings (SELinux Z, etc.) also count as
+        // explicit operator intent.
+        assert_eq!(
+            default_bind_to_ro("/host:/container:rw,Z"),
+            "/host:/container:rw,Z"
+        );
+    }
+
+    #[test]
+    fn build_container_default_options_set_init_true() {
+        let mut spec = sample_spec();
+        spec.options = RunOptions::default();
+        let body = build_container(&spec).unwrap();
+        let host = body.host_config.unwrap();
+        assert_eq!(host.init, Some(true));
+    }
+
+    #[test]
+    fn build_container_init_false_opt_out() {
+        let mut spec = sample_spec();
+        spec.options = RunOptions {
+            init: false,
+            ..RunOptions::default()
+        };
+        let body = build_container(&spec).unwrap();
+        let host = body.host_config.unwrap();
+        assert_eq!(host.init, Some(false));
     }
 
     #[test]

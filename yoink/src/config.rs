@@ -361,6 +361,15 @@ pub struct RunOptions {
     /// image's `USER` directive.
     #[serde(default)]
     pub user: Option<String>,
+    /// Run `tini` as PID 1 (docker's `--init`). **Default: `true`.**
+    /// Most app images run their language runtime as PID 1, which
+    /// doesn't reap zombies and often eats SIGTERM instead of
+    /// forwarding it to children — drains stall, healthcheck-gated
+    /// rolls hang, zombie procs accumulate. tini fixes both. Set to
+    /// `false` for images that already ship their own init system
+    /// (systemd-in-containers, s6-overlay, supervisord, …).
+    #[serde(default = "default_init")]
+    pub init: bool,
 }
 
 fn default_cap_drop() -> Vec<String> {
@@ -372,6 +381,10 @@ fn default_security_opt() -> Vec<String> {
 }
 
 fn default_read_only() -> bool {
+    true
+}
+
+fn default_init() -> bool {
     true
 }
 
@@ -396,6 +409,7 @@ impl Default for RunOptions {
             tmpfs: BTreeMap::new(),
             restart: None,
             user: None,
+            init: default_init(),
         }
     }
 }

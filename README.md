@@ -236,6 +236,9 @@ Compose's defaults are dev-friendly, not prod-friendly: every container runs wit
 | `cap_drop` | `["ALL"]` | every Linux capability dropped (no `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, …) | `cap_drop: []` (full default cap set), or surgically re-add via `cap_add` |
 | `security_opt` | `["no-new-privileges:true"]` | setuid binaries inside the container can't escalate via `execve` | `security_opt: []` |
 | `read_only` | `true` | rootfs mounted read-only — exploits can't drop binaries on disk | `read_only: false` |
+| `tmpfs` mount opts | auto-`noexec,nosuid,nodev` | a writable scratch tmpfs can't be used to drop + run a binary, set setuid bits, or create device nodes | include explicit `exec`/`suid`/`dev` in your tmpfs option string |
+| `binds` mode | `:ro` when no mode set | accidental bind-mount-and-write to host paths is impossible without explicit `:rw` | `"/host:/container:rw"` (explicit) |
+| `init` | `true` | tini as PID 1 reaps zombies + forwards SIGTERM, so drains and rolling swaps actually finish | `init: false` for images that ship their own init (systemd-in-containers, s6, supervisord) |
 | `pids_limit` | `1024` | bounds the fork-bomb class of exploits | `pids_limit: null` (unlimited), or any positive int |
 | `cpus` | `null` (uncapped) | — | set to `"2"`, `"500m"`, `"1.5"`, etc. — k8s style |
 | `memory` | `null` (uncapped) | — | set to `"512Mi"`, `"1Gi"`, `"512m"`, `"1g"` — k8s + docker styles both accepted |
