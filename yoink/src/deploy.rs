@@ -502,6 +502,21 @@ async fn finalize_one_host(
                 host: host.address.clone(),
                 source,
             })?;
+        // Multi-network attach: docker only honors the first
+        // endpoint at create time. Connect each additional network
+        // explicitly post-start, with the same alias set so the
+        // container resolves by name on every network.
+        let effective = service.effective_networks(&config.deploy);
+        let mut aliases = vec![replica.name.clone()];
+        aliases.extend(service.run.options.network_aliases.iter().cloned());
+        for net in effective.iter().skip(1) {
+            ops.connect_container_network(&host, &replica.name, net, &aliases)
+                .await
+                .map_err(|source| DeployError::Docker {
+                    host: host.address.clone(),
+                    source,
+                })?;
+        }
         on_event(DeployEvent::ContainerStarted {
             host: host.address.clone(),
             container: replica.name.clone(),

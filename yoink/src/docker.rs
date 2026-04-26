@@ -210,18 +210,21 @@ fn build_networking_config(
     container_name: &str,
     options: &RunOptions,
 ) -> NetworkingConfig {
-    // The container is reachable on each attached network by its
-    // container name (docker's built-in alias). User-supplied
-    // aliases are added to every network — same alias works
-    // regardless of which network the caller dialed in on.
+    // Only the first (primary) network goes here — docker silently
+    // drops endpoints_config entries that don't match
+    // host_config.network_mode at create time. Additional networks
+    // get attached post-start via `connect_container_network` in
+    // the deploy code, with the same aliases. The container is
+    // reachable as `container_name` on every attached network by
+    // virtue of docker's auto-alias plus our explicit one.
     let mut aliases = vec![container_name.to_string()];
     aliases.extend(options.network_aliases.iter().cloned());
     let mut endpoints = HashMap::new();
-    for network in networks {
+    if let Some(primary) = networks.first() {
         endpoints.insert(
-            network.clone(),
+            primary.clone(),
             EndpointSettings {
-                aliases: Some(aliases.clone()),
+                aliases: Some(aliases),
                 ..Default::default()
             },
         );

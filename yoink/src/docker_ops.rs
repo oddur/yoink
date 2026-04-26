@@ -369,6 +369,20 @@ pub trait DockerOps: Send + Sync {
     /// List every docker network on `host`. Used by `yoink networks`.
     async fn list_networks(&self, host: &Host) -> Result<Vec<NetworkInfo>, DockerError>;
 
+    /// Connect an already-running container to an additional docker
+    /// network. Used post-start for multi-network attachment because
+    /// docker's create-time `endpoints_config` can silently drop
+    /// entries that don't match `host_config.network_mode`.
+    /// Aliases ensure the container resolves by its name on the new
+    /// network too. Idempotent: already-connected returns Ok.
+    async fn connect_container_network(
+        &self,
+        host: &Host,
+        container: &str,
+        network: &str,
+        aliases: &[String],
+    ) -> Result<(), DockerError>;
+
     /// List every docker volume on `host`. Used by `yoink volumes`.
     async fn list_volumes(&self, host: &Host) -> Result<Vec<VolumeInfo>, DockerError>;
 
@@ -550,6 +564,12 @@ pub trait DockerOps: Send + Sync {
 // ───── RealDockerOps ────────────────────────────────────────────────────
 
 const HEALTHCHECK_CURL_IMAGE: &str = "curlimages/curl:8.10.1";
+/// Tiny image with busybox `nc -z` for TCP-only probes — curl's
+/// `--connect-only` is HTTP-scheme-bound and `telnet://` reads
+/// after connect, both of which break against servers that don't
+/// speak first (caddy with strict-SNI, redis, postgres). Busybox
+/// is ~5 MB and doesn't change per docker host.
+const HEALTHCHECK_TCP_IMAGE: &str = "busybox:1.37";
 
 /// Real implementation. One `bollard::Docker` per host, cached for the
 /// lifetime of the process.
@@ -723,6 +743,36 @@ impl DockerOps for RealDockerOps {
                     .map_err(|s| Self::err(host, s))?;
                 Ok(true)
             }
+            Err(other) => Err(Self::err(host, other)),
+        }
+    }
+
+    async fn connect_container_network(
+        &self,
+        host: &Host,
+        container: &str,
+        network: &str,
+        aliases: &[String],
+    ) -> Result<(), DockerError> {
+        let docker = self.client_for(host).await?;
+        let req = bollard::models::NetworkConnectRequest {
+            container: container.to_string(),
+            endpoint_config: Some(bollard::models::EndpointSettings {
+                aliases: if aliases.is_empty() {
+                    None
+                } else {
+                    Some(aliases.to_vec())
+                },
+                ..Default::default()
+            }),
+        };
+        match docker.connect_network(network, req).await {
+            // 403 = "endpoint already exists in network" — already
+            // connected, treat as success.
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 403, ..
+            }) => Ok(()),
             Err(other) => Err(Self::err(host, other)),
         }
     }
@@ -1240,22 +1290,28 @@ impl DockerOps for RealDockerOps {
         target: &str,
         port: u16,
     ) -> Result<(), DockerError> {
-        // `--connect-only` does TCP connect then exits 0 immediately,
-        // without trying to read. Critical for endpoints that accept
+        // `nc -z` (busybox netcat) does pure TCP connect + close,
+        // doesn't read afterward. Critical for endpoints that accept
         // the connection but don't send anything until the client
         // initiates TLS (caddy with strict-SNI / mTLS, redis raw
-        // protocol). The previous `telnet://` + `--max-time 5`
-        // approach times out reading from such servers, exiting
-        // non-zero even though the TCP layer is fine.
+        // protocol). curl's `--connect-only` is HTTP-scheme-bound
+        // and `telnet://` reads after connect — both fall over on
+        // those.
+        // Pull the busybox image best-effort. Idempotent — no-op
+        // when already cached. Without this the first probe on a
+        // fresh daemon 404s on create_container.
+        let _ = self.pull_image(host, "busybox", "1.37", None).await;
         let probe_name = format!("yoink-tcp-probe-{}-{}", target, rand_hex());
-        let url = format!("tcp://{target}:{port}");
-        let body = probe_body(
+        let body = probe_body_with_image(
+            HEALTHCHECK_TCP_IMAGE,
             network,
             vec![
-                "--connect-timeout".into(),
+                "nc".into(),
+                "-z".into(),
+                "-w".into(),
                 "5".into(),
-                "--connect-only".into(),
-                url,
+                target.to_string(),
+                port.to_string(),
             ],
         );
         let exit_status = self.create_start_wait(host, &probe_name, body).await?;
@@ -1670,10 +1726,18 @@ fn rand_hex() -> String {
 /// network as a guest, and disables auto-remove so the caller can
 /// inspect logs / exit code before reaping.
 fn probe_body(network: &str, cmd: Vec<String>) -> ContainerCreateBody {
+    probe_body_with_image(HEALTHCHECK_CURL_IMAGE, network, cmd)
+}
+
+fn probe_body_with_image(
+    image: &str,
+    network: &str,
+    cmd: Vec<String>,
+) -> ContainerCreateBody {
     let mut endpoints = HashMap::new();
     endpoints.insert(network.to_string(), EndpointSettings::default());
     ContainerCreateBody {
-        image: Some(HEALTHCHECK_CURL_IMAGE.to_string()),
+        image: Some(image.to_string()),
         cmd: Some(cmd),
         networking_config: Some(NetworkingConfig {
             endpoints_config: Some(endpoints),
@@ -1846,6 +1910,15 @@ impl DockerOps for FakeDockerOps {
     }
     async fn list_networks(&self, _host: &Host) -> Result<Vec<NetworkInfo>, DockerError> {
         Ok(Vec::new())
+    }
+    async fn connect_container_network(
+        &self,
+        _host: &Host,
+        _container: &str,
+        _network: &str,
+        _aliases: &[String],
+    ) -> Result<(), DockerError> {
+        Ok(())
     }
     async fn list_volumes(&self, _host: &Host) -> Result<Vec<VolumeInfo>, DockerError> {
         Ok(Vec::new())
