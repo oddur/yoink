@@ -4,6 +4,10 @@ version = { workspace = true }
 edition = { workspace = true }
 rust-version = { workspace = true }
 license = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+readme = { workspace = true }
 description = "Small, opinionated container deploy CLI for a handful of services on a handful of hosts."
 
 [lib]

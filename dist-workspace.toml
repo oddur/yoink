@@ -1,0 +1,22 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist' (https://opensource.axo.dev/cargo-dist/)
+[dist]
+cargo-dist-version = "0.31.0"
+ci = "github"
+# Installers to generate. Shell installer for `curl … | sh`,
+# Homebrew formula auto-published to a tap repo.
+installers = ["shell", "homebrew"]
+# Tap repo that receives the generated formula on each release.
+tap = "oddur/homebrew-yoink"
+# Where the formula goes inside the tap repo (default Formula/).
+formula = "yoink"
+# Target platforms. Drop windows (no story for yoink yet) + the
+# aarch64-linux variant (less common; add when an arm64 server use
+# case appears).
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Publishers run after the artifacts are uploaded. `homebrew` pushes
+# the formula to the tap repo configured above.
+publish-jobs = ["homebrew"]
+install-updater = false

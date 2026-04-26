@@ -32,3 +32,8 @@ needless_raw_string_hashes = "allow"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
