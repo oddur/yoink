@@ -7,6 +7,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
+authors = ["Oddur Magnusson"]
+repository = "https://github.com/oddur/yoink"
+homepage = "https://github.com/oddur/yoink"
+readme = "README.md"
 
 [workspace.lints.clippy]
 cargo = { level = "warn", priority = -1 }
