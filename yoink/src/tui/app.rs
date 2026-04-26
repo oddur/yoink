@@ -1725,7 +1725,7 @@ fn config_host(config: &Config, address: &str) -> Option<Host> {
 /// then sends a final `ReconcileUpdate::Done` regardless of outcome.
 /// Same shape as `cmd_up` in main.rs but without the printlns.
 async fn reconcile_one(
-    config: Config,
+    mut config: Config,
     ops: Arc<dyn DockerOps>,
     secrets: Option<Arc<crate::secrets::SecretsBundle>>,
     service: String,
@@ -1740,6 +1740,16 @@ async fn reconcile_one(
     let send_done = |result: Result<String, String>| {
         let _ = tx.send(ReconcileUpdate::Done(result));
     };
+
+    // Drop the synthetic `local` host (auto-injected for read-only
+    // TUI browsing) before any destructive code runs. Operators who
+    // genuinely want to deploy to local can add `address: local` to
+    // yoink.yaml — that entry survives because it was on disk.
+    config.hosts.retain(|h| h.address != Host::LOCAL_ADDRESS);
+    if config.hosts.is_empty() {
+        send_done(Err("no real hosts to deploy to (only the synthetic local host exists)".into()));
+        return;
+    }
 
     // Acquire one lock per configured host. Per-host parallel like
     // cmd_up; on any failure release whatever we already grabbed and
