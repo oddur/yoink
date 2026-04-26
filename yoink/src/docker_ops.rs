@@ -1240,20 +1240,21 @@ impl DockerOps for RealDockerOps {
         target: &str,
         port: u16,
     ) -> Result<(), DockerError> {
-        // curl supports the telnet:// scheme with `--connect-timeout`
-        // for raw TCP probes — connect succeeds → exit 0, connect fails
-        // (refused/timeout/host unreachable) → non-zero. Reuses the same
-        // image as the HTTP healthcheck so we don't pull a second tools
-        // image just for `nc`.
-        let url = format!("telnet://{target}:{port}");
+        // `--connect-only` does TCP connect then exits 0 immediately,
+        // without trying to read. Critical for endpoints that accept
+        // the connection but don't send anything until the client
+        // initiates TLS (caddy with strict-SNI / mTLS, redis raw
+        // protocol). The previous `telnet://` + `--max-time 5`
+        // approach times out reading from such servers, exiting
+        // non-zero even though the TCP layer is fine.
         let probe_name = format!("yoink-tcp-probe-{}-{}", target, rand_hex());
+        let url = format!("tcp://{target}:{port}");
         let body = probe_body(
             network,
             vec![
                 "--connect-timeout".into(),
                 "5".into(),
-                "--max-time".into(),
-                "5".into(),
+                "--connect-only".into(),
                 url,
             ],
         );
