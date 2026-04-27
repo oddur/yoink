@@ -1,29 +1,36 @@
-//! Secrets handling. Talks to Infisical's REST API directly — yoink no
-//! longer requires the `infisical` CLI binary to be installed at deploy
-//! time. Three auth modes, tried in order:
+//! Secrets handling. Two providers, dispatched by the
+//! `secrets.provider` tag in `yoink.yaml`:
 //!
-//!   1. Universal Auth (machine identity) — `INFISICAL_CLIENT_ID` +
-//!      `INFISICAL_CLIENT_SECRET` env vars. Recommended for CI.
-//!   2. Raw bearer token — `INFISICAL_TOKEN` env var. For one-off /
-//!      power-user runs where the operator already has a token.
-//!   3. Cached browser-flow login — read by `infisical login`'s persisted
-//!      session in `~/.infisical/infisical-config.json` + the OS keyring
-//!      entry it wrote. The recommended laptop dev path: run
-//!      `infisical login` once, then yoink reuses the same session.
+//!   - **`age`** (the batteries-included default) — a single sealed
+//!     dotenv file committed to the repo, decrypted at deploy time
+//!     with one key resolved from `YOINK_AGE_KEY` (raw),
+//!     `YOINK_AGE_KEY_FILE` (path), or
+//!     `~/.config/yoink/age.key`. Encrypt-side helpers live in
+//!     `crate::sealed`.
+//!   - **`infisical`** — original provider; talks to Infisical's
+//!     REST API directly (no `infisical` CLI required at deploy
+//!     time). Three auth modes, tried in order:
+//!       1. Universal Auth (machine identity) — `INFISICAL_CLIENT_ID`
+//!          + `INFISICAL_CLIENT_SECRET` env vars. Recommended for CI.
+//!       2. Raw bearer token — `INFISICAL_TOKEN` env var.
+//!       3. Cached browser-flow login — read from
+//!          `~/.infisical/infisical-config.json` + the OS keyring.
 //!
-//! Tokens must never appear in logs or error messages. The `Debug` and
-//! `Display` impls on `InfisicalToken` mask all but the first 4 chars.
+//! Tokens must never appear in logs or error messages. The `Debug`
+//! and `Display` impls on `InfisicalToken` mask all but the first 4
+//! chars.
 
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::config::SecretsConfig;
+use crate::config::{Config, SecretsConfig};
+use crate::sealed;
 
 pub const INFISICAL_TOKEN_ENV: &str = "INFISICAL_TOKEN";
 pub const INFISICAL_CLIENT_ID_ENV: &str = "INFISICAL_CLIENT_ID";
@@ -76,6 +83,26 @@ pub enum SecretsError {
     Api { status: u16, body: String },
     #[error("`HOME` env var not set — cannot locate `~/.infisical/infisical-config.json`")]
     NoHome,
+    #[error("read sealed secrets file {path}: {source}")]
+    SealedRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("decrypt sealed secrets file {path}: {source}")]
+    SealedDecrypt {
+        path: PathBuf,
+        #[source]
+        source: sealed::SealedError,
+    },
+    #[error("parse sealed dotenv contents from {path}: {source}")]
+    SealedParse {
+        path: PathBuf,
+        #[source]
+        source: sealed::SealedError,
+    },
+    #[error("locate age identity for sealed secrets: {0}")]
+    NoAgeIdentity(#[source] sealed::SealedError),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -113,8 +140,8 @@ impl InfisicalToken {
 }
 
 /// In-memory map of resolved secret keys → values. Built once at the
-/// start of a reconcile by calling Infisical's REST API. Each service
-/// then picks the keys it needs out of the bundle.
+/// start of a reconcile. Each service then picks the keys it needs out
+/// of the bundle.
 #[derive(Clone, Default)]
 pub struct SecretsBundle {
     values: BTreeMap<String, String>,
@@ -157,24 +184,58 @@ impl fmt::Debug for SecretsBundle {
 
 /// Convenience wrapper for the common "load whatever the operator
 /// configured" path. Returns `Ok(None)` when no `[secrets]` block is
-/// declared (services that don't need secrets). Any other error
-/// surfaces — the deploy + drift-detection paths both surface it.
-pub async fn load_bundle(
-    config: &crate::config::Config,
-) -> Result<Option<SecretsBundle>, SecretsError> {
+/// declared (services that don't need secrets).
+pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, SecretsError> {
     let Some(cfg) = &config.secrets else {
         return Ok(None);
     };
-    let bundle = fetch_secrets(cfg, cfg.domain.as_deref()).await?;
+    let bundle = match cfg {
+        SecretsConfig::Age { file, .. } => {
+            let path = sealed::resolve_sealed_path(config, file.as_deref());
+            load_age_bundle(&path)?
+        }
+        SecretsConfig::Infisical {
+            project_id,
+            environment,
+            path,
+            domain,
+        } => {
+            fetch_infisical_secrets(
+                project_id,
+                environment,
+                path.as_deref(),
+                domain.as_deref(),
+            )
+            .await?
+        }
+    };
     Ok(Some(bundle))
 }
 
-/// Fetch all secrets in the configured project + environment + path,
-/// returning a `SecretsBundle`. `domain_override` (typically
-/// `cfg.domain`) wins over the cached login's stored domain when both
-/// are present.
-pub async fn fetch_secrets(
-    cfg: &SecretsConfig,
+/// Load + decrypt + parse the sealed dotenv at `path`.
+fn load_age_bundle(path: &Path) -> Result<SecretsBundle, SecretsError> {
+    let bytes = std::fs::read(path).map_err(|source| SecretsError::SealedRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let identity = sealed::load_identity().map_err(SecretsError::NoAgeIdentity)?;
+    let plaintext =
+        sealed::unseal(&bytes, &identity).map_err(|source| SecretsError::SealedDecrypt {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let map = sealed::parse_dotenv(&plaintext).map_err(|source| SecretsError::SealedParse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(SecretsBundle::new(map))
+}
+
+/// Fetch every secret in an Infisical project + environment + path.
+pub async fn fetch_infisical_secrets(
+    project_id: &str,
+    environment: &str,
+    path: Option<&str>,
     domain_override: Option<&str>,
 ) -> Result<SecretsBundle, SecretsError> {
     let http = reqwest::Client::builder()
@@ -183,14 +244,14 @@ pub async fn fetch_secrets(
 
     let (base_url, bearer) = resolve_auth(&http, domain_override).await?;
 
-    let path = cfg.path.as_deref().unwrap_or("/");
+    let path = path.unwrap_or("/");
     let url = format!("{base_url}/api/v3/secrets/raw");
     let resp = http
         .get(&url)
         .bearer_auth(&bearer)
         .query(&[
-            ("workspaceId", cfg.project_id.as_str()),
-            ("environment", cfg.environment.as_str()),
+            ("workspaceId", project_id),
+            ("environment", environment),
             ("secretPath", path),
         ])
         .send()

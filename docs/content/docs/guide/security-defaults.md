@@ -1,5 +1,5 @@
 ---
-title: Sane security defaults
+title: Secure by default
 weight: 3
 ---
 

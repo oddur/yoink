@@ -78,4 +78,4 @@ yoink logs my-tool -f | hl                # live tail with `hl` highlighting (op
 - Other deploy modes (real registry, kamal-style): [Three deploy modes](/docs/guide/deploy-modes)
 - The `yoink.yaml` schema in full: [Configuration](/docs/reference/config)
 - The complete CLI surface: [CLI](/docs/reference/cli)
-- Hardened defaults yoink applies to every container: [Sane security defaults](/docs/guide/security-defaults)
+- Hardened defaults yoink applies to every container: [Secure by default](/docs/guide/security-defaults)

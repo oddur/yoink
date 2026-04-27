@@ -11,6 +11,7 @@ pub mod lock;
 pub mod network;
 pub mod output;
 pub mod prune;
+pub mod sealed;
 pub mod secrets;
 pub mod ssh_probe;
 pub mod status;

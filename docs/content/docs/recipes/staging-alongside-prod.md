@@ -73,3 +73,36 @@ Staging usually wants to deploy whatever's on `main`, while prod tracks `live`. 
 - Or commit a digest pointer in `yoink.staging.yaml` (build-once-promote-many) — same image, different deploy targets
 
 The image identity is the same across envs; only the runtime configuration differs.
+
+## Per-environment sealed secrets
+
+Each config carries its **own** sealed file. Set `secrets.file:` so the two environments don't collide:
+
+```yaml
+# yoink.prod.yaml
+secrets:
+  provider: age
+  file: secrets.prod.age
+  recipients: [age1...laptop, age1...prod-ci]
+
+# yoink.staging.yaml
+secrets:
+  provider: age
+  file: secrets.staging.age
+  recipients: [age1...laptop, age1...staging-ci]
+```
+
+The path is resolved the same way locally, in CI, and from the TUI — whatever the loaded config's `secrets.file:` says (relative to the config's directory). The TUI's secrets pane (`e` key) surfaces the active filename in the title bar so you can tell at a glance which environment you're editing:
+
+```
+yoink secrets · age — secrets.prod.age (2 recipients) · 7 keys · writable
+```
+
+Switch environments by switching configs:
+
+```sh
+yoink -c yoink.prod.yaml tui          # editing prod's secrets
+yoink -c yoink.staging.yaml tui       # editing staging's secrets
+```
+
+Rotation, recipients, and the `YOINK_AGE_KEY` env var are independent per environment — staging can have a different CI key than prod, scoped via `recipients:`.

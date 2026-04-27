@@ -19,6 +19,7 @@ name = "yoink"
 path = "src/main.rs"
 
 [dependencies]
+age = { version = "0.11", features = ["armor"] }
 ansi-to-tui = "8"
 anyhow = "1"
 async-trait = "0.1"

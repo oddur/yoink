@@ -79,6 +79,25 @@ yoink lock                               inspect / release the per-host deploy l
                                          after a crashed deploy left a sentinel container)
 yoink completions <shell>                generate shell completions (bash/zsh/fish/...)
 
+yoink secrets keygen                     generate an age identity. Default: print
+                                         the secret to stdout (operator decides
+                                         where to save). Public recipient also
+                                         printed for committing to yoink.yaml.
+  --out <PATH>                           write the secret to PATH (mode 0600)
+                                         instead of stdout. Make sure PATH is
+                                         gitignored.
+  --force                                overwrite an existing identity at --out
+yoink secrets edit                       decrypt the configured sealed file into
+                                         $EDITOR, re-seal on save (path comes from
+                                         `secrets.file:`; defaults to secrets.age)
+yoink secrets show [--reveal]            print KEY=value (values masked unless --reveal)
+yoink secrets seal --in <PATH>           seal a plaintext dotenv (or read from stdin)
+  --out <PATH>                           override the output path (defaults to
+                                         the configured `secrets.file:`)
+yoink secrets rotate                     generate a new identity and re-seal under
+                                         [existing recipients + new public]; prints
+                                         the new secret for pasting into CI
+
 yoink tui                                interactive ratatui dashboard (see TUI page)
 ```
 

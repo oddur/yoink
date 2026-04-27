@@ -132,20 +132,40 @@ pub struct RegistryConfig {
     pub password_secret: String,
 }
 
+/// Secrets provider config. The default, batteries-included shape is
+/// `age` — a single sealed file (`secrets.age` next to `yoink.yaml`)
+/// committed to the repo, decrypted at deploy time with one key
+/// resolved from `YOINK_AGE_KEY` (env, for CI) or
+/// `~/.config/yoink/age.key` (for laptop dev). `infisical` is the
+/// opt-in remote-provider path.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SecretsConfig {
-    /// Currently only "infisical" is supported.
-    pub provider: String,
-    pub project_id: String,
-    pub environment: String,
-    /// Optional path within the project (Infisical "folder").
-    #[serde(default)]
-    pub path: Option<String>,
-    /// Self-hosted Infisical instance URL. When unset, the cloud `SaaS`
-    /// at `app.infisical.com` is used.
-    #[serde(default)]
-    pub domain: Option<String>,
+#[serde(tag = "provider", rename_all = "lowercase", deny_unknown_fields)]
+pub enum SecretsConfig {
+    /// Sealed dotenv file, encrypted with [age](https://age-encryption.org).
+    Age {
+        /// Path to the sealed file relative to the config file's
+        /// directory. Defaults to `secrets.age` when unset.
+        #[serde(default)]
+        file: Option<String>,
+        /// Recipients to seal *new* writes against (used by
+        /// `yoink secrets edit / seal`). Each entry is an age public
+        /// key (`age1...`). Decryption only needs one matching identity.
+        #[serde(default)]
+        recipients: Vec<String>,
+    },
+    /// Infisical (self-hosted or cloud). The original provider — kept
+    /// as an opt-in for teams already running an Infisical instance.
+    Infisical {
+        project_id: String,
+        environment: String,
+        /// Optional path within the project (Infisical "folder").
+        #[serde(default)]
+        path: Option<String>,
+        /// Self-hosted Infisical instance URL. When unset, the cloud
+        /// `SaaS` at `app.infisical.com` is used.
+        #[serde(default)]
+        domain: Option<String>,
+    },
 }
 
 /// Local build instructions for a service. Powers `yoink build`
@@ -857,15 +877,6 @@ impl Config {
             }
         }
 
-        if let Some(secrets) = &self.secrets
-            && secrets.provider != "infisical"
-        {
-            return Err(ConfigError::Invalid(format!(
-                "secrets.provider {:?} not supported (only \"infisical\")",
-                secrets.provider
-            )));
-        }
-
         // (depends_on cycle detection deferred to topo_sort_services
         //  which has the full graph in front of it.)
 
@@ -1348,8 +1359,13 @@ secrets:
   project_id: p
   environment: prod
 "#;
+        // `SecretsConfig` is a tagged enum (`#[serde(tag = "provider")]`);
+        // an unknown discriminator like "vault" fails during serde
+        // deserialization, so this surfaces as a Parse error (not a
+        // post-parse validate error). Either branch confirms bogus
+        // providers don't load — the test only cares that they don't.
         let err = Config::parse_str(s).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid(m) if m.contains("provider")));
+        assert!(matches!(err, ConfigError::Parse(_) | ConfigError::Invalid(_)));
     }
 
     #[test]
