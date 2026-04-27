@@ -27,7 +27,8 @@ deploy:
 
 hosts:
   - { address: prod-eu-1, user: deploy }
-  # add more as needed; replicas + applicable_hosts handle distribution
+  # add more as needed; replicas + services[].hosts handle distribution
+  # — see /docs/recipes/multi-host-distribution
 
 # Infisical-resolved secrets, fetched once per `up` and folded into
 # spec_hash. See /docs/recipes/infisical-auth for the auth chain.

@@ -72,3 +72,9 @@ params:
   editURL:
     enable: true
     base: "https://github.com/oddur/yoink/edit/main/docs/content"
+  search:
+    enable: true
+    type: flexsearch
+    flexsearch:
+      index: content
+      tokenize: forward
