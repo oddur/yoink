@@ -161,10 +161,25 @@ impl HostsState {
             .block(Block::default().borders(Borders::ALL).title("hosts"));
         frame.render_stateful_widget(table, layout[1], &mut self.table);
 
-        let footer = filter_footer(
-            &self.filter,
-            "q quit · ↑↓ select · enter detail · r refresh · ? help",
-        );
+        // When the highlighted row is in error state, surface the
+        // full error text in the footer — much more useful than the
+        // truncated 60-char tail in the table cell.
+        let selected_error: Option<&str> = self
+            .table
+            .selected()
+            .and_then(|i| visible.get(i).copied())
+            .and_then(|src| match &self.rows[src].status {
+                HostStatus::Err(e) => Some(e.as_str()),
+                HostStatus::Ok(_) => None,
+            });
+        let footer = match selected_error {
+            Some(err) => Paragraph::new(format!("⚠ {err}"))
+                .style(Style::default().fg(Color::Yellow)),
+            None => filter_footer(
+                &self.filter,
+                "q quit · ↑↓ select · enter detail · r refresh · ? help",
+            ),
+        };
         frame.render_widget(footer, layout[2]);
     }
 }

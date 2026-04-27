@@ -303,9 +303,12 @@ enum Update {
     Dashboard(DashboardRefresh),
     /// Result of `schedule_history_refresh` — per-service container
     /// list across every host, drives the History pane's table.
+    /// `errors` carries per-host failure strings so the pane can
+    /// surface them instead of silently dropping unreachable hosts.
     ServiceHistory {
         service: String,
         rows: Vec<super::history::HistoryRow>,
+        errors: Vec<String>,
     },
     /// Push notification from a host's `docker events` stream. Triggers
     /// an immediate refresh of whichever pane is currently visible.
@@ -313,6 +316,11 @@ enum Update {
         host: Host,
         event: DockerEvent,
     },
+    /// Background task wants to surface a one-line message in the
+    /// toast ring (top-right of the breadcrumb). Used for silent
+    /// failures the operator otherwise wouldn't see — log streams
+    /// dying, event subscriptions failing, secrets loader blowing up.
+    Toast(String),
 }
 
 /// Background-task → run-loop messages. Events stream into the
@@ -617,6 +625,8 @@ pub struct App {
     hosts_in_flight: bool,
     host_detail_in_flight: bool,
     dashboard_in_flight: bool,
+    container_detail_in_flight: bool,
+    history_in_flight: bool,
     update_tx: UnboundedSender<Update>,
     update_rx: UnboundedReceiver<Update>,
 
@@ -676,6 +686,8 @@ impl App {
             hosts_in_flight: false,
             host_detail_in_flight: false,
             dashboard_in_flight: false,
+            container_detail_in_flight: false,
+            history_in_flight: false,
             update_tx,
             update_rx,
             log_tasks: Vec::new(),
@@ -926,6 +938,7 @@ impl App {
     fn spawn_secrets_loader(&self) {
         let config = self.config.clone();
         let slot = self.secrets.clone();
+        let tx = self.update_tx.clone();
         tokio::spawn(async move {
             match crate::secrets::load_bundle(&config).await {
                 Ok(Some(bundle)) => {
@@ -938,6 +951,9 @@ impl App {
                 }
                 Err(e) => {
                     warn!(error = %e, "secrets load for drift detection failed; column will stay '?'");
+                    let _ = tx.send(Update::Toast(format!(
+                        "✗ secrets load failed: {e} (drift column → ?)"
+                    )));
                 }
             }
         });
@@ -956,6 +972,10 @@ impl App {
                     Ok(rx) => rx,
                     Err(e) => {
                         warn!(host = %host.address, error = %e, "subscribe_events failed");
+                        let _ = tx.send(Update::Toast(format!(
+                            "✗ events stream {}: {e}",
+                            host.address
+                        )));
                         return;
                     }
                 };
@@ -970,6 +990,12 @@ impl App {
                         return;
                     }
                 }
+                // Stream ended without an explicit error — usually
+                // means the host went away. Surface it.
+                let _ = tx.send(Update::Toast(format!(
+                    "✗ events stream {} ended (host probably unreachable)",
+                    host.address
+                )));
             });
             self.event_tasks.push(task);
         }
@@ -1649,23 +1675,37 @@ impl App {
     /// `Update::ServiceHistory` back to the run loop. Mirrors the CLI
     /// `cmd_history` query.
     fn schedule_history_refresh(&mut self, service: String) {
+        if self.history_in_flight {
+            return;
+        }
+        self.history_in_flight = true;
         let ops = self.ops.clone();
         let hosts: Vec<Host> = self.config.hosts.iter().map(Host::from).collect();
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
             let label = format!("yoink.service={service}");
             let mut rows: Vec<super::history::HistoryRow> = Vec::new();
+            let mut errors: Vec<String> = Vec::new();
             for host in hosts {
-                if let Ok(containers) = ops.list_containers_by_label(&host, &label).await {
-                    for c in containers {
-                        rows.push(super::history::HistoryRow::from_container(
-                            &host.address,
-                            &c,
-                        ));
+                match ops.list_containers_by_label(&host, &label).await {
+                    Ok(containers) => {
+                        for c in containers {
+                            rows.push(super::history::HistoryRow::from_container(
+                                &host.address,
+                                &c,
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", host.address));
                     }
                 }
             }
-            let _ = tx.send(Update::ServiceHistory { service, rows });
+            let _ = tx.send(Update::ServiceHistory {
+                service,
+                rows,
+                errors,
+            });
         });
     }
 
@@ -1772,9 +1812,13 @@ impl App {
     }
 
     fn schedule_container_detail_refresh(&mut self) {
+        if self.container_detail_in_flight {
+            return;
+        }
         let Some((host, container)) = self.container_detail.target().cloned() else {
             return;
         };
+        self.container_detail_in_flight = true;
         let ops = self.ops.clone();
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
@@ -1825,6 +1869,7 @@ impl App {
                 {
                     self.container_detail.apply(*data);
                 }
+                self.container_detail_in_flight = false;
             }
             Update::Dashboard(data) => {
                 // Services & ServiceDetail share the same StatusReport
@@ -1843,10 +1888,16 @@ impl App {
                 self.dashboard.apply(data);
                 self.dashboard_in_flight = false;
             }
-            Update::ServiceHistory { service, rows } => {
-                self.history.apply(&service, rows);
+            Update::ServiceHistory {
+                service,
+                rows,
+                errors,
+            } => {
+                self.history.apply(&service, rows, errors);
+                self.history_in_flight = false;
             }
             Update::Event { host, event } => self.on_docker_event(&host, &event),
+            Update::Toast(msg) => self.push_toast(msg),
         }
     }
 
@@ -1903,6 +1954,7 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "failed to collect status for log streams");
+                self.push_toast(format!("✗ log collect failed: {e}"));
                 return;
             }
         };
@@ -1932,6 +1984,10 @@ impl App {
             Ok(rx) => rx,
             Err(e) => {
                 warn!(host = %host.address, container = %container, error = %e, "open_log_stream failed");
+                self.push_toast(format!(
+                    "✗ logs {}/{container}: {e}",
+                    host.address
+                ));
                 return;
             }
         };

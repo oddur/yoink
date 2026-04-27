@@ -69,13 +69,17 @@ impl HostDetailState {
     }
 
     /// Apply background-fetched results, preserving selection where possible.
+    /// Always flips `loaded = true` — even on error — so the pane
+    /// renders an error footer instead of looping on `(loading…)`.
+    /// Last-known good `containers`/`stats`/`host_info` are kept on
+    /// error so a transient blip doesn't blank the table.
     pub fn apply(&mut self, data: HostDetailRefresh) {
         self.last_error = data.error;
+        self.loaded = true;
         if self.last_error.is_none() {
             self.containers = data.containers;
             self.stats = data.stats;
             self.host_info = data.host_info;
-            self.loaded = true;
         }
         clamp_selection(&mut self.table, self.containers.len());
     }
