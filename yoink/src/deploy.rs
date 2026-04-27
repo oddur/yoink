@@ -59,6 +59,8 @@ pub enum DeployError {
         "service {service:?} has no `tag:` in config and was not given one via `--tag`; pass `--tag {service}=<value>` or add `tag:` to the service fragment"
     )]
     TagMissing { service: String },
+    #[error("{detail} (host: {host})")]
+    Custom { host: String, detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,7 +168,42 @@ pub fn build_labels(
     labels.insert("yoink.service".into(), service.name.clone());
     labels.insert("yoink.version".into(), tag.into());
     labels.insert("yoink.spec_hash".into(), spec_hash.into());
+    // Routing-relevant fields land in labels so changes flow through
+    // the existing spec_hash → drift → redeploy → /load pipeline.
+    // Without this, editing `caddy_extra_json:` on a stable service
+    // wouldn't trigger a redeploy and the new snippet wouldn't reach
+    // Caddy until something else changed.
+    if let Some(domain) = &service.domain {
+        labels.insert("yoink.caddy.domain".into(), domain.as_list().join(","));
+    }
+    if matches!(service.tls, crate::config::TlsMode::Off) {
+        labels.insert("yoink.caddy.tls".into(), "off".into());
+    } else if matches!(service.tls, crate::config::TlsMode::Cert) {
+        labels.insert("yoink.caddy.tls".into(), "cert".into());
+    }
+    if let Some(s) = &service.tls_cert_secret {
+        labels.insert("yoink.caddy.cert_secret".into(), s.clone());
+    }
+    if let Some(s) = &service.tls_key_secret {
+        labels.insert("yoink.caddy.key_secret".into(), s.clone());
+    }
+    if let Some(extra) = &service.caddy_extra_json {
+        labels.insert("yoink.caddy.extra_hash".into(), short_sha256(extra));
+    }
     labels
+}
+
+fn short_sha256(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    let d = h.finalize();
+    let mut out = String::with_capacity(16);
+    for b in &d[..8] {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Audit-trail labels added at create-container time. Deliberately
@@ -493,7 +530,7 @@ pub async fn deploy_service(
     // Start each pre-created container, healthcheck, swap out old.
     let mut host_results = Vec::with_capacity(prepared.len());
     for prep in prepared {
-        let result = finalize_one_host(ops, config, service, prep, on_event).await?;
+        let result = finalize_one_host(ops, config, service, prep, secrets, on_event).await?;
         host_results.push(result);
     }
     Ok(ServiceDeployReport {
@@ -627,6 +664,7 @@ async fn finalize_one_host(
     config: &Config,
     service: &ServiceConfig,
     prep: HostPrep,
+    secrets: Option<&SecretsBundle>,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<HostDeployResult, DeployError> {
     let HostPrep {
@@ -703,6 +741,19 @@ async fn finalize_one_host(
         total_attempts = total_attempts.max(attempts);
     }
 
+    // Caddy admin-API push: route the new replicas in (and the
+    // proxy itself, after first deploy, into a serving state).
+    // Runs between healthcheck-pass and the old-replica stop so
+    // there's a brief window where both old + new serve — Caddy
+    // gracefully reloads, no in-flight requests dropped. Skipped
+    // for non-routed services and when the proxy isn't enabled.
+    let triggers_caddy_load = crate::proxy::proxy_enabled(config)
+        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
+            || crate::proxy::is_proxied(service));
+    if triggers_caddy_load {
+        push_caddy_config(ops, &host, config, secrets).await?;
+    }
+
     if !stop_first {
         stopped_old = swap_out_old_containers_by_set(
             ops,
@@ -727,6 +778,55 @@ async fn finalize_one_host(
         healthcheck_attempts: total_attempts,
         stopped_old,
     })
+}
+
+/// Render the Caddy config for `host`'s view of `config` and POST it
+/// to the proxy's admin API. Errors abort the deploy — old config
+/// stays active because Caddy's `/load` is atomic.
+async fn push_caddy_config(
+    ops: &dyn DockerOps,
+    host: &Host,
+    config: &Config,
+    secrets: Option<&SecretsBundle>,
+) -> Result<(), DeployError> {
+    // Build the upstream-name lookup by querying each routed service's
+    // current containers on this host. Includes the just-started
+    // replica AND (briefly) the old one — Caddy reloads gracefully.
+    let routed: Vec<&ServiceConfig> = config
+        .services
+        .iter()
+        .filter(|s| crate::proxy::is_proxied(s))
+        .collect();
+    let mut upstream_names: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for svc in &routed {
+        let label = format!("yoink.service={}", svc.name);
+        let containers = ops
+            .list_containers_by_label(host, &label)
+            .await
+            .map_err(|source| DeployError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
+        let names: Vec<String> = containers
+            .into_iter()
+            .filter(crate::docker_ops::ContainerInfo::is_running)
+            .map(|c| c.name)
+            .collect();
+        upstream_names.insert(svc.name.clone(), names);
+    }
+    let json = crate::proxy::caddy::render(config, |s| upstream_names.get(s).cloned().unwrap_or_default(), secrets)
+        .map_err(|source| DeployError::Custom {
+            host: host.address.clone(),
+            detail: format!("render Caddy config: {source}"),
+        })?;
+    crate::proxy::admin::push_config(host, ops, &json)
+        .await
+        .map_err(|source| DeployError::Custom {
+            host: host.address.clone(),
+            detail: format!("push Caddy config: {source}"),
+        })?;
+    Ok(())
 }
 
 /// Build a `RunSpec` for the given service+tag. Used both to compute the

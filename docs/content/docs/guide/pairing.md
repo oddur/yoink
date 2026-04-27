@@ -1,9 +1,13 @@
 ---
-title: Pairing with Tailscale + caddy-docker-proxy
-weight: 4
+title: Pairing with Tailscale
+weight: 5
 ---
 
-`yoink` doesn't try to solve "how do I reach my hosts" or "how do I route HTTPS to the right container". It expects you to bring two off-the-shelf tools that solve those completely.
+`yoink` doesn't try to solve "how do I reach my hosts." It expects you to bring an off-the-shelf SSH connectivity layer.
+
+{{< callout type="info" >}}
+**Routing changed:** earlier versions of yoink documented [caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy) as the routing pairing. **That's been replaced** by yoink's [first-class reverse proxy integration](/docs/guide/proxy) (admin-API push, deterministic deploy timing, no Docker labels). The CDP path still works — it's just no longer the recommended pattern. Migrate by removing `caddy.*` labels from services, adding `domain:` to each, and `proxy.email:` at the top level.
+{{< /callout >}}
 
 ## Tailscale for SSH (the connectivity layer)
 
@@ -16,32 +20,21 @@ Yoink's transport is `ssh://user@host` via [bollard's SSH transport](https://doc
 
 The deploy user on each host is in the `docker` group (functionally root, scope your tailnet ACLs accordingly).
 
-## caddy-docker-proxy for the public surface
+## Routing
 
-Yoink owns the container lifecycle. **It does not own routing.** Public traffic landing on your hosts wants:
-
-- TLS termination (with auto-renewing certs)
-- Hostname → container routing
-- Per-route headers, redirects, rate limits
-
-[caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy) is a Caddy plugin that watches the Docker socket for container labels and reconfigures itself live. The pairing:
+For HTTPS termination + hostname routing, yoink ships a [bundled Caddy reverse proxy](/docs/guide/proxy). One field on a service:
 
 ```yaml
 services:
   - name: api
     image: ghcr.io/you/api
-    labels:
-      caddy: api.example.com
-      caddy.reverse_proxy: "{{upstreams 8080}}"
-    run:
-      port: 8080
-      replicas: 2
-      networks: [public, api]
+    domain: api.example.com
+    run: { port: 8080 }
+proxy:
+  email: ops@example.com
 ```
 
-`yoink up` deploys the api container with those labels; the caddy container (also yoink-managed, but separately) reads them via the docker socket and routes `https://api.example.com` to the api containers, automatically picking up new replicas and dropping retired ones. Cert issuance is Caddy's job (Let's Encrypt or Cloudflare origin); yoink doesn't know it's happening.
-
-Replicas plug into this naturally: `caddy.reverse_proxy: "{{upstreams 8080}}"` resolves all containers with the same network alias and round-robins between them. yoink's healthcheck-gated rolling swap means the caddy upstream pool is always traffic-ready.
+ACME issuance, rolling-deploy-synchronized routing flips, and per-service `caddy_extra_json:` for advanced features (auth, rate limit, headers) are all built in. See the [proxy guide](/docs/guide/proxy) and the [Cloudflare Origin Certs recipe](/docs/recipes/cloudflare-origin-certs).
 
 ## The split
 
@@ -50,8 +43,8 @@ Replicas plug into this naturally: `caddy.reverse_proxy: "{{upstreams 8080}}"` r
 | **container lifecycle** (pull, start, healthcheck, drain, replace) | yoink |
 | **dep-ordered deploys** (redis before api before caddy) | yoink |
 | **per-tier network isolation** | yoink |
-| **HTTPS / hostname routing / cert renewal** | caddy-docker-proxy |
-| **operator → host connectivity** | Tailscale |
-| **CI → host connectivity** | Tailscale |
+| **HTTPS / hostname routing / cert issuance** | yoink (bundled Caddy) |
+| **operator → host connectivity** | Tailscale (or your SSH config) |
+| **CI → host connectivity** | Tailscale (or your SSH config) |
 | **stateful services** (postgres, etc.) | docker compose on the host |
-| **secrets** | Infisical (REST API, no CLI install needed) |
+| **secrets** | yoink (age-sealed) or Infisical |

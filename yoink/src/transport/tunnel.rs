@@ -54,6 +54,21 @@ impl SshTunnel {
         ready_timeout: Duration,
         keyfile: Option<&std::path::Path>,
     ) -> Result<Self, TunnelError> {
+        Self::open_to(user, host, "127.0.0.1", remote_port, ready_timeout, keyfile).await
+    }
+
+    /// Generalized form: forward `local:0` to an arbitrary
+    /// `remote_dial_host:remote_port` reachable from the SSH host.
+    /// Used by the proxy admin client to dial the Caddy container's
+    /// IP on the host's docker bridge (loopback wouldn't reach it).
+    pub async fn open_to(
+        user: &str,
+        host: &str,
+        remote_dial_host: &str,
+        remote_port: u16,
+        ready_timeout: Duration,
+        keyfile: Option<&std::path::Path>,
+    ) -> Result<Self, TunnelError> {
         let local_port = pick_free_port().map_err(TunnelError::Bind)?;
 
         let mut cmd = Command::new("ssh");
@@ -75,7 +90,7 @@ impl SshTunnel {
             .arg("-o")
             .arg("ExitOnForwardFailure=yes")
             .arg("-L")
-            .arg(format!("{local_port}:127.0.0.1:{remote_port}"))
+            .arg(format!("{local_port}:{remote_dial_host}:{remote_port}"))
             .arg(format!("{user}@{host}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
