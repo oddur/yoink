@@ -14,6 +14,8 @@ yoink up --build --no-registry       # builds locally, ships, runs
 
 Done. `yoink init` reads your `Dockerfile`, `git remote`, and (optionally) `~/.ssh/config` to fill in every field. `yoink up` builds the image locally, ships it to the host over SSH (no registry needed), and runs it through a healthcheck-gated rolling deploy.
 
+> **One small edit between the two commands**, if you want the no-registry standalone path: open the generated `yoink.yaml` and change `image:` to a bare name (e.g. `my-tool`) so it doesn't include a registry prefix. The walkthrough below shows the full flow.
+
 Edit a line of code, run `yoink up --build --no-registry` again — yoink rebuilds, ships only changed layers, rolls the new container behind the healthcheck. ~5–15 seconds for a small image.
 
 ## Prerequisites
