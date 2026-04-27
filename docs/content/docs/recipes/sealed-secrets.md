@@ -13,7 +13,17 @@ The default secrets path. One sealed file committed to the repo, one key per env
    yoink secrets keygen
    ```
 
-   This writes `~/.config/yoink/age.key` (your private identity, *do not commit*) and prints the public recipient (`age1...`).
+   The secret key is printed to stdout — yoink intentionally does **not** save it to a global location like `~/.config/yoink/age.key` because multiple projects with distinct identities would collide there. You decide where to save it.
+
+   Common pattern: gitignore an `age.key` file alongside your `yoink.yaml` and write the secret there:
+
+   ```sh
+   yoink secrets keygen --out age.key
+   echo age.key >> .gitignore
+   export YOINK_AGE_KEY_FILE=$(pwd)/age.key
+   ```
+
+   Or for CI: paste the secret straight into a GitHub Actions secret named `YOINK_AGE_KEY` (no local save needed) — see [AGE secrets in GitHub Actions](/docs/recipes/age-in-github-actions).
 
 2. **Add the recipient to `yoink.yaml`:**
 
@@ -24,17 +34,7 @@ The default secrets path. One sealed file committed to the repo, one key per env
        - age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45
    ```
 
-3. **Add the secret key as a GitHub secret** named `YOINK_AGE_KEY`. Paste the contents of `AGE-SECRET-KEY-1...` (just the key line, not the comment header).
-
-   **Recommended**: instead of pasting your laptop key, generate a separate CI-only identity that doesn't touch disk:
-
-   ```sh
-   yoink secrets keygen --ci
-   ```
-
-   This prints a new secret + public key without saving anything locally. Paste the secret into the GitHub secret, add the public key to `secrets.recipients:`. See [AGE secrets in GitHub Actions](/docs/recipes/age-in-github-actions) for the full workflow.
-
-4. **Add `secrets.age` to your repo and commit it.** The next step creates it.
+3. **Add `secrets.age` to your repo and commit it.** The next step creates it.
 
 ## Sealing values
 
@@ -102,7 +102,7 @@ When yoink needs to decrypt, it looks in this order:
 
 1. `YOINK_AGE_KEY` env var — raw key (used in CI)
 2. `YOINK_AGE_KEY_FILE` env var — path to a key file
-3. `~/.config/yoink/age.key` — the laptop default
+3. `~/.config/yoink/age.key` — fallback if nothing else is set. Yoink doesn't write to this path itself (multi-project collisions); operators who *want* one global identity can put their key there manually.
 
 Stop at the first one set. Override at any layer.
 

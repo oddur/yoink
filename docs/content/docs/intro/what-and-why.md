@@ -28,7 +28,7 @@ Kamal is a lovely fit for "one app, one binary per host" but starts to creak the
 - **Drift detection.** Every effective spec (image, env, networks, mounts, options, file content) hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
 - **Three deploy modes.** CI-built (the default), kamal-style local-build with `yoink build --push`, or fully standalone with `yoink up --build --no-registry` — no CI, no registry, drop a `yoink.yaml` next to your Dockerfile and go.
 - **Secure by default.** cap_drop=ALL, no-new-privileges, read-only rootfs, init=tini, tmpfs noexec, binds default :ro. Override per service when needed.
-- **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI, `~/.config/yoink/age.key` on your laptop). No remote vault required. Infisical stays available as an opt-in for teams already running it.
+- **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI) or `YOINK_AGE_KEY_FILE` (a gitignored `age.key` next to your `yoink.yaml`). No remote vault required. Infisical stays available as an opt-in for teams already running it.
 - **k9s-style TUI.** A `ratatui` dashboard with one-key reconcile, prune, kill, shell-into, debug-sidecar, log filter, deploy history with one-press rollback. Keyboard-only.
 
 ## What it deliberately doesn't do

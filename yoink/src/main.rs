@@ -319,27 +319,26 @@ enum Command {
 /// Subcommands for `yoink secrets`.
 #[derive(clap::Subcommand)]
 enum SecretsAction {
-    /// Generate a fresh age identity. Prints the public recipient
-    /// (commit this to `yoink.yaml` under `secrets.recipients:`) and
-    /// writes the secret key to `~/.config/yoink/age.key` (override
-    /// with `--out`). Never commit the secret key.
+    /// Generate a fresh age identity. By default the secret key is
+    /// printed to stdout — operator decides where to save it
+    /// (typically a gitignored `age.key` next to the project's
+    /// `yoink.yaml`, OR pasted into a CI secret). The public
+    /// recipient is also printed for committing to `yoink.yaml`
+    /// under `secrets.recipients:`. Pass `--out PATH` to write the
+    /// secret to a specific file with mode 0o600 instead.
+    ///
+    /// Yoink intentionally does NOT default to a global location
+    /// like `~/.config/yoink/age.key` — multiple projects with
+    /// distinct identities would collide there.
     Keygen {
-        /// Path to write the secret key to. Default
-        /// `~/.config/yoink/age.key`. Refuses to overwrite an existing
-        /// file unless `--force`.
+        /// Write the secret key to PATH (mode 0o600) instead of
+        /// printing it to stdout. Refuses to overwrite an existing
+        /// file unless `--force`. Make sure PATH is gitignored.
         #[arg(long)]
         out: Option<PathBuf>,
         /// Overwrite an existing identity at `--out`.
         #[arg(long)]
         force: bool,
-        /// CI mode: generate a separate identity for CI to use
-        /// independently of the operator's laptop key. Prints the
-        /// secret key to stdout (for pasting into a GitHub Actions
-        /// secret named `YOINK_AGE_KEY`) but does NOT save it to
-        /// disk. Lets you rotate CI's identity without re-keying the
-        /// operator's laptop.
-        #[arg(long)]
-        ci: bool,
     },
     /// Decrypt the sealed file into `$EDITOR`, then re-seal on save.
     /// Creates the file if it doesn't exist yet.
@@ -2057,15 +2056,15 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             Some(Ok(()))
         }
         Command::Secrets {
-            action: SecretsAction::Keygen { out, force, ci },
-        } => Some(cmd_secrets_keygen(out.clone(), *force, *ci)),
+            action: SecretsAction::Keygen { out, force },
+        } => Some(cmd_secrets_keygen(out.clone(), *force)),
         _ => None,
     }
 }
 
 fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     match action {
-        SecretsAction::Keygen { out, force, ci } => cmd_secrets_keygen(out, force, ci),
+        SecretsAction::Keygen { out, force } => cmd_secrets_keygen(out, force),
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
         SecretsAction::Seal { r#in, out } => cmd_secrets_seal(config, r#in.as_deref(), out),
@@ -2073,31 +2072,35 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     }
 }
 
-fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool, ci: bool) -> Result<()> {
+fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
     use yoink::sealed;
     let (secret, public) = sealed::keygen();
-    if ci {
-        if out.is_some() {
-            return Err(anyhow::anyhow!(
-                "--ci is incompatible with --out (the secret is intentionally not saved to disk)"
-            ));
-        }
-        println!("CI identity (paste this into a GitHub Actions secret named YOINK_AGE_KEY):");
+    let recipient_block = format!(
+        "  secrets:\n    provider: age\n    recipients:\n      - {public}"
+    );
+    let Some(path) = out else {
+        // No --out: print the secret to stdout. Operator decides
+        // where to save (typically a gitignored file alongside the
+        // project's yoink.yaml, or pasted into a CI secret).
+        // Yoink intentionally does NOT default-write to a global
+        // path like ~/.config/yoink/age.key because multiple
+        // projects with distinct identities would collide there.
+        println!("New age identity. Save the secret somewhere — yoink won't.");
+        println!();
+        println!("Secret (private — never commit; gitignore the file you save it to):");
         println!();
         println!("{secret}");
         println!();
-        println!("Public recipient (add to yoink.yaml under `secrets.recipients:`):");
+        println!("Public recipient (add to yoink.yaml):");
         println!();
-        println!("  - {public}");
+        println!("{recipient_block}");
         println!();
-        println!("This secret was NOT written to disk. The terminal scrollback is now");
-        println!("the only copy outside GitHub — paste it into the secret and clear");
-        println!("scrollback when done.");
+        println!("Suggested next steps:");
+        println!("  • Save the secret to ./age.key (gitignored), then:");
+        println!("      export YOINK_AGE_KEY_FILE=$(pwd)/age.key");
+        println!("  • Or paste it into a CI secret named YOINK_AGE_KEY.");
+        println!("  • Clear your terminal scrollback when done.");
         return Ok(());
-    }
-    let path = match out {
-        Some(p) => p,
-        None => sealed::default_identity_path()?,
     };
     if path.exists() && !force {
         return Err(anyhow::anyhow!(
@@ -2110,15 +2113,14 @@ fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool, ci: bool) -> Result<()>
         chrono_like_now(),
     );
     sealed::write_atomically_secret(&path, body.as_bytes())?;
-    println!("wrote identity to {}", path.display());
+    println!("wrote identity to {} (mode 0600)", path.display());
     println!("public recipient: {public}");
     println!();
     println!("Add this to yoink.yaml:");
     println!();
-    println!("  secrets:");
-    println!("    provider: age");
-    println!("    recipients:");
-    println!("      - {public}");
+    println!("{recipient_block}");
+    println!();
+    println!("Make sure {} is gitignored.", path.display());
     Ok(())
 }
 

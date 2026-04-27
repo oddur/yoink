@@ -18,8 +18,11 @@ Self-contained walkthrough that exercises age-sealed secrets end-to-end against 
 ```sh
 cd examples/sealed-secrets
 
-# 1. Generate an age identity into this directory (NOT ~/.config).
-#    Writes age.key 0o600; prints the public recipient.
+# 1. Generate an age identity into this directory.
+#    `--out` writes age.key (mode 0o600) and prints the public
+#    recipient. Without `--out`, keygen prints the secret to stdout
+#    and you save it yourself — yoink never writes to a global
+#    location like ~/.config/yoink/age.key (multi-project safety).
 yoink secrets keygen --out age.key
 
 # 2. Paste the public key into yoink.yaml under `secrets.recipients:`,

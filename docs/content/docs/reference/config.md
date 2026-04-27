@@ -41,7 +41,7 @@ Two providers, selected by the `provider:` tag.
 
 ### `provider: age` (default, batteries-included)
 
-A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env, for CI), `YOINK_AGE_KEY_FILE` (path), or `~/.config/yoink/age.key`.
+A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env, for CI), `YOINK_AGE_KEY_FILE` (path, for laptop dev — typically a gitignored `age.key` next to `yoink.yaml`), or `~/.config/yoink/age.key` (fallback, never written to by yoink itself — multi-project safety).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|

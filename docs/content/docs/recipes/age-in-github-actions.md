@@ -11,33 +11,40 @@ You've already set up sealed secrets locally — see [Sealed secrets (age)](/doc
 
 - `secrets.age` is committed to the repo (encrypted)
 - `yoink.yaml` has a `secrets.recipients:` list
-- Your laptop's identity sits at `~/.config/yoink/age.key` (`yoink secrets keygen`)
+- Your laptop's identity is saved somewhere readable to you (typically a gitignored `age.key` next to the project's `yoink.yaml`)
 
 ## 1. Generate a CI-only identity
 
 Don't paste your laptop key into GitHub — generate a separate one:
 
 ```sh
-yoink secrets keygen --ci
+yoink secrets keygen
 ```
 
-Output:
+Default keygen prints the secret straight to stdout (it does **not** save to disk by default), which is exactly what you want for CI: paste the printed secret into a GitHub Actions secret and clear your scrollback. Output looks like:
 
 ```
-CI identity (paste this into a GitHub Actions secret named YOINK_AGE_KEY):
+New age identity. Save the secret somewhere — yoink won't.
+
+Secret (private — never commit; gitignore the file you save it to):
 
 AGE-SECRET-KEY-1KLY239F...
 
-Public recipient (add to yoink.yaml under `secrets.recipients:`):
+Public recipient (add to yoink.yaml):
 
-  - age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45
+  secrets:
+    provider: age
+    recipients:
+      - age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45
 
-This secret was NOT written to disk. The terminal scrollback is now
-the only copy outside GitHub — paste it into the secret and clear
-scrollback when done.
+Suggested next steps:
+  • Save the secret to ./age.key (gitignored), then:
+      export YOINK_AGE_KEY_FILE=$(pwd)/age.key
+  • Or paste it into a CI secret named YOINK_AGE_KEY.
+  • Clear your terminal scrollback when done.
 ```
 
-Yoink **does not save** the secret with `--ci`. The terminal scrollback is the only copy until you paste it into GitHub.
+Don't save it to disk — paste it directly into the GitHub secret. The scrollback is the only copy.
 
 ## 2. Add the public key to `yoink.yaml`
 
@@ -99,9 +106,9 @@ That's the whole integration. Yoink finds `YOINK_AGE_KEY` in the env, decrypts `
 
 Resolution order (same code path locally and in CI):
 
-1. `YOINK_AGE_KEY` env var — raw key (this is the CI path)
-2. `YOINK_AGE_KEY_FILE` env var — path to a key file
-3. `~/.config/yoink/age.key` — laptop default
+1. `YOINK_AGE_KEY` env var — raw key (the CI path)
+2. `YOINK_AGE_KEY_FILE` env var — path to a key file (the laptop path: `export YOINK_AGE_KEY_FILE=$(pwd)/age.key`)
+3. `~/.config/yoink/age.key` — fallback if you've manually placed a key there. Yoink doesn't write to this path itself.
 
 Stop at the first one set. If none are set, yoink errors with a pointer to `yoink secrets keygen`.
 
