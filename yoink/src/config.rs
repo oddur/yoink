@@ -164,6 +164,13 @@ pub struct ProxyConfig {
     /// Persisted across proxy restarts. Default `yoink_caddy_data`.
     #[serde(default)]
     pub cert_volume: Option<String>,
+    /// Host IP to bind `:80` and `:443` to. Default unset → bind
+    /// to all interfaces (`0.0.0.0`). Common use: bind to a
+    /// Tailscale IP so the proxy is reachable only over the
+    /// tailnet (`bind: 100.10.0.1`), or to `127.0.0.1` for local
+    /// dev where the proxy fronts a tunneled cloudflared session.
+    #[serde(default)]
+    pub bind: Option<String>,
     /// Proxy-level TLS configuration. When set, every routed service
     /// inherits this cert (and optional client-auth) by default.
     /// Per-service `tls_cert_secret:` / `tls_key_secret:` overrides
@@ -517,6 +524,26 @@ pub struct ServiceConfig {
     /// deploys without a CDN in front.
     #[serde(default)]
     pub compression: bool,
+    /// Path-prefix routing. When set, this service's route only
+    /// matches requests where the URL path starts with this prefix
+    /// (Caddy `path` matcher; `*` is allowed at the end). Lets two
+    /// services share a hostname:
+    ///
+    /// ```yaml
+    /// services:
+    ///   - name: api
+    ///     domain: example.com
+    ///     path_prefix: /api/*
+    ///     run: { port: 8080 }
+    ///   - name: web
+    ///     domain: example.com   # same host
+    ///     run: { port: 3000 }
+    /// ```
+    ///
+    /// Yoink orders routes so path-constrained ones come before
+    /// catch-all ones — first match wins, as Caddy does.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
     pub run: ServiceRun,
 }
 

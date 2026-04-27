@@ -47,8 +47,15 @@ where
     let proxy_tls = cfg.proxy.as_ref().and_then(|p| p.tls.as_ref());
     let proxied: Vec<&ServiceConfig> = cfg.services.iter().filter(|s| is_proxied(s)).collect();
 
-    let mut routes: Vec<Value> = Vec::with_capacity(proxied.len() + 1);
-    for svc in &proxied {
+    // Order services so path-constrained routes come before
+    // catch-all routes for the same host. Caddy uses first-match;
+    // without ordering, a `domain: example.com` (no path) before a
+    // `domain: example.com, path_prefix: /api/*` would always win.
+    let mut ordered: Vec<&ServiceConfig> = proxied.clone();
+    ordered.sort_by_key(|s| s.path_prefix.is_none()); // false (has prefix) < true (catch-all)
+
+    let mut routes: Vec<Value> = Vec::with_capacity(ordered.len() + 1);
+    for svc in &ordered {
         // Canonical-domain redirect: when a service lists multiple
         // hosts and pins one as canonical, render a 308 redirect
         // route from the non-canonical entries before the main route.
@@ -403,10 +410,21 @@ fn render_route(svc: &ServiceConfig, containers: &[String]) -> Result<Value> {
     }
     handle.push(reverse_proxy);
 
-    let host_match = json!({"host": svc.domain.as_ref().unwrap().as_list()});
+    // Match on host always; on path too when path_prefix is set.
+    // Caddy's `path` matcher accepts globs (`/api/*`); we pass the
+    // operator's value verbatim, so `/api/*` and `/api*` and
+    // `/api/foo` all do what Caddy does with them.
+    let mut matchers = serde_json::Map::new();
+    matchers.insert(
+        "host".into(),
+        json!(svc.domain.as_ref().unwrap().as_list()),
+    );
+    if let Some(prefix) = &svc.path_prefix {
+        matchers.insert("path".into(), json!([prefix]));
+    }
 
     let mut route = json!({
-        "match": [host_match],
+        "match": [Value::Object(matchers)],
         "handle": handle,
         "terminal": true,
     });

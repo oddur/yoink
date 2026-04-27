@@ -64,6 +64,7 @@ pub fn is_proxied(svc: &ServiceConfig) -> bool {
 /// exist in `deploy.networks`, and add `_proxy` to every routed
 /// service's `depends_on:` list. Idempotent — safe to call after
 /// validation has already added the proxy.
+#[allow(clippy::too_many_lines)] // mostly straight-line validation
 pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
     if !proxy_enabled(cfg) {
         return Ok(());
@@ -95,6 +96,37 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
                  `tls_key_secret` — both are required for the inline-cert path \
                  (or set `proxy.tls.cert_secret` to inherit)",
                 svc.name,
+            )));
+        }
+    }
+
+    // path_prefix disambiguation: when N services share a hostname,
+    // at most one can be the catch-all (no path_prefix); the rest must
+    // declare a path_prefix. Otherwise route order is operator-
+    // dependent and bugs are subtle.
+    let mut by_host: std::collections::BTreeMap<String, Vec<&ServiceConfig>> =
+        std::collections::BTreeMap::new();
+    for svc in &cfg.services {
+        let Some(domain) = &svc.domain else { continue };
+        for host in domain.as_list() {
+            by_host.entry(host).or_default().push(svc);
+        }
+    }
+    for (host, services) in &by_host {
+        if services.len() < 2 {
+            continue;
+        }
+        let catch_alls: Vec<&str> = services
+            .iter()
+            .filter(|s| s.path_prefix.is_none())
+            .map(|s| s.name.as_str())
+            .collect();
+        if catch_alls.len() > 1 {
+            return Err(ConfigError::Invalid(format!(
+                "{} services route {host:?} without a path_prefix \
+                 (services: {catch_alls:?}) — at most one catch-all per host; \
+                 add `path_prefix:` to the others",
+                catch_alls.len(),
             )));
         }
     }
@@ -203,28 +235,39 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         upstream_h2c: false,
         canonical_domain: None,
         compression: false,
+        path_prefix: None,
         run: ServiceRun {
             port: None,
             healthcheck_path: None,
-            // Caddy serves :80 + :443 on the host — that's the whole
-            // point of the proxy. Admin API on :2019 is published on
-            // 127.0.0.1 with an ephemeral host port (`:0:2019`) so
-            // it's reachable from the host (and only from the host)
-            // without going through docker's bridge networking,
-            // which doesn't expose user-defined-network container
-            // IPs to the host. The yoink CLI looks up the actual
-            // host port via `inspect_container` and SSH-tunnels to
-            // it for the duration of one `/load` call.
+            // Caddy serves :80 + :443 on the host. Admin API on :2019
+            // is published on 127.0.0.1 with an ephemeral host port
+            // (`:0:2019`) so it's reachable from the host (and only
+            // from the host) — docker doesn't route user-defined-
+            // network container IPs from the host. yoink looks up
+            // the actual host port via `inspect_container` and
+            // SSH-tunnels to it for one `/load` call.
+            //
+            // `proxy.bind:` (when set) prepends the bind address to
+            // :80/:443 so the proxy is reachable only on that
+            // interface (e.g. tailnet IP). Admin port stays on
+            // 127.0.0.1 regardless.
             //
             // The :80/:443 publishes also implicitly force stop-first
             // deploy (port bindings are exclusive at the kernel
             // level), so a proxy redeploy briefly drops :80/:443
             // until the new container binds.
-            publish: vec![
-                "80:80".to_string(),
-                "443:443".to_string(),
-                "127.0.0.1:0:2019".to_string(),
-            ],
+            publish: {
+                let prefix = p
+                    .bind
+                    .as_deref()
+                    .map(|ip| format!("{ip}:"))
+                    .unwrap_or_default();
+                vec![
+                    format!("{prefix}80:80"),
+                    format!("{prefix}443:443"),
+                    "127.0.0.1:0:2019".to_string(),
+                ]
+            },
             // Override the official caddy:2 image's entrypoint to
             // start with a minimal bootstrap config: admin bound to
             // 0.0.0.0:2019 (so the admin endpoint is reachable from
