@@ -408,11 +408,19 @@ impl ContainerDetailState {
             frame.render_widget(chart, cols[1]);
         }
 
-        // ── Panel 3: network rx/tx rate ───────────────────────────────
+        // ── Panel 3: network rx/tx rate, btop-style mirrored ──────────
+        // rx (incoming) plots above the zero line; tx (outgoing) plots
+        // mirrored below. The two series no longer overlap — at a
+        // glance you see "what's coming in" vs "what's going out"
+        // without having to disambiguate two same-axis lines.
         let rx_rates = StatsHistory::rate_series(&self.history.net_rx);
-        let tx_rates = StatsHistory::rate_series(&self.history.net_tx);
+        let tx_rates_pos = StatsHistory::rate_series(&self.history.net_tx);
+        // Mirror tx below the zero line by negating each y value. The
+        // rendered line still tracks the same magnitude — just on the
+        // negative side of the axis.
+        let tx_rates: Vec<(f64, f64)> = tx_rates_pos.iter().map(|(t, v)| (*t, -*v)).collect();
         let rx_now = rx_rates.last().map_or(0.0, |(_, v)| *v);
-        let tx_now = tx_rates.last().map_or(0.0, |(_, v)| *v);
+        let tx_now = tx_rates_pos.last().map_or(0.0, |(_, v)| *v);
         let net_title = if rx_rates.is_empty() && tx_rates.is_empty() {
             " net rx / tx (5 min) ".to_string()
         } else {
@@ -431,21 +439,28 @@ impl ContainerDetailState {
                 cols[2],
             );
         } else {
-            let max_rate = rx_rates
+            let rx_peak = rx_rates
                 .iter()
-                .chain(tx_rates.iter())
                 .map(|(_, v)| *v)
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
+                .fold(0.0_f64, f64::max);
+            let tx_peak = tx_rates_pos
+                .iter()
+                .map(|(_, v)| *v)
+                .fold(0.0_f64, f64::max);
+            // Symmetric y-axis around zero so the visual zero-line
+            // sits halfway down the panel regardless of whether
+            // download or upload is dominant. `.max(1.0)` keeps the
+            // axis non-degenerate during idle quiet periods.
+            let max_rate = rx_peak.max(tx_peak).max(1.0);
             let datasets = vec![
                 Dataset::default()
-                    .name("rx")
+                    .name("↓ rx")
                     .marker(Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(Color::Green))
                     .data(&rx_rates),
                 Dataset::default()
-                    .name("tx")
+                    .name("↑ tx")
                     .marker(Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(Color::Yellow))
@@ -462,8 +477,8 @@ impl ContainerDetailState {
                 .y_axis(
                     Axis::default()
                         .style(Style::default().fg(Color::DarkGray))
-                        .bounds([0.0, max_rate])
-                        .labels(rate_axis_labels(max_rate)),
+                        .bounds([-max_rate, max_rate])
+                        .labels(mirrored_rate_labels(max_rate)),
                 );
             frame.render_widget(chart, cols[2]);
         }
@@ -879,13 +894,18 @@ fn percent_axis_labels(max: f64, uncapped: bool) -> Vec<Span<'static>> {
     }
 }
 
-fn rate_axis_labels(max: f64) -> Vec<Span<'static>> {
+/// Labels for the mirrored rx/tx panel: bottom is `↑ tx_max`, middle
+/// is `0`, top is `↓ rx_max`. Both magnitudes are positive (the y
+/// values are signed but the operator reads the magnitude with the
+/// arrow indicating direction).
+fn mirrored_rate_labels(max: f64) -> Vec<Span<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
-    let half = max / 2.0;
+    let up = Style::default().fg(Color::Yellow);
+    let down = Style::default().fg(Color::Green);
     vec![
+        Span::styled(format!("↑{}", format_rate(max)), up),
         Span::styled("0".to_string(), dim),
-        Span::styled(format_rate(half), dim),
-        Span::styled(format_rate(max), dim),
+        Span::styled(format!("↓{}", format_rate(max)), down),
     ]
 }
 
