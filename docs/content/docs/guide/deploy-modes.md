@@ -98,9 +98,9 @@ The push runs entirely from the operator process — yoink never invokes `docker
 Concurrency: blob pushes per image run with a small parallelism (4) to overlap HEAD round-trips with PUT bodies. Multi-host fan-out across services is fully concurrent (`try_join_all` per image), so deploy time = max(per-host) instead of sum(per-host).
 
 ```
-✓ api:dev → backtrack-eu-1     done · unregistry
-✓ api:dev → backtrack-eu-2     done · unregistry
-✓ web:dev → backtrack-eu-1     done · unregistry
+✓ api:dev → host-1     done · unregistry
+✓ api:dev → host-2     done · unregistry
+✓ web:dev → host-1     done · unregistry
 ```
 
 If the unregistry setup fails for any reason (host can't pull the unregistry image, ssh forward refused, …), `--transport=auto` (the default) falls back to the tarball transport with a single warning line and continues. Use `--transport=unregistry` to make those failures hard errors instead.
@@ -116,8 +116,8 @@ For each (service, host), streams `docker save <image>:<tag>` from the operator'
 Per-host progress bars track bytes transferred + rate live in tarball mode:
 
 ```
-⠋ api:dev → backtrack-eu-1     234.5 MiB @  47.0 MiB/s (tarball)
-✓ web:dev → backtrack-eu-1     done · 89.3 MiB (tarball)
+⠋ api:dev → host-1     234.5 MiB @  47.0 MiB/s (tarball)
+✓ web:dev → host-1     done · 89.3 MiB (tarball)
 ```
 
 {{< callout type="info" >}}
