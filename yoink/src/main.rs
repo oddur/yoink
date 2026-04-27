@@ -542,6 +542,40 @@ macro_rules! info_eprintln {
     }};
 }
 
+/// Page `content` through `$PAGER` when stdout is a TTY (clig.dev:
+/// "Use pagers for lengthy output"). Falls back to `less -FIRX` when
+/// `$PAGER` is unset and to a plain print when `less` is unavailable
+/// or stdout is piped. The `-FIRX` flags make `less` quit if the
+/// content fits on one screen and avoid clearing it on exit.
+fn page_output(content: &str) {
+    use std::process::{Command, Stdio};
+
+    if !io::stdout().is_terminal() {
+        print!("{content}");
+        return;
+    }
+    let pager_cmd = std::env::var("PAGER").unwrap_or_else(|_| "less -FIRX".to_string());
+    let mut parts = pager_cmd.split_whitespace();
+    let Some(bin) = parts.next() else {
+        print!("{content}");
+        return;
+    };
+    let args: Vec<&str> = parts.collect();
+    let Ok(mut child) = Command::new(bin)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .spawn()
+    else {
+        // Pager binary not on PATH — print directly rather than fail.
+        print!("{content}");
+        return;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(content.as_bytes());
+    }
+    let _ = child.wait();
+}
+
 /// TTY-gated interactive confirmation for destructive operations
 /// (clig.dev: severe changes require non-trivial confirmation). When
 /// stdin is a TTY, prompts for a literal "yes". When stdin is not a
@@ -1730,19 +1764,24 @@ async fn cmd_history(
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         TableFormat::Text => {
-            println!(
+            use std::fmt::Write as _;
+            let mut buf = String::new();
+            writeln!(
+                buf,
                 "{:<22}  {:<28}  {:<10}  {:<10}  {:<10}  when",
                 "host", "container", "version", "state", "deployed-by"
-            );
+            )?;
             for (when, host_addr, name, version, state, by) in trimmed {
                 let when_str = match when {
                     Some(t) if t > 0 => output::format_relative_time(Some(t)),
                     _ => "?".into(),
                 };
-                println!(
+                writeln!(
+                    buf,
                     "{host_addr:<22}  {name:<28}  {version:<10}  {state:<10}  {by:<10}  {when_str}"
-                );
+                )?;
             }
+            page_output(&buf);
         }
     }
     Ok(())
