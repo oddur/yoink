@@ -69,13 +69,18 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         return Ok(());
     }
 
+    let proxy_has_inline_cert = cfg
+        .proxy
+        .as_ref()
+        .and_then(|p| p.tls.as_ref())
+        .is_some();
+
     // Validation: any service using `tls: cert` must name both
-    // `tls_cert_secret` and `tls_key_secret`; reject early so the
-    // operator gets a config-time error rather than a deploy-time one.
+    // `tls_cert_secret` and `tls_key_secret` (or inherit from
+    // `proxy.tls`); reject early so the operator gets a config-time
+    // error rather than a deploy-time one.
     for svc in &cfg.services {
-        if svc.domain.is_some()
-            && svc.run.port.is_none()
-        {
+        if svc.domain.is_some() && svc.run.port.is_none() {
             return Err(ConfigError::Invalid(format!(
                 "service {:?} has `domain:` but no `run.port` — the proxy needs to know \
                  which container port to forward to",
@@ -87,22 +92,27 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         {
             return Err(ConfigError::Invalid(format!(
                 "service {:?} sets `tls: cert` but is missing `tls_cert_secret` and/or \
-                 `tls_key_secret` — both are required for the inline-cert path",
+                 `tls_key_secret` — both are required for the inline-cert path \
+                 (or set `proxy.tls.cert_secret` to inherit)",
                 svc.name,
             )));
         }
     }
 
     // ACME requires an email address — fail loudly if any service uses
-    // `tls: auto` (the default) but `proxy.email` isn't set.
-    let any_acme = cfg
-        .services
-        .iter()
-        .any(|s| s.domain.is_some() && matches!(s.tls, TlsMode::Auto));
+    // `tls: auto` (the default) and we'd actually run ACME (no
+    // proxy-level inline cert overrides it) and `proxy.email` isn't
+    // set.
+    let any_acme = !proxy_has_inline_cert
+        && cfg
+            .services
+            .iter()
+            .any(|s| s.domain.is_some() && matches!(s.tls, TlsMode::Auto));
     if any_acme && cfg.proxy.as_ref().and_then(|p| p.email.as_ref()).is_none() {
         return Err(ConfigError::Invalid(
             "at least one service uses `tls: auto` (Let's Encrypt) but `proxy.email:` \
-             is unset — Let's Encrypt requires a registration email"
+             is unset — Let's Encrypt requires a registration email (or set \
+             `proxy.tls.cert_secret` for an inline cert instead)"
                 .to_string(),
         ));
     }

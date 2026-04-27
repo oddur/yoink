@@ -49,9 +49,36 @@ Containers are named in upstream entries (not IPs), so a container restart with 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | implicit when any service has `domain:` | |
-| `email` | string | — | Let's Encrypt registration email. **Required when any service uses `tls: auto`.** |
+| `email` | string | — | Let's Encrypt registration email. **Required when any service uses `tls: auto`.** Unused when `proxy.tls:` is set. |
 | `image` | string | `caddy:2` | Override to use an [`xcaddy`](https://github.com/caddyserver/xcaddy)-built image with plugins (rate-limit, l4, redis-storage, …). |
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. Persisted across proxy restarts. |
+| `tls` | block (see below) | — | Proxy-level TLS — every routed service inherits this cert (and optional mTLS) by default. |
+
+### `proxy.tls:` block
+
+When set, all routed services use the same TLS config by default. Per-service `tls_cert_secret:` / `tls_key_secret:` overrides for the rare different-cert-per-service case. ACME is implicitly off and a `:80 → :443` redirect is auto-emitted.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `cert_secret` | string | required | Sealed-secret name holding the PEM cert (full chain). |
+| `key_secret` | string | required | Sealed-secret name holding the PEM private key. |
+| `client_auth` | block | — | Optional mTLS (e.g. Cloudflare origin-pull). |
+| `client_auth.mode` | enum | `require_and_verify` | `request` / `require` / `verify_if_given` / `require_and_verify`. |
+| `client_auth.trust_pool_secret` | string | required (when `client_auth` set) | Sealed-secret name holding the trust-pool CA bundle (PEM). |
+
+Common shape:
+
+```yaml
+proxy:
+  tls:
+    cert_secret: CF_ORIGIN_CERT
+    key_secret:  CF_ORIGIN_KEY
+    client_auth:
+      mode: require_and_verify
+      trust_pool_secret: CF_ORIGIN_PULL_CA
+```
+
+This is the Cloudflare-style "every route is an origin behind Cloudflare's edge with mTLS proving the request came from Cloudflare" pattern. No host-filesystem cert state — everything lives in `secrets.age` (or Infisical), encrypted at rest.
 
 That's the full surface. Five service-level fields, four proxy-level fields. Anything beyond that is `caddy_extra_json:` or a custom proxy image.
 

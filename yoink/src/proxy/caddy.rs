@@ -35,6 +35,7 @@ use super::is_proxied;
 /// — one entry per replica, in deterministic order. Cert/key bytes
 /// for `tls: cert` services come from `bundle`; an `Err` is returned
 /// if a referenced secret is missing.
+#[allow(clippy::too_many_lines)] // mostly straight-line JSON assembly
 pub fn render<F>(
     cfg: &Config,
     container_names_for: F,
@@ -43,17 +44,53 @@ pub fn render<F>(
 where
     F: Fn(&str) -> Vec<String>,
 {
+    let proxy_tls = cfg.proxy.as_ref().and_then(|p| p.tls.as_ref());
     let proxied: Vec<&ServiceConfig> = cfg.services.iter().filter(|s| is_proxied(s)).collect();
 
-    let mut routes: Vec<Value> = Vec::with_capacity(proxied.len());
+    let mut routes: Vec<Value> = Vec::with_capacity(proxied.len() + 1);
     for svc in &proxied {
         routes.push(render_route(svc, &container_names_for(&svc.name))?);
+    }
+
+    // Auto :80 → :443 redirect when proxy-level TLS is in play. Caddy
+    // would normally do this via auto_https; we emit it explicitly so
+    // the rendered config is self-contained and doesn't rely on
+    // Caddy's auto-pilot semantics around inline certs.
+    if proxy_tls.is_some() {
+        routes.insert(0, redirect_route_http_to_https());
     }
 
     let mut http_server = json!({
         "listen": [":80", ":443"],
         "routes": routes,
     });
+
+    // mTLS lives in connection_policies, applied to every TLS handshake.
+    if let Some(tls) = proxy_tls
+        && let Some(client_auth) = tls.client_auth.as_ref()
+    {
+        let bundle = bundle.ok_or_else(|| {
+            anyhow!(
+                "proxy.tls.client_auth requires a [secrets] block to resolve \
+                 trust_pool_secret"
+            )
+        })?;
+        let trust_pool = bundle
+            .get(&client_auth.trust_pool_secret)
+            .ok_or_else(|| {
+                anyhow!(
+                    "proxy.tls.client_auth.trust_pool_secret={:?} not found in the \
+                     secrets bundle",
+                    client_auth.trust_pool_secret,
+                )
+            })?;
+        http_server["tls_connection_policies"] = json!([{
+            "client_authentication": {
+                "mode": client_auth.mode.as_caddy(),
+                "trusted_ca_certs_pem": [trust_pool],
+            }
+        }]);
+    }
 
     let mut config = json!({
         "apps": {
@@ -65,8 +102,11 @@ where
         }
     });
 
-    // ACME automation, only when at least one service uses `tls: auto`.
-    let any_acme = proxied.iter().any(|s| matches!(s.tls, TlsMode::Auto));
+    // ACME is only for services that genuinely want it AND aren't
+    // covered by a proxy-level inline cert. Proxy-level cert disables
+    // ACME entirely (we never want both running on the same domains).
+    let any_acme = proxy_tls.is_none()
+        && proxied.iter().any(|s| matches!(s.tls, TlsMode::Auto));
     if any_acme {
         let email = cfg
             .proxy
@@ -90,9 +130,36 @@ where
         });
     }
 
-    // Inline certificates for `tls: cert` services. We collect them
-    // into a single `load_pem` list rather than one per service so
-    // Caddy's matcher dedup is straightforward.
+    // Resolve the inline cert(s). Two sources merge into one
+    // `load_pem` list:
+    //   - proxy.tls.cert_secret/key_secret (covers every routed
+    //     service that doesn't override).
+    //   - per-service tls_cert_secret/tls_key_secret (the override).
+    let mut pem_entries: Vec<Value> = Vec::new();
+
+    if let Some(tls) = proxy_tls {
+        let bundle = bundle.ok_or_else(|| {
+            anyhow!("proxy.tls.cert_secret requires a [secrets] block to resolve")
+        })?;
+        let cert = bundle.get(&tls.cert_secret).ok_or_else(|| {
+            anyhow!(
+                "proxy.tls.cert_secret={:?} not found in the secrets bundle",
+                tls.cert_secret,
+            )
+        })?;
+        let key = bundle.get(&tls.key_secret).ok_or_else(|| {
+            anyhow!(
+                "proxy.tls.key_secret={:?} not found in the secrets bundle",
+                tls.key_secret,
+            )
+        })?;
+        pem_entries.push(json!({
+            "certificate": cert,
+            "key": key,
+            "tags": ["yoink:proxy-default"],
+        }));
+    }
+
     let cert_services: Vec<&&ServiceConfig> = proxied
         .iter()
         .filter(|s| matches!(s.tls, TlsMode::Cert))
@@ -104,7 +171,6 @@ where
                 cert_services.len(),
             )
         })?;
-        let mut pem_entries: Vec<Value> = Vec::new();
         for svc in &cert_services {
             let cert_name = svc.tls_cert_secret.as_deref().expect("validated upstream");
             let key_name = svc.tls_key_secret.as_deref().expect("validated upstream");
@@ -128,14 +194,31 @@ where
                 "tags": [format!("yoink:{}", svc.name)],
             }));
         }
+    }
 
-        // Merge with any existing `apps.tls` (from ACME above).
+    if !pem_entries.is_empty() {
         let tls = config["apps"].as_object_mut().unwrap();
         let entry = tls.entry("tls").or_insert_with(|| json!({}));
         entry["certificates"] = json!({ "load_pem": pem_entries });
     }
 
     Ok(config)
+}
+
+fn redirect_route_http_to_https() -> Value {
+    // Match :80 only; rewrite scheme + 308 redirect. Caddy's `redir`
+    // handler is the JSON shape below.
+    json!({
+        "match": [{"protocol": "http"}],
+        "handle": [{
+            "handler": "static_response",
+            "status_code": 308,
+            "headers": {
+                "Location": ["https://{http.request.host}{http.request.uri}"],
+            }
+        }],
+        "terminal": true,
+    })
 }
 
 fn render_route(svc: &ServiceConfig, containers: &[String]) -> Result<Value> {
@@ -359,6 +442,103 @@ services:
             .as_str()
             .unwrap()
             .starts_with("-----BEGIN CERT"));
+    }
+
+    #[test]
+    fn proxy_tls_with_mtls_renders_connection_policies_and_redirect() {
+        let yaml = r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+secrets: { provider: age, recipients: [age1xxxxx] }
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+    client_auth:
+      mode: require_and_verify
+      trust_pool_secret: CF_CA
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+  - name: web
+    image: img
+    tag: t
+    domain: [example.com, www.example.com]
+    run: { port: 3000 }
+"#;
+        let cfg = parse(yaml);
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("CF_CERT".to_string(), "-----BEGIN CERTIFICATE-----\n".into());
+        values.insert("CF_KEY".to_string(), "-----BEGIN PRIVATE KEY-----\n".into());
+        values.insert("CF_CA".to_string(), "-----BEGIN CERTIFICATE-----CA\n".into());
+        let bundle = SecretsBundle::new(values);
+        let json = render(&cfg, |_| vec!["api-1".into()], Some(&bundle)).expect("render");
+
+        // No ACME — proxy-level cert overrides it.
+        assert!(json["apps"]["tls"]["automation"].is_null());
+
+        // mTLS connection_policies present.
+        let policies = &json["apps"]["http"]["servers"]["main"]["tls_connection_policies"];
+        assert_eq!(
+            policies[0]["client_authentication"]["mode"].as_str(),
+            Some("require_and_verify")
+        );
+        assert!(policies[0]["client_authentication"]["trusted_ca_certs_pem"][0]
+            .as_str()
+            .unwrap()
+            .contains("CA"));
+
+        // First route is the :80 → :443 redirect.
+        let routes = json["apps"]["http"]["servers"]["main"]["routes"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            routes[0]["match"][0]["protocol"].as_str(),
+            Some("http")
+        );
+        assert_eq!(routes[0]["handle"][0]["status_code"].as_i64(), Some(308));
+
+        // Inline cert is present (one entry covers everything).
+        let pem = &json["apps"]["tls"]["certificates"]["load_pem"];
+        assert_eq!(pem.as_array().unwrap().len(), 1);
+        assert_eq!(
+            pem[0]["tags"][0].as_str(),
+            Some("yoink:proxy-default")
+        );
+
+        // Both services routed (api + web).
+        let host_routes: Vec<&Value> = routes.iter().skip(1).collect();
+        assert_eq!(host_routes.len(), 2);
+    }
+
+    #[test]
+    fn proxy_tls_without_acme_skips_email_requirement() {
+        let yaml = r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+secrets: { provider: age, recipients: [age1xxxxx] }
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#;
+        // No proxy.email: but no ACME because proxy.tls is set.
+        let cfg = parse(yaml);
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("CF_CERT".to_string(), "cert".into());
+        values.insert("CF_KEY".to_string(), "key".into());
+        let json = render(&cfg, |_| vec![], Some(&SecretsBundle::new(values))).expect("render");
+        assert!(json["apps"]["tls"]["automation"].is_null());
+        assert!(json["apps"]["tls"]["certificates"]["load_pem"][0].is_object());
     }
 
     #[test]

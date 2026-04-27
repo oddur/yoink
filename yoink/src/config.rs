@@ -138,7 +138,7 @@ pub struct HostConfig {
 }
 
 /// Reverse-proxy config. The proxy itself is a yoink-managed Caddy
-/// service (`name = "_proxy"`, `kind = ServiceKind::Proxy`) that's
+/// service (`name = "yoink-proxy"`, `kind = ServiceKind::Proxy`) that's
 /// synthesized at config-load time when any service has `domain:` set.
 /// This block tunes the synthesized service. All fields optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -151,7 +151,8 @@ pub struct ProxyConfig {
     pub enabled: Option<bool>,
     /// Email address for Let's Encrypt ACME registration. Required
     /// when any service uses `tls: auto` (which is the default for
-    /// services with `domain:`).
+    /// services with `domain:`). Unused when `proxy.tls.cert_secret`
+    /// is set — yoink doesn't ACME on top of an inline cert.
     #[serde(default)]
     pub email: Option<String>,
     /// Caddy image. Override to use an `xcaddy`-built image with
@@ -163,6 +164,89 @@ pub struct ProxyConfig {
     /// Persisted across proxy restarts. Default `yoink_caddy_data`.
     #[serde(default)]
     pub cert_volume: Option<String>,
+    /// Proxy-level TLS configuration. When set, every routed service
+    /// inherits this cert (and optional client-auth) by default.
+    /// Per-service `tls_cert_secret:` / `tls_key_secret:` overrides
+    /// for the rare different-cert-per-service case.
+    ///
+    /// The common shape (one wildcard cert covers everything):
+    /// ```yaml
+    /// proxy:
+    ///   tls:
+    ///     cert_secret: CF_ORIGIN_CERT
+    ///     key_secret:  CF_ORIGIN_KEY
+    ///     client_auth:
+    ///       mode: require_and_verify
+    ///       trust_pool_secret: CF_ORIGIN_PULL_CA
+    /// ```
+    #[serde(default)]
+    pub tls: Option<ProxyTls>,
+}
+
+/// Proxy-level TLS. When `cert_secret` + `key_secret` are set, ACME
+/// is implicitly off and a `:80 → :443` redirect is auto-emitted by
+/// the renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyTls {
+    /// Sealed-secret name holding the PEM cert (full chain). Inlined
+    /// into the rendered Caddy JSON at deploy time. When set, every
+    /// routed service uses this cert unless it overrides via
+    /// per-service `tls_cert_secret:`.
+    pub cert_secret: String,
+    /// Sealed-secret name holding the PEM private key matching
+    /// `cert_secret`.
+    pub key_secret: String,
+    /// Optional client-certificate authentication (mTLS). Required
+    /// for setups like Cloudflare origin-pull where the proxy
+    /// rejects requests that don't present a Cloudflare-signed
+    /// client cert.
+    #[serde(default)]
+    pub client_auth: Option<ClientAuth>,
+}
+
+/// Client-certificate auth (mTLS) for proxy-level TLS. The trust
+/// pool is sealed-secret content, inlined into rendered JSON — no
+/// host-filesystem dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAuth {
+    /// Caddy `client_authentication.mode`. Default
+    /// `require_and_verify` (the strict choice; `require` skips
+    /// CA verification, `verify_if_given` is opt-in).
+    #[serde(default = "default_client_auth_mode")]
+    pub mode: ClientAuthMode,
+    /// Sealed-secret name holding the trust-pool CA chain (PEM).
+    /// Common case: Cloudflare's origin-pull CA bundle.
+    pub trust_pool_secret: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    Request,
+    Require,
+    VerifyIfGiven,
+    #[default]
+    RequireAndVerify,
+}
+
+impl ClientAuthMode {
+    /// String form Caddy expects in JSON
+    /// (`client_authentication.mode`).
+    #[must_use]
+    pub fn as_caddy(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Require => "require",
+            Self::VerifyIfGiven => "verify_if_given",
+            Self::RequireAndVerify => "require_and_verify",
+        }
+    }
+}
+
+fn default_client_auth_mode() -> ClientAuthMode {
+    ClientAuthMode::RequireAndVerify
 }
 
 impl ProxyConfig {
