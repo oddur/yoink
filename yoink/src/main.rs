@@ -495,6 +495,15 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
     let mut had_error = false;
     for host_cfg in &config.hosts {
         let host = Host::from(host_cfg);
+        if host.is_local() {
+            // The synthetic `local` host doesn't go through ssh —
+            // bollard talks to the laptop's docker socket directly.
+            // Skip the probe and go straight to version().
+        } else if let Err(probe) = yoink::ssh_probe::probe(&host).await {
+            had_error = true;
+            eprintln!("✗ {}: {}", host.address, probe);
+            continue;
+        }
         match ops.version(&host).await {
             Ok(v) => println!(
                 "✓ {}: docker {} (api {}) on {}/{}",
@@ -515,6 +524,7 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
     }
     Ok(())
 }
+
 
 // `UpOptions` mirrors the `up` subcommand's flags 1:1. The bool count
 // is the actual CLI surface; rolling them into an enum would just hide

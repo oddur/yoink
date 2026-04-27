@@ -12,5 +12,6 @@ pub mod network;
 pub mod output;
 pub mod prune;
 pub mod secrets;
+pub mod ssh_probe;
 pub mod status;
 pub mod tui;
