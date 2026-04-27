@@ -159,6 +159,74 @@ Staging usually wants to deploy whatever's on `main`, while prod tracks `live`. 
 
 The image identity is the same across envs; only the runtime configuration differs.
 
+## Standalone mode (no CI, no registry)
+
+The default story (push image to a registry → `yoink up` pulls it on each host) is the right answer when you have CI and many hosts. It's the wrong answer when you're an indie developer who just wants their thing running on a server, or when you're rapidly iterating on a Dockerfile and don't want a 5-minute CI loop between every change.
+
+Yoink supports a "build locally, ship directly to hosts, skip the registry" mode. Two new pieces:
+
+```yaml
+services:
+  - name: api
+    image: my-app                    # bare name — no registry prefix
+    tag: dev                         # any string — yoink just tags it
+    build:                           # tells `yoink build` how to produce the image
+      context: .                     # build context (default ".")
+      dockerfile: Dockerfile         # default — `Dockerfile` in context root
+      args:
+        RUST_VERSION: "1.95"
+      target: runtime                # multi-stage build target (optional)
+    run:
+      port: 8080
+```
+
+Then:
+
+```sh
+yoink build api                      # docker build → tag local image as my-app:dev
+yoink up --no-registry --service api # save+load to each host (no docker pull)
+```
+
+What `--no-registry` does: for every selected service × applicable host, yoink runs `docker save <image>:<tag>` against the **operator's local docker daemon**, captures the tarball, and streams it into the host's docker daemon via the same ssh+bollard transport (calling `POST /images/load` directly). After the load completes, the host has the image in its local cache, and the rest of the deploy flow (which already short-circuits when an image is locally present) runs unchanged — healthcheck-gated rolling swap, drift detection, the works.
+
+### When this fits
+
+- **Rapid iteration on a single host.** Edit Dockerfile → `yoink build api && yoink up --no-registry --service api` → see it running on the box. ~15 seconds for a small image, ~1 minute for a larger one. No registry to set up, no CI to wait on.
+- **Hobby / indie / prototype deployments.** "I just want this thing on a server" — no build pipeline, no registry account, no auth dance.
+- **Air-gapped or restricted-network hosts.** The host doesn't need outbound network access to anything but the operator's ssh.
+
+### When it doesn't
+
+- **Many hosts.** N hosts = N save+load streams (each gets the full tarball). A registry is a hub that lets each host pull the missing layers in parallel from a closer point. For 1-3 hosts the difference is small; at 10+ hosts a registry is meaningfully faster.
+- **Large images.** Every `--no-registry` deploy ships the full image tarball over ssh per host. A 200MB Rust binary is fine; a 2GB Java or Node app gets uglier each push.
+- **You want rollback by tag.** `--no-registry` mode relies on the host's local image cache to find old generations. `docker image prune` blows that away. A registry keeps every pushed tag indefinitely.
+- **Auditability matters.** A registry has a record of "image `<sha256:…>` was pushed at time T by user U." `--no-registry` is invisible to anything but the local docker daemons.
+
+### Self-hosted registry as a yoink service
+
+The middle ground: run a `registry:2` container on one of your hosts, expose it via tailscale, and use that as your registry. Operator config:
+
+```yaml
+services:
+  - name: registry
+    image: registry
+    tag: "2"
+    networks: [registry]
+    run:
+      port: 5000
+      volumes:
+        - "registry-data:/var/lib/registry"
+      options:
+        memory: "256Mi"
+
+# Then point yoink at it like any other registry. Tailscale ACLs are
+# the auth surface — no docker login / registry password needed.
+registry:
+  server: registry.my-tailnet.ts.net:5000
+```
+
+Recipe — not yoink-specific code. Best for "I want a registry but I don't want to pay for one and I don't want to run it on a separate machine."
+
 ## Install
 
 ### Homebrew

@@ -148,11 +148,47 @@ pub struct SecretsConfig {
     pub domain: Option<String>,
 }
 
+/// Local build instructions for a service. Powers `yoink build`
+/// (and the `yoink up --no-registry` "deploy without a registry" path).
+/// Resolves all paths relative to the loaded config file's directory
+/// — same convention as `service.run.files` and `include:` globs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildConfig {
+    /// Build context directory passed to `docker build`. Default `.`.
+    #[serde(default = "default_build_context")]
+    pub context: String,
+    /// Path to the Dockerfile relative to `context`. Default
+    /// `Dockerfile` (docker's own default).
+    #[serde(default)]
+    pub dockerfile: Option<String>,
+    /// `--build-arg KEY=VALUE` pairs.
+    #[serde(default)]
+    pub args: BTreeMap<String, String>,
+    /// `--target` for multi-stage builds.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Extra `--build-arg`-style flags to forward verbatim. Use when
+    /// you need a docker-cli flag yoink doesn't model directly.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+fn default_build_context() -> String {
+    ".".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub name: String,
     pub image: String,
+    /// Local-build instructions. When set, `yoink build [<service>]`
+    /// runs `docker build` against this context, tagging the result
+    /// as `<image>:<tag>`. Pairs with `yoink up --no-registry` for the
+    /// "edit Dockerfile, deploy directly to host" loop.
+    #[serde(default)]
+    pub build: Option<BuildConfig>,
     /// Image tag, OR a content digest `sha256:<hex>` for digest-pinned
     /// deploys. Optional: when omitted from the config the operator
     /// MUST pass `--tag <name>=<value>` (or per-service `--service x

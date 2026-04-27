@@ -412,6 +412,18 @@ pub trait DockerOps: Send + Sync {
         credentials: Option<bollard::auth::DockerCredentials>,
     ) -> Result<(), DockerError>;
 
+    /// Stream a `docker save`-style tarball into the host's docker
+    /// daemon (`POST /images/load`). The body is the same format as
+    /// the operator's local `docker save IMAGE` would produce.
+    /// Powers the `--no-registry` deploy path: build locally, save
+    /// to a tarball, ship it over ssh, load on the host. No registry
+    /// involved.
+    async fn load_image(
+        &self,
+        host: &Host,
+        tar: bytes::Bytes,
+    ) -> Result<(), DockerError>;
+
     /// `true` if `image:tag` is already present in the host's local
     /// image cache (no pull needed). Used to skip redundant pulls
     /// after a prefetch pass. Errors degrade to `false` so a flaky
@@ -903,6 +915,29 @@ impl DockerOps for RealDockerOps {
             }) => Ok(false),
             Err(source) => Err(Self::err(host, source)),
         }
+    }
+
+    async fn load_image(
+        &self,
+        host: &Host,
+        tar: bytes::Bytes,
+    ) -> Result<(), DockerError> {
+        use bollard::query_parameters::ImportImageOptions;
+        let docker = self.client_for(host).await?;
+        let mut stream = docker.import_image(
+            ImportImageOptions {
+                quiet: false,
+                platform: None,
+            },
+            bollard::body_full(tar),
+            None,
+        );
+        // Drain the progress stream — surface errors but ignore the
+        // "Loaded image: ..." status messages.
+        while let Some(item) = stream.next().await {
+            item.map_err(|s| Self::err(host, s))?;
+        }
+        Ok(())
     }
 
     async fn list_containers_by_label(
@@ -1840,6 +1875,7 @@ struct FakeState {
     container_stats: VecDeque<Result<ContainerStats, DockerError>>,
     ensure_network: VecDeque<Result<bool, DockerError>>,
     pull_image: VecDeque<Result<(), DockerError>>,
+    load_image: VecDeque<Result<(), DockerError>>,
     list_containers: VecDeque<Result<Vec<ContainerInfo>, DockerError>>,
     create_container: VecDeque<Result<String, DockerError>>,
     start_container: VecDeque<Result<(), DockerError>>,
@@ -1862,6 +1898,7 @@ pub enum RecordedCall {
     ContainerStats(Host, String),
     EnsureNetwork(Host, String),
     PullImage(Host, String, String),
+    LoadImage(Host),
     ListContainersByLabel(Host, String),
     ListRunningContainers(Host),
     CreateContainer(Host, String),
@@ -2027,6 +2064,15 @@ impl DockerOps for FakeDockerOps {
         // Tests want pulls to actually fire by default; presence-check
         // returning false keeps existing test expectations intact.
         Ok(false)
+    }
+    async fn load_image(
+        &self,
+        host: &Host,
+        _tar: bytes::Bytes,
+    ) -> Result<(), DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::LoadImage(host.clone()));
+        pop(&mut s.load_image, "load_image")
     }
     async fn list_containers_by_label(
         &self,
