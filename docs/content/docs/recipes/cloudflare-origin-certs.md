@@ -41,6 +41,8 @@ Save and exit. The values land in `secrets.age` (committed to the repo, encrypte
 
 ## Wire it up in `yoink.yaml`
 
+**Single service, single cert** — per-service:
+
 ```yaml
 services:
   - name: api
@@ -54,7 +56,89 @@ services:
       port: 8080
 ```
 
-Note: `proxy.email:` isn't required when no service uses `tls: auto`. The proxy block can be empty (or omitted entirely).
+**Many services, one wildcard cert** (the common case — `*.example.com` covers everything) — proxy-level:
+
+```yaml
+proxy:
+  tls:
+    cert_secret: CF_ORIGIN_CERT
+    key_secret:  CF_ORIGIN_KEY
+
+services:
+  - name: api
+    domain: api.example.com
+    run: { port: 8080 }
+  - name: web
+    domain: example.com
+    run: { port: 3000 }
+  - name: admin
+    domain: admin.example.com
+    run: { port: 9090 }
+```
+
+Every routed service inherits the proxy-level cert. Per-service `tls_cert_secret:` still overrides for the rare different-cert case.
+
+Note: `proxy.email:` isn't required when no service uses `tls: auto`. ACME is implicitly off when `proxy.tls.cert_secret` is set.
+
+## Origin-pull mTLS (lock your origin to Cloudflare's edge)
+
+By default, anyone who knows your origin IP can hit it directly with a `Host:` header — bypassing Cloudflare's WAF, rate limits, bot blocks, etc. **Origin-pull mTLS** fixes that: the origin requires every request to present a Cloudflare-signed client certificate. Anything else gets a TLS handshake error.
+
+This is what backtrack runs in production.
+
+### One-time setup
+
+Cloudflare provides a static **Origin Pull CA bundle** that signs every cert their edge presents to your origin:
+
+1. Download the bundle from <https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem>.
+2. Add it to `secrets.age` alongside the cert/key:
+
+```dotenv
+CF_ORIGIN_PULL_CA=-----BEGIN CERTIFICATE-----
+<bundle contents>
+-----END CERTIFICATE-----
+```
+
+3. Enable Authenticated Origin Pulls in the Cloudflare dashboard: SSL/TLS → Origin Server → **Authenticated Origin Pulls** → toggle on.
+
+### `yoink.yaml`
+
+Add `client_auth:` to the `proxy.tls:` block:
+
+```yaml
+proxy:
+  tls:
+    cert_secret: CF_ORIGIN_CERT
+    key_secret:  CF_ORIGIN_KEY
+    client_auth:
+      mode: require_and_verify             # strict — reject anything not signed by the CA
+      trust_pool_secret: CF_ORIGIN_PULL_CA
+```
+
+That applies to **every** routed service. From now on, requests that don't come through Cloudflare are dropped at the TLS layer — your origin simply doesn't appear to exist for them.
+
+`mode:` options (default `require_and_verify`):
+
+- `require_and_verify` — strict; reject anything without a valid client cert. **Recommended.**
+- `require` — require a cert but skip verification (don't use this).
+- `verify_if_given` — accept anonymous; verify if present. Mixed-mode.
+- `request` — request but don't enforce. Almost never useful.
+
+### Verify
+
+After `yoink up`, this should fail (no client cert):
+
+```sh
+curl -v https://your-origin-ip/health -H 'Host: api.example.com'
+# → tls: handshake failure
+```
+
+This should succeed (through Cloudflare's edge):
+
+```sh
+curl https://api.example.com/health
+# → 200 OK
+```
 
 ## Cloudflare side
 

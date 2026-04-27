@@ -3,39 +3,42 @@ title: First deploy
 weight: 2
 ---
 
-The fastest path: **drop a `yoink.yaml` next to your `Dockerfile`, run one command**. No CI, no registry, no pre-existing image.
+**The goal**: a fresh VPS to a running app in 5 minutes, two commands, one YAML file. No CI, no registry, no Tailscale.
 
-{{< callout type="info" >}}
-This is the **standalone mode** — see [Three deploy modes](/docs/guide/deploy-modes) when you want CI-built or kamal-style instead.
-{{< /callout >}}
+## TL;DR
 
-The story is **"deploy this repo to this host with these creds."** A fresh VPS (Hetzner, Linode, DigitalOcean, your home lab) with docker installed and an SSH login that works is enough — no registry, no CI, no Tailscale.
+```sh
+yoink init root@1.2.3.4              # generates yoink.yaml from your repo
+yoink up --build --no-registry       # builds locally, ships, runs
+```
+
+Done. `yoink init` reads your `Dockerfile`, `git remote`, and (optionally) `~/.ssh/config` to fill in every field. `yoink up` builds the image locally, ships it to the host over SSH (no registry needed), and runs it through a healthcheck-gated rolling deploy.
+
+Edit a line of code, run `yoink up --build --no-registry` again — yoink rebuilds, ships only changed layers, rolls the new container behind the healthcheck. ~5–15 seconds for a small image.
 
 ## Prerequisites
 
-- Yoink [installed](/docs/start/install) on your laptop.
-- A host with docker installed and an SSH login that works without a password — i.e. `ssh root@<host>` (or `ssh deploy@<host>`) drops you in. A fresh Hetzner / Linode / DigitalOcean box with your SSH public key dropped into `~/.ssh/authorized_keys` qualifies.
-- Docker running on your laptop (`yoink build` shells out to `docker build`).
+- Yoink [installed](/docs/start/install) on your laptop (`brew install oddur/yoink/yoink`).
+- A host with docker installed and key-based SSH login that works — `ssh root@<host>` should drop you into a shell. A fresh Hetzner / Linode / DigitalOcean / Hetzner Cloud box with your SSH public key in `~/.ssh/authorized_keys` qualifies.
+- Docker on your laptop (`yoink build` shells out to `docker build`).
 
-That's it. Yoink uses your operating system's SSH client, so anything you've already set up (`~/.ssh/config`, `ssh-agent`, hardware keys, jump hosts) just works.
+That's it. Yoink uses your operating system's SSH client, so anything you've set up (`~/.ssh/config`, `ssh-agent`, hardware keys, jump hosts) just works.
 
 {{< callout type="info" >}}
-**Tailscale is opt-in, not required.** It's a great fit when you want stable hostnames across hosts that move IPs or live behind NAT — see [Pairing](/docs/guide/pairing). For a single VPS, plain SSH to the host's IP or DNS name is the simplest path.
+**No Tailscale required.** Plain SSH to the host's IP or DNS name is the simplest path. Tailscale becomes useful when you have multiple hosts behind NAT or want stable hostnames — see [Pairing](/docs/guide/pairing).
 {{< /callout >}}
 
 ## Walkthrough
 
 {{% steps %}}
 
-### Generate a `yoink.yaml`
+### Generate `yoink.yaml`
 
 ```sh
-yoink init root@1.2.3.4              # pass <user>@<host> straight in
-# or, omit and yoink will ask if it finds candidate hosts
-yoink init
+yoink init root@1.2.3.4
 ```
 
-That produces a `yoink.yaml` with every field already filled in. Yoink reads what's around the cwd — your `Dockerfile`, `git remote get-url origin`, `~/.ssh/config` — and infers the right answer for each field. Output:
+Output:
 
 ```
 ✓ wrote yoink.yaml (15 lines, validates clean)
@@ -46,25 +49,19 @@ inferred:
   host      root@1.2.3.4                    (positional arg)
   port      3000 with /health healthcheck   (Dockerfile EXPOSE)
   user      hono                            (Dockerfile USER)
-
-next:
-  yoink validate
-  yoink up --tag my-tool=$(git rev-parse HEAD)
 ```
 
-The summary shows exactly what was inferred and where each value came from — edit the one line in `yoink.yaml` if anything's off. Common overrides via flags: `--service`, `--image`, `--port`, `--no-port`. See [the CLI reference](/docs/reference/cli) for the full surface.
+The summary tells you exactly what was inferred and where each value came from. Edit the line in `yoink.yaml` if anything's off.
 
-If you don't pass a host but `~/.ssh/config` has candidate entries, yoink prompts you to confirm or override (it never silently picks the first one — that's almost never what you want). On a non-tty (CI), it bails with an instruction to pass the host explicitly.
-
-For this walkthrough we'll change one line: edit `image:` to a bare name (no registry prefix) so we can use **standalone mode** — build locally, ship directly to the host, no registry involved:
+For this walkthrough we'll change one thing: edit `image:` to a bare name (no registry prefix) so we can use **standalone mode** — build locally, ship directly to the host, no registry involved:
 
 ```yaml
 services:
   - name: my-tool
-    image: my-tool       # bare name, no registry prefix
+    image: my-tool                  # bare name = build locally, no registry
     tag: dev
     build:
-      context: .         # build the Dockerfile next to this yoink.yaml
+      context: .                    # build the Dockerfile next to this yoink.yaml
     run:
       port: 8080
 ```
@@ -75,98 +72,107 @@ services:
 yoink up --build --no-registry
 ```
 
-That builds the image locally, streams it directly to `my-server` over ssh (no registry involved), and runs it.
+Builds the image locally, ships it directly to the host over SSH, runs it through a healthcheck-gated rolling deploy.
 
 ### Iterate
 
-Edit the Dockerfile or your code. Re-run the same command:
+Edit code or Dockerfile. Re-run the same command:
 
 ```sh
 yoink up --build --no-registry
 ```
 
-Yoink rebuilds, ships the new image to the host, and rolls it through the healthcheck-gated swap. ~15 seconds for a small image.
+Only changed layers cross the wire (yoink uses [unregistry-style](/docs/guide/deploy-modes#standalone-no-registry) layer-dedup transport). Healthcheck-gated swap; the old container only stops after the new one is healthy.
 
 ### Inspect what's running
 
 ```sh
 yoink status                              # snapshot table
-yoink tui                                 # k9s-style dashboard
-yoink logs my-tool -f | hl                # live tail with `hl` highlighting (optional)
+yoink tui                                 # k9s-style dashboard with logs / shell-into / drift
+yoink logs my-tool -f | hl                # live tail, optional `hl` highlighting
 ```
 
 {{% /steps %}}
 
-## What happens under the hood
+## Add HTTPS routing
 
-1. **`yoink up --build`** sees that `my-tool` has a `build:` block and runs `docker build` locally, tagging as `my-tool:dev`.
-2. **`--no-registry`** spawns `docker save my-tool:dev` and streams the tarball over the existing ssh+bollard transport into the host's docker daemon (`POST /images/load`). Per-host progress bars show bytes + rate.
-3. The host's docker daemon now has `my-tool:dev` cached. Yoink's normal reconcile runs — `image_present` short-circuits the would-be `docker pull`, the image gets `docker run`'d with the runtime options, and the rolling swap completes after the healthcheck passes.
+Want yoink to terminate TLS and route to your container? Add **two lines**:
 
-## Different setups
+```yaml
+hosts:
+  - { address: 1.2.3.4, user: root }
 
-### Fresh VPS, root user, password-only SSH
+proxy:
+  email: ops@example.com         # for Let's Encrypt registration
 
-A brand-new Hetzner / DigitalOcean / Linode box typically gives you a `root` password and no key. Two-step: drop your SSH public key once, then `yoink up`.
+services:
+  - name: my-tool
+    image: my-tool
+    tag: dev
+    build: { context: . }
+    domain: my-tool.example.com  # ← that
+    run:
+      port: 8080
+      healthcheck_path: /health
+```
+
+Point DNS at `1.2.3.4`. `yoink up --build --no-registry` again. `https://my-tool.example.com` serves with a Let's Encrypt cert. Yoink runs Caddy as a managed service alongside your app and renders its config from your `yoink.yaml`. See the [reverse proxy guide](/docs/guide/proxy) for the full surface.
+
+## Different SSH setups
+
+### Fresh VPS, root password only
+
+Drop your SSH key once, then yoink takes over:
 
 ```sh
-# one-time, from your laptop
 ssh-copy-id root@1.2.3.4                  # asks for the root password once
-# from then on
 yoink up --build --no-registry
 ```
 
-Yoink itself never asks for a password — it relies on key-based auth via your SSH client. The secret stays on your laptop.
+### Non-default key
 
-### Non-default SSH key
-
-Use `~/.ssh/config` to bind a key to the host. Yoink picks it up automatically because it shells out to your `ssh`:
+`~/.ssh/config` works:
 
 ```
-# ~/.ssh/config
 Host my-server
   HostName 1.2.3.4
   User root
   IdentityFile ~/.ssh/my-server.pem
 ```
 
-Then in `yoink.yaml`:
 ```yaml
 hosts:
   - { address: my-server, user: root }
 ```
 
-### Ship the deploy key with the repo (sealed-secrets)
+### Ship the deploy key with the repo
 
-If you don't want each operator to manage the host's private key in their personal `ssh-agent` — handy for fresh VPS hosts a small team rotates onto, or for CI runners — drop the SSH key into the [sealed-secrets bundle](/docs/recipes/sealed-secrets) and reference it from the host:
+For team setups where you don't want every operator to manage the host's key in their personal `ssh-agent`. Drop the key in [sealed secrets](/docs/recipes/sealed-secrets) and reference from the host:
 
 ```yaml
 secrets:
   provider: age
-  # `secrets.age` next to yoink.yaml, encrypted with `yoink secrets edit`
 
 hosts:
   - address: 1.2.3.4
     user: root
-    ssh_key_secret: PROD_HOST_SSH_KEY
+    ssh_key_secret: PROD_HOST_SSH_KEY    # name in secrets.age
 ```
 
-`yoink secrets edit` to add the key:
-```
-PROD_HOST_SSH_KEY=-----BEGIN OPENSSH PRIVATE KEY-----
-...
------END OPENSSH PRIVATE KEY-----
-```
-
-At deploy time, yoink decrypts the key into a `0o600` tempfile (auto-removed when the deploy finishes) and uses it for both the bollard daemon connection and the pre-flight `ssh_probe`. The key never lands in your operator's personal ssh-agent.
+`yoink secrets edit` to add the key value. At deploy time, yoink decrypts to a `0o600` tempfile (auto-removed on exit) and uses it for the SSH connection.
 
 ### Tailscale (opt-in)
 
-If you're already on Tailscale, point `address:` at the tailnet hostname and you're done — no IP allowlist, no DNS, no jump host. See [Pairing](/docs/guide/pairing) for the why.
+If you're on Tailscale, point `address:` at the tailnet hostname. See [Pairing](/docs/guide/pairing).
 
 ## What's next
 
-- Other deploy modes (real registry, kamal-style): [Deploy modes](/docs/guide/deploy-modes)
-- The `yoink.yaml` schema in full: [Configuration](/docs/reference/config)
-- The complete CLI surface: [CLI](/docs/reference/cli)
-- Hardened defaults yoink applies to every container: [Secure by default](/docs/guide/security-defaults)
+| If you want to… | Read |
+|---|---|
+| Add HTTPS routing | [Reverse proxy guide](/docs/guide/proxy) |
+| Use Cloudflare origin certs (no Let's Encrypt) | [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs) |
+| Host a gRPC backend | [gRPC hosting](/docs/recipes/grpc-hosting) |
+| Deploy from CI instead of locally | [Deploy modes](/docs/guide/deploy-modes) |
+| Understand the rolling deploy + drift detection | [Architecture](/docs/guide/architecture) |
+| See every CLI flag and config field | [CLI](/docs/reference/cli) and [Configuration](/docs/reference/config) |
+| See what hardened defaults yoink applies | [Secure by default](/docs/guide/security-defaults) |

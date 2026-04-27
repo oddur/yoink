@@ -3,21 +3,40 @@ title: Reverse proxy
 weight: 4
 ---
 
-Yoink bundles **Caddy** as a managed proxy service. One field on a service exposes it on a domain with TLS:
+Yoink bundles **Caddy** as a managed proxy service. One field exposes a service on a domain with TLS — yoink runs Caddy, renders its config from your `yoink.yaml`, issues certs via Let's Encrypt, and routes traffic to your container.
+
+## TL;DR
 
 ```yaml
+# yoink.yaml
+hosts:
+  - { address: 1.2.3.4, user: root }
+
+proxy:
+  email: ops@example.com           # for Let's Encrypt registration
+
 services:
   - name: api
     image: ghcr.io/me/api
     tag: v1
-    domain: api.example.com         # ← that's the whole opt-in
+    domain: api.example.com        # ← the whole proxy opt-in
     run:
       port: 8080
-proxy:
-  email: ops@example.com            # required for Let's Encrypt
+      healthcheck_path: /health
 ```
 
-`yoink up`. Caddy is reconciled. App is reconciled. TLS is issued. Routing works.
+Point `api.example.com` DNS at `1.2.3.4`. Run `yoink up`. Done — `https://api.example.com` serves with a valid cert.
+
+That's the floor. The rest of this page is reference + advanced patterns.
+
+{{< callout type="info" >}}
+**Recipes for advanced setups** are split into focused pages:
+
+- [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs) — skip Let's Encrypt with a 15-year cert + origin-pull mTLS that locks your origin to Cloudflare's edge.
+- [gRPC hosting](/docs/recipes/grpc-hosting) — `upstream_h2c: true` for native gRPC backends (Tonic, grpc-go, grpc-java).
+- [Caddy snippets cookbook](/docs/recipes/caddy-snippets) — copy-paste recipes for forward_auth, basic_auth, IP allowlists, headers, redirects, body limits.
+- [Multi-host Let's Encrypt with Redis storage](/docs/recipes/multi-host-redis-storage) — share ACME state across hosts to avoid rate limits.
+{{< /callout >}}
 
 ## How it works
 
