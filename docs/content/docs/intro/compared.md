@@ -9,7 +9,8 @@ Yoink lives in a populated neighborhood. Pick the tool that fits your scale and 
 **Quick decision tree.**
 1 host, 1 app → **plain `docker compose`** is fine.
 1-3 hosts, Rails/Django/Phoenix-shaped app → **[Kamal](https://kamal-deploy.org)**.
-1-10 hosts, multi-service, want drift detection / per-tier networks / k9s-style TUI → **yoink**.
+1-10 hosts, multi-service, want a web UI + agents on each host → **[Komodo](https://komo.do)**.
+1-10 hosts, multi-service, want a single binary with no control plane → **yoink**.
 Many hosts, autoscaling, multi-tenant, "real" infrastructure team → **Kubernetes**.
 {{< /callout >}}
 
@@ -40,6 +41,31 @@ Kamal is the closest neighbor — both are "ship a Rust/Ruby binary, ssh into ho
 **Pick Kamal when**: you have a Rails/Phoenix/Hanami app, you want one tool that builds + deploys + routes, and you don't need replicas or per-tier network isolation.
 
 **Pick yoink when**: you've got several services with different shapes (Rust API + Node web + Caddy + Postgres), you want drift detection and a k9s-style TUI for inspect/rollback, and you're willing to bring your own reverse proxy. Or when you want the no-registry, no-CI standalone loop for a hobby project.
+
+## vs. [Komodo](https://komo.do)
+
+Komodo is a fellow Rust-built deploy/management tool for self-hosted containers, with a sizable feature overlap with yoink. The biggest split is **ceremony**: Komodo is a long-running web service with a control plane and per-host agents; yoink is a single binary you run from your laptop or CI.
+
+| | **yoink** | **Komodo** |
+|---|---|---|
+| Architecture | Single Rust binary, runs on demand | `Komodo Core` (web service + UI) + `Komodo Periphery` (agent on every managed host) |
+| Always-on services to operate | None | Two: Core (with a database — MongoDB or FerretDB) + Periphery on each host |
+| Operator interface | CLI + TUI (k9s-style, keyboard-only) | Web UI (primary) + CLI/API |
+| State of truth | The git repo's `yoink.yaml` | Komodo's database (UI-edited, with optional GitOps "Resource Sync" file imports) |
+| Deploy trigger | `yoink up` from operator's laptop or CI | Click in the UI, webhook, scheduled, or sync-from-git |
+| Multi-user / RBAC | None — operator-as-user | First-class users, groups, permissions |
+| Auth | Whatever ssh + git + your secret store gives you | OAuth (GitHub / Google) + local accounts, baked in |
+| Bring-your-own-host | yoink connects to any host you can ssh into | Each host needs `Periphery` installed + reachable from Core |
+| Container shape | Yoink-managed containers via per-service spec | Stacks (compose files) / Deployments / Builds / Repos |
+| Drift detection | ✓ (`yoink.spec_hash` label) | ✓ (UI shows diff between desired and live) |
+| Reverse proxy | None — pairs with caddy / Traefik | None — same |
+| Healthcheck-gated rolling swap | ✓ | ✓ (compose-style) |
+| Audit log of who deployed what | git history of `yoink.yaml` + per-container deploy labels | First-class audit log in the database |
+| Best fit team size | 1–3 operators sharing a repo | 3+ operators, a team that benefits from a UI + RBAC |
+
+**Pick Komodo when**: you want a UI for non-CLI users, you're managing more hosts than fit in one operator's head, RBAC matters, and the overhead of running a database + a web service + per-host agents is worth it for the control-plane affordances.
+
+**Pick yoink when**: a single binary on your laptop is the entire control surface, the git repo is the source of truth, and you'd rather not operate yet another service-with-database to deploy your services. The CLI/TUI shape works best for 1–3 operators who are already comfortable in a terminal.
 
 ## vs. plain `docker compose`
 
