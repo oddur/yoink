@@ -337,6 +337,13 @@ enum Command {
         #[arg(long)]
         check_hosts: bool,
     },
+    /// Render the Caddy admin-API JSON yoink would push for the
+    /// current config. Read-only; useful for inspecting the proxy
+    /// config or piping into `caddy adapt` / a debug Caddy's `/load`
+    /// for schema-validation. Container upstream lookups are skipped
+    /// (uses service-name fallbacks) so this works without a host
+    /// connection.
+    ProxyRender,
     /// Inspect / release the per-host deploy lock. Useful after a
     /// crashed deploy left a sentinel container running.
     Lock {
@@ -595,6 +602,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Volumes { host } => cmd_volumes(&config, host.as_deref()).await,
         Command::Dump { log_tail } => cmd_dump(&config, log_tail).await,
         Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
+        Command::ProxyRender => cmd_proxy_render(&config).await,
         Command::Lock { action } => cmd_lock(&config, action).await,
         Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
         Command::Completions { shell } => {
@@ -2045,6 +2053,23 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
     if check_hosts {
         cmd_preflight(config).await?;
     }
+    Ok(())
+}
+
+async fn cmd_proxy_render(config: &Config) -> Result<()> {
+    if !yoink::proxy::proxy_enabled(config) {
+        anyhow::bail!(
+            "proxy is not enabled — no service has `domain:` and `proxy.enabled` is unset"
+        );
+    }
+    // Loads the secrets bundle when configured so `tls_*_secret` and
+    // `client_auth.trust_pool_secret` references resolve. Empty
+    // upstream lookup → render uses service-name fallbacks.
+    let bundle = load_secrets_bundle(config).await?;
+    let json = yoink::proxy::caddy::render(config, |_| Vec::new(), bundle.as_ref())
+        .context("render Caddy config")?;
+    let pretty = serde_json::to_string_pretty(&json).context("serialize rendered config")?;
+    println!("{pretty}");
     Ok(())
 }
 
