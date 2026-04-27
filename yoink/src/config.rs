@@ -148,11 +148,48 @@ pub struct SecretsConfig {
     pub domain: Option<String>,
 }
 
+/// Local build instructions for a service. Powers `yoink build`
+/// (and the `yoink up --no-registry` "deploy without a registry" path).
+/// Resolves all paths relative to the loaded config file's directory
+/// — same convention as `service.run.files` and `include:` globs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildConfig {
+    /// Build context directory passed to `docker build`. Default `.`.
+    #[serde(default = "default_build_context")]
+    pub context: String,
+    /// Path to the Dockerfile relative to `context`. Default
+    /// `Dockerfile` (docker's own default).
+    #[serde(default)]
+    pub dockerfile: Option<String>,
+    /// `--build-arg KEY=VALUE` pairs.
+    #[serde(default)]
+    pub args: BTreeMap<String, String>,
+    /// `--target` for multi-stage builds.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Extra `docker build` flags to forward verbatim, inserted
+    /// before the context arg. Escape hatch for flags yoink doesn't
+    /// model directly (e.g. `--platform`, `--secret`, `--ssh`).
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+fn default_build_context() -> String {
+    ".".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub name: String,
     pub image: String,
+    /// Local-build instructions. When set, `yoink build [<service>]`
+    /// runs `docker build` against this context, tagging the result
+    /// as `<image>:<tag>`. Pairs with `yoink up --no-registry` for the
+    /// "edit Dockerfile, deploy directly to host" loop.
+    #[serde(default)]
+    pub build: Option<BuildConfig>,
     /// Image tag, OR a content digest `sha256:<hex>` for digest-pinned
     /// deploys. Optional: when omitted from the config the operator
     /// MUST pass `--tag <name>=<value>` (or per-service `--service x
@@ -502,6 +539,21 @@ fn local_socket_exists() -> bool {
 }
 
 impl Config {
+    /// Walk `self.services` filtered by an optional name list. `None`
+    /// returns every service in topo order; `Some(&[…])` keeps only
+    /// the named ones (in topo order, not in the order the operator
+    /// listed them — `yoink up --service web --service api` still
+    /// runs api first when api → … → web in the dep graph).
+    /// Used wherever the CLI takes `--service`.
+    pub fn selected_services<'a>(
+        &'a self,
+        filter: Option<&'a [String]>,
+    ) -> impl Iterator<Item = &'a ServiceConfig> {
+        self.services.iter().filter(move |svc| {
+            filter.is_none_or(|names| names.iter().any(|n| n == &svc.name))
+        })
+    }
+
     pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.display().to_string(),

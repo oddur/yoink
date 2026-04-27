@@ -360,6 +360,14 @@ pub enum LogStream {
     Stderr,
 }
 
+/// Body shape for `DockerOps::load_image` — a chunked stream of
+/// `Bytes` (typically wrapping `docker save`'s stdout via
+/// `tokio_util::io::ReaderStream`). Pinned + boxed so the trait
+/// stays object-safe.
+pub type ImageTarStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+>;
+
 /// The async surface every consumer of Docker uses. Methods take a `&Host`
 /// so the same trait object can drive multiple remote daemons.
 #[async_trait]
@@ -410,6 +418,15 @@ pub trait DockerOps: Send + Sync {
         image: &str,
         tag: &str,
         credentials: Option<bollard::auth::DockerCredentials>,
+    ) -> Result<(), DockerError>;
+
+    /// Stream a `docker save`-style tarball into the host's docker
+    /// daemon (`POST /images/load`). Body is a `Stream<Bytes>` so
+    /// memory stays bounded by the chunk size, not the image size.
+    async fn load_image(
+        &self,
+        host: &Host,
+        body: ImageTarStream,
     ) -> Result<(), DockerError>;
 
     /// `true` if `image:tag` is already present in the host's local
@@ -903,6 +920,29 @@ impl DockerOps for RealDockerOps {
             }) => Ok(false),
             Err(source) => Err(Self::err(host, source)),
         }
+    }
+
+    async fn load_image(
+        &self,
+        host: &Host,
+        body: ImageTarStream,
+    ) -> Result<(), DockerError> {
+        use bollard::query_parameters::ImportImageOptions;
+        let docker = self.client_for(host).await?;
+        let mut stream = docker.import_image(
+            ImportImageOptions {
+                quiet: false,
+                platform: None,
+            },
+            bollard::body_try_stream(body),
+            None,
+        );
+        // Drain the progress stream — surface errors but ignore the
+        // "Loaded image: ..." status messages.
+        while let Some(item) = stream.next().await {
+            item.map_err(|s| Self::err(host, s))?;
+        }
+        Ok(())
     }
 
     async fn list_containers_by_label(
@@ -1840,6 +1880,7 @@ struct FakeState {
     container_stats: VecDeque<Result<ContainerStats, DockerError>>,
     ensure_network: VecDeque<Result<bool, DockerError>>,
     pull_image: VecDeque<Result<(), DockerError>>,
+    load_image: VecDeque<Result<(), DockerError>>,
     list_containers: VecDeque<Result<Vec<ContainerInfo>, DockerError>>,
     create_container: VecDeque<Result<String, DockerError>>,
     start_container: VecDeque<Result<(), DockerError>>,
@@ -1862,6 +1903,7 @@ pub enum RecordedCall {
     ContainerStats(Host, String),
     EnsureNetwork(Host, String),
     PullImage(Host, String, String),
+    LoadImage(Host),
     ListContainersByLabel(Host, String),
     ListRunningContainers(Host),
     CreateContainer(Host, String),
@@ -2027,6 +2069,15 @@ impl DockerOps for FakeDockerOps {
         // Tests want pulls to actually fire by default; presence-check
         // returning false keeps existing test expectations intact.
         Ok(false)
+    }
+    async fn load_image(
+        &self,
+        host: &Host,
+        _body: ImageTarStream,
+    ) -> Result<(), DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::LoadImage(host.clone()));
+        pop(&mut s.load_image, "load_image")
     }
     async fn list_containers_by_label(
         &self,

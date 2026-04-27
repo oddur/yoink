@@ -66,6 +66,51 @@ enum Command {
         /// updated). Ignored when `--dry-run` isn't set.
         #[arg(long, value_enum, default_value_t = DryRunFormat::Text)]
         format: DryRunFormat,
+        /// Skip the registry-pull step. For each (host, image) pair,
+        /// stream `docker save <image>` from the operator's local
+        /// docker daemon directly into the host's docker via
+        /// `docker load`. Pair with `--build` for the one-shot
+        /// "edit Dockerfile, deploy" loop without CI or a registry.
+        #[arg(long)]
+        no_registry: bool,
+        /// Run `docker build` for any selected service with a
+        /// `build:` block before deploying. Eliminates the separate
+        /// `yoink build && yoink up` two-step for the standalone
+        /// workflow — `yoink up --build --no-registry --service my-tool`
+        /// is the indie one-shot. With a registry-prefixed image, you
+        /// still need to push (`yoink build --push`) — `--build` here
+        /// builds without pushing, so this combination is most useful
+        /// alongside `--no-registry`.
+        #[arg(long)]
+        build: bool,
+    },
+    /// Build one or more services' images via `docker build` against
+    /// the operator's local docker daemon. Tags the result as
+    /// `<image>:<tag>`. Pair with `yoink up --no-registry` to deploy
+    /// the freshly-built image without any registry. Requires the
+    /// service to declare a `build:` block.
+    Build {
+        /// Restrict to one or more services (those with a `build:`
+        /// block). Empty = build every service that has one.
+        #[arg(long = "service", short = 's', value_name = "NAME")]
+        services: Vec<String>,
+        /// Override the resolved tag (same shape as `up --tag`).
+        #[arg(long = "tag", value_name = "[NAME=]TAG")]
+        tag: Vec<String>,
+        /// Allow operating with a dirty git working tree.
+        #[arg(long)]
+        allow_dirty: bool,
+        /// Forward `--no-cache` to `docker build`.
+        #[arg(long)]
+        no_cache: bool,
+        /// Run `docker push <image>:<tag>` after a successful build.
+        /// Use this when `image:` points at a real remote registry
+        /// (`ghcr.io/you/api`, `4db05qgnlk.registry.depot.dev/api`,
+        /// etc.) and you want the kamal-style "build locally, deploy
+        /// from registry" loop in a single command. Operator must
+        /// already be `docker login`'d to the target registry.
+        #[arg(long)]
+        push: bool,
     },
     /// Show what's running where (across all services).
     Status {
@@ -365,7 +410,42 @@ async fn run(cli: Cli) -> Result<()> {
             allow_dirty,
             dry_run,
             format,
-        } => cmd_up(&config, &services, &tag, allow_dirty, dry_run, format).await,
+            no_registry,
+            build,
+        } => {
+            cmd_up(
+                &config,
+                UpOptions {
+                    services: &services,
+                    tag_args: &tag,
+                    allow_dirty,
+                    dry_run,
+                    format,
+                    no_registry,
+                    build,
+                },
+            )
+            .await
+        }
+        Command::Build {
+            services,
+            tag,
+            allow_dirty,
+            no_cache,
+            push,
+        } => {
+            cmd_build(
+                &config,
+                BuildOptions {
+                    services: &services,
+                    tag_args: &tag,
+                    allow_dirty,
+                    no_cache,
+                    push,
+                },
+            )
+            .await
+        }
         Command::Status { json } => cmd_status(&config, json).await,
         Command::Rollback { service, tag } => cmd_rollback(&config, service, tag).await,
         Command::Prune { dry_run } => cmd_prune(&config, dry_run).await,
@@ -436,16 +516,33 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_up(
-    config: &Config,
-    services: &[String],
-    tag_args: &[String],
+// `UpOptions` mirrors the `up` subcommand's flags 1:1. The bool count
+// is the actual CLI surface; rolling them into an enum would just hide
+// the same surface area at higher cognitive cost.
+#[allow(clippy::struct_excessive_bools)]
+struct UpOptions<'a> {
+    services: &'a [String],
+    tag_args: &'a [String],
     allow_dirty: bool,
     dry_run: bool,
     format: DryRunFormat,
-) -> Result<()> {
+    no_registry: bool,
+    build: bool,
+}
+
+#[allow(clippy::too_many_lines)] // borderline (6 lines over); split if it grows further
+async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
     use yoink::docker_ops::Host;
     use yoink::lock::HostLock;
+    let UpOptions {
+        services,
+        tag_args,
+        allow_dirty,
+        dry_run,
+        format,
+        no_registry,
+        build,
+    } = up;
 
     // Wrap in Arc so the heartbeat tasks (one per host lock) can hold
     // their own clone for the duration of the deploy.
@@ -453,11 +550,7 @@ async fn cmd_up(
     let bundle = load_secrets_bundle(config).await?;
     let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
 
-    let services_filter = if services.is_empty() {
-        None
-    } else {
-        Some(services)
-    };
+    let services_filter = services_filter(services);
 
     if dry_run {
         return run_dry_run(
@@ -469,6 +562,38 @@ async fn cmd_up(
             format,
         )
         .await;
+    }
+
+    // Optional `--build` pre-flight: rebuild any selected service that
+    // declares a `build:` block before deploying. Lets the indie
+    // "drop yoink.yaml in repo and `yoink up --build --no-registry`"
+    // loop work as a one-shot without remembering to run `yoink build`
+    // separately. Push is intentionally not auto-engaged — kamal-style
+    // flows still go through the explicit `yoink build --push` step.
+    if build {
+        for svc in config.selected_services(services_filter) {
+            if svc.build.is_none() {
+                continue;
+            }
+            let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
+            yoink::build::build_service(config, svc, &tag, false, false)
+                .await
+                .with_context(|| format!("build {}", svc.name))?;
+        }
+    }
+
+    // No-registry pre-flight: save+load every selected image to every
+    // applicable host so the reconcile loop's `image_present` check
+    // short-circuits any registry pull. Failures here block the
+    // deploy ("forgot to `yoink build`?" / local daemon down).
+    if no_registry {
+        yoink::build::load_images_to_hosts(
+            ops.as_ref(),
+            config,
+            &tag_overrides,
+            services_filter,
+        )
+        .await?;
     }
 
     // Per-host advisory locks. Sentinel container holds the lock; a
@@ -546,6 +671,17 @@ async fn cmd_up(
     Ok(())
 }
 
+/// Convert the CLI's `--service` repeat into the `Option<&[String]>`
+/// shape every downstream caller wants: empty list → no filter →
+/// "every service"; non-empty → filter to those.
+fn services_filter(services: &[String]) -> Option<&[String]> {
+    if services.is_empty() {
+        None
+    } else {
+        Some(services)
+    }
+}
+
 /// Build the `service_name → tag` override map. Each `--tag` argument
 /// is either `name=tag` (override that named service's tag) or a bare
 /// `tag` (applies to every `--service`-selected service). A bare tag
@@ -594,6 +730,59 @@ fn parse_tag_overrides(
         }
     }
     Ok(out)
+}
+
+struct BuildOptions<'a> {
+    services: &'a [String],
+    tag_args: &'a [String],
+    allow_dirty: bool,
+    no_cache: bool,
+    push: bool,
+}
+
+/// `yoink build` — run `docker build` for every selected service that
+/// declares a `build:` block. Tags the result on the operator's
+/// local daemon as `<image>:<tag>`, ready for `yoink up --no-registry`.
+async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
+    let BuildOptions {
+        services,
+        tag_args,
+        allow_dirty,
+        no_cache,
+        push,
+    } = build;
+    let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
+    let services_filter = services_filter(services);
+    let explicit_services = services_filter.is_some();
+
+    let mut built_any = false;
+    for svc in config.selected_services(services_filter) {
+        if svc.build.is_none() {
+            // Explicit `--service api` against a service without a
+            // `build:` block is operator error — they expected a
+            // build. Bare `yoink build` (no filter) just skips
+            // registry-only services silently.
+            if explicit_services {
+                anyhow::bail!(
+                    "service {:?} has no `build:` block — add one or build the image yourself",
+                    svc.name
+                );
+            }
+            continue;
+        }
+        let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
+        yoink::build::build_service(config, svc, &tag, no_cache, push)
+            .await
+            .with_context(|| format!("build {}", svc.name))?;
+        built_any = true;
+    }
+    if !built_any {
+        anyhow::bail!(
+            "no services with a `build:` block matched. \
+             Add `build:` to a service or pass --service to one that has it."
+        );
+    }
+    Ok(())
 }
 
 async fn cmd_status(config: &Config, json: bool) -> Result<()> {
@@ -671,11 +860,15 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
     let tag_args = std::slice::from_ref(&tag_arg);
     cmd_up(
         config,
-        services_arg,
-        tag_args,
-        true,
-        false,
-        DryRunFormat::Text,
+        UpOptions {
+            services: services_arg,
+            tag_args,
+            allow_dirty: true,
+            dry_run: false,
+            format: DryRunFormat::Text,
+            no_registry: false,
+            build: false,
+        },
     )
     .await
 }
