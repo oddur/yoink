@@ -126,8 +126,18 @@ impl StatsHistory {
         }
     }
 
+    #[allow(dead_code)] // Useful for tests + future "reset on disconnect" hooks.
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    /// True when the CPU samples ring is empty — used by the App-level
+    /// GC sweep to drop history entries whose newest sample has aged
+    /// out of the window (i.e. the container hasn't been seen by the
+    /// poller for at least `HISTORY_WINDOW_SECS`).
+    #[must_use]
+    pub fn cpu_pct_is_empty(&self) -> bool {
+        self.cpu_pct.is_empty()
     }
 
     fn x_window(&self) -> (f64, f64) {
@@ -163,7 +173,6 @@ pub struct ContainerDetailState {
     stats: Option<ContainerStats>,
     last_error: Option<String>,
     loaded: bool,
-    history: StatsHistory,
     /// `Some` when the operator pressed `p` and the docker-top result
     /// has landed; rendered as a modal overlay until dismissed with Esc.
     top: Option<ProcessTable>,
@@ -188,7 +197,6 @@ impl ContainerDetailState {
             self.inspect = None;
             self.stats = None;
             self.loaded = false;
-            self.history.clear();
             self.top = None;
             self.top_loading = false;
         }
@@ -223,18 +231,18 @@ impl ContainerDetailState {
         // Flip loaded unconditionally so the pane renders the error
         // path (which already exists at the top of `render`) instead
         // of looping on `(loading…)`. Last-known good inspect/stats
-        // stay around to ride out transient blips.
+        // stay around to ride out transient blips. Stats history is
+        // owned by the App-level shared store now (see
+        // `App::container_history`); the per-render fetch only
+        // refreshes the inspect block + the latest gauge sample.
         self.loaded = true;
         if self.last_error.is_none() {
             self.inspect = data.inspect;
-            if let Some(stats) = data.stats.as_ref() {
-                self.history.push(stats);
-            }
             self.stats = data.stats;
         }
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect, history: Option<&StatsHistory>) {
         if let Some(err) = &self.last_error {
             let block = Block::default().borders(Borders::ALL).title(" container ");
             frame.render_widget(
@@ -273,7 +281,7 @@ impl ContainerDetailState {
             ])
             .split(area);
         Self::render_card(frame, chunks[0], inspect, self.stats.as_ref());
-        self.render_history(frame, chunks[1]);
+        Self::render_history(frame, chunks[1], history);
 
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -299,7 +307,7 @@ impl ContainerDetailState {
         clippy::cast_possible_truncation,
         clippy::too_many_lines
     )]
-    fn render_history(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_history(frame: &mut Frame<'_>, area: Rect, history: Option<&StatsHistory>) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -309,9 +317,25 @@ impl ContainerDetailState {
             ])
             .split(area);
 
-        let (xmin, xmax) = self.history.x_window();
-        let cpu_data: Vec<(f64, f64)> = self.history.cpu_pct.iter().copied().collect();
-        let mem_data: Vec<(f64, f64)> = self.history.mem_pct.iter().copied().collect();
+        let Some(history) = history else {
+            // Empty store — render three "(collecting…)" placeholders.
+            for (i, title) in ["CPU %", "Mem %", "net rx / tx"].iter().enumerate() {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {title} (5 min) "));
+                frame.render_widget(
+                    Paragraph::new("(collecting…)")
+                        .style(Style::default().fg(Color::DarkGray))
+                        .block(block),
+                    cols[i],
+                );
+            }
+            return;
+        };
+
+        let (xmin, xmax) = history.x_window();
+        let cpu_data: Vec<(f64, f64)> = history.cpu_pct.iter().copied().collect();
+        let mem_data: Vec<(f64, f64)> = history.mem_pct.iter().copied().collect();
 
         // ── Panel 1: CPU% over time ───────────────────────────────────
         let cpu_now = cpu_data.last().map(|(_, v)| *v);
@@ -360,7 +384,7 @@ impl ContainerDetailState {
 
         // ── Panel 2: Mem (own y-axis, % when capped, MB when uncapped) ─
         let mem_now = mem_data.last().map(|(_, v)| *v);
-        let mem_unit = if self.history.mem_uncapped { "MB" } else { "%" };
+        let mem_unit = if history.mem_uncapped { "MB" } else { "%" };
         let mem_title = match mem_now {
             Some(m) => format!(" Mem {m:>5.1}{mem_unit} (5 min) "),
             None => format!(" Mem {mem_unit} (5 min) "),
@@ -374,7 +398,7 @@ impl ContainerDetailState {
                 cols[1],
             );
         } else {
-            let mem_max = if self.history.mem_uncapped {
+            let mem_max = if history.mem_uncapped {
                 mem_data
                     .iter()
                     .map(|(_, v)| *v)
@@ -385,7 +409,7 @@ impl ContainerDetailState {
             };
             let datasets = vec![
                 Dataset::default()
-                    .name(if self.history.mem_uncapped { "mem MB" } else { "mem%" })
+                    .name(if history.mem_uncapped { "mem MB" } else { "mem%" })
                     .marker(Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(Color::Magenta))
@@ -403,31 +427,31 @@ impl ContainerDetailState {
                     Axis::default()
                         .style(Style::default().fg(Color::DarkGray))
                         .bounds([0.0, mem_max])
-                        .labels(percent_axis_labels(mem_max, self.history.mem_uncapped)),
+                        .labels(percent_axis_labels(mem_max, history.mem_uncapped)),
                 );
             frame.render_widget(chart, cols[1]);
         }
 
         // ── Panel 3: network rx/tx rate, btop-style mirrored ──────────
-        // rx (incoming) plots above the zero line; tx (outgoing) plots
-        // mirrored below. The two series no longer overlap — at a
-        // glance you see "what's coming in" vs "what's going out"
-        // without having to disambiguate two same-axis lines.
-        let rx_rates = StatsHistory::rate_series(&self.history.net_rx);
-        let tx_rates_pos = StatsHistory::rate_series(&self.history.net_tx);
-        // Mirror tx below the zero line by negating each y value. The
+        // tx (outgoing) plots above the zero line; rx (incoming) plots
+        // mirrored below. Outgoing-on-top reads naturally as "this
+        // container is pushing X out to the world", and the two series
+        // can no longer overlap.
+        let rx_rates_pos = StatsHistory::rate_series(&history.net_rx);
+        let tx_rates = StatsHistory::rate_series(&history.net_tx);
+        // Mirror rx below the zero line by negating each y value. The
         // rendered line still tracks the same magnitude — just on the
         // negative side of the axis.
-        let tx_rates: Vec<(f64, f64)> = tx_rates_pos.iter().map(|(t, v)| (*t, -*v)).collect();
-        let rx_now = rx_rates.last().map_or(0.0, |(_, v)| *v);
-        let tx_now = tx_rates_pos.last().map_or(0.0, |(_, v)| *v);
+        let rx_rates: Vec<(f64, f64)> = rx_rates_pos.iter().map(|(t, v)| (*t, -*v)).collect();
+        let rx_now = rx_rates_pos.last().map_or(0.0, |(_, v)| *v);
+        let tx_now = tx_rates.last().map_or(0.0, |(_, v)| *v);
         let net_title = if rx_rates.is_empty() && tx_rates.is_empty() {
             " net rx / tx (5 min) ".to_string()
         } else {
             format!(
-                " net ↓{} ↑{} (5 min) ",
-                format_rate(rx_now),
-                format_rate(tx_now)
+                " net ↑{} ↓{} (5 min) ",
+                format_rate(tx_now),
+                format_rate(rx_now)
             )
         };
         let net_block = Block::default().borders(Borders::ALL).title(net_title);
@@ -439,11 +463,11 @@ impl ContainerDetailState {
                 cols[2],
             );
         } else {
-            let rx_peak = rx_rates
+            let rx_peak = rx_rates_pos
                 .iter()
                 .map(|(_, v)| *v)
                 .fold(0.0_f64, f64::max);
-            let tx_peak = tx_rates_pos
+            let tx_peak = tx_rates
                 .iter()
                 .map(|(_, v)| *v)
                 .fold(0.0_f64, f64::max);
@@ -454,17 +478,17 @@ impl ContainerDetailState {
             let max_rate = rx_peak.max(tx_peak).max(1.0);
             let datasets = vec![
                 Dataset::default()
-                    .name("↓ rx")
-                    .marker(Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Green))
-                    .data(&rx_rates),
-                Dataset::default()
                     .name("↑ tx")
                     .marker(Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(Color::Yellow))
                     .data(&tx_rates),
+                Dataset::default()
+                    .name("↓ rx")
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Green))
+                    .data(&rx_rates),
             ];
             let chart = Chart::new(datasets)
                 .block(net_block)
@@ -894,18 +918,19 @@ fn percent_axis_labels(max: f64, uncapped: bool) -> Vec<Span<'static>> {
     }
 }
 
-/// Labels for the mirrored rx/tx panel: bottom is `↑ tx_max`, middle
-/// is `0`, top is `↓ rx_max`. Both magnitudes are positive (the y
-/// values are signed but the operator reads the magnitude with the
-/// arrow indicating direction).
+/// Labels for the mirrored rx/tx panel: bottom is `↓ rx_max` (green —
+/// incoming, plotted below zero), middle is `0`, top is `↑ tx_max`
+/// (yellow — outgoing, plotted above zero). Both magnitudes are
+/// positive (the y values are signed but the operator reads the
+/// magnitude with the arrow indicating direction).
 fn mirrored_rate_labels(max: f64) -> Vec<Span<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let up = Style::default().fg(Color::Yellow);
     let down = Style::default().fg(Color::Green);
     vec![
-        Span::styled(format!("↑{}", format_rate(max)), up),
-        Span::styled("0".to_string(), dim),
         Span::styled(format!("↓{}", format_rate(max)), down),
+        Span::styled("0".to_string(), dim),
+        Span::styled(format!("↑{}", format_rate(max)), up),
     ]
 }
 

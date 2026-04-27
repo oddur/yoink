@@ -38,7 +38,7 @@ use crate::config::Config;
 use crate::docker_ops::{DockerEvent, DockerEventKind, DockerOps, Host, LogLine};
 use crate::status::StatusReport;
 
-use super::container_detail::{self, ContainerDetailRefresh, ContainerDetailState};
+use super::container_detail::{self, ContainerDetailRefresh, ContainerDetailState, StatsHistory};
 use super::dashboard::{self, DashboardRefresh, DashboardState};
 use super::host_detail::{self, HostDetailRefresh, HostDetailState};
 use super::hosts::{self, HostRow, HostsState};
@@ -67,6 +67,12 @@ const RESOURCES_TICK: Duration = Duration::from_secs(15);
 /// formatted line — generous so an operator returning to a `HostDetail`
 /// pane after lunch sees recent context.
 const EVENT_HISTORY_PER_HOST: usize = 200;
+/// Cadence of the always-on stats-history poller (one task per host).
+/// Matches `FAST_TICK` — by the time the operator opens a container
+/// detail pane, the chart has whatever back-history the poller managed
+/// to collect at this rate. 2s is the same cadence dashboard uses, so
+/// the docker daemon load is comparable.
+const STATS_HISTORY_TICK: Duration = Duration::from_secs(2);
 /// How often to re-stat + re-parse the on-disk config so a `vim
 /// services/api.yaml` is reflected without restarting the TUI. Polling
 /// (vs notify/inotify) keeps the dep tree small; 2s latency is fine
@@ -393,6 +399,13 @@ enum Update {
         container: String,
         result: Result<crate::docker_ops::ProcessTable, String>,
     },
+    /// Batch of `(host_address, container_name, stats)` samples produced
+    /// by the always-on background stats poller. Each sample is folded
+    /// into the per-container `StatsHistory` so that opening a
+    /// container's detail pane shows the rolling 5-minute history
+    /// regardless of which view the operator was on while it was being
+    /// collected.
+    StatsBatch(Vec<(String, String, crate::docker_ops::ContainerStats)>),
 }
 
 /// Auto-pop error overlay carrying the full text (including URLs
@@ -578,6 +591,7 @@ async fn run_loop(
     app.schedule_hosts_refresh();
     app.schedule_dashboard_refresh();
     app.start_event_subscriptions();
+    app.start_stats_history_pollers();
     app.spawn_secrets_loader();
     if matches!(app.view, View::Logs) {
         app.start_service_log_streams().await;
@@ -759,6 +773,18 @@ pub struct App {
     /// Newest entries pushed at the back. Drives the events panel
     /// at the bottom of the `HostDetail` pane.
     host_events: std::collections::HashMap<String, std::collections::VecDeque<String>>,
+    /// Per-container stats history, populated by the always-on
+    /// background stats poller. Keyed by `(host_address,
+    /// container_name)` so opening any container's detail pane
+    /// renders the rolling 5-minute history immediately rather than
+    /// starting from zero. Last-update tracking is implicit in each
+    /// `StatsHistory`'s elapsed-time anchor; entries are GC'd when
+    /// their newest sample falls outside `2 × HISTORY_WINDOW_SECS`.
+    container_history:
+        std::collections::HashMap<(String, String), super::container_detail::StatsHistory>,
+    /// Per-host `JoinHandle`s for the always-on stats poller. Aborted
+    /// on Drop and re-spawned on `hosts:` config reload.
+    stats_history_tasks: Vec<JoinHandle<()>>,
     update_tx: UnboundedSender<Update>,
     update_rx: UnboundedReceiver<Update>,
 
@@ -828,6 +854,8 @@ impl App {
             history_in_flight: false,
             resources_in_flight: false,
             host_events: std::collections::HashMap::new(),
+            container_history: std::collections::HashMap::new(),
+            stats_history_tasks: Vec::new(),
             update_tx,
             update_rx,
             log_tasks: Vec::new(),
@@ -865,6 +893,8 @@ impl App {
         if hosts_changed {
             self.stop_event_subscriptions();
             self.start_event_subscriptions();
+            self.stop_stats_history_pollers();
+            self.start_stats_history_pollers();
             self.schedule_hosts_refresh();
         }
         self.schedule_dashboard_refresh();
@@ -1171,6 +1201,106 @@ impl App {
         for task in self.event_tasks.drain(..) {
             task.abort();
         }
+    }
+
+    /// Spawn one always-on stats-history poller per configured host.
+    /// The poller lists running containers on its host every
+    /// `STATS_HISTORY_TICK` and fetches `container_stats` for each
+    /// one in parallel, then ships the batch back through `update_tx`
+    /// as `Update::StatsBatch`. This keeps the rolling 5-minute
+    /// window alive for every container regardless of which view
+    /// the operator is currently on, so opening a container detail
+    /// pane shows immediate context instead of an empty chart.
+    ///
+    /// Idempotent on re-spawn: callers must invoke
+    /// `stop_stats_history_pollers` first (we do that on `hosts:`
+    /// config-reload before respawning, and on Drop).
+    fn start_stats_history_pollers(&mut self) {
+        for host_cfg in &self.config.hosts {
+            let host = Host::from(host_cfg);
+            let ops = self.ops.clone();
+            let tx = self.update_tx.clone();
+            let task = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(STATS_HISTORY_TICK);
+                // First tick fires immediately; eat it so we don't
+                // hammer the daemon during App startup when nothing's
+                // visible yet.
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let containers = match ops.list_running_containers(&host).await {
+                        Ok(cs) => cs,
+                        Err(e) => {
+                            tracing::debug!(
+                                host = %host.address,
+                                error = %e,
+                                "stats poller: list_running_containers failed",
+                            );
+                            continue;
+                        }
+                    };
+                    if containers.is_empty() {
+                        // Still send an empty batch so the receiver
+                        // gets a heartbeat (useful for future GC
+                        // strategies that key off "we polled at T").
+                        if tx.send(Update::StatsBatch(Vec::new())).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let stat_futs = containers.iter().map(|c| {
+                        let ops = ops.clone();
+                        let host = host.clone();
+                        let name = c.name.clone();
+                        async move {
+                            let res = ops.container_stats(&host, &name).await.ok();
+                            (host.address.clone(), name, res)
+                        }
+                    });
+                    let results = futures_util::future::join_all(stat_futs).await;
+                    let batch: Vec<(String, String, crate::docker_ops::ContainerStats)> = results
+                        .into_iter()
+                        .filter_map(|(h, n, s)| s.map(|stats| (h, n, stats)))
+                        .collect();
+                    if tx.send(Update::StatsBatch(batch)).is_err() {
+                        return;
+                    }
+                }
+            });
+            self.stats_history_tasks.push(task);
+        }
+    }
+
+    fn stop_stats_history_pollers(&mut self) {
+        for task in self.stats_history_tasks.drain(..) {
+            task.abort();
+        }
+    }
+
+    /// Push one stats sample into the per-container history store.
+    /// Cheap — each container gets its own bounded ring buffer.
+    fn record_stats_sample(
+        &mut self,
+        host: &str,
+        container: &str,
+        stats: &crate::docker_ops::ContainerStats,
+    ) {
+        let entry = self
+            .container_history
+            .entry((host.to_string(), container.to_string()))
+            .or_default();
+        entry.push(stats);
+    }
+
+    /// Drop history entries whose newest sample is older than
+    /// `2 × HISTORY_WINDOW_SECS`. Called from the slow ticks so a
+    /// long-running TUI doesn't slowly accumulate ghost containers.
+    fn gc_container_history(&mut self) {
+        // The `StatsHistory` window-trim logic already drops samples
+        // that have aged out, so an entry whose ring is empty has
+        // had no fresh sample for at least HISTORY_WINDOW_SECS — that's
+        // the GC signal.
+        self.container_history.retain(|_, h| !h.cpu_pct_is_empty());
     }
 
     /// Returns true when the loop should exit.
@@ -2420,6 +2550,12 @@ impl App {
                 self.resources.apply(data);
                 self.resources_in_flight = false;
             }
+            Update::StatsBatch(samples) => {
+                for (host, container, stats) in samples {
+                    self.record_stats_sample(&host, &container, &stats);
+                }
+                self.gc_container_history();
+            }
             Update::Top {
                 host,
                 container,
@@ -2614,7 +2750,7 @@ impl App {
                     &events,
                 );
             }
-            View::ContainerDetail { .. } => {
+            View::ContainerDetail { host, container } => {
                 // Split: top 2/3 = inspect data, bottom 1/3 = live log tail.
                 let split = ratatui::layout::Layout::default()
                     .direction(ratatui::layout::Direction::Vertical)
@@ -2623,7 +2759,10 @@ impl App {
                         ratatui::layout::Constraint::Length(12),
                     ])
                     .split(pane_area);
-                self.container_detail.render(frame, split[0]);
+                let history: Option<&StatsHistory> = self
+                    .container_history
+                    .get(&(host.address.clone(), container.clone()));
+                self.container_detail.render(frame, split[0], history);
                 self.logs.render(frame, split[1], &self.config);
             }
             View::Services => self.services.render(frame, pane_area, &self.config),
@@ -2859,6 +2998,7 @@ impl Drop for App {
     fn drop(&mut self) {
         self.stop_log_streams();
         self.stop_event_subscriptions();
+        self.stop_stats_history_pollers();
     }
 }
 
