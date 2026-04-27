@@ -166,13 +166,18 @@ impl DashboardState {
         self.apply(data);
     }
 
-    /// Apply background-fetched results.
+    /// Apply background-fetched results. `loaded` flips
+    /// unconditionally — when `report` is `None` (host unreachable,
+    /// ssh probe failed, etc.), the existing render path uses
+    /// `last_error` to surface the failure instead of looping on
+    /// `(loading…)`. Last-known good `report`/`stats` are kept on
+    /// error to ride out transient blips.
     pub fn apply(&mut self, data: DashboardRefresh) {
         self.last_error = data.error;
+        self.loaded = true;
         if let Some(report) = data.report {
             self.report = Some(report);
             self.stats = data.stats;
-            self.loaded = true;
         }
     }
 
@@ -248,7 +253,15 @@ impl DashboardState {
 
     fn build_rows(&self, config: &Config, secrets: Option<&SecretsBundle>) -> Vec<Row<'static>> {
         let Some(report) = &self.report else {
-            return vec![Row::new(vec![Cell::from("(loading…)")])];
+            // No cached report. If the first fetch already finished
+            // and errored (loaded=true), don't pretend we're still
+            // loading — the error footer carries the detail.
+            let cell = if self.loaded {
+                "(no data — see error in footer)"
+            } else {
+                "(loading…)"
+            };
+            return vec![Row::new(vec![Cell::from(cell)])];
         };
         let mut rows: Vec<Row<'_>> = Vec::new();
         for host in &report.hosts {
