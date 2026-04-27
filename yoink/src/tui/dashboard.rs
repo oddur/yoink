@@ -502,6 +502,7 @@ services:
             cpu_pct: 12.5,
             mem_used: 64 * 1024 * 1024,
             mem_limit: Some(512 * 1024 * 1024),
+            ..Default::default()
         }));
         let mut state = DashboardState::new();
         state.refresh(&ops, &config()).await;

@@ -153,21 +153,26 @@ impl HostDetailState {
         area: ratatui::layout::Rect,
         config: &Config,
         secrets: Option<&SecretsBundle>,
+        events: &[String],
     ) {
-        // 4-section layout: header (1) · summary panel (5) · table (rest) · footer (1).
+        // 5-section layout: header · summary · containers (Min) · events (Length 8 when present) · footer.
+        // The event panel collapses to 0 when no events are recorded yet.
+        let event_height: u16 = if events.is_empty() { 0 } else { 8 };
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Length(5),
                 Constraint::Min(0),
+                Constraint::Length(event_height),
                 Constraint::Length(1),
             ])
             .split(area);
         let header_area = layout[0];
         let summary_area = layout[1];
         let table_area = layout[2];
-        let footer_area = layout[3];
+        let events_area = layout[3];
+        let footer_area = layout[4];
 
         let header_text = match &self.host {
             Some(h) => format!(
@@ -259,9 +264,36 @@ impl HostDetailState {
         }
         let footer = filter_footer(
             &self.filter,
-            "q quit · esc back · ↑↓ select · enter logs · ! shell · D debug · r refresh",
+            "↑↓ select · enter logs · i inspect · ! shell · D debug · S start · X stop · R restart · K kill · U reconcile · r refresh",
         );
         frame.render_widget(footer, footer_area);
+
+        if !events.is_empty() && event_height > 0 {
+            Self::render_events(frame, events_area, events);
+        }
+    }
+
+    /// Bottom-of-pane scrolling event log showing the most recent
+    /// docker events for this host (start / die / health-change /
+    /// network create / volume mount …). Newest at the top — same
+    /// reading order as `docker events --since` truncated to the
+    /// most operator-relevant `EVENT_HISTORY_PER_HOST` lines.
+    fn render_events(frame: &mut Frame<'_>, area: ratatui::layout::Rect, events: &[String]) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " events (newest first) ",
+                Style::default().fg(Color::Gray),
+            ));
+        let inner_h = block.inner(area).height as usize;
+        let lines: Vec<Line<'static>> = events
+            .iter()
+            .rev()
+            .take(inner_h.max(1))
+            .map(|s| Line::from(s.clone()))
+            .collect();
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
     /// Host-aggregate summary panel: bordered block hosting two
@@ -481,12 +513,12 @@ mod tests {
         ops.push_container_stats(Ok(ContainerStats {
             cpu_pct: 100.0,
             mem_used: 64 * 1024 * 1024,
-            mem_limit: None,
+            ..Default::default()
         }));
         ops.push_container_stats(Ok(ContainerStats {
             cpu_pct: 50.0,
             mem_used: 32 * 1024 * 1024,
-            mem_limit: None,
+            ..Default::default()
         }));
 
         let mut state = HostDetailState::new();
@@ -501,16 +533,8 @@ mod tests {
     async fn select_next_and_prev_clamp_to_bounds() {
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![container("a"), container("b")]));
-        ops.push_container_stats(Ok(ContainerStats {
-            cpu_pct: 0.0,
-            mem_used: 0,
-            mem_limit: None,
-        }));
-        ops.push_container_stats(Ok(ContainerStats {
-            cpu_pct: 0.0,
-            mem_used: 0,
-            mem_limit: None,
-        }));
+        ops.push_container_stats(Ok(ContainerStats::default()));
+        ops.push_container_stats(Ok(ContainerStats::default()));
         let mut state = HostDetailState::new();
         state.set_host(host());
         state.refresh(&ops).await;

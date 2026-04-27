@@ -7,18 +7,35 @@
 //! inside: `Enter`/`l` opens the dedicated logs view, `!` shells in,
 //! `D` spawns the debug sidecar, `Esc` returns to host detail.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, Wrap,
+};
 
-use crate::docker_ops::{ContainerDetail, ContainerStats, DockerOps, Host};
+use crate::docker_ops::{ContainerDetail, ContainerStats, DockerOps, Host, ProcessTable};
 use crate::output::{format_bytes, format_relative_time};
 
 use super::ui::{bold, gauge_color, health_style, inline_gauge, kv, kv_styled, state_style};
+
+/// Total wall-clock window the history charts cover. Picked to be long
+/// enough that an operator can correlate "I deployed X" with "memory
+/// climbed for 4 minutes" without having to scroll, but short enough
+/// that the underlying ring buffer stays cheap (≈150 samples at the 2s
+/// fast-tick).
+const HISTORY_WINDOW_SECS: f64 = 300.0;
+/// Cap on samples retained in `StatsHistory` — generous overhead for
+/// the case where the operator's terminal stays open longer than the
+/// fast tick can keep up. At ~1 sample / second this is ~10 minutes
+/// worth of headroom; older points are dropped.
+const HISTORY_CAP: usize = 600;
 
 /// Substrings that mark an env var as secret-ish — values are
 /// rendered as `<redacted>` so an over-the-shoulder operator can't
@@ -33,6 +50,112 @@ const REDACT_HINTS: &[&str] = &[
     "DSN",
 ];
 
+/// Bounded ring of `(elapsed_seconds, value)` pairs covering at most
+/// [`HISTORY_WINDOW_SECS`]. `started` anchors elapsed-time so the chart
+/// keeps a stable x-axis as samples slide off.
+#[derive(Default)]
+pub struct StatsHistory {
+    started: Option<Instant>,
+    cpu_pct: VecDeque<(f64, f64)>,
+    /// Memory utilization as a 0..=100 percentage when a memory cap
+    /// is set; absolute MB when uncapped (chart auto-scales the y-axis
+    /// in that case).
+    mem_pct: VecDeque<(f64, f64)>,
+    /// Cumulative bytes — the chart renderer diffs successive samples
+    /// to derive a per-second rate.
+    net_rx: VecDeque<(f64, f64)>,
+    net_tx: VecDeque<(f64, f64)>,
+    /// True when memory is uncapped on the container — the y-axis on
+    /// the mem chart switches to "MB" labelling instead of "0–100%".
+    mem_uncapped: bool,
+    /// Last absolute mem bytes (for the uncapped case so the y-axis
+    /// max can grow).
+    mem_max_bytes: i64,
+}
+
+impl StatsHistory {
+    fn now_elapsed(&mut self) -> f64 {
+        let started = self.started.get_or_insert_with(Instant::now);
+        started.elapsed().as_secs_f64()
+    }
+
+    /// Record a fresh sample. Drops points that fall outside the
+    /// history window so the chart keeps a fixed time horizon.
+    pub fn push(&mut self, stats: &ContainerStats) {
+        let t = self.now_elapsed();
+        self.cpu_pct.push_back((t, stats.cpu_pct.max(0.0)));
+
+        match stats.mem_limit {
+            Some(limit) if limit > 0 => {
+                self.mem_uncapped = false;
+                #[allow(clippy::cast_precision_loss)]
+                let pct = (stats.mem_used as f64 / limit as f64) * 100.0;
+                self.mem_pct.push_back((t, pct.clamp(0.0, 100.0)));
+            }
+            _ => {
+                self.mem_uncapped = true;
+                #[allow(clippy::cast_precision_loss)]
+                let mb = (stats.mem_used as f64) / 1_048_576.0;
+                self.mem_pct.push_back((t, mb.max(0.0)));
+                if stats.mem_used > self.mem_max_bytes {
+                    self.mem_max_bytes = stats.mem_used;
+                }
+            }
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self.net_rx.push_back((t, stats.net_rx_bytes.max(0) as f64));
+            self.net_tx.push_back((t, stats.net_tx_bytes.max(0) as f64));
+        }
+
+        // Trim by both time-window and absolute cap.
+        let cutoff = t - HISTORY_WINDOW_SECS;
+        for q in [
+            &mut self.cpu_pct,
+            &mut self.mem_pct,
+            &mut self.net_rx,
+            &mut self.net_tx,
+        ] {
+            while q.front().is_some_and(|(s, _)| *s < cutoff) {
+                q.pop_front();
+            }
+            while q.len() > HISTORY_CAP {
+                q.pop_front();
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn x_window(&self) -> (f64, f64) {
+        let now = self.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
+        let lo = (now - HISTORY_WINDOW_SECS).max(0.0);
+        (lo, now.max(HISTORY_WINDOW_SECS))
+    }
+
+    /// Convert cumulative-bytes samples into per-second rates suitable
+    /// for plotting. The first sample produces no rate; pairs of
+    /// successive samples produce `(t_b, (b - a) / (t_b - t_a))`.
+    fn rate_series(samples: &VecDeque<(f64, f64)>) -> Vec<(f64, f64)> {
+        let mut out = Vec::with_capacity(samples.len());
+        let mut prev: Option<&(f64, f64)> = None;
+        for cur in samples {
+            if let Some(p) = prev {
+                let dt = cur.0 - p.0;
+                if dt > 0.0 {
+                    let rate = ((cur.1 - p.1) / dt).max(0.0);
+                    out.push((cur.0, rate));
+                }
+            }
+            prev = Some(cur);
+        }
+        out
+    }
+}
+
 #[derive(Default)]
 pub struct ContainerDetailState {
     target: Option<(Host, String)>,
@@ -40,6 +163,13 @@ pub struct ContainerDetailState {
     stats: Option<ContainerStats>,
     last_error: Option<String>,
     loaded: bool,
+    history: StatsHistory,
+    /// `Some` when the operator pressed `p` and the docker-top result
+    /// has landed; rendered as a modal overlay until dismissed with Esc.
+    top: Option<ProcessTable>,
+    /// `true` once the user has requested processes — drives the
+    /// "(loading…)" modal state until the result lands.
+    top_loading: bool,
 }
 
 pub struct ContainerDetailRefresh {
@@ -58,8 +188,30 @@ impl ContainerDetailState {
             self.inspect = None;
             self.stats = None;
             self.loaded = false;
+            self.history.clear();
+            self.top = None;
+            self.top_loading = false;
         }
         self.target = Some((host, container));
+    }
+
+    pub fn begin_top_load(&mut self) {
+        self.top_loading = true;
+    }
+
+    pub fn set_top(&mut self, table: ProcessTable) {
+        self.top_loading = false;
+        self.top = Some(table);
+    }
+
+    pub fn dismiss_top(&mut self) {
+        self.top = None;
+        self.top_loading = false;
+    }
+
+    /// True when the top modal is on screen (renderer adds the overlay).
+    pub fn top_visible(&self) -> bool {
+        self.top_loading || self.top.is_some()
     }
 
     pub fn target(&self) -> Option<&(Host, String)> {
@@ -75,6 +227,9 @@ impl ContainerDetailState {
         self.loaded = true;
         if self.last_error.is_none() {
             self.inspect = data.inspect;
+            if let Some(stats) = data.stats.as_ref() {
+                self.history.push(stats);
+            }
             self.stats = data.stats;
         }
     }
@@ -106,20 +261,247 @@ impl ContainerDetailState {
             return;
         };
 
-        // Layout: header card (8 rows) · two-column data (rest split
-        // horizontally between env+labels and ports+mounts+networks).
+        // Layout: header card · 5-min stats history strip · two-column
+        // data block (env+labels on the right, ports/mounts/networks/
+        // security on the left).
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(8), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Min(0),
+            ])
             .split(area);
         Self::render_card(frame, chunks[0], inspect, self.stats.as_ref());
+        self.render_history(frame, chunks[1]);
 
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[1]);
+            .split(chunks[2]);
         Self::render_runtime(frame, cols[0], inspect);
         Self::render_env_labels(frame, cols[1], inspect);
+
+        if self.top_visible() {
+            self.render_top_modal(frame);
+        }
+    }
+
+    /// Side-by-side line charts for the rolling 5-minute window. Left:
+    /// CPU% (cyan) + Mem% (magenta). Right: network rx (green) + tx
+    /// (yellow), bytes-per-second derived from successive samples.
+    /// Both panels render an axis label legend; empty data falls back
+    /// to a "(collecting…)" centred line so the panel doesn't look broken
+    /// in the first 2-3 seconds before the first stats sample lands.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines
+    )]
+    fn render_history(&self, frame: &mut Frame<'_>, area: Rect) {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+
+        // ── Left panel: CPU% + Mem% over time ─────────────────────────
+        let (xmin, xmax) = self.history.x_window();
+        let cpu_data: Vec<(f64, f64)> = self.history.cpu_pct.iter().copied().collect();
+        let mem_data: Vec<(f64, f64)> = self.history.mem_pct.iter().copied().collect();
+
+        let left_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" CPU % · Mem % (5 min) ");
+
+        if cpu_data.is_empty() {
+            frame.render_widget(
+                Paragraph::new("(collecting samples…)")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .block(left_block),
+                cols[0],
+            );
+        } else {
+            let cpu_max = cpu_data
+                .iter()
+                .map(|(_, v)| *v)
+                .fold(0.0_f64, f64::max)
+                .max(100.0);
+            let mem_max = if self.history.mem_uncapped {
+                let m = mem_data.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
+                m.max(1.0)
+            } else {
+                100.0
+            };
+            // Both metrics share a y-axis scaled to the larger of the
+            // two — keeping them in one panel saves vertical real estate
+            // and makes "memory leaked while CPU was idle" patterns
+            // jump out at a glance.
+            let y_max = cpu_max.max(mem_max);
+            let datasets = vec![
+                Dataset::default()
+                    .name("cpu%")
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Cyan))
+                    .data(&cpu_data),
+                Dataset::default()
+                    .name(if self.history.mem_uncapped {
+                        "mem MB"
+                    } else {
+                        "mem%"
+                    })
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Magenta))
+                    .data(&mem_data),
+            ];
+            let chart = Chart::new(datasets)
+                .block(left_block)
+                .x_axis(
+                    Axis::default()
+                        .style(Style::default().fg(Color::DarkGray))
+                        .bounds([xmin, xmax])
+                        .labels(time_axis_labels(xmin, xmax)),
+                )
+                .y_axis(
+                    Axis::default()
+                        .style(Style::default().fg(Color::DarkGray))
+                        .bounds([0.0, y_max])
+                        .labels(percent_axis_labels(y_max, self.history.mem_uncapped)),
+                );
+            frame.render_widget(chart, cols[0]);
+        }
+
+        // ── Right panel: network rx/tx rate ───────────────────────────
+        let rx_rates = StatsHistory::rate_series(&self.history.net_rx);
+        let tx_rates = StatsHistory::rate_series(&self.history.net_tx);
+        let right_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" net rx / tx (5 min, B/s) ");
+
+        if rx_rates.is_empty() && tx_rates.is_empty() {
+            frame.render_widget(
+                Paragraph::new("(collecting samples…)")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .block(right_block),
+                cols[1],
+            );
+        } else {
+            let max_rate = rx_rates
+                .iter()
+                .chain(tx_rates.iter())
+                .map(|(_, v)| *v)
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let datasets = vec![
+                Dataset::default()
+                    .name("rx")
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Green))
+                    .data(&rx_rates),
+                Dataset::default()
+                    .name("tx")
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Yellow))
+                    .data(&tx_rates),
+            ];
+            let chart = Chart::new(datasets)
+                .block(right_block)
+                .x_axis(
+                    Axis::default()
+                        .style(Style::default().fg(Color::DarkGray))
+                        .bounds([xmin, xmax])
+                        .labels(time_axis_labels(xmin, xmax)),
+                )
+                .y_axis(
+                    Axis::default()
+                        .style(Style::default().fg(Color::DarkGray))
+                        .bounds([0.0, max_rate])
+                        .labels(rate_axis_labels(max_rate)),
+                );
+            frame.render_widget(chart, cols[1]);
+        }
+    }
+
+    /// Centre-modal overlay listing `docker top` rows. Same dimensions
+    /// as the help/error modals so the visual language stays consistent.
+    fn render_top_modal(&self, frame: &mut Frame<'_>) {
+        use ratatui::widgets::Clear;
+        let area = frame.area();
+        let modal_width = (area.width.saturating_sub(4)).clamp(60, 140);
+        let modal_height = (area.height.saturating_sub(4)).clamp(8, 30);
+        let x = (area.width.saturating_sub(modal_width)) / 2;
+        let y = (area.height.saturating_sub(modal_height)) / 2;
+        let modal_area = Rect {
+            x,
+            y,
+            width: modal_width,
+            height: modal_height,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Cyan))
+            .title(" processes (docker top — esc to close) ");
+        frame.render_widget(Clear, modal_area);
+
+        if self.top_loading && self.top.is_none() {
+            let body = Paragraph::new("(loading…)")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block);
+            frame.render_widget(body, modal_area);
+            return;
+        }
+
+        let Some(table) = self.top.as_ref() else {
+            return;
+        };
+        if table.processes.is_empty() {
+            let body = Paragraph::new("(no processes — container exited?)")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block);
+            frame.render_widget(body, modal_area);
+            return;
+        }
+        // Compute per-column widths from the longest cell in each column
+        // (titles + rows). Cap each column to 24 so a single huge `CMD`
+        // doesn't crowd everything else off-screen.
+        let n_cols = table
+            .titles
+            .len()
+            .max(table.processes.iter().map(Vec::len).max().unwrap_or(0));
+        let mut widths_chars: Vec<usize> = vec![0; n_cols];
+        for (i, t) in table.titles.iter().enumerate() {
+            if let Some(w) = widths_chars.get_mut(i) {
+                *w = (*w).max(t.chars().count());
+            }
+        }
+        for row in &table.processes {
+            for (i, cell) in row.iter().enumerate() {
+                if let Some(w) = widths_chars.get_mut(i) {
+                    *w = (*w).max(cell.chars().count().min(48));
+                }
+            }
+        }
+        let widths: Vec<Constraint> = widths_chars
+            .iter()
+            .map(|w| Constraint::Length(u16::try_from(*w + 2).unwrap_or(u16::MAX)))
+            .collect();
+        let header = Row::new(
+            table
+                .titles
+                .iter()
+                .map(|t| Cell::from(t.clone()).style(bold()))
+                .collect::<Vec<_>>(),
+        );
+        let rows: Vec<Row<'_>> = table
+            .processes
+            .iter()
+            .map(|p| Row::new(p.iter().map(|c| Cell::from(c.clone())).collect::<Vec<_>>()))
+            .collect();
+        let widget = Table::new(rows, widths).header(header).block(block);
+        frame.render_widget(widget, modal_area);
     }
 
     /// Top "card" — image, state, command, restart info, live gauges.
@@ -401,6 +783,72 @@ fn parse_unix_seconds(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(days * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// Build x-axis tick labels for the rolling window. Three ticks: oldest,
+/// midpoint, newest. Labels are minutes:seconds relative to "now".
+fn time_axis_labels(xmin: f64, xmax: f64) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let span = (xmax - xmin).max(1.0);
+    let oldest = format!("-{:.0}m", (span / 60.0).floor());
+    let middle = format!("-{:.0}m", (span / 120.0).floor());
+    vec![
+        Span::styled(oldest, dim),
+        Span::styled(middle, dim),
+        Span::styled("now".to_string(), dim),
+    ]
+}
+
+fn percent_axis_labels(max: f64, uncapped: bool) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    if uncapped {
+        vec![
+            Span::styled("0".to_string(), dim),
+            Span::styled(format!("{:.0}M", max / 2.0), dim),
+            Span::styled(format!("{max:.0}M"), dim),
+        ]
+    } else {
+        vec![
+            Span::styled("0%".to_string(), dim),
+            Span::styled(format!("{:.0}%", max / 2.0), dim),
+            Span::styled(format!("{max:.0}%"), dim),
+        ]
+    }
+}
+
+fn rate_axis_labels(max: f64) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let half = max / 2.0;
+    vec![
+        Span::styled("0".to_string(), dim),
+        Span::styled(format_rate(half), dim),
+        Span::styled(format_rate(max), dim),
+    ]
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn format_rate(bytes_per_sec: f64) -> String {
+    if bytes_per_sec < 1024.0 {
+        format!("{bytes_per_sec:.0}B/s")
+    } else if bytes_per_sec < 1024.0 * 1024.0 {
+        format!("{:.1}KB/s", bytes_per_sec / 1024.0)
+    } else if bytes_per_sec < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1}MB/s", bytes_per_sec / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2}GB/s", bytes_per_sec / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+/// Background-friendly `docker top` fetch — runs off the event loop
+/// so a slow daemon doesn't freeze the TUI.
+pub async fn fetch_top(
+    ops: Arc<dyn DockerOps>,
+    host: Host,
+    container: String,
+) -> Result<ProcessTable, String> {
+    ops.top_container(&host, &container)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Background-friendly fetch — `'static + Send` so it can be `tokio::spawn`-ed.

@@ -173,8 +173,9 @@ impl HostsState {
                 HostStatus::Ok(_) => None,
             });
         let footer = match selected_error {
-            Some(err) => Paragraph::new(format!("⚠ {err}"))
-                .style(Style::default().fg(Color::Yellow)),
+            Some(err) => {
+                Paragraph::new(format!("⚠ {err}")).style(Style::default().fg(Color::Yellow))
+            }
             None => filter_footer(
                 &self.filter,
                 "q quit · ↑↓ select · enter detail · r refresh · ? help",
@@ -421,12 +422,12 @@ services:
         ops.push_container_stats(Ok(ContainerStats {
             cpu_pct: 50.0,
             mem_used: 100 * 1024 * 1024,
-            mem_limit: None,
+            ..Default::default()
         }));
         ops.push_container_stats(Ok(ContainerStats {
             cpu_pct: 25.0,
             mem_used: 200 * 1024 * 1024,
-            mem_limit: None,
+            ..Default::default()
         }));
         // host-b: version errors → no further calls expected
         ops.push_version(Err(DockerError::FakeExhausted("test")));
