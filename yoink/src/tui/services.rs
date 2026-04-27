@@ -56,13 +56,17 @@ impl ServicesState {
     /// Refresh data is shared with the dashboard — the caller hands us
     /// the latest `StatusReport` so we don't fetch a second time per
     /// tick. `service_names` reflects the config's declared order.
+    /// `report = None` means the underlying fetch failed (host
+    /// unreachable, etc.); we still flip `loaded = true` so the pane
+    /// renders rows from the config (with running=0/N) instead of
+    /// hanging on `(loading…)` indefinitely.
     pub fn apply(&mut self, report: Option<StatusReport>, service_names: Vec<String>) {
+        self.service_names = service_names;
+        self.loaded = true;
         if let Some(r) = report {
             self.report = Some(r);
-            self.service_names = service_names;
-            self.loaded = true;
-            clamp_selection(&mut self.table, self.service_names.len());
         }
+        clamp_selection(&mut self.table, self.service_names.len());
     }
 
     pub fn select_next(&mut self) {
@@ -245,10 +249,14 @@ impl ServiceDetailState {
     /// Apply data from a shared `StatusReport`, filtering down to the
     /// rows for the currently-selected service. `host_users` lets us
     /// reconstruct the `Host` (with ssh user) that the row drills into.
+    /// `report = None` means the underlying fetch failed; we still
+    /// flip `loaded = true` so the pane renders `(no instances)`
+    /// instead of looping on `(loading…)` indefinitely.
     pub fn apply(&mut self, report: Option<Arc<StatusReport>>, config: &Config) {
         let Some(name) = self.service.clone() else {
             return;
         };
+        self.loaded = true;
         if let Some(r) = report {
             let mut rows = Vec::new();
             for host_status in &r.hosts {
@@ -271,7 +279,6 @@ impl ServiceDetailState {
                 }
             }
             self.rows = rows;
-            self.loaded = true;
             clamp_selection(&mut self.table, self.rows.len());
         }
     }
