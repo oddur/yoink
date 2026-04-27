@@ -16,16 +16,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
-use bytes::Bytes;
 use futures_util::StreamExt;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use thiserror::Error;
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
 
 use crate::config::{Config, ServiceConfig};
 use crate::docker;
-use crate::docker_ops::{DockerOps, Host};
+use crate::docker_ops::{DockerError, DockerOps, Host, ImageTarStream};
+use crate::output::format_bytes;
 
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -40,14 +40,14 @@ pub enum BuildError {
          (is the operator logged into the registry? `docker login <registry>`)"
     )]
     DockerPushFailed { service: String, status: String },
-    #[error("`docker save` for {image:?} exited with status {status}")]
-    DockerSaveFailed { image: String, status: String },
-    #[error("`docker load` on {host} failed: {source}")]
-    LoadImage {
-        host: String,
-        #[source]
-        source: Box<crate::docker_ops::DockerError>,
+    #[error("`docker save` for {image:?} exited with status {status}{stderr}", stderr = if .stderr.is_empty() { String::new() } else { format!(":\n{}", .stderr) })]
+    DockerSaveFailed {
+        image: String,
+        status: String,
+        stderr: String,
     },
+    #[error(transparent)]
+    Docker(#[from] DockerError),
     #[error("failed to spawn `{program}`: {source}")]
     Spawn {
         program: String,
@@ -203,10 +203,20 @@ pub async fn save_and_load_to_host(
         .stdout
         .take()
         .expect("piped stdout should always be available");
+    // Drain stderr concurrently into a buffer — surfaces "no such image"
+    // and similar diagnostics in the failure path; otherwise the caller
+    // only sees the exit code.
+    let stderr = child
+        .stderr
+        .take()
+        .expect("piped stderr should always be available");
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = String::new();
+        let _ = tokio::io::BufReader::new(stderr).read_to_string(&mut buf).await;
+        buf
+    });
 
-    // Wrap stdout in a Stream<Item = Result<Bytes, io::Error>>. Tap
-    // every chunk for progress reporting; callers see live byte
-    // counts as the tarball flows.
     let total = Arc::new(AtomicU64::new(0));
     let total_clone = Arc::clone(&total);
     let mut on_progress = on_progress;
@@ -217,26 +227,19 @@ pub async fn save_and_load_to_host(
             on_progress(n);
         }
     });
-
-    let body: std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
-    > = Box::pin(stream);
-
-    ops.load_image(host, body)
-        .await
-        .map_err(|source| BuildError::LoadImage {
-            host: host.address.clone(),
-            source: Box::new(source),
-        })?;
+    let body: ImageTarStream = Box::pin(stream);
+    ops.load_image(host, body).await?;
 
     let status = child.wait().await.map_err(|source| BuildError::Spawn {
         program: "docker".into(),
         source,
     })?;
+    let stderr_text = stderr_task.await.unwrap_or_default();
     if !status.success() {
         return Err(BuildError::DockerSaveFailed {
             image: image_ref.to_string(),
             status: status.to_string(),
+            stderr: stderr_text.trim().to_string(),
         });
     }
     Ok(total.load(Ordering::Relaxed))
@@ -271,8 +274,16 @@ pub async fn load_images_to_hosts(
         }
     }
 
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
     for (image_ref, host_cfgs) in &by_image {
-        let multi = MultiProgress::new();
+        // Hide the progress draw target on non-TTY (CI logs); the
+        // steady-tick wakeups still happen but indicatif batches them
+        // off-screen so it doesn't pollute the captured output.
+        let multi = if interactive {
+            MultiProgress::new()
+        } else {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        };
         let style = ProgressStyle::with_template(
             "{spinner:.green} {prefix:<24} {bytes:>10} @ {bytes_per_sec:>10}  {wide_msg}",
         )
@@ -282,7 +293,9 @@ pub async fn load_images_to_hosts(
             let host = Host::from(*host_cfg);
             let bar = multi.add(ProgressBar::new_spinner().with_style(style.clone()));
             bar.set_prefix(format!("{} → {}", short_image(image_ref), host.address));
-            bar.enable_steady_tick(std::time::Duration::from_millis(100));
+            if interactive {
+                bar.enable_steady_tick(std::time::Duration::from_millis(100));
+            }
             let bar_for_progress = bar.clone();
             let image_ref = image_ref.clone();
             async move {
@@ -291,7 +304,8 @@ pub async fn load_images_to_hosts(
                 })
                 .await
                 .with_context(|| format!("save+load {image_ref} → {}", host.address))?;
-                bar.finish_with_message(format!("done · {}", indicatif::HumanBytes(total)));
+                let signed = i64::try_from(total).unwrap_or(i64::MAX);
+                bar.finish_with_message(format!("done · {}", format_bytes(signed)));
                 anyhow::Ok(())
             }
         });

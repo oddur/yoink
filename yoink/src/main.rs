@@ -415,13 +415,15 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             cmd_up(
                 &config,
-                &services,
-                &tag,
-                allow_dirty,
-                dry_run,
-                format,
-                no_registry,
-                build,
+                UpOptions {
+                    services: &services,
+                    tag_args: &tag,
+                    allow_dirty,
+                    dry_run,
+                    format,
+                    no_registry,
+                    build,
+                },
             )
             .await
         }
@@ -431,7 +433,19 @@ async fn run(cli: Cli) -> Result<()> {
             allow_dirty,
             no_cache,
             push,
-        } => cmd_build(&config, &services, &tag, allow_dirty, no_cache, push).await,
+        } => {
+            cmd_build(
+                &config,
+                BuildOptions {
+                    services: &services,
+                    tag_args: &tag,
+                    allow_dirty,
+                    no_cache,
+                    push,
+                },
+            )
+            .await
+        }
         Command::Status { json } => cmd_status(&config, json).await,
         Command::Rollback { service, tag } => cmd_rollback(&config, service, tag).await,
         Command::Prune { dry_run } => cmd_prune(&config, dry_run).await,
@@ -502,23 +516,33 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
     Ok(())
 }
 
-// TODO: bundle the flags into an `UpOptions` struct before the next
-// deploy-flag addition. Already noted in the post-v0.7.0 /simplify
-// pass; allowing here so the flag landing for the indie loop isn't
-// blocked by a refactor.
-#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
-async fn cmd_up(
-    config: &Config,
-    services: &[String],
-    tag_args: &[String],
+// `UpOptions` mirrors the `up` subcommand's flags 1:1. The bool count
+// is the actual CLI surface; rolling them into an enum would just hide
+// the same surface area at higher cognitive cost.
+#[allow(clippy::struct_excessive_bools)]
+struct UpOptions<'a> {
+    services: &'a [String],
+    tag_args: &'a [String],
     allow_dirty: bool,
     dry_run: bool,
     format: DryRunFormat,
     no_registry: bool,
     build: bool,
-) -> Result<()> {
+}
+
+#[allow(clippy::too_many_lines)] // borderline (6 lines over); split if it grows further
+async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
     use yoink::docker_ops::Host;
     use yoink::lock::HostLock;
+    let UpOptions {
+        services,
+        tag_args,
+        allow_dirty,
+        dry_run,
+        format,
+        no_registry,
+        build,
+    } = up;
 
     // Wrap in Arc so the heartbeat tasks (one per host lock) can hold
     // their own clone for the duration of the deploy.
@@ -708,17 +732,25 @@ fn parse_tag_overrides(
     Ok(out)
 }
 
-/// `yoink build` — run `docker build` for every selected service that
-/// declares a `build:` block. Tags the result on the operator's
-/// local daemon as `<image>:<tag>`, ready for `yoink up --no-registry`.
-async fn cmd_build(
-    config: &Config,
-    services: &[String],
-    tag_args: &[String],
+struct BuildOptions<'a> {
+    services: &'a [String],
+    tag_args: &'a [String],
     allow_dirty: bool,
     no_cache: bool,
     push: bool,
-) -> Result<()> {
+}
+
+/// `yoink build` — run `docker build` for every selected service that
+/// declares a `build:` block. Tags the result on the operator's
+/// local daemon as `<image>:<tag>`, ready for `yoink up --no-registry`.
+async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
+    let BuildOptions {
+        services,
+        tag_args,
+        allow_dirty,
+        no_cache,
+        push,
+    } = build;
     let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
     let services_filter = services_filter(services);
     let explicit_services = services_filter.is_some();
@@ -828,13 +860,15 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
     let tag_args = std::slice::from_ref(&tag_arg);
     cmd_up(
         config,
-        services_arg,
-        tag_args,
-        true,
-        false,
-        DryRunFormat::Text,
-        false,
-        false,
+        UpOptions {
+            services: services_arg,
+            tag_args,
+            allow_dirty: true,
+            dry_run: false,
+            format: DryRunFormat::Text,
+            no_registry: false,
+            build: false,
+        },
     )
     .await
 }

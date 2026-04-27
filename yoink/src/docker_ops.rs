@@ -360,6 +360,14 @@ pub enum LogStream {
     Stderr,
 }
 
+/// Body shape for `DockerOps::load_image` — a chunked stream of
+/// `Bytes` (typically wrapping `docker save`'s stdout via
+/// `tokio_util::io::ReaderStream`). Pinned + boxed so the trait
+/// stays object-safe.
+pub type ImageTarStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+>;
+
 /// The async surface every consumer of Docker uses. Methods take a `&Host`
 /// so the same trait object can drive multiple remote daemons.
 #[async_trait]
@@ -413,24 +421,12 @@ pub trait DockerOps: Send + Sync {
     ) -> Result<(), DockerError>;
 
     /// Stream a `docker save`-style tarball into the host's docker
-    /// daemon (`POST /images/load`). The body is the same format as
-    /// the operator's local `docker save IMAGE` would produce.
-    /// Powers the `--no-registry` deploy path: build locally, save
-    /// to a tarball, ship it over ssh, load on the host. No registry
-    /// involved.
-    ///
-    /// Body comes in as a stream of byte chunks (typically wrapping
-    /// `docker save`'s stdout via `tokio_util::io::ReaderStream`) so
-    /// memory stays bounded by chunk size, not image size.
+    /// daemon (`POST /images/load`). Body is a `Stream<Bytes>` so
+    /// memory stays bounded by the chunk size, not the image size.
     async fn load_image(
         &self,
         host: &Host,
-        body: std::pin::Pin<
-            Box<
-                dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
-                    + Send,
-            >,
-        >,
+        body: ImageTarStream,
     ) -> Result<(), DockerError>;
 
     /// `true` if `image:tag` is already present in the host's local
@@ -929,12 +925,7 @@ impl DockerOps for RealDockerOps {
     async fn load_image(
         &self,
         host: &Host,
-        body: std::pin::Pin<
-            Box<
-                dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
-                    + Send,
-            >,
-        >,
+        body: ImageTarStream,
     ) -> Result<(), DockerError> {
         use bollard::query_parameters::ImportImageOptions;
         let docker = self.client_for(host).await?;
@@ -2082,12 +2073,7 @@ impl DockerOps for FakeDockerOps {
     async fn load_image(
         &self,
         host: &Host,
-        _body: std::pin::Pin<
-            Box<
-                dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
-                    + Send,
-            >,
-        >,
+        _body: ImageTarStream,
     ) -> Result<(), DockerError> {
         let mut s = self.lock();
         s.calls.push(RecordedCall::LoadImage(host.clone()));
