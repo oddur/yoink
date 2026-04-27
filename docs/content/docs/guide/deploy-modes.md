@@ -1,17 +1,24 @@
 ---
-title: Three deploy modes
+title: Deploy modes
 weight: 2
 ---
 
-Yoink supports three ways of getting a container image to a host. Pick the one that fits your setup; they're not mutually exclusive (mix per-service or per-environment).
+Yoink treats **where the image is built** and **how it gets to the host** as independent choices. Both axes are first-class — pick the combination that fits, mix per-service or per-environment.
 
-| | Image origin | Build | Distribution | When it fits |
-|---|---|---|---|---|
-| **CI-built (default)** | CI builds + pushes on every commit | external | `docker pull` from registry | Production with multiple hosts and an existing CI/CD pipeline |
-| **Local-build, kamal-style** | Operator's machine | `yoink build --push` | `docker pull` from registry | Indie / one-person team that wants the full deploy loop in one tool, willing to keep a registry |
-| **Standalone (no registry)** | Operator's machine | `yoink up --build --no-registry` (one command) | `docker save \| docker load` over ssh | Rapid iteration on a single host; air-gapped; low-ceremony tools/utilities |
+**Build origin:**
+- **In CI.** GitHub Actions / GitLab / etc. builds and tags the image on every merge. Operator config has no `build:` block — yoink just pulls and rolls. Fits production with an existing CI/CD pipeline.
+- **On the operator's machine.** A `build:` block on the service tells yoink to run `docker build` locally before deploying. Same `yoink up` flow either way; a config can mix CI-built infrastructure (`caddy`, `redis`) with locally-built app code. Fits indie / one-person teams and rapid local iteration.
 
-Pick by service if you want — `yoink build` only runs against services with a `build:` block, so a config can mix CI-built infrastructure (`caddy`, `redis`) with locally-built app code.
+**Distribution:**
+- **Via a container registry.** The standard path: `docker push` to a registry (real, self-hosted, or pull-through), `docker pull` from each host. Registry-protocol dedup means only changed layers cross the wire. Fits multi-host production, audit, and tag-based rollback.
+- **Direct to host, no registry.** `--no-registry` ships the locally-built image straight to each host over SSH. By default this uses an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar so you still get layer-level dedup — only the changed blobs cross the wire on redeploy. Fits rapid iteration, hobby/indie/prototype hosts, and air-gapped environments where opening a registry is overkill.
+
+| Build origin → / Distribution ↓ | In CI | On operator's machine |
+|---|---|---|
+| **Via registry** | CI pushes, hosts pull. The default for production. | `yoink build --push` then `yoink up`. Kamal-style. |
+| **Direct to host (no registry)** | Less common, but valid: CI builds then runs `yoink up --no-registry --transport=unregistry --tag api=<sha>`. | `yoink up --build --no-registry`, one command. The standalone loop. |
+
+The four cells share a deploy engine — drift detection, healthcheck-gated rolling swap, dependency-ordered waves work the same regardless of how the image arrived.
 
 ## CI-built — the default
 
@@ -75,22 +82,48 @@ yoink build my-tool                                # docker build → tag local 
 yoink up --no-registry --service my-tool           # save+load to each host
 ```
 
-What `--no-registry` does: for every (service, host) the deploy targets, yoink streams `docker save <image>:<tag>` from the operator's local docker daemon directly into the host's docker daemon via the same ssh+bollard transport that `up` already uses (calling `POST /images/load`). After the load completes, the host has the image cached and the rest of the deploy flow (which already short-circuits when an image is locally present) runs unchanged — healthcheck-gated rolling swap, drift detection, the works.
+What `--no-registry` does: for every (service, host) the deploy targets, yoink ships the locally-built image to the host without any external registry. By default it uses the **unregistry transport** (described below); pass `--transport tarball` to opt out and use the legacy whole-image stream.
 
-Per-host progress bars track bytes transferred + rate live:
+### How the unregistry transport works (default)
+
+For each host:
+
+1. yoink starts an ephemeral [`ghcr.io/psviderski/unregistry`](https://github.com/psviderski/unregistry) sidecar container on the host. Unregistry is a tiny OCI registry that reads/writes the host's image store directly via the containerd socket — no separate blob storage, images land in `docker images` immediately on push.
+2. yoink opens an SSH-tunnelled local port to the sidecar.
+3. yoink reads the image bytes from the operator's docker daemon (via `docker save`-style export over the local socket) and pushes blob-by-blob over the SSH tunnel using the standard OCI registry HTTP protocol — `HEAD` first, `PUT` only if missing. **Layer-level dedup means redeploys only ship the layers that actually changed**, the same way pushing to a real registry would.
+4. The sidecar is `--rm` and is also force-removed by name on the next `up` run via a label sweep, so a crashed deploy doesn't leak.
+
+The push runs entirely from the operator process — yoink never invokes `docker push` on the operator's daemon. This matters on macOS Docker Desktop (and Rancher Desktop / Colima): the daemon lives in a Linux VM, so a `docker push 127.0.0.1:<port>/...` from the daemon would hit the VM's loopback, not the operator's. By pushing from the operator process directly, yoink works on every platform without `insecure-registries` config.
+
+Concurrency: blob pushes per image run with a small parallelism (4) to overlap HEAD round-trips with PUT bodies. Multi-host fan-out across services is fully concurrent (`try_join_all` per image), so deploy time = max(per-host) instead of sum(per-host).
 
 ```
-⠋ api:dev → backtrack-eu-1     234.5 MiB @  47.0 MiB/s
-⠋ api:dev → backtrack-eu-2      56.0 MiB @  11.2 MiB/s
-✓ web:dev → backtrack-eu-1     done · 89.3 MiB
+✓ api:dev → host-1     done · unregistry
+✓ api:dev → host-2     done · unregistry
+✓ web:dev → host-1     done · unregistry
 ```
 
-Multi-host fan-out is fully concurrent (`try_join_all` per image): each host gets its own `docker save` process + its own bollard connection, so deploy time = max(per-host) instead of sum(per-host).
+If the unregistry setup fails for any reason (host can't pull the unregistry image, ssh forward refused, …), `--transport=auto` (the default) falls back to the tarball transport with a single warning line and continues. Use `--transport=unregistry` to make those failures hard errors instead.
+
+### Tarball transport (opt-out)
+
+```sh
+yoink up --build --no-registry --transport tarball
+```
+
+For each (service, host), streams `docker save <image>:<tag>` from the operator's local docker daemon directly into the host's docker daemon via the same ssh+bollard transport that `up` already uses (calling `POST /images/load`). The whole image crosses the wire every deploy — no dedup. Slower than unregistry on redeploy, but has zero dependencies on the host beyond docker. Useful when you can't pull the unregistry image (truly air-gapped hosts) or when you want to debug a transport issue.
+
+Per-host progress bars track bytes transferred + rate live in tarball mode:
+
+```
+⠋ api:dev → host-1     234.5 MiB @  47.0 MiB/s (tarball)
+✓ web:dev → host-1     done · 89.3 MiB (tarball)
+```
 
 {{< callout type="info" >}}
 **Standalone mode fits when**: rapid iteration on a single host; hobby/indie/prototype deployments; air-gapped or restricted-network hosts.
 
-**It doesn't fit when**: many hosts (N hosts = N save+load streams; a registry is a hub); large images (every deploy ships the full tarball over ssh per host); you want rollback by tag (registry keeps every pushed tag indefinitely; local docker cache doesn't); auditability matters.
+**It doesn't fit when**: many hosts (a registry is naturally a hub); you want rollback by tag (registry keeps every pushed tag indefinitely; local docker cache doesn't); auditability matters.
 {{< /callout >}}
 
 ## Self-hosted registry as a yoink service

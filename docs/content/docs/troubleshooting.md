@@ -33,7 +33,7 @@ Run `yoink preflight` to get a classified error. The two common cases:
 
 **Tailscale SSH "additional check required":**
 ```
-✗ backtrack-eu-1: ssh probe failed: Tailscale SSH requires an additional
+✗ host-1: ssh probe failed: Tailscale SSH requires an additional
   check — open this URL in a browser, then re-run:
     https://login.tailscale.com/a/<token>
 ```

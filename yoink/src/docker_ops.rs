@@ -1850,7 +1850,7 @@ async fn collect_stdout_stderr(
 
 /// Cheap random hex suffix for one-shot probe container names so two
 /// concurrent deploys can't collide.
-fn rand_hex() -> String {
+pub(crate) fn rand_hex() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
