@@ -21,7 +21,8 @@ yoink rollback api        # roll back to the previous version
   {{< card link="/docs/intro/compared" title="Is this for me?" subtitle="Side-by-side matrix vs Kamal, Coolify, Dokku, Komodo, Kubernetes, plain compose. When yoink is the right answer, when it isn't." icon="adjustments" >}}
   {{< card link="/docs/guide/deploy-modes" title="Three deploy modes" subtitle="CI-built, local-build push-then-deploy, no-registry standalone." icon="server" >}}
   {{< card link="/docs/guide/security-defaults" title="Secure by default" subtitle="non-root uid, cap_drop=ALL, read-only rootfs, no-new-privileges, init=tini, …" icon="shield-check" >}}
-  {{< card link="/docs/recipes" title="Recipes" subtitle="Staging alongside prod, self-hosted registry, Infisical secrets, PR-comment dry-run." icon="clipboard-list" >}}
+  {{< card link="/docs/recipes/ai-agents" title="Driving yoink from an AI agent" subtitle="CLI + YAML, no GUI. Patterns for Claude Code, Cursor, GitHub Actions." icon="terminal" >}}
+  {{< card link="/docs/recipes" title="Recipes" subtitle="Staging alongside prod, sealed secrets, Cloudflare origin certs, Caddy snippets." icon="clipboard-list" >}}
   {{< card link="/docs/reference" title="Reference" subtitle="Every CLI flag, every config field, every TUI keybind." icon="document-text" >}}
 {{< /cards >}}
 

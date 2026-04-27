@@ -8,6 +8,7 @@ sidebar:
 Task-oriented how-tos. Each recipe stands alone — pick the one that matches what you're doing.
 
 {{< cards cols="2" >}}
+  {{< card link="/docs/recipes/ai-agents" title="Driving yoink from an AI agent" subtitle="CLI + YAML, no GUI, deterministic exit codes. Patterns for Claude Code, Cursor, Aider, GitHub Copilot Workspace." icon="terminal" >}}
   {{< card link="/docs/recipes/sealed-secrets" title="Sealed secrets (age)" subtitle="The default. Commit secrets.age, decrypt with one key. No remote vault needed." icon="lock-closed" >}}
   {{< card link="/docs/recipes/age-in-github-actions" title="AGE secrets in GitHub Actions" subtitle="Generate a CI-only identity, paste into a GitHub secret, deploy. One env var." icon="lightning-bolt" >}}
   {{< card link="/docs/recipes/cloudflare-origin-certs" title="Cloudflare Origin Certificates" subtitle="Skip Let's Encrypt — 15-year cert + origin-pull mTLS that locks your origin to Cloudflare's edge." icon="cloud" >}}
