@@ -9,15 +9,18 @@
 //! This is the "I just want to get this thing running on a host"
 //! path: no CI, no registry, no auth dance.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use anyhow::Context as _;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::config::{Config, ServiceConfig};
 use crate::docker;
+use crate::docker_ops::{DockerOps, Host};
 
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -55,9 +58,27 @@ fn resolve_relative_to_config(config: &Config, p: &str) -> PathBuf {
     }
 }
 
-/// Run `docker build` for one service. The image is tagged as
-/// `<image>:<tag>` on the operator's local docker daemon. Returns
-/// when the build succeeds; surfaces stderr verbatim on failure.
+/// Resolve a service's effective tag for a build/deploy: a `--tag`
+/// override wins, otherwise the config-pinned `tag:`. Errors with a
+/// helpful message if neither is present.
+pub fn resolve_service_tag(
+    svc: &ServiceConfig,
+    overrides: &BTreeMap<String, String>,
+) -> anyhow::Result<String> {
+    overrides
+        .get(&svc.name)
+        .cloned()
+        .or_else(|| svc.tag.clone())
+        .with_context(|| {
+            format!(
+                "service {:?} has no `tag:` set and no `--tag {}=…` override",
+                svc.name, svc.name
+            )
+        })
+}
+
+/// Build one service, tagging the result on the operator's local
+/// daemon as `<image>:<tag>`. Stderr surfaces verbatim on failure.
 pub async fn build_service(
     config: &Config,
     service: &ServiceConfig,
@@ -147,6 +168,60 @@ pub async fn save_image_locally(image_ref: &str) -> Result<bytes::Bytes, BuildEr
         });
     }
     Ok(bytes::Bytes::from(buf))
+}
+
+/// Pre-flight for `yoink up --no-registry`: for every selected
+/// service × applicable host, `docker save` the local image and
+/// stream it into the host's docker daemon. After this returns, the
+/// host has the image cached and the reconcile's `image_present`
+/// check short-circuits the would-be-pull.
+///
+/// Per-image: one local `docker save` (deduped via the `BTreeMap`),
+/// then a parallel `try_join_all` of `load_image` calls fan-out to
+/// every applicable host. Sequential per-image (one save in flight
+/// at a time) keeps the operator's local docker daemon from racing
+/// itself.
+pub async fn load_images_to_hosts(
+    ops: &dyn DockerOps,
+    config: &Config,
+    tag_overrides: &BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
+) -> anyhow::Result<()> {
+    // image_ref → applicable HostConfigs. BTreeMap keys dedupe shared
+    // images; the inner Vec keeps `&HostConfig` so `Host::from` does
+    // the right thing without re-scanning by address.
+    let mut by_image: BTreeMap<String, Vec<&crate::config::HostConfig>> = BTreeMap::new();
+    for svc in config.selected_services(services_filter) {
+        let tag = resolve_service_tag(svc, tag_overrides)?;
+        let image_ref = docker::image_reference(&svc.image, &tag);
+        let entry = by_image.entry(image_ref).or_default();
+        for host_cfg in svc.applicable_hosts(&config.hosts) {
+            if !entry.iter().any(|h| h.address == host_cfg.address) {
+                entry.push(host_cfg);
+            }
+        }
+    }
+
+    for (image_ref, host_cfgs) in &by_image {
+        eprintln!(
+            "yoink up --no-registry: docker save {image_ref} → {} host(s)",
+            host_cfgs.len()
+        );
+        let tar = save_image_locally(image_ref)
+            .await
+            .with_context(|| format!("docker save {image_ref}"))?;
+        let loads = host_cfgs.iter().map(|host_cfg| {
+            let host = Host::from(*host_cfg);
+            let tar = tar.clone();
+            async move {
+                ops.load_image(&host, tar)
+                    .await
+                    .with_context(|| format!("docker load on {}", host.address))
+            }
+        });
+        futures_util::future::try_join_all(loads).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

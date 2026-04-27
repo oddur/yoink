@@ -168,8 +168,9 @@ pub struct BuildConfig {
     /// `--target` for multi-stage builds.
     #[serde(default)]
     pub target: Option<String>,
-    /// Extra `--build-arg`-style flags to forward verbatim. Use when
-    /// you need a docker-cli flag yoink doesn't model directly.
+    /// Extra `docker build` flags to forward verbatim, inserted
+    /// before the context arg. Escape hatch for flags yoink doesn't
+    /// model directly (e.g. `--platform`, `--secret`, `--ssh`).
     #[serde(default)]
     pub extra_args: Vec<String>,
 }
@@ -538,6 +539,21 @@ fn local_socket_exists() -> bool {
 }
 
 impl Config {
+    /// Walk `self.services` filtered by an optional name list. `None`
+    /// returns every service in topo order; `Some(&[…])` keeps only
+    /// the named ones (in topo order, not in the order the operator
+    /// listed them — `yoink up --service web --service api` still
+    /// runs api first when api → … → web in the dep graph).
+    /// Used wherever the CLI takes `--service`.
+    pub fn selected_services<'a>(
+        &'a self,
+        filter: Option<&'a [String]>,
+    ) -> impl Iterator<Item = &'a ServiceConfig> {
+        self.services.iter().filter(move |svc| {
+            filter.is_none_or(|names| names.iter().any(|n| n == &svc.name))
+        })
+    }
+
     pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.display().to_string(),

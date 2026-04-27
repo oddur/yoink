@@ -501,11 +501,7 @@ async fn cmd_up(
     let bundle = load_secrets_bundle(config).await?;
     let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
 
-    let services_filter = if services.is_empty() {
-        None
-    } else {
-        Some(services)
-    };
+    let services_filter = services_filter(services);
 
     if dry_run {
         return run_dry_run(
@@ -519,16 +515,12 @@ async fn cmd_up(
         .await;
     }
 
-    // No-registry pre-flight: for each (image, host) pair selected by
-    // the deploy, save the image from the operator's local docker
-    // daemon and stream the tarball into the host's docker via
-    // `docker load`. After this loop runs, the existing reconcile
-    // flow's `image_present` check short-circuits the
-    // would-be-pull. Failures here are deploy-blocking — the
-    // operator either forgot to `yoink build` or the local daemon
-    // isn't reachable.
+    // No-registry pre-flight: save+load every selected image to every
+    // applicable host so the reconcile loop's `image_present` check
+    // short-circuits any registry pull. Failures here block the
+    // deploy ("forgot to `yoink build`?" / local daemon down).
     if no_registry {
-        load_images_to_hosts(
+        yoink::build::load_images_to_hosts(
             ops.as_ref(),
             config,
             &tag_overrides,
@@ -612,6 +604,17 @@ async fn cmd_up(
     Ok(())
 }
 
+/// Convert the CLI's `--service` repeat into the `Option<&[String]>`
+/// shape every downstream caller wants: empty list → no filter →
+/// "every service"; non-empty → filter to those.
+fn services_filter(services: &[String]) -> Option<&[String]> {
+    if services.is_empty() {
+        None
+    } else {
+        Some(services)
+    }
+}
+
 /// Build the `service_name → tag` override map. Each `--tag` argument
 /// is either `name=tag` (override that named service's tag) or a bare
 /// `tag` (applies to every `--service`-selected service). A bare tag
@@ -673,25 +676,17 @@ async fn cmd_build(
     no_cache: bool,
 ) -> Result<()> {
     let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
-    let services_filter: Option<&[String]> = if services.is_empty() {
-        None
-    } else {
-        Some(services)
-    };
+    let services_filter = services_filter(services);
+    let explicit_services = services_filter.is_some();
 
     let mut built_any = false;
-    for svc in &config.services {
-        if let Some(filter) = services_filter
-            && !filter.iter().any(|s| s == &svc.name)
-        {
-            continue;
-        }
+    for svc in config.selected_services(services_filter) {
         if svc.build.is_none() {
-            // When the operator targets a specific service that doesn't
-            // have a build block, that's an error — they expected a
-            // build. When we're iterating over all services, just skip
-            // (image probably comes from a registry).
-            if services_filter.is_some() {
+            // Explicit `--service api` against a service without a
+            // `build:` block is operator error — they expected a
+            // build. Bare `yoink build` (no filter) just skips
+            // registry-only services silently.
+            if explicit_services {
                 anyhow::bail!(
                     "service {:?} has no `build:` block — add one or build the image yourself",
                     svc.name
@@ -699,17 +694,7 @@ async fn cmd_build(
             }
             continue;
         }
-        let tag = tag_overrides
-            .get(&svc.name)
-            .cloned()
-            .or_else(|| svc.tag.clone())
-            .with_context(|| {
-                format!(
-                    "service {:?} has no `tag:` and no `--tag {}=…` override; \
-                     yoink build needs a concrete tag to label the image as",
-                    svc.name, svc.name,
-                )
-            })?;
+        let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
         yoink::build::build_service(config, svc, &tag, no_cache)
             .await
             .with_context(|| format!("build {}", svc.name))?;
@@ -720,72 +705,6 @@ async fn cmd_build(
             "no services with a `build:` block matched. \
              Add `build:` to a service or pass --service to one that has it."
         );
-    }
-    Ok(())
-}
-
-/// Pre-flight for `yoink up --no-registry`: for every selected
-/// service × applicable host, `docker save` the local image and
-/// stream it into the host's docker daemon. After this returns,
-/// the host has the image in its local cache and the reconcile's
-/// `image_present` check short-circuits any registry pull.
-async fn load_images_to_hosts(
-    ops: &dyn DockerOps,
-    config: &Config,
-    tag_overrides: &std::collections::BTreeMap<String, String>,
-    services_filter: Option<&[String]>,
-) -> Result<()> {
-    use std::collections::BTreeSet;
-    use yoink::docker_ops::Host;
-
-    // Build the set of distinct (image, tag) → applicable hosts the
-    // operator wants pre-loaded. Walk service config + tag overrides
-    // exactly like reconcile does so we never miss one or load extras.
-    let mut by_image: std::collections::BTreeMap<String, BTreeSet<String>> =
-        std::collections::BTreeMap::new();
-    for svc in &config.services {
-        if let Some(filter) = services_filter
-            && !filter.iter().any(|s| s == &svc.name)
-        {
-            continue;
-        }
-        let tag = tag_overrides
-            .get(&svc.name)
-            .cloned()
-            .or_else(|| svc.tag.clone())
-            .with_context(|| {
-                format!(
-                    "service {:?} has no `tag:` set and no override; \
-                     --no-registry needs a concrete tag to look up the local image",
-                    svc.name
-                )
-            })?;
-        let image_ref = yoink::docker::image_reference(&svc.image, &tag);
-        let entry = by_image.entry(image_ref).or_default();
-        for host_cfg in svc.applicable_hosts(&config.hosts) {
-            entry.insert(host_cfg.address.clone());
-        }
-    }
-
-    for (image_ref, hosts) in &by_image {
-        eprintln!("yoink up --no-registry: docker save {image_ref} → {} host(s)", hosts.len());
-        let tar = yoink::build::save_image_locally(image_ref)
-            .await
-            .with_context(|| format!("docker save {image_ref}"))?;
-        for addr in hosts {
-            let host = Host {
-                address: addr.clone(),
-                user: config
-                    .hosts
-                    .iter()
-                    .find(|h| &h.address == addr)
-                    .map(|h| h.user.clone())
-                    .unwrap_or_default(),
-            };
-            ops.load_image(&host, tar.clone())
-                .await
-                .with_context(|| format!("docker load on {}", host.address))?;
-        }
     }
     Ok(())
 }
