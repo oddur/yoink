@@ -3653,6 +3653,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22692a6476a21fa75fdfc11d452fda482af402c008cdbaf3476414e122040973"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4960,6 +4971,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tabled",
+ "tar",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",

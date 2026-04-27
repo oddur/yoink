@@ -26,6 +26,10 @@ use crate::config::{Config, ServiceConfig};
 use crate::docker;
 use crate::docker_ops::{DockerError, DockerOps, Host, ImageTarStream};
 use crate::output::format_bytes;
+use crate::transport::{
+    Transport,
+    unregistry::{self, SIDECAR_LABEL, SIDECAR_LABEL_VALUE},
+};
 
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -213,7 +217,9 @@ pub async fn save_and_load_to_host(
     let stderr_task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut buf = String::new();
-        let _ = tokio::io::BufReader::new(stderr).read_to_string(&mut buf).await;
+        let _ = tokio::io::BufReader::new(stderr)
+            .read_to_string(&mut buf)
+            .await;
         buf
     });
 
@@ -261,6 +267,7 @@ pub async fn load_images_to_hosts(
     config: &Config,
     tag_overrides: &BTreeMap<String, String>,
     services_filter: Option<&[String]>,
+    transport: Transport,
 ) -> anyhow::Result<()> {
     let mut by_image: BTreeMap<String, Vec<&crate::config::HostConfig>> = BTreeMap::new();
     for svc in config.selected_services(services_filter) {
@@ -271,6 +278,21 @@ pub async fn load_images_to_hosts(
             if !entry.iter().any(|h| h.address == host_cfg.address) {
                 entry.push(host_cfg);
             }
+        }
+    }
+
+    // Best-effort sweep of leaked unregistry sidecars from previous
+    // crashed deploys. Skipped for the tarball transport since it can't
+    // create them. Errors here are logged-and-ignored — sweeping is a
+    // hygiene step, not a correctness gate.
+    if !matches!(transport, Transport::Tarball) {
+        let unique_hosts: BTreeMap<String, &crate::config::HostConfig> = by_image
+            .values()
+            .flatten()
+            .map(|h| (h.address.clone(), *h))
+            .collect();
+        for host_cfg in unique_hosts.values() {
+            sweep_leaked_sidecars(ops, &Host::from(*host_cfg)).await;
         }
     }
 
@@ -299,19 +321,94 @@ pub async fn load_images_to_hosts(
             let bar_for_progress = bar.clone();
             let image_ref = image_ref.clone();
             async move {
-                let total = save_and_load_to_host(&image_ref, ops, &host, move |n| {
+                deliver_image(transport, ops, &host, &image_ref, &bar, move |n| {
                     bar_for_progress.inc(n);
                 })
                 .await
-                .with_context(|| format!("save+load {image_ref} → {}", host.address))?;
-                let signed = i64::try_from(total).unwrap_or(i64::MAX);
-                bar.finish_with_message(format!("done · {}", format_bytes(signed)));
+                .with_context(|| format!("deliver {image_ref} → {}", host.address))?;
                 anyhow::Ok(())
             }
         });
         futures_util::future::try_join_all(loads).await?;
     }
     Ok(())
+}
+
+/// Per-host dispatch for one image. Returns the bytes-on-wire for the
+/// tarball path (used to drive the progress bar's "done · N MiB" final
+/// label); the unregistry path defers to `docker push`'s own progress
+/// rendering on stderr — bytes-on-wire isn't easily harvested without
+/// parsing, and the registry-protocol dedup means the metric is less
+/// interesting than for tarball anyway.
+async fn deliver_image(
+    transport: Transport,
+    ops: &dyn DockerOps,
+    host: &Host,
+    image_ref: &str,
+    bar: &ProgressBar,
+    on_progress: impl FnMut(u64) + Send + 'static,
+) -> anyhow::Result<()> {
+    match transport {
+        Transport::Tarball => {
+            let total = save_and_load_to_host(image_ref, ops, host, on_progress).await?;
+            let signed = i64::try_from(total).unwrap_or(i64::MAX);
+            bar.finish_with_message(format!("done · {} (tarball)", format_bytes(signed)));
+            Ok(())
+        }
+        Transport::Unregistry => {
+            unregistry::push(ops, host, image_ref).await?;
+            bar.finish_with_message("done · unregistry");
+            Ok(())
+        }
+        Transport::Auto => match unregistry::push(ops, host, image_ref).await {
+            Ok(()) => {
+                bar.finish_with_message("done · unregistry");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!(
+                    "warn: unregistry transport failed for {image_ref} → {}: {e}; \
+                     falling back to tarball",
+                    host.address,
+                );
+                let total = save_and_load_to_host(image_ref, ops, host, on_progress).await?;
+                let signed = i64::try_from(total).unwrap_or(i64::MAX);
+                bar.finish_with_message(format!(
+                    "done · {} (tarball fallback)",
+                    format_bytes(signed)
+                ));
+                Ok(())
+            }
+        },
+    }
+}
+
+/// Force-remove every container labeled
+/// `yoink.role=unregistry-ephemeral` on `host`. Catches sidecars
+/// leaked by a prior `yoink up` that crashed mid-push. Errors are
+/// logged-and-swallowed — this is hygiene, not a gate. The label
+/// scope is narrow enough that we don't bother filtering by age.
+async fn sweep_leaked_sidecars(ops: &dyn DockerOps, host: &Host) {
+    let label = format!("{SIDECAR_LABEL}={SIDECAR_LABEL_VALUE}");
+    let containers = match ops.list_containers_by_label(host, &label).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(
+                "sweep: list_containers_by_label({label}) failed on {}: {e}",
+                host.address
+            );
+            return;
+        }
+    };
+    for c in containers {
+        if let Err(e) = ops.force_remove_container(host, &c.name).await {
+            tracing::warn!(
+                "sweep: failed to remove leaked unregistry sidecar {} on {}: {e}",
+                c.name,
+                host.address
+            );
+        }
+    }
 }
 
 /// Trim a registry-prefixed image to its short form for progress

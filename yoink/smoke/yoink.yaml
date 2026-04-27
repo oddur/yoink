@@ -1,0 +1,23 @@
+# Throwaway yoink.yaml for the unregistry-transport CLI smoke test.
+# Spins up one container running `sleep 3600` on backtrack-eu-1 from a
+# locally-built image, pushed to the host via the unregistry transport.
+# The image is built from ./Dockerfile by `yoink up --build`.
+
+deploy:
+  networks: [yoink-smoke-net]
+
+hosts:
+  - address: backtrack-eu-1
+    user: root
+
+services:
+  - name: yoink-smoke-test
+    image: yoink-smoke-test
+    build:
+      context: .
+      dockerfile: Dockerfile
+    networks: [yoink-smoke-net]
+    run:
+      # No port / no healthcheck — sleep container has no listener.
+      # Kept minimal so the smoke focuses on the image-transport leg.
+      replicas: 1

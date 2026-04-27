@@ -67,12 +67,28 @@ enum Command {
         #[arg(long, value_enum, default_value_t = DryRunFormat::Text)]
         format: DryRunFormat,
         /// Skip the registry-pull step. For each (host, image) pair,
-        /// stream `docker save <image>` from the operator's local
-        /// docker daemon directly into the host's docker via
-        /// `docker load`. Pair with `--build` for the one-shot
+        /// ship the locally-built image to the host directly (no
+        /// external registry). Default transport is `unregistry` (see
+        /// `--transport`). Pair with `--build` for the one-shot
         /// "edit Dockerfile, deploy" loop without CI or a registry.
         #[arg(long)]
         no_registry: bool,
+        /// How `--no-registry` ships images to each host.
+        /// `unregistry` (default via `auto`) spins up an ephemeral
+        /// `ghcr.io/psviderski/unregistry` sidecar on the host, opens
+        /// an SSH-tunnelled local port, and pushes layers over the
+        /// OCI registry protocol — only the layers the host doesn't
+        /// already have cross the wire (massive win on redeploys).
+        /// Push runs from the yoink process directly, so it works
+        /// even on macOS Docker Desktop where the daemon lives in a
+        /// VM. `tarball` opts out: streams the entire `docker save`
+        /// tarball over ssh — slower, no dedup, but zero dependencies
+        /// on the host beyond docker. `auto` tries unregistry first
+        /// and falls back to tarball with a warning if anything in
+        /// the unregistry setup fails (e.g. ghcr unreachable, ssh
+        /// forward refused). Ignored without `--no-registry`.
+        #[arg(long, value_enum, default_value_t = TransportMode::Auto)]
+        transport: TransportMode,
         /// Run `docker build` for any selected service with a
         /// `build:` block before deploying. Eliminates the separate
         /// `yoink build && yoink up` two-step for the standalone
@@ -475,6 +491,7 @@ async fn run(cli: Cli) -> Result<()> {
             dry_run,
             format,
             no_registry,
+            transport,
             build,
         } => {
             cmd_up(
@@ -486,6 +503,7 @@ async fn run(cli: Cli) -> Result<()> {
                     dry_run,
                     format,
                     no_registry,
+                    transport: transport.into(),
                     build,
                 },
             )
@@ -581,7 +599,6 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
     Ok(())
 }
 
-
 // `UpOptions` mirrors the `up` subcommand's flags 1:1. The bool count
 // is the actual CLI surface; rolling them into an enum would just hide
 // the same surface area at higher cognitive cost.
@@ -593,6 +610,7 @@ struct UpOptions<'a> {
     dry_run: bool,
     format: DryRunFormat,
     no_registry: bool,
+    transport: yoink::transport::Transport,
     build: bool,
 }
 
@@ -607,6 +625,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
         dry_run,
         format,
         no_registry,
+        transport,
         build,
     } = up;
 
@@ -658,6 +677,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
             config,
             &tag_overrides,
             services_filter,
+            transport,
         )
         .await?;
     }
@@ -933,6 +953,7 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
             dry_run: false,
             format: DryRunFormat::Text,
             no_registry: false,
+            transport: yoink::transport::Transport::Auto,
             build: false,
         },
     )
@@ -1288,6 +1309,26 @@ enum DryRunFormat {
     Text,
     Markdown,
     Json,
+}
+
+/// CLI shape for `--transport`; mirrors `yoink::transport::Transport` so
+/// the value-enum stays bound to the binary surface.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum TransportMode {
+    #[default]
+    Auto,
+    Unregistry,
+    Tarball,
+}
+
+impl From<TransportMode> for yoink::transport::Transport {
+    fn from(m: TransportMode) -> Self {
+        match m {
+            TransportMode::Auto => Self::Auto,
+            TransportMode::Unregistry => Self::Unregistry,
+            TransportMode::Tarball => Self::Tarball,
+        }
+    }
 }
 
 impl From<DryRunFormat> for yoink::diff::Format {
@@ -2075,9 +2116,8 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
 fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
     use yoink::sealed;
     let (secret, public) = sealed::keygen();
-    let recipient_block = format!(
-        "  secrets:\n    provider: age\n    recipients:\n      - {public}"
-    );
+    let recipient_block =
+        format!("  secrets:\n    provider: age\n    recipients:\n      - {public}");
     let Some(path) = out else {
         // No --out: print the secret to stdout. Operator decides
         // where to save (typically a gitignored file alongside the
@@ -2129,8 +2169,8 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
     let (file_override, recipients) = expect_age_block(config)?;
     let path = sealed::resolve_sealed_path(config, file_override.as_deref());
     let plaintext = if path.exists() {
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("read sealed file {}", path.display()))?;
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
         let identity = sealed::load_identity()?;
         sealed::unseal(&bytes, &identity)?
     } else {
@@ -2152,8 +2192,8 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
         unreachable!()
     };
     let path = sealed::resolve_sealed_path(config, file.as_deref());
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("read sealed file {}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
     let identity = sealed::load_identity()?;
     let plaintext = sealed::unseal(&bytes, &identity)?;
     let parsed = sealed::parse_dotenv(&plaintext)?;
@@ -2167,16 +2207,13 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_secrets_seal(
-    config: &Config,
-    input: Option<&Path>,
-    out: Option<PathBuf>,
-) -> Result<()> {
+fn cmd_secrets_seal(config: &Config, input: Option<&Path>, out: Option<PathBuf>) -> Result<()> {
     use yoink::sealed;
     let (file_override, recipients) = expect_age_block(config)?;
     let plaintext = match input {
-        Some(p) if p.as_os_str() != "-" => std::fs::read_to_string(p)
-            .with_context(|| format!("read input {}", p.display()))?,
+        Some(p) if p.as_os_str() != "-" => {
+            std::fs::read_to_string(p).with_context(|| format!("read input {}", p.display()))?
+        }
         _ => {
             use std::io::Read;
             let mut buf = String::new();
@@ -2187,8 +2224,8 @@ fn cmd_secrets_seal(
     let parsed = sealed::parse_dotenv(&plaintext)?;
     let canonical = sealed::render_dotenv(&parsed);
     let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
-    let target = out
-        .unwrap_or_else(|| sealed::resolve_sealed_path(config, file_override.as_deref()));
+    let target =
+        out.unwrap_or_else(|| sealed::resolve_sealed_path(config, file_override.as_deref()));
     sealed::write_atomically(&target, &sealed_bytes)?;
     println!("sealed {} key(s) to {}", parsed.len(), target.display());
     Ok(())
@@ -2207,8 +2244,8 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     }
 
     // Decrypt with the current identity before generating the new key.
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("read sealed file {}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
     let identity = sealed::load_identity()?;
     let plaintext = sealed::unseal(&bytes, &identity)?;
     let parsed = sealed::parse_dotenv(&plaintext)?;
@@ -2249,9 +2286,7 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn expect_secrets_provider_age(
-    config: &Config,
-) -> Result<&yoink::config::SecretsConfig> {
+fn expect_secrets_provider_age(config: &Config) -> Result<&yoink::config::SecretsConfig> {
     use yoink::config::SecretsConfig;
     match config.secrets.as_ref() {
         Some(s @ SecretsConfig::Age { .. }) => Ok(s),
@@ -2348,8 +2383,7 @@ fn write_scratch_file(path: &Path, contents: &[u8]) -> Result<()> {
 
     #[cfg(not(unix))]
     {
-        std::fs::write(path, contents)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
         Ok(())
     }
 }

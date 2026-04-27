@@ -33,7 +33,7 @@ Kamal is the closest neighbor — both are "ship a Rust/Ruby binary, ssh into ho
 | Resource limits | k8s-style (`"500m"`, `"2Gi"`) | docker-style (`cpus: 2`, `memory: 1g`) |
 | Per-service `pids_limit` | ✓ | ✗ |
 | Secure-by-default RunOptions | ✓ (cap_drop=ALL, no-new-privileges, read_only=true, pids_limit=1024, init=tini, tmpfs noexec, binds default :ro) | ✗ (docker defaults) |
-| No-registry deploy | ✓ (`yoink up --build --no-registry` streams `docker save` over ssh) | ✗ (registry required) |
+| No-registry deploy | ✓ (`yoink up --build --no-registry` runs an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar on the host and pushes only the missing layers via SSH; tarball fallback) | ✗ (registry required) |
 | Maturity | New (born 2026) | Mature (born 2023, used at 37signals scale) |
 | Ecosystem | Rust-built, opinionated for "I run a few heterogeneous services" | Ruby/Rails ecosystem, `rails new` → `kamal init` is the canonical Rails deploy story today |
 
