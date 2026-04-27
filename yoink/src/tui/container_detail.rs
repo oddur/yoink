@@ -287,12 +287,13 @@ impl ContainerDetailState {
         }
     }
 
-    /// Side-by-side line charts for the rolling 5-minute window. Left:
-    /// CPU% (cyan) + Mem% (magenta). Right: network rx (green) + tx
-    /// (yellow), bytes-per-second derived from successive samples.
-    /// Both panels render an axis label legend; empty data falls back
-    /// to a "(collecting…)" centred line so the panel doesn't look broken
-    /// in the first 2-3 seconds before the first stats sample lands.
+    /// Three side-by-side line charts covering the rolling 5-minute
+    /// window — one each for CPU%, Mem (% when capped, MB when not),
+    /// and network rx/tx rate. Splitting CPU and Mem into separate
+    /// panels means each y-axis scales to its own metric: a 4 GB
+    /// memory peak no longer flattens the CPU line into the bottom
+    /// pixel row. The latest sampled value is rendered in each panel
+    /// title so it's readable without squinting at the rightmost edge.
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -301,23 +302,29 @@ impl ContainerDetailState {
     fn render_history(&self, frame: &mut Frame<'_>, area: Rect) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+            ])
             .split(area);
 
-        // ── Left panel: CPU% + Mem% over time ─────────────────────────
         let (xmin, xmax) = self.history.x_window();
         let cpu_data: Vec<(f64, f64)> = self.history.cpu_pct.iter().copied().collect();
         let mem_data: Vec<(f64, f64)> = self.history.mem_pct.iter().copied().collect();
 
-        let left_block = Block::default()
-            .borders(Borders::ALL)
-            .title(" CPU % · Mem % (5 min) ");
-
+        // ── Panel 1: CPU% over time ───────────────────────────────────
+        let cpu_now = cpu_data.last().map(|(_, v)| *v);
+        let cpu_title = match cpu_now {
+            Some(c) => format!(" CPU {c:>5.1}% (5 min) "),
+            None => " CPU % (5 min) ".to_string(),
+        };
+        let cpu_block = Block::default().borders(Borders::ALL).title(cpu_title);
         if cpu_data.is_empty() {
             frame.render_widget(
-                Paragraph::new("(collecting samples…)")
+                Paragraph::new("(collecting…)")
                     .style(Style::default().fg(Color::DarkGray))
-                    .block(left_block),
+                    .block(cpu_block),
                 cols[0],
             );
         } else {
@@ -326,17 +333,6 @@ impl ContainerDetailState {
                 .map(|(_, v)| *v)
                 .fold(0.0_f64, f64::max)
                 .max(100.0);
-            let mem_max = if self.history.mem_uncapped {
-                let m = mem_data.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
-                m.max(1.0)
-            } else {
-                100.0
-            };
-            // Both metrics share a y-axis scaled to the larger of the
-            // two — keeping them in one panel saves vertical real estate
-            // and makes "memory leaked while CPU was idle" patterns
-            // jump out at a glance.
-            let y_max = cpu_max.max(mem_max);
             let datasets = vec![
                 Dataset::default()
                     .name("cpu%")
@@ -344,19 +340,9 @@ impl ContainerDetailState {
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(Color::Cyan))
                     .data(&cpu_data),
-                Dataset::default()
-                    .name(if self.history.mem_uncapped {
-                        "mem MB"
-                    } else {
-                        "mem%"
-                    })
-                    .marker(Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Magenta))
-                    .data(&mem_data),
             ];
             let chart = Chart::new(datasets)
-                .block(left_block)
+                .block(cpu_block)
                 .x_axis(
                     Axis::default()
                         .style(Style::default().fg(Color::DarkGray))
@@ -366,25 +352,83 @@ impl ContainerDetailState {
                 .y_axis(
                     Axis::default()
                         .style(Style::default().fg(Color::DarkGray))
-                        .bounds([0.0, y_max])
-                        .labels(percent_axis_labels(y_max, self.history.mem_uncapped)),
+                        .bounds([0.0, cpu_max])
+                        .labels(percent_axis_labels(cpu_max, false)),
                 );
             frame.render_widget(chart, cols[0]);
         }
 
-        // ── Right panel: network rx/tx rate ───────────────────────────
+        // ── Panel 2: Mem (own y-axis, % when capped, MB when uncapped) ─
+        let mem_now = mem_data.last().map(|(_, v)| *v);
+        let mem_unit = if self.history.mem_uncapped { "MB" } else { "%" };
+        let mem_title = match mem_now {
+            Some(m) => format!(" Mem {m:>5.1}{mem_unit} (5 min) "),
+            None => format!(" Mem {mem_unit} (5 min) "),
+        };
+        let mem_block = Block::default().borders(Borders::ALL).title(mem_title);
+        if mem_data.is_empty() {
+            frame.render_widget(
+                Paragraph::new("(collecting…)")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .block(mem_block),
+                cols[1],
+            );
+        } else {
+            let mem_max = if self.history.mem_uncapped {
+                mem_data
+                    .iter()
+                    .map(|(_, v)| *v)
+                    .fold(0.0_f64, f64::max)
+                    .max(1.0)
+            } else {
+                100.0
+            };
+            let datasets = vec![
+                Dataset::default()
+                    .name(if self.history.mem_uncapped { "mem MB" } else { "mem%" })
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Magenta))
+                    .data(&mem_data),
+            ];
+            let chart = Chart::new(datasets)
+                .block(mem_block)
+                .x_axis(
+                    Axis::default()
+                        .style(Style::default().fg(Color::DarkGray))
+                        .bounds([xmin, xmax])
+                        .labels(time_axis_labels(xmin, xmax)),
+                )
+                .y_axis(
+                    Axis::default()
+                        .style(Style::default().fg(Color::DarkGray))
+                        .bounds([0.0, mem_max])
+                        .labels(percent_axis_labels(mem_max, self.history.mem_uncapped)),
+                );
+            frame.render_widget(chart, cols[1]);
+        }
+
+        // ── Panel 3: network rx/tx rate ───────────────────────────────
         let rx_rates = StatsHistory::rate_series(&self.history.net_rx);
         let tx_rates = StatsHistory::rate_series(&self.history.net_tx);
-        let right_block = Block::default()
-            .borders(Borders::ALL)
-            .title(" net rx / tx (5 min, B/s) ");
-
+        let rx_now = rx_rates.last().map_or(0.0, |(_, v)| *v);
+        let tx_now = tx_rates.last().map_or(0.0, |(_, v)| *v);
+        let net_title = if rx_rates.is_empty() && tx_rates.is_empty() {
+            " net rx / tx (5 min) ".to_string()
+        } else {
+            format!(
+                " net ↓{} ↑{} (5 min) ",
+                format_rate(rx_now),
+                format_rate(tx_now)
+            )
+        };
+        let net_block = Block::default().borders(Borders::ALL).title(net_title);
         if rx_rates.is_empty() && tx_rates.is_empty() {
             frame.render_widget(
-                Paragraph::new("(collecting samples…)")
+                Paragraph::new("(collecting…)")
                     .style(Style::default().fg(Color::DarkGray))
-                    .block(right_block),
-                cols[1],
+                    .block(net_block),
+                cols[2],
             );
         } else {
             let max_rate = rx_rates
@@ -408,7 +452,7 @@ impl ContainerDetailState {
                     .data(&tx_rates),
             ];
             let chart = Chart::new(datasets)
-                .block(right_block)
+                .block(net_block)
                 .x_axis(
                     Axis::default()
                         .style(Style::default().fg(Color::DarkGray))
@@ -421,7 +465,7 @@ impl ContainerDetailState {
                         .bounds([0.0, max_rate])
                         .labels(rate_axis_labels(max_rate)),
                 );
-            frame.render_widget(chart, cols[1]);
+            frame.render_widget(chart, cols[2]);
         }
     }
 
@@ -578,6 +622,25 @@ impl ContainerDetailState {
             let mut mem_spans = vec![Span::raw(label)];
             mem_spans.extend(inline_gauge(ratio, 16, gauge_color(ratio)));
             right_lines.push(Line::from(mem_spans));
+
+            // Cumulative network bytes since the container started.
+            // Per-second rate lives in the history chart's title; this
+            // line answers "how much has this thing transferred in
+            // total" — useful for spotting the runaway egress case.
+            right_lines.push(Line::from(vec![
+                Span::styled("NET ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "↓ ".to_string(),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(format_bytes(s.net_rx_bytes)),
+                Span::raw("  "),
+                Span::styled(
+                    "↑ ".to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(format_bytes(s.net_tx_bytes)),
+            ]));
         } else {
             right_lines.push(Line::from(Span::styled(
                 "(no live stats yet)",
