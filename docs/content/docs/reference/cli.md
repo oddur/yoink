@@ -17,6 +17,19 @@ Every subcommand accepts:
 ## Subcommand reference
 
 ```
+yoink init [HOST]                        generate a starter yoink.yaml in cwd. Detects
+                                         Dockerfile (EXPOSE/USER/HEALTHCHECK) + git remote
+                                         + ~/.ssh/config and writes a validated config
+                                         with zero prompts. HOST optional when ssh config
+                                         supplies a non-wildcard Host entry.
+  --force                                overwrite an existing yoink.yaml
+  --interactive                          prompt for every field instead of inferring
+                                         (defaults match the inferences)
+  --service <NAME>                       override the inferred service name
+  --port <N>                             override inferred port (Dockerfile EXPOSE or 8080)
+  --no-port                              skip port + healthcheck (no HTTP surface)
+  --image <PATH>                         override the inferred image reference
+
 yoink preflight                          verify Docker is reachable on each configured host
 
 yoink up                                 reconcile every service to its desired spec

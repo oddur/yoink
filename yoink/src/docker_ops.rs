@@ -380,6 +380,15 @@ pub type ImageTarStream = std::pin::Pin<
 pub trait DockerOps: Send + Sync {
     async fn version(&self, host: &Host) -> Result<DockerVersion, DockerError>;
 
+    /// Path to the SSH private key to use when subprocess-spawning
+    /// `ssh` for this host (e.g. unregistry's tunnel + probe). Returns
+    /// `Some` only when the host declared `ssh_key_secret:` and the
+    /// key was decrypted into a tempfile by `ssh_keys::prepare`.
+    /// Default `None` for `FakeDockerOps` and the no-key case.
+    fn ssh_keyfile(&self, _host: &Host) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Host-level info from `docker info` — capacity, container counts.
     async fn host_info(&self, host: &Host) -> Result<HostInfo, DockerError>;
 
@@ -625,14 +634,25 @@ const HEALTHCHECK_TCP_IMAGE: &str = "busybox:1.37";
 pub struct RealDockerOps {
     clients: tokio::sync::Mutex<HashMap<String, Docker>>,
     timeout_secs: u64,
+    /// Per-host private-key tempfiles for hosts declaring
+    /// `ssh_key_secret:`. Built by `crate::ssh_keys::prepare` from the
+    /// secrets bundle; passed into bollard `connect_with_ssh` as the
+    /// `keypair_path` arg, and added to `ssh_probe`'s `ssh -i`.
+    key_manager: Option<std::sync::Arc<crate::ssh_keys::KeyManager>>,
 }
 
 impl RealDockerOps {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_key_manager(None)
+    }
+
+    #[must_use]
+    pub fn with_key_manager(km: Option<std::sync::Arc<crate::ssh_keys::KeyManager>>) -> Self {
         Self {
             clients: tokio::sync::Mutex::new(HashMap::new()),
             timeout_secs: 120,
+            key_manager: km,
         }
     }
 
@@ -660,17 +680,27 @@ impl RealDockerOps {
             // TUI just hangs on "(loading…)". Probing gives us a
             // classified, actionable error string before bollard
             // ever opens the long-lived connection.
-            crate::ssh_probe::probe(host)
+            let keyfile = self
+                .key_manager
+                .as_ref()
+                .and_then(|km| km.key_for(host))
+                .map(|p| p.to_string_lossy().into_owned());
+            crate::ssh_probe::probe(host, keyfile.as_deref())
                 .await
                 .map_err(|detail| DockerError::SshProbe {
                     host: host.address.clone(),
                     detail,
                 })?;
-            Docker::connect_with_ssh(&key, self.timeout_secs, bollard::API_DEFAULT_VERSION, None)
-                .map_err(|source| DockerError::Connect {
-                    host: host.address.clone(),
-                    source,
-                })?
+            Docker::connect_with_ssh(
+                &key,
+                self.timeout_secs,
+                bollard::API_DEFAULT_VERSION,
+                keyfile,
+            )
+            .map_err(|source| DockerError::Connect {
+                host: host.address.clone(),
+                source,
+            })?
         };
         clients.insert(key.clone(), docker.clone());
         Ok(docker)
@@ -730,6 +760,13 @@ impl RealDockerOps {
 
 #[async_trait]
 impl DockerOps for RealDockerOps {
+    fn ssh_keyfile(&self, host: &Host) -> Option<std::path::PathBuf> {
+        self.key_manager
+            .as_ref()
+            .and_then(|km| km.key_for(host))
+            .map(std::path::Path::to_path_buf)
+    }
+
     async fn version(&self, host: &Host) -> Result<DockerVersion, DockerError> {
         let docker = self.client_for(host).await?;
         let v = docker.version().await.map_err(|s| Self::err(host, s))?;

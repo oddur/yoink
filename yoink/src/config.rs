@@ -118,6 +118,17 @@ pub enum OnFailure {
 pub struct HostConfig {
     pub address: String,
     pub user: String,
+    /// Optional: name of a sealed-secret entry holding an SSH private
+    /// key (PEM format) to use when connecting to this host. When set,
+    /// yoink loads the key into a per-process `ssh-agent` at deploy
+    /// time, sets `SSH_AUTH_SOCK`, and bollard's spawned ssh client
+    /// inherits the env. Lets you ship the deploy key with the repo
+    /// (encrypted at rest in `secrets.age`) without requiring every
+    /// operator to add the key to their personal ssh-agent.
+    /// Use this when the operator's host doesn't already have key-based
+    /// auth set up — fresh VPS with `root` user, throwaway hosts, etc.
+    #[serde(default)]
+    pub ssh_key_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -667,6 +678,7 @@ impl Config {
         self.hosts.push(HostConfig {
             address: local.to_string(),
             user: local.to_string(),
+            ssh_key_secret: None,
         });
     }
 
