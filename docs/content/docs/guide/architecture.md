@@ -123,7 +123,7 @@ When yoink creates a container, the bollard `HostConfig` it sends to docker is b
 - **Port bindings** parsed from `publish:` entries
 - **Restart policy** = the `restart:` string (`no` / `always` / `unless-stopped` / `on-failure`); default unset = no restart
 
-The full security-defaults table is on [Sane security defaults](/docs/guide/security-defaults).
+The full security-defaults table is on [Secure by default](/docs/guide/security-defaults).
 
 ## Healthcheck-gated rolling swap
 

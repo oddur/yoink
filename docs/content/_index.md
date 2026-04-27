@@ -20,7 +20,7 @@ yoink rollback api        # roll back to the previous version
   {{< card link="/docs/start/first-deploy" title="Five-minute first deploy" subtitle="Drop a yoink.yaml next to your Dockerfile, run one command." icon="lightning-bolt" >}}
   {{< card link="/docs/intro/compared" title="Is this for me?" subtitle="vs Kamal, vs Kubernetes, vs plain compose. When yoink is the right answer, when it isn't." icon="adjustments" >}}
   {{< card link="/docs/guide/deploy-modes" title="Three deploy modes" subtitle="CI-built, kamal-style local-build, no-registry standalone." icon="server" >}}
-  {{< card link="/docs/guide/security-defaults" title="Sane security defaults" subtitle="cap_drop=ALL, read-only rootfs, no-new-privileges, init=tini, …" icon="shield-check" >}}
+  {{< card link="/docs/guide/security-defaults" title="Secure by default" subtitle="cap_drop=ALL, read-only rootfs, no-new-privileges, init=tini, …" icon="shield-check" >}}
   {{< card link="/docs/recipes" title="Recipes" subtitle="Staging alongside prod, self-hosted registry, Infisical secrets, PR-comment dry-run." icon="clipboard-list" >}}
   {{< card link="/docs/reference" title="Reference" subtitle="Every CLI flag, every config field, every TUI keybind." icon="document-text" >}}
 {{< /cards >}}
@@ -35,7 +35,7 @@ Kamal is a lovely fit for "one app, one binary per host" but starts to creak the
 - **Per-service network tiers** for blast-radius isolation without a CNI plugin
 - **Drift detection.** Every effective spec hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
 - **Three deploy modes**: CI-built (the default), local-build kamal-style with `yoink build --push`, or fully standalone with `yoink up --build --no-registry` (no CI, no registry — drop a `yoink.yaml` next to your Dockerfile and go)
-- **Sane security defaults**: cap_drop=ALL, no-new-privileges, read-only rootfs, init=tini, tmpfs noexec, binds default :ro. Override per service when needed.
+- **Secure by default**: cap_drop=ALL, no-new-privileges, read-only rootfs, init=tini, tmpfs noexec, binds default :ro. Override per service when needed.
 - **Sealed secrets out of the box**: commit a single `secrets.age` file, decrypt with one key from `YOINK_AGE_KEY` (env in CI, file on your laptop). No remote vault needed. Infisical is opt-in for teams already running one.
 - **k9s-style TUI** with deploy history, one-press rollback, drift cells, logs auto-piped through `hl`
 

@@ -59,6 +59,8 @@ echo "FOO=bar" | yoink secrets seal
 yoink secrets seal --in plain.env --out secrets.age
 ```
 
+For one-off per-key tweaks during incident response, the TUI has a dedicated pane (press `e` from any view). View / add / edit / remove individual keys without leaving the dashboard. Bulk multi-line edits stay on `yoink secrets edit` — the TUI is per-key only.
+
 ## Inspecting
 
 ```sh

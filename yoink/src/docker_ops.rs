@@ -876,7 +876,7 @@ impl DockerOps for RealDockerOps {
                 name: v.name,
                 driver: v.driver,
                 mountpoint: v.mountpoint,
-                created: v.created_at.map(|d| d.to_string()),
+                created: v.created_at.as_ref().map(ToString::to_string),
             })
             .collect())
     }

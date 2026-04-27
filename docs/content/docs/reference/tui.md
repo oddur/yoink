@@ -13,6 +13,17 @@ Heavily inspired by [k9s](https://k9scli.io/). Keyboard-driven panes for dashboa
 
 ![yoink TUI container detail](https://github.com/user-attachments/assets/36d3cc00-355c-482b-addc-454a0070b58e)
 
+## Top-level modes
+
+| key | mode |
+|---|---|
+| `d` | Dashboard |
+| `h` | Hosts |
+| `s` | Services |
+| `l` | Logs |
+| `e` | Encrypted-secrets |
+| `Tab` / `Shift-Tab` | cycle modes forward / backward |
+
 ## Operator gestures from the dashboard
 
 | key | action |
@@ -27,8 +38,27 @@ Heavily inspired by [k9s](https://k9scli.io/). Keyboard-driven panes for dashboa
 | `!` | shell into container |
 | `D` | debug sidecar (alpine in target's pid+net ns) |
 | `H` | service deploy history; on a stopped row press `r` to roll back |
+| `x` | toggle eXited containers visible in the table |
+| `r` | refresh |
+| `/` | filter substring (Esc clears) |
 | `?` | help overlay |
 | `q` | quit |
+
+## Secrets pane (`e`)
+
+View / add / edit / remove individual sealed secrets without leaving the TUI. Reuses the same on-disk format as `yoink secrets edit` and respects per-environment `secrets.file:` paths — the title bar shows which file is active.
+
+| key | action |
+|---|---|
+| `↑` / `↓` / `j` / `k` | select key |
+| `r` | reveal/mask values |
+| `/` | filter substring |
+| `a` | add a new secret (age provider only) |
+| `e` / `enter` | edit selected value |
+| `d` | delete selected (with confirmation) |
+| `Esc` / `q` | back |
+
+When the provider is Infisical the pane is read-only — edits go via the Infisical web UI. When no age identity is available, the pane shows the failed-load reason + a remediation pointer. For bulk multi-line edits, drop to the CLI: `yoink secrets edit`.
 
 ## Pretty logs
 

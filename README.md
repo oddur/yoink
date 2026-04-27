@@ -16,7 +16,7 @@ The README is a pointer; the [docs site](https://oddur.github.io/yoink/) is cano
 
 - [Is this for me?](https://oddur.github.io/yoink/docs/intro/compared) — vs. Kamal, Kubernetes, plain compose
 - [Five-minute first deploy](https://oddur.github.io/yoink/docs/start/first-deploy) — install + run
-- [Three deploy modes](https://oddur.github.io/yoink/docs/guide/deploy-modes), [Sane security defaults](https://oddur.github.io/yoink/docs/guide/security-defaults), [Pairing with Tailscale + caddy](https://oddur.github.io/yoink/docs/guide/pairing)
+- [Three deploy modes](https://oddur.github.io/yoink/docs/guide/deploy-modes), [Secure by default](https://oddur.github.io/yoink/docs/guide/security-defaults), [Pairing with Tailscale + caddy](https://oddur.github.io/yoink/docs/guide/pairing)
 - [Recipes](https://oddur.github.io/yoink/docs/recipes) — staging alongside prod, self-hosted registry, Infisical, PR-comment dry-run
 - [Reference](https://oddur.github.io/yoink/docs/reference) — CLI / config schema / TUI keybinds
 

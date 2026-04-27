@@ -71,6 +71,7 @@ pub enum Mode {
     Hosts,
     Services,
     Logs,
+    Secrets,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +106,9 @@ pub enum View {
         /// `docker exec`. Used for distroless / shell-less images.
         debug: bool,
     },
+    /// Sealed-secrets management — view / add / edit / remove
+    /// individual KEY=value entries without leaving the TUI.
+    Secrets,
 }
 
 impl View {
@@ -121,18 +125,21 @@ impl View {
             | View::ContainerDetail { .. } => 1,
             View::Services | View::ServiceDetail(_) | View::ServiceHistory(_) => 2,
             View::Logs => 3,
+            View::Secrets => 4,
         }
     }
 
     /// Lines for the `?` help overlay. Per-view so the operator only
     /// sees the keybinds that actually do something here.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn help_lines(&self) -> Vec<&'static str> {
         let global = vec![
             "global",
-            "  q / Ctrl-C   quit yoink",
-            "  d / h / s / l   dashboard / hosts / services / logs",
-            "  ?            toggle this help overlay",
+            "  q / Ctrl-C    quit yoink",
+            "  d h s l e     dashboard / hosts / services / logs / encrypted-secrets",
+            "  Tab / S-Tab   cycle modes forward / backward",
+            "  ?             toggle this help overlay",
             "",
         ];
         let view_specific: Vec<&'static str> = match self {
@@ -146,7 +153,7 @@ impl View {
                 "  P            prune stale + orphan containers (with confirmation)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh",
-                "  e            toggle exited containers",
+                "  x            toggle eXited containers",
             ],
             View::Hosts => vec![
                 "hosts",
@@ -218,6 +225,16 @@ impl View {
                 "  y            yank visible buffer to system clipboard",
                 "  k            clear · esc back",
             ],
+            View::Secrets => vec![
+                "secrets",
+                "  ↑↓ / j k     select key",
+                "  /            filter substring",
+                "  r            reveal/mask values",
+                "  a            add a new secret (age provider only)",
+                "  e            edit selected value",
+                "  d            delete selected (with confirmation)",
+                "  esc          back",
+            ],
             View::ContainerShell { .. } => vec![
                 "shell",
                 "  Ctrl-Q       exit shell, back to host detail",
@@ -272,6 +289,7 @@ impl View {
                 container.clone(),
                 "detail".into(),
             ],
+            View::Secrets => vec![root, "Secrets".into()],
         }
     }
 }
@@ -283,6 +301,7 @@ impl From<Mode> for View {
             Mode::Hosts => View::Hosts,
             Mode::Services => View::Services,
             Mode::Logs => View::Logs,
+            Mode::Secrets => View::Secrets,
         }
     }
 }
@@ -576,6 +595,7 @@ pub struct App {
     pub history: super::history::HistoryState,
     pub container_detail: ContainerDetailState,
     pub logs: LogsState,
+    pub secrets_state: super::secrets::SecretsState,
     /// `Some` while a `ContainerShell` view is active; cleared on exit.
     shell: Option<ShellState>,
     /// `?` toggles a modal help overlay listing keybinds for the
@@ -683,6 +703,7 @@ impl App {
             history: super::history::HistoryState::new(),
             container_detail: ContainerDetailState::new(),
             logs: LogsState::new(),
+            secrets_state: super::secrets::SecretsState::new(),
             shell: None,
             show_help: false,
             error_modal: None,
@@ -1146,6 +1167,38 @@ impl App {
             return false;
         }
 
+        // Secrets remove-confirmation modal: same shape as kill.
+        if self.secrets_state.confirming_remove() {
+            let confirm = matches!(key.code, KeyCode::Char('y') | KeyCode::Enter);
+            if confirm {
+                if let Some(key) = self.secrets_state.confirm_remove() {
+                    self.secrets_state.apply_remove(key);
+                }
+            } else {
+                self.secrets_state.cancel_edit();
+            }
+            return false;
+        }
+
+        // Secrets add/edit input mode: capture all printable input.
+        // Enter commits, Esc cancels. Captured before tab nav so
+        // typing `s` (Services tab) doesn't fire while the operator
+        // is in the middle of a value.
+        if matches!(self.view, View::Secrets) && self.secrets_state.input_mode() {
+            match key.code {
+                KeyCode::Esc => self.secrets_state.cancel_edit(),
+                KeyCode::Enter => {
+                    if let Some(commit) = self.secrets_state.commit_input() {
+                        self.secrets_state.apply_commit(commit);
+                    }
+                }
+                KeyCode::Backspace => self.secrets_state.backspace(),
+                KeyCode::Char(c) => self.secrets_state.push_char(c),
+                _ => {}
+            }
+            return false;
+        }
+
         // Reconcile-progress modal: while running, eat all keys
         // (Ctrl-C/Q already handled above) so a stray j/k can't
         // navigate the underlying view. `y` always works to yank
@@ -1217,6 +1270,34 @@ impl App {
             }
             KeyCode::Char('l') => {
                 self.transition(View::Logs).await;
+                return false;
+            }
+            KeyCode::Char('e') => {
+                self.transition(View::Secrets).await;
+                return false;
+            }
+            // Tab / Shift-Tab cycle through the top-level modes
+            // (k9s-friendly alternative to direct-letter access).
+            KeyCode::Tab => {
+                let next = match self.view.top_section() {
+                    0 => View::Hosts,
+                    1 => View::Services,
+                    2 => View::Logs,
+                    3 => View::Secrets,
+                    _ => View::Dashboard,
+                };
+                self.transition(next).await;
+                return false;
+            }
+            KeyCode::BackTab => {
+                let prev = match self.view.top_section() {
+                    0 => View::Secrets,
+                    1 => View::Dashboard,
+                    2 => View::Hosts,
+                    3 => View::Services,
+                    _ => View::Logs,
+                };
+                self.transition(prev).await;
                 return false;
             }
             _ => {}
@@ -1419,7 +1500,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('r') => self.schedule_dashboard_refresh(),
-                KeyCode::Char('e') => self.dashboard.toggle_show_exited(),
+                KeyCode::Char('x') => self.dashboard.toggle_show_exited(),
                 KeyCode::Char('P') => self.open_prune_modal(),
                 KeyCode::Char('A') => self.open_reconcile_all_modal(),
                 _ => {}
@@ -1530,6 +1611,17 @@ impl App {
                 KeyCode::Char('G') | KeyCode::End => self.logs.jump_to_bottom(),
                 _ => {}
             },
+            View::Secrets => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.secrets_state.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.secrets_state.select_next(),
+                KeyCode::Char('r') => self.secrets_state.toggle_reveal(),
+                KeyCode::Char('a') => self.secrets_state.begin_add(),
+                KeyCode::Char('e') | KeyCode::Enter => {
+                    self.secrets_state.begin_edit_selected();
+                }
+                KeyCode::Char('d') => self.secrets_state.begin_remove_selected(),
+                _ => {}
+            },
         }
         false
     }
@@ -1569,6 +1661,7 @@ impl App {
             View::HostDetail(_) => Some(&mut self.host_detail.filter),
             View::Services => Some(&mut self.services.filter),
             View::ServiceDetail(_) => Some(&mut self.service_detail.filter),
+            View::Secrets => Some(&mut self.secrets_state.filter),
             _ => None,
         }
     }
@@ -1720,6 +1813,12 @@ impl App {
             View::ServiceHistory(name) => {
                 self.history.set_service(name.clone());
                 self.schedule_history_refresh(name.clone());
+            }
+            View::Secrets => {
+                // Decrypt + populate happens lazily on first render
+                // via `ensure_loaded`. Clear any half-finished edit
+                // from a previous visit so the operator starts fresh.
+                self.secrets_state.cancel_edit();
             }
         }
         self.view = new_view;
@@ -2103,7 +2202,7 @@ impl App {
             },
             |(_, msg)| format!("● {msg}"),
         );
-        let tabs = ["Dashboard", "Hosts", "Services", "Logs"];
+        let tabs = ["Dashboard", "Hosts", "Services", "Logs", "Secrets"];
         let selected_tab = Some(self.view.top_section());
         super::ui::render_header(frame, header_area, &tabs, selected_tab, &crumbs, &right);
 
@@ -2153,6 +2252,10 @@ impl App {
                     shell.render(frame, pane_area);
                 }
             }
+            View::Secrets => {
+                self.secrets_state.ensure_loaded(&self.config, false);
+                self.secrets_state.render(frame, pane_area);
+            }
         }
 
         if self.show_help {
@@ -2174,6 +2277,10 @@ impl App {
                 "[any]         cancel",
             ];
             super::ui::render_modal(frame, "kill container?", &lines);
+        }
+        if let Some((title, body)) = self.secrets_state.confirm_modal_lines() {
+            let lines: Vec<&str> = body.iter().map(String::as_str).collect();
+            super::ui::render_modal(frame, title, &lines);
         }
         if let Some((service, tag)) = &self.reconcile_target {
             let svc_line = format!("service:  {service}");

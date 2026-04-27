@@ -9,6 +9,7 @@ mod host_detail;
 mod hosts;
 mod logs;
 mod progress;
+mod secrets;
 mod services;
 mod shell;
 mod ui;
