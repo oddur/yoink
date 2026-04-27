@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::docker_ops::{DockerError, DockerOps, Host};
+use crate::docker_ops::{DockerError, DockerOps, Host, parse_published_port};
 use crate::transport::tunnel::{SshTunnel, TunnelError};
 
 use super::{ADMIN_PORT, PROXY_SERVICE_NAME};
@@ -127,22 +127,6 @@ pub async fn push_config(
     Ok(())
 }
 
-/// `parse_inspect` formats each entry as `"<host_port>:<container_port>/<proto>"`
-/// (or `"(unpublished) <container_port>/<proto>"`). Find the entry whose
-/// container port is `wanted` and return the host port.
-fn parse_published_port(entries: &[String], wanted: u16) -> Option<u16> {
-    let suffix = format!(":{wanted}/");
-    for entry in entries {
-        if let Some(idx) = entry.find(&suffix) {
-            let host_port = &entry[..idx];
-            if let Ok(p) = host_port.parse::<u16>() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
 async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), AdminError> {
     let url = format!("http://127.0.0.1:{local_port}/config/");
     let client = reqwest::Client::builder()
@@ -161,19 +145,3 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_published_port_picks_wanted() {
-        let entries = vec![
-            "80:80/tcp".to_string(),
-            "443:443/tcp".to_string(),
-            "32773:2019/tcp".to_string(),
-        ];
-        assert_eq!(parse_published_port(&entries, 2019), Some(32773));
-        assert_eq!(parse_published_port(&entries, 80), Some(80));
-        assert_eq!(parse_published_port(&entries, 9999), None);
-    }
-}
