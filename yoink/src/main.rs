@@ -2340,7 +2340,7 @@ fn write_scratch_file(path: &Path, contents: &[u8]) -> Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(path)
-            .with_context(|| format!("open {} (O_EXCL, mode 0600)", path.display()))?;
+            .with_context(|| format!("create scratch file {}", path.display()))?;
         f.write_all(contents)
             .with_context(|| format!("write {}", path.display()))?;
         Ok(())
