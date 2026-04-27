@@ -67,14 +67,22 @@ enum Command {
         #[arg(long, value_enum, default_value_t = DryRunFormat::Text)]
         format: DryRunFormat,
         /// Skip the registry-pull step. For each (host, image) pair,
-        /// `docker save` the image from the operator's local docker
-        /// daemon and stream the tarball into the host's docker via
-        /// `docker load`. Pair with `yoink build` for the
-        /// "edit Dockerfile, deploy" loop without standing up CI or
-        /// a registry. The image must already exist locally
-        /// (run `yoink build` first or build it yourself).
+        /// stream `docker save <image>` from the operator's local
+        /// docker daemon directly into the host's docker via
+        /// `docker load`. Pair with `--build` for the one-shot
+        /// "edit Dockerfile, deploy" loop without CI or a registry.
         #[arg(long)]
         no_registry: bool,
+        /// Run `docker build` for any selected service with a
+        /// `build:` block before deploying. Eliminates the separate
+        /// `yoink build && yoink up` two-step for the standalone
+        /// workflow — `yoink up --build --no-registry --service my-tool`
+        /// is the indie one-shot. With a registry-prefixed image, you
+        /// still need to push (`yoink build --push`) — `--build` here
+        /// builds without pushing, so this combination is most useful
+        /// alongside `--no-registry`.
+        #[arg(long)]
+        build: bool,
     },
     /// Build one or more services' images via `docker build` against
     /// the operator's local docker daemon. Tags the result as
@@ -403,6 +411,7 @@ async fn run(cli: Cli) -> Result<()> {
             dry_run,
             format,
             no_registry,
+            build,
         } => {
             cmd_up(
                 &config,
@@ -412,6 +421,7 @@ async fn run(cli: Cli) -> Result<()> {
                 dry_run,
                 format,
                 no_registry,
+                build,
             )
             .await
         }
@@ -492,6 +502,11 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
     Ok(())
 }
 
+// TODO: bundle the flags into an `UpOptions` struct before the next
+// deploy-flag addition. Already noted in the post-v0.7.0 /simplify
+// pass; allowing here so the flag landing for the indie loop isn't
+// blocked by a refactor.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 async fn cmd_up(
     config: &Config,
     services: &[String],
@@ -500,6 +515,7 @@ async fn cmd_up(
     dry_run: bool,
     format: DryRunFormat,
     no_registry: bool,
+    build: bool,
 ) -> Result<()> {
     use yoink::docker_ops::Host;
     use yoink::lock::HostLock;
@@ -522,6 +538,24 @@ async fn cmd_up(
             format,
         )
         .await;
+    }
+
+    // Optional `--build` pre-flight: rebuild any selected service that
+    // declares a `build:` block before deploying. Lets the indie
+    // "drop yoink.yaml in repo and `yoink up --build --no-registry`"
+    // loop work as a one-shot without remembering to run `yoink build`
+    // separately. Push is intentionally not auto-engaged — kamal-style
+    // flows still go through the explicit `yoink build --push` step.
+    if build {
+        for svc in config.selected_services(services_filter) {
+            if svc.build.is_none() {
+                continue;
+            }
+            let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
+            yoink::build::build_service(config, svc, &tag, false, false)
+                .await
+                .with_context(|| format!("build {}", svc.name))?;
+        }
     }
 
     // No-registry pre-flight: save+load every selected image to every
@@ -799,6 +833,7 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
         true,
         false,
         DryRunFormat::Text,
+        false,
         false,
     )
     .await

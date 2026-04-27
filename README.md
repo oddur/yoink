@@ -167,7 +167,7 @@ Yoink supports three ways of getting a container image to a host. Pick the one t
 |---|---|---|---|---|
 | **CI-built (default)** | CI (GitHub Actions, Depot, etc.) builds + pushes on every commit | external | `docker pull` from registry | Production with multiple hosts and an existing CI/CD pipeline |
 | **Local-build, kamal-style** | Operator's machine | `yoink build --push` | `docker pull` from registry | Indie / one-person team that wants the full deploy loop in one tool, willing to keep a registry |
-| **Standalone (no registry)** | Operator's machine | `yoink build` | `docker save \| docker load` over ssh | Rapid iteration on a single host; air-gapped; "I just want this thing running" |
+| **Standalone (no registry)** | Operator's machine | `yoink up --build --no-registry` (one command) | `docker save \| docker load` over ssh | Rapid iteration on a single host; air-gapped; low-ceremony tools/utilities; "I just want this thing running" |
 
 Pick by service if you want — `yoink build` only runs against services with a `build:` block, so a config can mix CI-built infrastructure (`caddy`, `redis`) with locally-built app code.
 
@@ -203,23 +203,37 @@ Two-step instead of one-shot is deliberate: `yoink build && yoink up` is the exp
 
 ### Standalone (no registry)
 
+The whole loop in one command for a low-ceremony tool repo: drop a `yoink.yaml` next to your `Dockerfile`, describe where the thing should land, run `yoink up --build --no-registry`. Build, ship, run. No CI to set up, no registry account, no auth dance.
+
 ```yaml
+# yoink.yaml — sits alongside the Dockerfile in your repo
+hosts:
+  - { address: my-server, user: deploy }   # tailnet hostname
+
 services:
-  - name: api
-    image: my-app                   # bare name — no registry prefix
+  - name: my-tool
+    image: my-tool                  # bare name — no registry prefix
     tag: dev
     build:
-      context: .
+      context: .                    # `.` = same directory as yoink.yaml
     run:
       port: 8080
 ```
 
 ```sh
-yoink build api                     # docker build → tag local image as my-app:dev
-yoink up --no-registry --service api # save+load to each host (no docker pull)
+yoink up --build --no-registry      # build + save+load + run, in one command
 ```
 
-What `--no-registry` does: for every (service, host) the deploy targets, yoink streams `docker save <image>:<tag>` from the operator's local docker daemon directly into the host's docker daemon via the same ssh+bollard transport that `up` already uses (calling `POST /images/load`). The transfer is **streaming** — chunks of ~8 KiB flow through the pipe, never buffering the full tarball in operator-side RAM. A 2 GB image costs 8 KiB of memory on the operator's machine, not 2 GB. After the load completes, the host has the image cached and the rest of the deploy flow (which already short-circuits when an image is locally present) runs unchanged — healthcheck-gated rolling swap, drift detection, the works.
+That's it. Edit Dockerfile, rerun, watch the new version roll. Useful for utilities, internal admin tools, prototypes — anything where the GitHub Actions + container-registry overhead is more friction than the deploy is worth.
+
+If you'd rather keep build and deploy as separate steps (e.g. share the build artifact with another shell, or build on a beefy laptop while deploying from a thin runner), the explicit two-command form still works:
+
+```sh
+yoink build my-tool                 # docker build → tag local image as my-tool:dev
+yoink up --no-registry --service my-tool  # save+load to each host
+```
+
+What `--no-registry` does: for every (service, host) the deploy targets, yoink streams `docker save <image>:<tag>` from the operator's local docker daemon directly into the host's docker daemon via the same ssh+bollard transport that `up` already uses (calling `POST /images/load`). After the load completes, the host has the image cached and the rest of the deploy flow (which already short-circuits when an image is locally present) runs unchanged — healthcheck-gated rolling swap, drift detection, the works.
 
 Per-host progress bars track bytes transferred + rate live:
 
