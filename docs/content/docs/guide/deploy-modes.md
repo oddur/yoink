@@ -15,7 +15,7 @@ Yoink treats **where the image is built** and **how it gets to the host** as ind
 
 | Build origin → / Distribution ↓ | In CI | On operator's machine |
 |---|---|---|
-| **Via registry** | CI pushes, hosts pull. The default for production. | `yoink build --push` then `yoink up`. Kamal-style. |
+| **Via registry** | CI pushes, hosts pull. The default for production. | `yoink build --push` then `yoink up` — the classic two-step build+deploy. |
 | **Direct to host (no registry)** | Less common, but valid: CI builds then runs `yoink up --no-registry --transport=unregistry --tag api=<sha>`. | `yoink up --build --no-registry`, one command. The standalone loop. |
 
 The four cells share a deploy engine — drift detection, healthcheck-gated rolling swap, dependency-ordered waves work the same regardless of how the image arrived.
@@ -24,7 +24,7 @@ The four cells share a deploy engine — drift detection, healthcheck-gated roll
 
 Operator config has no `build:` block; CI builds the image and pushes it to a registry on every merge. `yoink up` pulls and rolls. The image reference is fully qualified (`image: ghcr.io/you/api`) and the tag typically gets overridden at deploy time via `--tag api=<sha>`.
 
-## Local-build, kamal-style
+## Local-build (push-then-deploy)
 
 ```yaml
 services:
@@ -46,9 +46,9 @@ yoink build api --push               # docker build → docker push ghcr.io/you/
 yoink up --service api               # docker pull on each host → rolling swap
 ```
 
-`yoink build --push` runs `docker build` against your local docker daemon, tagging as `<image>:<tag>` (which equals the registry path because of how `image:` is configured), then runs `docker push`. After that the standard deploy path takes over — exactly like kamal, except the build step is a separate command (so you can build without pushing for CI of your own; or push without rebuilding for re-tagging).
+`yoink build --push` runs `docker build` against your local docker daemon, tagging as `<image>:<tag>` (which equals the registry path because of how `image:` is configured), then runs `docker push`. After that the standard deploy path takes over.
 
-Two-step instead of one-shot is deliberate: `yoink build && yoink up` is the explicit version of `kamal deploy`, and the separation lets you run them on different machines (build on a beefy laptop, deploy from a thin runner) when you want to.
+Two-step instead of one-shot is deliberate: `yoink build && yoink up` keeps the two phases separate so you can build without pushing (for your own CI), push without rebuilding (for re-tagging), or run the steps on different machines (build on a beefy laptop, deploy from a thin runner).
 
 ## Standalone (no registry)
 

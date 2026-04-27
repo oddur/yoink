@@ -13,7 +13,6 @@ yoink.staging.yaml          # staging entry; includes services/staging/*.yaml
 services/prod/api.yaml
 services/prod/web.yaml
 services/prod/redis.yaml
-services/prod/caddy.yaml
 services/prod/otel.yaml
 services/staging/api.yaml   # name: api-staging, networks: [api-staging, …]
 services/staging/web.yaml   # name: web-staging
@@ -23,7 +22,9 @@ services/staging/web.yaml   # name: web-staging
 
 ```yaml
 deploy:
-  networks: [public, api, web, redis, otel]
+  # `yoink-ingress` and `yoink-proxy-admin` are auto-injected by the
+  # bundled-proxy code path — no need to list them here.
+  networks: [api, web, redis, otel]
 
 hosts:
   - { address: prod-eu-1, user: deploy }
@@ -49,7 +50,22 @@ registry:
 
 include:
   - services/prod/*.yaml
+
+# Bundled reverse proxy (yoink-proxy). Renders Caddy from each
+# service's `domain:` field; ACME is implicitly off because
+# `proxy.tls.cert_secret` is set, and a :80 → :443 redirect is
+# auto-emitted. Origin-pull mTLS locks the origin to Cloudflare's
+# edge — direct hits to the host IP fail at TLS handshake.
+proxy:
+  tls:
+    cert_secret: CF_ORIGIN_CERT
+    key_secret:  CF_ORIGIN_KEY
+    client_auth:
+      mode: require_and_verify
+      trust_pool_secret: CF_ORIGIN_PULL_CA
 ```
+
+For ACME (Let's Encrypt) instead of sealed Cloudflare origin certs, drop `proxy.tls` and set `proxy.email: ops@example.com` — every service with `domain:` then auto-issues. See the [proxy guide](/docs/guide/proxy) and the [Cloudflare Origin Certs recipe](/docs/recipes/cloudflare-origin-certs).
 
 ## `services/prod/api.yaml`
 
@@ -60,6 +76,8 @@ services:
     # tag: provided at deploy via `--tag api=$(git rev-parse HEAD)`
     depends_on: [redis, otel]
     networks: [api, redis, otel]            # api dials redis + otel
+    domain: api.example.com                 # bundled proxy fronts this
+    upstream_h2c: true                      # gRPC + HTTP/1.1 over one h2c upstream
     secrets: [DATABASE_URL, JWT_SIGNING_KEY]
     env_from_secrets:
       # Same secret store, different env-var name on the container
@@ -115,28 +133,9 @@ services:
         network_aliases: [redis]
 ```
 
-## `services/prod/caddy.yaml`
+## Reverse proxy
 
-```yaml
-services:
-  - name: caddy
-    image: lucaslorentz/caddy-docker-proxy
-    tag: 2.10-alpine
-    depends_on: [api, web]
-    networks: [public, api, web]
-    binds:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - "/srv/caddy/data:/data:rw"           # cert storage; explicit :rw
-    run:
-      publish:
-        - "80:80"
-        - "443:443"
-        - "443:443/udp"                       # HTTP/3
-      options:
-        memory: "128Mi"
-        cpus: "0.5"
-        cap_add: [NET_BIND_SERVICE]           # needed for :80/:443
-```
+There is no `caddy.yaml` fragment in this layout. Yoink's bundled proxy is synthesized from the top-level `proxy:` block plus each service's `domain:` field — no explicit Caddy service to declare, no Caddyfile to maintain, no `caddy_data` volume to babysit. See [the proxy guide](/docs/guide/proxy) for the full surface (mTLS, h2c, multi-domain canonical redirects, snippets).
 
 ## `services/prod/otel.yaml`
 
@@ -202,10 +201,11 @@ See [PR-comment dry-run](/docs/recipes/pr-comment-dry-run) for the complete work
 
 ## What this exercises
 
-- **Multi-tier networks** — `redis` only on `redis`; `caddy` only on `public/api/web`; otel isolated on `otel`. Per-service blast radius.
+- **Multi-tier networks** — `redis` only on `redis`; otel isolated on `otel`; api joined to `api/redis/otel` per its dial-out needs. Per-service blast radius.
+- **Bundled reverse proxy** — `domain:` on api/web, `proxy.tls` block once at the top, no `caddy.yaml` fragment to maintain. The proxy auto-joins `yoink-ingress` along with every routed service.
 - **Pre-deploy hooks** — `api-migrate` runs once per up, before the api swap, with the same image as the runtime.
 - **`env_from_secrets`** — secret stored under one name, exposed under a different env-var name on the container. Pattern for legacy env-var conventions.
 - **`files:` mounts** — content-hashed bind that feeds into `spec_hash`. Edit the otel config, redeploy → the otel container reroles automatically because its hash changed.
-- **Surgical security opt-outs** — `caddy` keeps everything default-on except `NET_BIND_SERVICE`; `otel` opts out of the hardened defaults entirely (with a comment explaining why); everything else inherits the defaults.
+- **Surgical security opt-outs** — `otel` opts out of the hardened defaults (with a comment explaining why); everything else inherits the defaults.
 - **Config fragmentation** — one file per service, glob-included. Each fragment is independent; renaming a service is a one-file operation.
 - **Staging alongside prod** — see [the recipe](/docs/recipes/staging-alongside-prod) for the same hosts running a `yoink.staging.yaml` with `name: api-staging` etc.

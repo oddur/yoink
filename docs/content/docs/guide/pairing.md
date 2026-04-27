@@ -6,7 +6,7 @@ weight: 5
 `yoink` doesn't try to solve "how do I reach my hosts." It expects you to bring an off-the-shelf SSH connectivity layer.
 
 {{< callout type="info" >}}
-**Routing changed:** earlier versions of yoink documented [caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy) as the routing pairing. **That's been replaced** by yoink's [first-class reverse proxy integration](/docs/guide/proxy) (admin-API push, deterministic deploy timing, no Docker labels). The CDP path still works — it's just no longer the recommended pattern. Migrate by removing `caddy.*` labels from services, adding `domain:` to each, and `proxy.email:` at the top level.
+**For routing**, yoink now ships a [bundled Caddy reverse proxy](/docs/guide/proxy) — set `domain:` on a service and you're done. This page covers the connectivity layer (Tailscale) and the rest of the stack split.
 {{< /callout >}}
 
 ## Tailscale for SSH (the connectivity layer)
