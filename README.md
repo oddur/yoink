@@ -219,7 +219,17 @@ yoink build api                     # docker build → tag local image as my-app
 yoink up --no-registry --service api # save+load to each host (no docker pull)
 ```
 
-What `--no-registry` does: for every (service, host) the deploy targets, yoink runs `docker save <image>:<tag>` against the operator's local docker daemon, captures the tarball, and streams it into the host's docker daemon via the same ssh+bollard transport that `up` already uses (calling `POST /images/load`). After the load completes, the host has the image in its local cache, and the rest of the deploy flow (which already short-circuits when an image is locally present) runs unchanged — healthcheck-gated rolling swap, drift detection, the works.
+What `--no-registry` does: for every (service, host) the deploy targets, yoink streams `docker save <image>:<tag>` from the operator's local docker daemon directly into the host's docker daemon via the same ssh+bollard transport that `up` already uses (calling `POST /images/load`). The transfer is **streaming** — chunks of ~8 KiB flow through the pipe, never buffering the full tarball in operator-side RAM. A 2 GB image costs 8 KiB of memory on the operator's machine, not 2 GB. After the load completes, the host has the image cached and the rest of the deploy flow (which already short-circuits when an image is locally present) runs unchanged — healthcheck-gated rolling swap, drift detection, the works.
+
+Per-host progress bars track bytes transferred + rate live:
+
+```
+⠋ api:dev → backtrack-eu-1     234.5 MiB @  47.0 MiB/s
+⠋ api:dev → backtrack-eu-2      56.0 MiB @  11.2 MiB/s
+✓ web:dev → backtrack-eu-1     done · 89.3 MiB
+```
+
+Multi-host fan-out is fully concurrent (`try_join_all` per image): each host gets its own `docker save` process + its own bollard connection, so deploy time = max(per-host) instead of sum(per-host).
 
 **Standalone mode fits when**:
 

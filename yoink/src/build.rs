@@ -12,11 +12,16 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
+use bytes::Bytes;
+use futures_util::StreamExt;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::io::ReaderStream;
 
 use crate::config::{Config, ServiceConfig};
 use crate::docker;
@@ -37,14 +42,18 @@ pub enum BuildError {
     DockerPushFailed { service: String, status: String },
     #[error("`docker save` for {image:?} exited with status {status}")]
     DockerSaveFailed { image: String, status: String },
+    #[error("`docker load` on {host} failed: {source}")]
+    LoadImage {
+        host: String,
+        #[source]
+        source: Box<crate::docker_ops::DockerError>,
+    },
     #[error("failed to spawn `{program}`: {source}")]
     Spawn {
         program: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to read `docker save` output: {0}")]
-    ReadSave(#[source] std::io::Error),
 }
 
 /// Resolve a path declared in the config (`build.context`,
@@ -160,12 +169,26 @@ pub async fn build_service(
     Ok(())
 }
 
-/// Spawn `docker save <image_ref>` against the operator's local
-/// docker daemon and slurp the resulting tarball into memory. The
-/// caller hands this byte buffer to `DockerOps::load_image` per host
-/// — bollard's `import_image` body has to be a single Bytes today, so
-/// streaming is a future optimization (see `bollard::body_stream`).
-pub async fn save_image_locally(image_ref: &str) -> Result<bytes::Bytes, BuildError> {
+/// Stream `docker save <image_ref>` from the operator's local docker
+/// daemon directly into the host's docker daemon via bollard's
+/// `import_image` (`POST /images/load`). Memory stays bounded by
+/// `ReaderStream`'s chunk size (8 KiB by default) regardless of how
+/// large the image is — a 2GB Java/Node app costs 8 KiB of buffer,
+/// not 2GB of RAM, on the operator's machine.
+///
+/// `on_progress` is called with each chunk's byte count as it flows
+/// through the pipe — wire it to a progress bar (CLI) or an event
+/// channel (TUI). Use `|_| ()` for silent transfers.
+///
+/// Multi-host: each call spawns its own `docker save` process and
+/// holds its own client connection to the host. Run multiple calls
+/// concurrently via `try_join_all` for full parallel fan-out.
+pub async fn save_and_load_to_host(
+    image_ref: &str,
+    ops: &dyn DockerOps,
+    host: &Host,
+    on_progress: impl FnMut(u64) + Send + 'static,
+) -> Result<u64, BuildError> {
     let mut child = Command::new("docker")
         .arg("save")
         .arg(image_ref)
@@ -176,15 +199,36 @@ pub async fn save_image_locally(image_ref: &str) -> Result<bytes::Bytes, BuildEr
             program: "docker".into(),
             source,
         })?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .expect("piped stdout should always be available");
-    let mut buf: Vec<u8> = Vec::new();
-    stdout
-        .read_to_end(&mut buf)
+
+    // Wrap stdout in a Stream<Item = Result<Bytes, io::Error>>. Tap
+    // every chunk for progress reporting; callers see live byte
+    // counts as the tarball flows.
+    let total = Arc::new(AtomicU64::new(0));
+    let total_clone = Arc::clone(&total);
+    let mut on_progress = on_progress;
+    let stream = ReaderStream::new(stdout).inspect(move |chunk| {
+        if let Ok(bytes) = chunk {
+            let n = bytes.len() as u64;
+            total_clone.fetch_add(n, Ordering::Relaxed);
+            on_progress(n);
+        }
+    });
+
+    let body: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+    > = Box::pin(stream);
+
+    ops.load_image(host, body)
         .await
-        .map_err(BuildError::ReadSave)?;
+        .map_err(|source| BuildError::LoadImage {
+            host: host.address.clone(),
+            source: Box::new(source),
+        })?;
+
     let status = child.wait().await.map_err(|source| BuildError::Spawn {
         program: "docker".into(),
         source,
@@ -195,29 +239,26 @@ pub async fn save_image_locally(image_ref: &str) -> Result<bytes::Bytes, BuildEr
             status: status.to_string(),
         });
     }
-    Ok(bytes::Bytes::from(buf))
+    Ok(total.load(Ordering::Relaxed))
 }
 
 /// Pre-flight for `yoink up --no-registry`: for every selected
-/// service × applicable host, `docker save` the local image and
-/// stream it into the host's docker daemon. After this returns, the
-/// host has the image cached and the reconcile's `image_present`
-/// check short-circuits the would-be-pull.
+/// service × applicable host, stream `docker save` from the
+/// operator's local daemon into the host's daemon via
+/// `import_image`. Memory stays bounded regardless of image size
+/// (`ReaderStream` chunk size, 8 KiB).
 ///
-/// Per-image: one local `docker save` (deduped via the `BTreeMap`),
-/// then a parallel `try_join_all` of `load_image` calls fan-out to
-/// every applicable host. Sequential per-image (one save in flight
-/// at a time) keeps the operator's local docker daemon from racing
-/// itself.
+/// Per-image: parallel fan-out across all applicable hosts via
+/// `try_join_all`. Each host gets its own `docker save` process
+/// (so streams are independent) and its own progress bar. Multiple
+/// images run sequentially so the operator's local docker daemon
+/// isn't fork-bombed.
 pub async fn load_images_to_hosts(
     ops: &dyn DockerOps,
     config: &Config,
     tag_overrides: &BTreeMap<String, String>,
     services_filter: Option<&[String]>,
 ) -> anyhow::Result<()> {
-    // image_ref → applicable HostConfigs. BTreeMap keys dedupe shared
-    // images; the inner Vec keeps `&HostConfig` so `Host::from` does
-    // the right thing without re-scanning by address.
     let mut by_image: BTreeMap<String, Vec<&crate::config::HostConfig>> = BTreeMap::new();
     for svc in config.selected_services(services_filter) {
         let tag = resolve_service_tag(svc, tag_overrides)?;
@@ -231,25 +272,42 @@ pub async fn load_images_to_hosts(
     }
 
     for (image_ref, host_cfgs) in &by_image {
-        eprintln!(
-            "yoink up --no-registry: docker save {image_ref} → {} host(s)",
-            host_cfgs.len()
-        );
-        let tar = save_image_locally(image_ref)
-            .await
-            .with_context(|| format!("docker save {image_ref}"))?;
+        let multi = MultiProgress::new();
+        let style = ProgressStyle::with_template(
+            "{spinner:.green} {prefix:<24} {bytes:>10} @ {bytes_per_sec:>10}  {wide_msg}",
+        )
+        .expect("static progress template parses");
+
         let loads = host_cfgs.iter().map(|host_cfg| {
             let host = Host::from(*host_cfg);
-            let tar = tar.clone();
+            let bar = multi.add(ProgressBar::new_spinner().with_style(style.clone()));
+            bar.set_prefix(format!("{} → {}", short_image(image_ref), host.address));
+            bar.enable_steady_tick(std::time::Duration::from_millis(100));
+            let bar_for_progress = bar.clone();
+            let image_ref = image_ref.clone();
             async move {
-                ops.load_image(&host, tar)
-                    .await
-                    .with_context(|| format!("docker load on {}", host.address))
+                let total = save_and_load_to_host(&image_ref, ops, &host, move |n| {
+                    bar_for_progress.inc(n);
+                })
+                .await
+                .with_context(|| format!("save+load {image_ref} → {}", host.address))?;
+                bar.finish_with_message(format!("done · {}", indicatif::HumanBytes(total)));
+                anyhow::Ok(())
             }
         });
         futures_util::future::try_join_all(loads).await?;
     }
     Ok(())
+}
+
+/// Trim a registry-prefixed image to its short form for progress
+/// labels (`ghcr.io/oddur/api:dev` → `api:dev`, `bt-api:abc` →
+/// `bt-api:abc`). Keeps the prefix-or-tag axis the operator cares
+/// about without eating the whole terminal width.
+fn short_image(image_ref: &str) -> String {
+    image_ref
+        .rsplit_once('/')
+        .map_or_else(|| image_ref.to_string(), |(_, tail)| tail.to_string())
 }
 
 #[cfg(test)]

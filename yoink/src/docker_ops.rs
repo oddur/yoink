@@ -418,10 +418,19 @@ pub trait DockerOps: Send + Sync {
     /// Powers the `--no-registry` deploy path: build locally, save
     /// to a tarball, ship it over ssh, load on the host. No registry
     /// involved.
+    ///
+    /// Body comes in as a stream of byte chunks (typically wrapping
+    /// `docker save`'s stdout via `tokio_util::io::ReaderStream`) so
+    /// memory stays bounded by chunk size, not image size.
     async fn load_image(
         &self,
         host: &Host,
-        tar: bytes::Bytes,
+        body: std::pin::Pin<
+            Box<
+                dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
+                    + Send,
+            >,
+        >,
     ) -> Result<(), DockerError>;
 
     /// `true` if `image:tag` is already present in the host's local
@@ -920,7 +929,12 @@ impl DockerOps for RealDockerOps {
     async fn load_image(
         &self,
         host: &Host,
-        tar: bytes::Bytes,
+        body: std::pin::Pin<
+            Box<
+                dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
+                    + Send,
+            >,
+        >,
     ) -> Result<(), DockerError> {
         use bollard::query_parameters::ImportImageOptions;
         let docker = self.client_for(host).await?;
@@ -929,7 +943,7 @@ impl DockerOps for RealDockerOps {
                 quiet: false,
                 platform: None,
             },
-            bollard::body_full(tar),
+            bollard::body_try_stream(body),
             None,
         );
         // Drain the progress stream — surface errors but ignore the
@@ -2068,7 +2082,12 @@ impl DockerOps for FakeDockerOps {
     async fn load_image(
         &self,
         host: &Host,
-        _tar: bytes::Bytes,
+        _body: std::pin::Pin<
+            Box<
+                dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
+                    + Send,
+            >,
+        >,
     ) -> Result<(), DockerError> {
         let mut s = self.lock();
         s.calls.push(RecordedCall::LoadImage(host.clone()));
