@@ -129,13 +129,25 @@ pub async fn push(
             }
         })?;
 
+    // If this host uses `ssh_key_secret:`, route both the probe and
+    // the tunnel's ssh through the same key bollard is using. Without
+    // this, the probe would hit the operator's default identity (or
+    // none) and the tunnel would silently auth-fail.
+    let keyfile = ops.ssh_keyfile(host);
     // Pre-flight ssh so we surface classified errors (Tailscale auth,
     // permission denied, …) instead of the tunnel's generic "didn't
     // become reachable" timeout. Same probe `yoink preflight` uses.
-    ssh_probe::probe(host)
+    ssh_probe::probe(host, keyfile.as_deref().and_then(|p| p.to_str()))
         .await
         .map_err(UnregistryError::SshProbe)?;
-    let tunnel = SshTunnel::open(&host.user, &host.address, host_port, READY_TIMEOUT).await?;
+    let tunnel = SshTunnel::open(
+        &host.user,
+        &host.address,
+        host_port,
+        READY_TIMEOUT,
+        keyfile.as_deref(),
+    )
+    .await?;
 
     // End-to-end probe: a TCP-level readiness check on the SSH tunnel
     // returns Ok the instant ssh starts listening locally, BEFORE the

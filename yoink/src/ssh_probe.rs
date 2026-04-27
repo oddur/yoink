@@ -32,21 +32,30 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(8);
 /// Bounded by `PROBE_DEADLINE` — on timeout we kill the child and
 /// return the partial stderr (which usually has the actionable
 /// signal already, e.g. Tailscale's auth URL).
-pub async fn probe(host: &Host) -> Result<(), String> {
+pub async fn probe(host: &Host, keyfile_override: Option<&str>) -> Result<(), String> {
     let target = format!("{}@{}", host.user, host.address);
-    let mut child = tokio::process::Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            &target,
-            "true",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+    let mut cmd = tokio::process::Command::new("ssh");
+    if let Some(keyfile) = keyfile_override {
+        // When the host uses `ssh_key_secret:`, route this probe at
+        // the same key bollard will use. Without it, the probe would
+        // pass via the operator's personal agent while the actual
+        // deploy fails — or vice versa. `IdentitiesOnly=yes` stops
+        // ssh from trying agent keys first.
+        cmd.args(["-i", keyfile, "-o", "IdentitiesOnly=yes"]);
+    }
+    cmd.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        &target,
+        "true",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("could not invoke ssh: {e}"))?;
 

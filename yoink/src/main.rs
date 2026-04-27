@@ -608,7 +608,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn cmd_preflight(config: &Config) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let mut had_error = false;
     for host_cfg in &config.hosts {
         let host = Host::from(host_cfg);
@@ -665,7 +665,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
 
     // Wrap in Arc so the heartbeat tasks (one per host lock) can hold
     // their own clone for the duration of the deploy.
-    let ops: std::sync::Arc<dyn DockerOps> = std::sync::Arc::new(RealDockerOps::new());
+    let ops: std::sync::Arc<dyn DockerOps> = std::sync::Arc::new(build_real_ops(config).await?);
     let bundle = load_secrets_bundle(config).await?;
     let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
 
@@ -906,7 +906,7 @@ async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
 }
 
 async fn cmd_status(config: &Config, json: bool) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let report = StatusReport::collect(&ops, config)
         .await
         .context("collect status")?;
@@ -923,7 +923,7 @@ async fn cmd_status(config: &Config, json: bool) -> Result<()> {
 
 async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> Result<()> {
     use yoink::docker_ops::Host;
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
 
     // Verify the service exists in config; otherwise the user typo'd.
     if !config.services.iter().any(|s| s.name == service) {
@@ -996,7 +996,7 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
 
 async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
     use yoink::prune::{self, PruneReason};
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let report = prune::run(&ops, config, dry_run).await.context("prune")?;
     let items = if dry_run {
         &report.planned
@@ -1026,6 +1026,22 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
     secrets::load_bundle(config)
         .await
         .context("load secrets bundle")
+}
+
+/// Build a `RealDockerOps` that knows about any `hosts[].ssh_key_secret`
+/// entries in the config — decrypts them from the secrets bundle into
+/// 0600 tempfiles and threads the paths into bollard + `ssh_probe`.
+/// Held as an `Arc<KeyManager>` inside `RealDockerOps`, so the
+/// tempfiles live exactly as long as the ops object.
+///
+/// For configs without `ssh_key_secret:` and without a `[secrets]`
+/// block, this is essentially `RealDockerOps::new()` — no decrypt
+/// happens, no tempfile, no extra cost.
+async fn build_real_ops(config: &Config) -> Result<RealDockerOps> {
+    let bundle = load_secrets_bundle(config).await?;
+    let km = yoink::ssh_keys::prepare(config, bundle.as_ref())
+        .context("prepare per-host ssh keys")?;
+    Ok(RealDockerOps::with_key_manager(km.map(std::sync::Arc::new)))
 }
 
 /// Resolve `(service, optional host)` to exactly one running container
@@ -1085,7 +1101,7 @@ async fn cmd_exec(
     host_filter: Option<&str>,
     cmd: Vec<String>,
 ) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
     let result = ops
         .exec_oneshot(&host, &container, cmd)
@@ -1110,7 +1126,7 @@ async fn cmd_logs(
     follow: bool,
     tail: u32,
 ) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
     if follow {
         let mut rx = ops
@@ -1142,7 +1158,7 @@ async fn cmd_logs(
 }
 
 async fn cmd_version(config: &Config, service: &str) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let report = StatusReport::collect_for_service(&ops, config, service)
         .await
         .context("collect status")?;
@@ -1179,7 +1195,7 @@ async fn cmd_pty(
 ) -> Result<()> {
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 
-    let ops: std::sync::Arc<dyn DockerOps> = std::sync::Arc::new(RealDockerOps::new());
+    let ops: std::sync::Arc<dyn DockerOps> = std::sync::Arc::new(build_real_ops(config).await?);
     let (host, container) =
         resolve_running_container(ops.as_ref(), config, service, host_filter).await?;
 
@@ -1328,7 +1344,7 @@ async fn cmd_tui(config: &Config, config_path: PathBuf, mode: Mode, mouse: bool)
     let mut config = config.clone();
     config.push_local_host_if_socket();
     let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
-        std::sync::Arc::new(RealDockerOps::new());
+        std::sync::Arc::new(build_real_ops(&config).await?);
     tui::run(&config, config_path, ops, mode, mouse)
         .await
         .context("run TUI")
@@ -1391,7 +1407,7 @@ async fn run_dry_run(
 }
 
 async fn cmd_restart(config: &Config, service: &str, host_filter: Option<&str>) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
     let drain = std::time::Duration::from_secs(10);
     eprintln!("stopping {}@{container} (drain {drain:?})…", host.address);
@@ -1412,7 +1428,7 @@ async fn cmd_kill(
     host_filter: Option<&str>,
     yes: bool,
 ) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
     if !yes {
         eprintln!(
@@ -1449,7 +1465,7 @@ async fn cmd_pull(
         });
     let bundle = load_secrets_bundle(config).await?;
     let credentials = deploy::registry_credentials(config, bundle.as_ref());
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     // Fan out across hosts so a slow daemon doesn't block the others.
     let pulls = config
         .hosts
@@ -1491,7 +1507,7 @@ async fn cmd_pull(
 }
 
 async fn cmd_history(config: &Config, service: &str, limit: usize) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let label = format!("yoink.service={service}");
     // Fan out across hosts. Each call returns running + exited
     // containers labeled with this service.
@@ -1552,7 +1568,7 @@ struct TopRow {
 
 async fn cmd_top(config: &Config, limit: usize) -> Result<()> {
     use yoink::output::{format_bytes, format_relative_time};
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let report = StatusReport::collect(&ops, config)
         .await
         .context("collect status")?;
@@ -1633,7 +1649,7 @@ async fn cmd_top(config: &Config, limit: usize) -> Result<()> {
 }
 
 async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let probes = config
         .hosts
         .iter()
@@ -1668,7 +1684,7 @@ async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> 
 }
 
 async fn cmd_volumes(config: &Config, host_filter: Option<&str>) -> Result<()> {
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let probes = config
         .hosts
         .iter()
@@ -1755,7 +1771,7 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
     use yoink::docker;
     use yoink::lock::LOCK_NAME;
 
-    let ops = std::sync::Arc::new(RealDockerOps::new()) as std::sync::Arc<dyn DockerOps>;
+    let ops = std::sync::Arc::new(build_real_ops(config).await?) as std::sync::Arc<dyn DockerOps>;
     // Best-effort secrets load — drift hashes are accurate when it
     // succeeds, marked "?" otherwise. Failure is logged via tracing
     // (silenced inside dump output).
@@ -2015,7 +2031,7 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
 
 async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
     use yoink::lock::LOCK_NAME;
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     match action {
         LockAction::Status => {
             // Fan out across hosts — one slow daemon shouldn't make
@@ -2077,7 +2093,7 @@ async fn cmd_diff(config: &Config, service: &str, tag_override: Option<&str>) ->
         .or_else(|| svc_cfg.tag.clone())
         .unwrap_or_else(|| "<git>".into());
 
-    let ops = RealDockerOps::new();
+    let ops = build_real_ops(config).await?;
     let report = StatusReport::collect_for_service(&ops, config, service)
         .await
         .context("collect status")?;

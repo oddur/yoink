@@ -52,10 +52,18 @@ impl SshTunnel {
         host: &str,
         remote_port: u16,
         ready_timeout: Duration,
+        keyfile: Option<&std::path::Path>,
     ) -> Result<Self, TunnelError> {
         let local_port = pick_free_port().map_err(TunnelError::Bind)?;
 
         let mut cmd = Command::new("ssh");
+        if let Some(key) = keyfile {
+            // Match the key the bollard daemon connection + ssh_probe
+            // are using for this host (see `RealDockerOps::ssh_keyfile`).
+            // `IdentitiesOnly=yes` stops ssh from trying agent keys
+            // first.
+            cmd.arg("-i").arg(key).arg("-o").arg("IdentitiesOnly=yes");
+        }
         cmd.arg("-N")
             // Fail fast on stale ControlMaster sockets / unreachable host.
             .arg("-o")

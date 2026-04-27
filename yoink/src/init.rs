@@ -436,13 +436,30 @@ fn resolve_host(
         return Ok((addr, user, origin, "positional arg"));
     }
     if let Some(hint) = detection.ssh_host.as_ref() {
-        let user = hint.user.clone().unwrap_or_else(|| DEFAULT_SSH_USER.into());
-        let origin = if hint.user.is_some() {
-            HostUserOrigin::SshConfig
-        } else {
-            HostUserOrigin::Default
-        };
-        return Ok((hint.address.clone(), user, origin, "~/.ssh/config"));
+        // Don't silently use the first ssh-config entry — it's almost
+        // never what the operator wants. On a TTY, confirm or override
+        // it interactively. Otherwise (CI, no tty) bail with the same
+        // helpful message as the no-detection path.
+        if io::stdin().is_terminal() {
+            let suggested = match &hint.user {
+                Some(u) => format!("{u}@{}", hint.address),
+                None => hint.address.clone(),
+            };
+            let answer = ask("ssh host (user@address)", &suggested)?;
+            let (user, addr) = match answer.split_once('@') {
+                Some((u, a)) => (u.to_string(), a.to_string()),
+                None => (
+                    hint.user.clone().unwrap_or_else(|| DEFAULT_SSH_USER.into()),
+                    answer,
+                ),
+            };
+            return Ok((addr, user, HostUserOrigin::HostArg, "interactive prompt"));
+        }
+        anyhow::bail!(
+            "found `{}` in ~/.ssh/config but not picking it silently — pass one as positional arg, e.g. `yoink init deploy@{}`, or run interactively in a terminal",
+            hint.address,
+            hint.address,
+        );
     }
     anyhow::bail!(
         "couldn't infer an ssh host — pass one as positional arg, e.g. `yoink init deploy@my-server`, or use --interactive"
