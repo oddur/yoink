@@ -49,6 +49,12 @@ where
 
     let mut routes: Vec<Value> = Vec::with_capacity(proxied.len() + 1);
     for svc in &proxied {
+        // Canonical-domain redirect: when a service lists multiple
+        // hosts and pins one as canonical, render a 308 redirect
+        // route from the non-canonical entries before the main route.
+        if let Some(redirect) = render_canonical_redirect_route(svc)? {
+            routes.push(redirect);
+        }
         routes.push(render_route(svc, &container_names_for(&svc.name))?);
     }
 
@@ -66,6 +72,11 @@ where
     });
 
     // mTLS lives in connection_policies, applied to every TLS handshake.
+    // Caddy 2's `tls.ca_pool.source.inline` provider takes
+    // base64-encoded DER certs (the bytes that sit between PEM
+    // BEGIN/END markers), one entry per cert in the chain. We split
+    // the trust-pool PEM into blocks here so a multi-cert bundle
+    // (e.g. Cloudflare's origin-pull CA chain) round-trips correctly.
     if let Some(tls) = proxy_tls
         && let Some(client_auth) = tls.client_auth.as_ref()
     {
@@ -84,15 +95,37 @@ where
                     client_auth.trust_pool_secret,
                 )
             })?;
+        let der_b64_certs = pem_to_der_b64_blocks(trust_pool);
+        if der_b64_certs.is_empty() {
+            return Err(anyhow!(
+                "proxy.tls.client_auth.trust_pool_secret={:?} has no CERTIFICATE PEM \
+                 blocks",
+                client_auth.trust_pool_secret,
+            ));
+        }
         http_server["tls_connection_policies"] = json!([{
             "client_authentication": {
                 "mode": client_auth.mode.as_caddy(),
-                "trusted_ca_certs_pem": [trust_pool],
+                "ca": {
+                    "provider": "inline",
+                    "trusted_ca_certs": der_b64_certs,
+                }
             }
         }]);
     }
 
     let mut config = json!({
+        // Same admin block as the synthesized proxy's bootstrap. Caddy
+        // /load REPLACES the active config — if we omit the admin
+        // block, Caddy reverts admin from `0.0.0.0:2019` to the
+        // default `localhost:2019`, which breaks docker's port
+        // forwarding (the docker-proxy on the host sends to the
+        // container's eth0:2019, not lo). Subsequent /load calls
+        // would then time out trying to reach the admin endpoint.
+        "admin": {
+            "listen": "0.0.0.0:2019",
+            "enforce_origin": false,
+        },
         "apps": {
             "http": {
                 "servers": {
@@ -205,6 +238,76 @@ where
     Ok(config)
 }
 
+/// Extract each `-----BEGIN CERTIFICATE-----` block from a PEM bundle
+/// and return its base64-encoded DER body (the inner base64 content
+/// without headers / whitespace). Caddy 2's `tls.ca_pool.source.inline`
+/// `trusted_ca_certs` is a list of base64-DER strings — one per cert
+/// in the chain — not full PEM. Other PEM types (PRIVATE KEY,
+/// EC PRIVATE KEY, …) are ignored: trust pools are CERTIFICATE only.
+fn pem_to_der_b64_blocks(pem: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_cert = false;
+    let mut acc = String::new();
+    for line in pem.lines() {
+        let line = line.trim();
+        if line == "-----BEGIN CERTIFICATE-----" {
+            in_cert = true;
+            acc.clear();
+        } else if line == "-----END CERTIFICATE-----" {
+            if in_cert && !acc.is_empty() {
+                out.push(std::mem::take(&mut acc));
+            }
+            in_cert = false;
+        } else if in_cert {
+            acc.push_str(line);
+        }
+    }
+    out
+}
+
+/// Build a `:443`-side route that 308-redirects every non-canonical
+/// hostname listed in `domain:` to `canonical_domain:`. Returns
+/// `Ok(None)` for services that don't set `canonical_domain` or that
+/// only declare one hostname (nothing to redirect).
+fn render_canonical_redirect_route(svc: &ServiceConfig) -> Result<Option<Value>> {
+    let Some(canonical) = svc.canonical_domain.as_deref() else {
+        return Ok(None);
+    };
+    let domains = svc
+        .domain
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow!(
+                "service {:?}: canonical_domain set without domain (caught by \
+                 inject_implicit_proxy validation upstream)",
+                svc.name,
+            )
+        })?
+        .as_list();
+    if !domains.iter().any(|d| d == canonical) {
+        return Err(anyhow!(
+            "service {:?}: canonical_domain={canonical:?} is not one of the entries \
+             in domain: {domains:?}",
+            svc.name,
+        ));
+    }
+    let non_canonical: Vec<String> = domains.into_iter().filter(|d| d != canonical).collect();
+    if non_canonical.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "match": [{"host": non_canonical}],
+        "handle": [{
+            "handler": "static_response",
+            "status_code": 308,
+            "headers": {
+                "Location": [format!("https://{canonical}{{http.request.uri}}")],
+            }
+        }],
+        "terminal": true,
+    })))
+}
+
 fn redirect_route_http_to_https() -> Value {
     // Match :80 only; rewrite scheme + 308 redirect. Caddy's `redir`
     // handler is the JSON shape below.
@@ -252,7 +355,9 @@ fn render_route(svc: &ServiceConfig, containers: &[String]) -> Result<Value> {
     let mut handle: Vec<Value> = Vec::new();
 
     // Operator-supplied snippet. Append before the reverse_proxy so
-    // gating directives (forward_auth) run first.
+    // gating directives (forward_auth) run first. Routes are
+    // auto-wrapped in a `subroute` handler so the operator never has
+    // to know about `subroute` to inline a (match → handle).
     if let Some(extra) = svc.caddy_extra_json.as_deref() {
         let parsed: Value = serde_json::from_str(extra).with_context(|| {
             format!(
@@ -260,22 +365,22 @@ fn render_route(svc: &ServiceConfig, containers: &[String]) -> Result<Value> {
                 svc.name,
             )
         })?;
-        // Accept either a single object (one handler) or a list.
-        match parsed {
-            Value::Array(xs) => handle.extend(xs),
-            Value::Object(_) => handle.push(parsed),
-            other => {
-                return Err(anyhow!(
-                    "service {:?}: caddy_extra_json must be a JSON object or array of \
-                     objects, got {}",
-                    svc.name,
-                    discriminant_str(&other),
-                ));
-            }
+        for item in normalize_extra_json(parsed, &svc.name)? {
+            handle.push(item);
         }
     }
 
-    handle.push(json!({
+    // Optional gzip + zstd compression handler. Vanilla Caddy's
+    // `encode` module — no plugin needed.
+    if svc.compression {
+        handle.push(json!({
+            "handler": "encode",
+            "encodings": {"gzip": {}, "zstd": {}},
+            "prefer": ["zstd", "gzip"],
+        }));
+    }
+
+    let mut reverse_proxy = json!({
         "handler": "reverse_proxy",
         "upstreams": upstreams,
         "health_checks": {
@@ -285,7 +390,18 @@ fn render_route(svc: &ServiceConfig, containers: &[String]) -> Result<Value> {
                 "timeout": "2s",
             }
         }
-    }));
+    });
+    if svc.upstream_h2c {
+        // h2c = HTTP/2 cleartext to the upstream. Required for native
+        // gRPC backends (Tonic, grpc-go, grpc-java) and for
+        // HTTP/2-only upstream apps. Doesn't affect what Caddy serves
+        // to clients.
+        reverse_proxy["transport"] = json!({
+            "protocol": "http",
+            "versions": ["h2c"],
+        });
+    }
+    handle.push(reverse_proxy);
 
     let host_match = json!({"host": svc.domain.as_ref().unwrap().as_list()});
 
@@ -300,6 +416,69 @@ fn render_route(svc: &ServiceConfig, containers: &[String]) -> Result<Value> {
     }
 
     Ok(route)
+}
+
+/// Coerce `caddy_extra_json` parsed value into a list of handler
+/// objects ready to splice into the route's `handle` array.
+///
+/// - Handler shape (`{"handler": "x", ...}`) → pass-through.
+/// - Route shape (`{"match": ..., "handle": ...}`) → wrapped in a
+///   single `subroute` handler. Operators get to write the natural
+///   shape ("when X, do Y") without knowing `subroute` exists.
+/// - Mixed lists → each entry classified independently; route-shaped
+///   entries are wrapped together in one `subroute`.
+fn normalize_extra_json(parsed: Value, svc_name: &str) -> Result<Vec<Value>> {
+    let items: Vec<Value> = match parsed {
+        Value::Array(xs) => xs,
+        Value::Object(_) => vec![parsed],
+        other => {
+            return Err(anyhow!(
+                "service {svc_name:?}: caddy_extra_json must be a JSON object or array \
+                 of objects, got {}",
+                discriminant_str(&other),
+            ));
+        }
+    };
+
+    let mut handlers: Vec<Value> = Vec::with_capacity(items.len());
+    let mut routes_buf: Vec<Value> = Vec::new();
+    for item in items {
+        let obj = match item.as_object() {
+            Some(_) => item,
+            None => {
+                return Err(anyhow!(
+                    "service {svc_name:?}: caddy_extra_json entries must be JSON \
+                     objects (a handler or a route), got {}",
+                    discriminant_str(&item),
+                ));
+            }
+        };
+        if obj.get("handler").is_some() {
+            // Flush any pending routes into a subroute, then append
+            // this handler — preserves user-written ordering.
+            if !routes_buf.is_empty() {
+                handlers.push(json!({
+                    "handler": "subroute",
+                    "routes": std::mem::take(&mut routes_buf),
+                }));
+            }
+            handlers.push(obj);
+        } else if obj.get("match").is_some() || obj.get("handle").is_some() {
+            routes_buf.push(obj);
+        } else {
+            return Err(anyhow!(
+                "service {svc_name:?}: caddy_extra_json entry has neither `handler` \
+                 (handler form) nor `match`/`handle` (route form): {obj}",
+            ));
+        }
+    }
+    if !routes_buf.is_empty() {
+        handlers.push(json!({
+            "handler": "subroute",
+            "routes": routes_buf,
+        }));
+    }
+    Ok(handlers)
 }
 
 fn discriminant_str(v: &Value) -> &'static str {
@@ -473,7 +652,11 @@ services:
         let mut values = std::collections::BTreeMap::new();
         values.insert("CF_CERT".to_string(), "-----BEGIN CERTIFICATE-----\n".into());
         values.insert("CF_KEY".to_string(), "-----BEGIN PRIVATE KEY-----\n".into());
-        values.insert("CF_CA".to_string(), "-----BEGIN CERTIFICATE-----CA\n".into());
+        values.insert(
+            "CF_CA".to_string(),
+            "-----BEGIN CERTIFICATE-----\nMIIBfakeCAder\n-----END CERTIFICATE-----\n"
+                .into(),
+        );
         let bundle = SecretsBundle::new(values);
         let json = render(&cfg, |_| vec!["api-1".into()], Some(&bundle)).expect("render");
 
@@ -486,10 +669,14 @@ services:
             policies[0]["client_authentication"]["mode"].as_str(),
             Some("require_and_verify")
         );
-        assert!(policies[0]["client_authentication"]["trusted_ca_certs_pem"][0]
-            .as_str()
-            .unwrap()
-            .contains("CA"));
+        assert_eq!(
+            policies[0]["client_authentication"]["ca"]["provider"].as_str(),
+            Some("inline")
+        );
+        assert_eq!(
+            policies[0]["client_authentication"]["ca"]["trusted_ca_certs"][0].as_str(),
+            Some("MIIBfakeCAder")
+        );
 
         // First route is the :80 → :443 redirect.
         let routes = json["apps"]["http"]["servers"]["main"]["routes"]

@@ -1,19 +1,21 @@
 //! Push rendered Caddy JSON to the proxy's admin API.
 //!
-//! Caddy's admin API listens on `:2019` *inside* the container, on
-//! the `yoink-proxy-admin` Docker network only (never published to
-//! the host). The yoink CLI reaches it for the duration of one
-//! `/load` call by:
+//! Caddy's admin API listens on `:2019` *inside* the container and is
+//! published on the host's loopback at an ephemeral port (chosen by
+//! docker via `127.0.0.1:0:2019`). The yoink CLI:
 //!
-//! 1. Looking up the proxy container's IP on the admin network.
-//! 2. Opening an SSH-tunnelled forward from `localhost:<rand>` →
-//!    `<container_ip>:2019` on the host.
-//! 3. `POST`ing the JSON to `http://localhost:<rand>/load` with
-//!    `Content-Type: application/json`.
-//! 4. Dropping the tunnel.
+//! 1. Looks up the proxy container, reads the host-side admin port
+//!    from its inspect output.
+//! 2. SSH-tunnels from `operator-localhost:<rand>` to
+//!    `host-localhost:<published>`.
+//! 3. `POST`s the JSON to `http://127.0.0.1:<rand>/load`.
+//! 4. Drops the tunnel.
 //!
-//! The state machine integration in `deploy.rs` calls
-//! [`push_config`] at the routing-flip moment of the rolling swap.
+//! Why loopback-published instead of using the container's docker IP
+//! directly: docker doesn't route user-defined-network container IPs
+//! from the host, so an SSH-tunnel `-L … :<container_ip>:2019` gets
+//! "connection refused". Loopback publishing is the established
+//! pattern (same shape as the unregistry transport).
 
 use std::time::{Duration, Instant};
 
@@ -23,7 +25,7 @@ use thiserror::Error;
 use crate::docker_ops::{DockerError, DockerOps, Host};
 use crate::transport::tunnel::{SshTunnel, TunnelError};
 
-use super::{ADMIN_NETWORK, ADMIN_PORT, PROXY_SERVICE_NAME};
+use super::{ADMIN_PORT, PROXY_SERVICE_NAME};
 
 #[derive(Debug, Error)]
 pub enum AdminError {
@@ -36,10 +38,10 @@ pub enum AdminError {
     #[error("proxy container {PROXY_SERVICE_NAME:?} not running on {host}")]
     ProxyNotRunning { host: String },
     #[error(
-        "proxy container on {host} is not attached to {ADMIN_NETWORK:?} \
-         (yoink expected the implicit injection to put it there)"
+        "proxy container on {host} has no published admin port — yoink expected \
+         it on `127.0.0.1:0:{ADMIN_PORT}` but inspect returned: {ports:?}"
     )]
-    NoAdminNetwork { host: String },
+    NoPublishedAdminPort { host: String, ports: Vec<String> },
     #[error("ssh tunnel to proxy admin: {0}")]
     Tunnel(#[from] TunnelError),
     #[error("proxy admin endpoint did not respond within {timeout:?}")]
@@ -57,8 +59,8 @@ pub enum AdminError {
 }
 
 /// Push `config` to the proxy on `host`. Looks up the proxy
-/// container's IP on the admin network, opens an SSH tunnel, POSTs
-/// to `/load`, drops the tunnel.
+/// container's host-side admin port, opens an SSH tunnel to host
+/// loopback at that port, POSTs to `/load`, drops the tunnel.
 pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
@@ -79,17 +81,25 @@ pub async fn push_config(
             host: host.address.clone(),
         })?;
 
-    // The admin-network IP isn't carried in `ContainerDetail.networks`
-    // (which is just network names). Use a one-shot exec against the
-    // proxy container itself to read its own IP — see `pick_admin_ip`.
-    let ip = pick_admin_ip(host, ops, &running.name).await?;
+    let detail = ops
+        .inspect_container(host, &running.name)
+        .await
+        .map_err(|source| AdminError::Docker {
+            host: host.address.clone(),
+            source,
+        })?;
+    let host_port = parse_published_port(&detail.ports, ADMIN_PORT).ok_or_else(|| {
+        AdminError::NoPublishedAdminPort {
+            host: host.address.clone(),
+            ports: detail.ports.clone(),
+        }
+    })?;
 
     let keyfile = ops.ssh_keyfile(host);
-    let tunnel = SshTunnel::open_to(
+    let tunnel = SshTunnel::open(
         &host.user,
         &host.address,
-        &ip,
-        ADMIN_PORT,
+        host_port,
         Duration::from_secs(20),
         keyfile.as_deref(),
     )
@@ -117,50 +127,20 @@ pub async fn push_config(
     Ok(())
 }
 
-async fn pick_admin_ip(
-    host: &Host,
-    ops: &dyn DockerOps,
-    container: &str,
-) -> Result<String, AdminError> {
-    let detail = ops
-        .inspect_container(host, container)
-        .await
-        .map_err(|source| AdminError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
-    if !detail.networks.iter().any(|n| n == ADMIN_NETWORK) {
-        return Err(AdminError::NoAdminNetwork {
-            host: host.address.clone(),
-        });
+/// `parse_inspect` formats each entry as `"<host_port>:<container_port>/<proto>"`
+/// (or `"(unpublished) <container_port>/<proto>"`). Find the entry whose
+/// container port is `wanted` and return the host port.
+fn parse_published_port(entries: &[String], wanted: u16) -> Option<u16> {
+    let suffix = format!(":{wanted}/");
+    for entry in entries {
+        if let Some(idx) = entry.find(&suffix) {
+            let host_port = &entry[..idx];
+            if let Ok(p) = host_port.parse::<u16>() {
+                return Some(p);
+            }
+        }
     }
-    // ContainerDetail surfaces network names but not IPs. Use the
-    // bollard inspect raw response indirectly via a one-shot exec
-    // probe: ask the container to print its address on the admin
-    // network. Cheap, no schema changes to ContainerDetail.
-    //
-    // Caddy doesn't ship with `ip` or `hostname -I`. Use `getent
-    // hosts <self-name>` which works on Alpine + Debian + Caddy's
-    // distroless variants because nsswitch falls back to /etc/hosts
-    // where Docker writes the container's own IPs.
-    let result = ops
-        .exec_oneshot(
-            host,
-            container,
-            vec!["sh".into(), "-c".into(), format!("getent hosts {container} | awk '{{print $1}}' | head -1")],
-        )
-        .await
-        .map_err(|source| AdminError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
-    let ip = result.stdout.trim().to_string();
-    if ip.is_empty() {
-        return Err(AdminError::NoAdminNetwork {
-            host: host.address.clone(),
-        });
-    }
-    Ok(ip)
+    None
 }
 
 async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), AdminError> {
@@ -171,12 +151,29 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
         .expect("reqwest client builder");
     let deadline = Instant::now() + timeout;
     loop {
-        match client.get(&url).send().await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-            Err(_) => return Err(AdminError::NotReady { timeout }),
+        if client.get(&url).send().await.is_ok() {
+            return Ok(());
         }
+        if Instant::now() >= deadline {
+            return Err(AdminError::NotReady { timeout });
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_published_port_picks_wanted() {
+        let entries = vec![
+            "80:80/tcp".to_string(),
+            "443:443/tcp".to_string(),
+            "32773:2019/tcp".to_string(),
+        ];
+        assert_eq!(parse_published_port(&entries, 2019), Some(32773));
+        assert_eq!(parse_published_port(&entries, 80), Some(80));
+        assert_eq!(parse_published_port(&entries, 9999), None);
     }
 }

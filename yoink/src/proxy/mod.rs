@@ -168,15 +168,25 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
 }
 
 fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
+    // Split `image[:tag]` into the two fields yoink expects. Yoink's
+    // normalize_image_references only splits on `@` for digest pinning,
+    // not on `:` for tag — that pass runs before we synthesize, so we
+    // do the split inline here. Defaults to `caddy:2` when unset.
+    let raw = p.resolved_image();
+    let (image, tag) = match raw.rsplit_once(':') {
+        // Reject `host:port/repo` (port-bearing registries) by checking
+        // the suffix doesn't contain `/`. For the registry case the
+        // operator passes the full ref including tag, e.g.
+        // `ghcr.io/me/caddy-redis:2.7`.
+        Some((repo, t)) if !t.contains('/') => (repo.to_string(), Some(t.to_string())),
+        _ => (raw, None),
+    };
     ServiceConfig {
         name: PROXY_SERVICE_NAME.to_string(),
-        image: p.resolved_image(),
+        image,
         kind: Some(ServiceKind::Proxy),
         build: None,
-        // Tag baked into the image ref — Caddy's official tag is the
-        // version (`caddy:2`); for xcaddy-built images the operator
-        // pins the tag in `proxy.image:` directly.
-        tag: None,
+        tag,
         hosts: None,
         env: std::collections::BTreeMap::default(),
         secrets: Vec::new(),
@@ -190,14 +200,70 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         tls_cert_secret: None,
         tls_key_secret: None,
         caddy_extra_json: None,
+        upstream_h2c: false,
+        canonical_domain: None,
+        compression: false,
         run: ServiceRun {
-            // Caddy serves :80 + :443 on the host. We publish those
-            // because that's the whole point of the proxy. The admin
-            // API on :2019 is NOT published — it's reached via
-            // SSH-tunnelled access to the container's IP on the
-            // `_proxy-admin` network.
             port: None,
             healthcheck_path: None,
+            // Caddy serves :80 + :443 on the host — that's the whole
+            // point of the proxy. Admin API on :2019 is published on
+            // 127.0.0.1 with an ephemeral host port (`:0:2019`) so
+            // it's reachable from the host (and only from the host)
+            // without going through docker's bridge networking,
+            // which doesn't expose user-defined-network container
+            // IPs to the host. The yoink CLI looks up the actual
+            // host port via `inspect_container` and SSH-tunnels to
+            // it for the duration of one `/load` call.
+            //
+            // The :80/:443 publishes also implicitly force stop-first
+            // deploy (port bindings are exclusive at the kernel
+            // level), so a proxy redeploy briefly drops :80/:443
+            // until the new container binds.
+            publish: vec![
+                "80:80".to_string(),
+                "443:443".to_string(),
+                "127.0.0.1:0:2019".to_string(),
+            ],
+            // Override the official caddy:2 image's entrypoint to
+            // start with a minimal bootstrap config: admin bound to
+            // 0.0.0.0:2019 (so the admin endpoint is reachable from
+            // the docker bridge — the default `localhost:2019` would
+            // refuse our SSH-tunneled `/load`), `enforce_origin: false`
+            // + a known origin (`yoink-admin`) so we can route past
+            // Caddy's host-header check by setting Host: yoink-admin
+            // on every admin request. The actual routes are pushed
+            // via `/load` immediately after the container is healthy.
+            entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
+            cmd: vec![
+                concat!(
+                    "echo '{\"admin\":{\"listen\":\"0.0.0.0:2019\",",
+                    "\"enforce_origin\":false,",
+                    "\"origins\":[\"yoink-admin\"]}}'",
+                    " | exec caddy run --config /dev/stdin",
+                )
+                .to_string(),
+            ],
+            // Yoink's `cap_drop: [ALL]` default would block Caddy
+            // from binding :80/:443 (privileged ports). Re-add the
+            // one cap that lets it; everything else stays dropped.
+            options: crate::config::RunOptions {
+                cap_drop: vec!["ALL".to_string()],
+                cap_add: vec!["NET_BIND_SERVICE".to_string()],
+                // Caddy's official image runs as root and writes ACME
+                // state to /data as root — overriding to a non-root
+                // user would lose write access to the cert volume.
+                user: Some("0:0".to_string()),
+                ..crate::config::RunOptions::default()
+            },
+            // ACME state, certs, OCSP staples — survives container
+            // recreation. Volume name comes from `proxy.cert_volume`
+            // (default `yoink_caddy_data`). A second volume holds
+            // Caddy's autosave config so it can resume on restart.
+            volumes: vec![
+                format!("{}:/data", p.resolved_cert_volume()),
+                "yoink_caddy_config:/config".to_string(),
+            ],
             ..ServiceRun::default()
         },
     }

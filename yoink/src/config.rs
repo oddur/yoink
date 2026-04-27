@@ -487,12 +487,36 @@ pub struct ServiceConfig {
     /// additional `handle` entries (rendered before the auto-generated
     /// `reverse_proxy` handler). Escape hatch for Caddy features yoink
     /// doesn't model — `forward_auth`, `rate_limit`, `headers`, etc.
-    /// Must be a JSON array of Caddy handler objects. Yoink does not
-    /// validate the contents — invalid handlers will fail at Caddy's
-    /// `/load` step with the API's parse error surfaced verbatim.
+    /// Accepts either a list of handlers (`[{"handler": "...", ...}]`)
+    /// or a list of routes (`[{"match": ..., "handle": ...}]`); routes
+    /// are auto-wrapped in a `subroute` handler so the operator never
+    /// has to know about `subroute`. Yoink does not validate the
+    /// contents — invalid handlers will fail at Caddy's `/load` step
+    /// with the API's parse error surfaced verbatim.
     /// See <https://caddyserver.com/docs/json/apps/http/servers/routes/handle/>.
     #[serde(default)]
     pub caddy_extra_json: Option<String>,
+    /// Talk to the backend over HTTP/2 cleartext (`h2c`). Renders a
+    /// `transport: { protocol: http, versions: [h2c] }` block on the
+    /// auto-generated `reverse_proxy` handler. Required for native
+    /// gRPC backends (Tonic, grpc-go, grpc-java) and for HTTP/2-only
+    /// upstream apps. Doesn't affect what Caddy serves to clients —
+    /// just how it dials the upstream.
+    #[serde(default)]
+    pub upstream_h2c: bool,
+    /// One of the entries in `domain:` to treat as canonical. Yoink
+    /// auto-renders a 308 redirect from every other entry to this one.
+    /// Common pattern: `domain: [example.com, www.example.com]` +
+    /// `canonical_domain: example.com` redirects www → apex.
+    /// Must match exactly one of the strings in `domain:`.
+    #[serde(default)]
+    pub canonical_domain: Option<String>,
+    /// Compress responses with gzip + zstd. Renders Caddy's `encode`
+    /// handler before `reverse_proxy`. No-op when behind Cloudflare
+    /// (the edge already compresses); useful for direct-origin
+    /// deploys without a CDN in front.
+    #[serde(default)]
+    pub compression: bool,
     pub run: ServiceRun,
 }
 
