@@ -7,6 +7,7 @@ pub mod docker_ops;
 pub mod files;
 pub mod git;
 pub mod healthcheck;
+pub mod init;
 pub mod lock;
 pub mod network;
 pub mod output;

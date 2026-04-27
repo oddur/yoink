@@ -37,6 +37,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Generate a starter `yoink.yaml` for the current repo with
+    /// best-practices defaults. Detects cwd / Dockerfile / git remote /
+    /// `~/.ssh/config` and writes a complete validated config with
+    /// zero prompts in the happy path. Pass HOST as a positional arg
+    /// when ssh config can't infer one. `--interactive` engages a
+    /// stdio prompt fallback.
+    Init {
+        /// Ssh target (e.g. `deploy@prod-eu-1` or just `prod-eu-1`).
+        /// Optional when `~/.ssh/config` has a non-wildcard Host
+        /// yoink can use.
+        host: Option<String>,
+        /// Overwrite an existing `yoink.yaml`.
+        #[arg(long)]
+        force: bool,
+        /// Prompt for every field (defaults match the inferred
+        /// values; hit Enter to accept each).
+        #[arg(long)]
+        interactive: bool,
+        /// Override the inferred service name.
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+        /// Override the inferred port (default: Dockerfile EXPOSE
+        /// or 8080).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Don't include `port:` / `healthcheck_path:` in the config
+        /// (for services with no HTTP surface).
+        #[arg(long)]
+        no_port: bool,
+        /// Override the inferred image reference.
+        #[arg(long, value_name = "PATH")]
+        image: Option<String>,
+    },
     /// Verify Docker is reachable on each configured host.
     Preflight,
     /// Reconcile every service in the config to its desired spec.
@@ -570,6 +603,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Secrets { action } => cmd_secrets(&config, action),
         Command::Tui { mode, mouse } => cmd_tui(&config, cli.config.clone(), mode, mouse).await,
+        Command::Init { .. } => unreachable!("init handled by run_bootstrap"),
     }
 }
 
@@ -2099,6 +2133,23 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
         Command::Secrets {
             action: SecretsAction::Keygen { out, force },
         } => Some(cmd_secrets_keygen(out.clone(), *force)),
+        Command::Init {
+            host,
+            force,
+            interactive,
+            service,
+            port,
+            no_port,
+            image,
+        } => Some(yoink::init::cmd_init(yoink::init::InitOpts {
+            host: host.clone(),
+            force: *force,
+            interactive: *interactive,
+            service: service.clone(),
+            port: *port,
+            no_port: *no_port,
+            image: image.clone(),
+        })),
         _ => None,
     }
 }
