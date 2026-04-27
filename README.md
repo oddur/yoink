@@ -173,7 +173,7 @@ Pick by service if you want — `yoink build` only runs against services with a 
 
 ### CI-built — the default
 
-Operator config has no `build:` block; CI builds the image and pushes it to a registry on every merge. `yoink up` pulls and rolls. This is what every example so far in this README has been doing — `image: ghcr.io/you/api` with `--tag api=<sha>` overriding tag at deploy time.
+Operator config has no `build:` block; CI builds the image and pushes it to a registry on every merge. `yoink up` pulls and rolls. The image reference is fully qualified (`image: ghcr.io/you/api`) and the tag typically gets overridden at deploy time via `--tag api=<sha>`.
 
 ### Local-build, kamal-style
 
@@ -285,8 +285,6 @@ services:
 Then `yoink build api --push` pushes to your tailnet registry; `yoink up --service api` pulls from it. Tailscale ACLs are the registry's auth surface — no `docker login` / registry password needed if your tailnet is correctly scoped. Persistent storage via the `registry-data` volume.
 
 Best for "I want a registry but I don't want to pay for one and I don't want to run it on a separate machine."
-
-Recipe — not yoink-specific code. Best for "I want a registry but I don't want to pay for one and I don't want to run it on a separate machine."
 
 ## Install
 
