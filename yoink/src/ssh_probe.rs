@@ -11,15 +11,30 @@
 //! Used by `yoink preflight` today; TUI Hosts pane is a candidate
 //! consumer for the same flow.
 
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::io::AsyncReadExt;
+
 use crate::docker_ops::Host;
 
+/// Hard ceiling on probe duration. `ConnectTimeout` is the TCP
+/// handshake budget; this bounds the entire ssh process — including
+/// `BatchMode`-resistant prompts (Tailscale's "additional check
+/// required" gate prints to stderr but keeps the connection open
+/// regardless of `BatchMode=yes`).
+const PROBE_DEADLINE: Duration = Duration::from_secs(8);
+
 /// Probe the SSH connection. Returns `Ok(())` when `ssh user@host
-/// true` succeeds with `BatchMode=yes` (no interactive prompts);
-/// otherwise an operator-readable error string with both a
-/// classified hint and the raw stderr.
+/// true` succeeds; otherwise an operator-readable error string with
+/// a classified hint plus whatever stderr accumulated.
+///
+/// Bounded by `PROBE_DEADLINE` — on timeout we kill the child and
+/// return the partial stderr (which usually has the actionable
+/// signal already, e.g. Tailscale's auth URL).
 pub async fn probe(host: &Host) -> Result<(), String> {
     let target = format!("{}@{}", host.user, host.address);
-    let output = tokio::process::Command::new("ssh")
+    let mut child = tokio::process::Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
@@ -30,18 +45,44 @@ pub async fn probe(host: &Host) -> Result<(), String> {
             &target,
             "true",
         ])
-        .output()
-        .await
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("could not invoke ssh: {e}"))?;
-    if output.status.success() {
+
+    // Drain stderr into a buffer in parallel with waiting on the
+    // child. If the child times out we kill it; then awaiting the
+    // pipe finishes immediately because the descriptor closed.
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "ssh child has no stderr pipe".to_string())?;
+    let stderr_task: tokio::task::JoinHandle<Vec<u8>> = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf).await;
+        buf
+    });
+
+    let wait = tokio::time::timeout(PROBE_DEADLINE, child.wait()).await;
+    let timed_out = wait.is_err();
+    if timed_out {
+        let _ = child.kill().await;
+    }
+    let success = matches!(wait, Ok(Ok(s)) if s.success());
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+
+    if success {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+
     let translated = classify(&stderr);
-    Err(format!(
-        "ssh probe failed: {translated}\n\nraw ssh stderr:\n{}",
-        stderr.trim()
-    ))
+    let prefix = if timed_out {
+        format!("ssh probe timed out after {}s: {translated}", PROBE_DEADLINE.as_secs())
+    } else {
+        format!("ssh probe failed: {translated}")
+    };
+    Err(format!("{prefix}\n\nraw ssh stderr:\n{}", stderr.trim()))
 }
 
 /// Pattern-match ssh stderr against the failure modes operators hit
