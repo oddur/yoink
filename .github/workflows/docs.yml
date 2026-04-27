@@ -1,0 +1,71 @@
+name: Deploy docs
+
+# Build the Hugo + Hextra docs site under docs/ and publish to GitHub
+# Pages on every push to main. Hextra is pulled in as a Hugo module
+# (see docs/go.mod), so the runner needs Go + the extended Hugo build.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deploy to avoid races between two pushes
+# in flight; cancel an older one if a newer commit lands.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0   # `enableGitInfo: true` reads commit dates
+
+      - name: Setup Hugo
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: "0.160.1"
+          extended: true
+
+      - name: Setup Go (for Hugo modules)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Resolve Hugo modules
+        run: hugo mod tidy
+
+      - name: Build site
+        run: hugo --gc --minify --baseURL "${{ steps.pages.outputs.base_url }}/"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
