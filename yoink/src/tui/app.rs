@@ -781,9 +781,15 @@ impl App {
     /// when an error string is too long to fit in the one-line
     /// footer (Tailscale auth URL, multi-line ssh-probe output,
     /// etc.). Operator dismisses with Esc; the same error won't
-    /// re-pop on subsequent refresh ticks. The fingerprint keys on
-    /// the first line of the body, so token-regeneration in the URL
-    /// doesn't count as a different error.
+    /// re-pop on subsequent refresh ticks.
+    ///
+    /// **Why first-line fingerprinting:** the first line is the
+    /// classified hint (e.g. `ssh probe failed: Tailscale SSH
+    /// requires an additional check — open this URL...`), which
+    /// stays stable across token regenerations in the URL on
+    /// subsequent lines. Hashing the full body would make every
+    /// token rotation re-pop the same modal the operator just
+    /// dismissed.
     fn show_error_modal_once(&mut self, title: &str, body: &str) {
         let first_line = body.lines().next().unwrap_or("").to_string();
         let fp = format!("{title}|{first_line}");
@@ -1733,10 +1739,24 @@ impl App {
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
             let label = format!("yoink.service={service}");
+            // Fan out per-host fetches in parallel — sequential here
+            // multiplies the ssh-probe timeout by the host count
+            // (3 hosts down × 8s = 24s total before the operator
+            // sees anything). `StatusReport::collect` already does
+            // the same thing for the dashboard.
+            let futs = hosts.into_iter().map(|host| {
+                let ops = ops.clone();
+                let label = label.clone();
+                async move {
+                    let result = ops.list_containers_by_label(&host, &label).await;
+                    (host, result)
+                }
+            });
+            let results = futures_util::future::join_all(futs).await;
             let mut rows: Vec<super::history::HistoryRow> = Vec::new();
             let mut errors: Vec<String> = Vec::new();
-            for host in hosts {
-                match ops.list_containers_by_label(&host, &label).await {
+            for (host, result) in results {
+                match result {
                     Ok(containers) => {
                         for c in containers {
                             rows.push(super::history::HistoryRow::from_container(
