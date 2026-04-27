@@ -22,7 +22,7 @@ use tracing::warn;
 
 use super::oci_push::{self, OciPushError};
 use super::tunnel::{SshTunnel, TunnelError};
-use crate::docker_ops::{DockerError, DockerOps, Host, rand_hex};
+use crate::docker_ops::{DockerError, DockerOps, Host, parse_published_port, rand_hex};
 use crate::ssh_probe;
 
 /// Image used for the ephemeral on-host registry sidecar.
@@ -307,21 +307,6 @@ fn sidecar_create_body() -> ContainerCreateBody {
     }
 }
 
-/// `parse_inspect` formats each entry as `"<host_port>:<container_port>/<proto>"`.
-/// Find the entry whose container port matches `wanted` and return the
-/// host port as a u16.
-fn parse_published_port(entries: &[String], wanted: u16) -> Option<u16> {
-    let suffix = format!(":{wanted}/");
-    for entry in entries {
-        if let Some(idx) = entry.find(&suffix) {
-            let host_port = &entry[..idx];
-            if let Ok(p) = host_port.parse::<u16>() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
 
 
 /// RAII guard that force-removes the sidecar if Drop runs before

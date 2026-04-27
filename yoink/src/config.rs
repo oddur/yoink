@@ -55,6 +55,12 @@ pub struct Config {
     /// will pull successfully.
     #[serde(default)]
     pub registry: Option<RegistryConfig>,
+    /// Optional reverse-proxy config. The proxy is auto-enabled when
+    /// any service declares `domain:`; this block only needs to be set
+    /// when overriding defaults (e.g. to set `email:` for ACME or to
+    /// pin a custom Caddy image with plugins). See [`ProxyConfig`].
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
     /// Glob patterns (relative to this file's directory) of additional
     /// config fragments to load. Each fragment may declare `services`
     /// and/or `hooks.pre_deploy`; everything else (`hosts`, `secrets`,
@@ -129,6 +135,141 @@ pub struct HostConfig {
     /// auth set up — fresh VPS with `root` user, throwaway hosts, etc.
     #[serde(default)]
     pub ssh_key_secret: Option<String>,
+}
+
+/// Reverse-proxy config. The proxy itself is a yoink-managed Caddy
+/// service (`name = "yoink-proxy"`, `kind = ServiceKind::Proxy`) that's
+/// synthesized at config-load time when any service has `domain:` set.
+/// This block tunes the synthesized service. All fields optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// Force the proxy on or off, regardless of whether any service
+    /// has `domain:`. Default: implicit `true` when any service
+    /// declares `domain:`, else `false`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Email address for Let's Encrypt ACME registration. Required
+    /// when any service uses `tls: auto` (which is the default for
+    /// services with `domain:`). Unused when `proxy.tls.cert_secret`
+    /// is set — yoink doesn't ACME on top of an inline cert.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Caddy image. Override to use an `xcaddy`-built image with
+    /// plugins (e.g. `caddy-storage-redis` for multi-host certs,
+    /// `caddy-ratelimit`, `caddy-l4`). Default `caddy:2`.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Named Docker volume for ACME state, certs, and OCSP staples.
+    /// Persisted across proxy restarts. Default `yoink_caddy_data`.
+    #[serde(default)]
+    pub cert_volume: Option<String>,
+    /// Host IP to bind `:80` and `:443` to. Default unset → bind
+    /// to all interfaces (`0.0.0.0`). Common use: bind to a
+    /// Tailscale IP so the proxy is reachable only over the
+    /// tailnet (`bind: 100.10.0.1`), or to `127.0.0.1` for local
+    /// dev where the proxy fronts a tunneled cloudflared session.
+    #[serde(default)]
+    pub bind: Option<String>,
+    /// Proxy-level TLS configuration. When set, every routed service
+    /// inherits this cert (and optional client-auth) by default.
+    /// Per-service `tls_cert_secret:` / `tls_key_secret:` overrides
+    /// for the rare different-cert-per-service case.
+    ///
+    /// The common shape (one wildcard cert covers everything):
+    /// ```yaml
+    /// proxy:
+    ///   tls:
+    ///     cert_secret: CF_ORIGIN_CERT
+    ///     key_secret:  CF_ORIGIN_KEY
+    ///     client_auth:
+    ///       mode: require_and_verify
+    ///       trust_pool_secret: CF_ORIGIN_PULL_CA
+    /// ```
+    #[serde(default)]
+    pub tls: Option<ProxyTls>,
+}
+
+/// Proxy-level TLS. When `cert_secret` + `key_secret` are set, ACME
+/// is implicitly off and a `:80 → :443` redirect is auto-emitted by
+/// the renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyTls {
+    /// Sealed-secret name holding the PEM cert (full chain). Inlined
+    /// into the rendered Caddy JSON at deploy time. When set, every
+    /// routed service uses this cert unless it overrides via
+    /// per-service `tls_cert_secret:`.
+    pub cert_secret: String,
+    /// Sealed-secret name holding the PEM private key matching
+    /// `cert_secret`.
+    pub key_secret: String,
+    /// Optional client-certificate authentication (mTLS). Required
+    /// for setups like Cloudflare origin-pull where the proxy
+    /// rejects requests that don't present a Cloudflare-signed
+    /// client cert.
+    #[serde(default)]
+    pub client_auth: Option<ClientAuth>,
+}
+
+/// Client-certificate auth (mTLS) for proxy-level TLS. The trust
+/// pool is sealed-secret content, inlined into rendered JSON — no
+/// host-filesystem dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAuth {
+    /// Caddy `client_authentication.mode`. Default
+    /// `require_and_verify` (the strict choice; `require` skips
+    /// CA verification, `verify_if_given` is opt-in).
+    #[serde(default = "default_client_auth_mode")]
+    pub mode: ClientAuthMode,
+    /// Sealed-secret name holding the trust-pool CA chain (PEM).
+    /// Common case: Cloudflare's origin-pull CA bundle.
+    pub trust_pool_secret: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    Request,
+    Require,
+    VerifyIfGiven,
+    #[default]
+    RequireAndVerify,
+}
+
+impl ClientAuthMode {
+    /// String form Caddy expects in JSON
+    /// (`client_authentication.mode`).
+    #[must_use]
+    pub fn as_caddy(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Require => "require",
+            Self::VerifyIfGiven => "verify_if_given",
+            Self::RequireAndVerify => "require_and_verify",
+        }
+    }
+}
+
+fn default_client_auth_mode() -> ClientAuthMode {
+    ClientAuthMode::RequireAndVerify
+}
+
+impl ProxyConfig {
+    /// Resolve the Caddy image, applying the default.
+    #[must_use]
+    pub fn resolved_image(&self) -> String {
+        self.image.clone().unwrap_or_else(|| "caddy:2".to_string())
+    }
+
+    /// Resolve the cert volume name, applying the default.
+    #[must_use]
+    pub fn resolved_cert_volume(&self) -> String {
+        self.cert_volume
+            .clone()
+            .unwrap_or_else(|| "yoink_caddy_data".to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -210,11 +351,63 @@ fn default_build_context() -> String {
     ".".to_string()
 }
 
+fn default_hsts() -> bool {
+    true
+}
+
+/// Discriminator for special-purpose services. Most services are
+/// regular app workloads (`None`); the only variant today is `Proxy`
+/// for the implicit `_proxy` service yoink synthesizes when any
+/// service declares `domain:`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceKind {
+    Proxy,
+}
+
+/// `domain:` accepts either a single hostname or a list — a service
+/// can be reachable on multiple domain names (e.g. `api.example.com`
+/// + `api.example.net`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum DomainSpec {
+    Single(String),
+    Many(Vec<String>),
+}
+
+impl DomainSpec {
+    /// Flatten to a sorted list of hostnames. Used by the renderer.
+    #[must_use]
+    pub fn as_list(&self) -> Vec<String> {
+        match self {
+            Self::Single(s) => vec![s.clone()],
+            Self::Many(v) => v.clone(),
+        }
+    }
+}
+
+/// TLS mode for a service's `domain:`. Default `Auto` (Let's Encrypt
+/// via ACME). `Off` serves on `:80` only. `Cert` uses an inline
+/// certificate sourced from `tls_cert_secret` + `tls_key_secret` in
+/// the sealed-secrets bundle (e.g. Cloudflare Origin Certificates).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    #[default]
+    Auto,
+    Off,
+    Cert,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub name: String,
     pub image: String,
+    /// Special-purpose service marker. Set automatically on the
+    /// implicit `_proxy` service; users do not write this.
+    #[serde(default)]
+    pub kind: Option<ServiceKind>,
     /// Local-build instructions. When set, `yoink build [<service>]`
     /// runs `docker build` against this context, tagging the result
     /// as `<image>:<tag>`. Pairs with `yoink up --no-registry` for the
@@ -280,6 +473,108 @@ pub struct ServiceConfig {
     /// isolation (e.g. caddy with `[frontend]` only, no db reach).
     #[serde(default)]
     pub networks: Option<Vec<String>>,
+    /// Hostname(s) the reverse proxy should route to this service.
+    /// Setting `domain:` on any service auto-enables the bundled Caddy
+    /// proxy. The proxy gets the routes for `domain:` → `<container>:<run.port>`.
+    /// Requires `run.port:` to be set.
+    #[serde(default)]
+    pub domain: Option<DomainSpec>,
+    /// TLS mode for `domain:`. `auto` uses Let's Encrypt via ACME
+    /// (the default); `off` serves on `:80` only; `cert` uses an
+    /// inline certificate from `tls_cert_secret` + `tls_key_secret`.
+    #[serde(default)]
+    pub tls: TlsMode,
+    /// Name of the sealed-secret entry holding a PEM certificate
+    /// (full chain). Used when `tls: cert`. Pairs with
+    /// `tls_key_secret`. Common case: Cloudflare Origin Certificates
+    /// rotated quarterly into `secrets.age`.
+    #[serde(default)]
+    pub tls_cert_secret: Option<String>,
+    /// Name of the sealed-secret entry holding the PEM private key
+    /// matching `tls_cert_secret`. Used when `tls: cert`.
+    #[serde(default)]
+    pub tls_key_secret: Option<String>,
+    /// Raw JSON merged into this service's Caddy site-block route as
+    /// additional `handle` entries (rendered before the auto-generated
+    /// `reverse_proxy` handler). Escape hatch for Caddy features yoink
+    /// doesn't model — `forward_auth`, `rate_limit`, `headers`, etc.
+    /// Accepts either a list of handlers (`[{"handler": "...", ...}]`)
+    /// or a list of routes (`[{"match": ..., "handle": ...}]`); routes
+    /// are auto-wrapped in a `subroute` handler so the operator never
+    /// has to know about `subroute`. Yoink does not validate the
+    /// contents — invalid handlers will fail at Caddy's `/load` step
+    /// with the API's parse error surfaced verbatim.
+    /// See <https://caddyserver.com/docs/json/apps/http/servers/routes/handle/>.
+    #[serde(default)]
+    pub caddy_extra_json: Option<String>,
+    /// Like `caddy_extra_json:` but takes Caddyfile syntax — the
+    /// friendlier shape Caddy's docs and ecosystem use:
+    ///
+    /// ```yaml
+    /// caddy_extra_caddyfile: |
+    ///   forward_auth authelia:9091 {
+    ///     uri /api/verify?rd=https://auth.example.com
+    ///     copy_headers Remote-User Remote-Groups Remote-Email
+    ///   }
+    /// ```
+    ///
+    /// Yoink shells out to `caddy adapt --adapter caddyfile` (in an
+    /// ephemeral container) at render time to convert the snippet to
+    /// JSON, then splices the resulting handlers into the route.
+    /// Requires docker on the operator's machine. Cannot be combined
+    /// with `caddy_extra_json:` on the same service — pick one shape.
+    #[serde(default)]
+    pub caddy_extra_caddyfile: Option<String>,
+    /// Talk to the backend over HTTP/2 cleartext (`h2c`). Renders a
+    /// `transport: { protocol: http, versions: [h2c] }` block on the
+    /// auto-generated `reverse_proxy` handler. Required for native
+    /// gRPC backends (Tonic, grpc-go, grpc-java) and for HTTP/2-only
+    /// upstream apps. Doesn't affect what Caddy serves to clients —
+    /// just how it dials the upstream.
+    #[serde(default)]
+    pub upstream_h2c: bool,
+    /// One of the entries in `domain:` to treat as canonical. Yoink
+    /// auto-renders a 308 redirect from every other entry to this one.
+    /// Common pattern: `domain: [example.com, www.example.com]` +
+    /// `canonical_domain: example.com` redirects www → apex.
+    /// Must match exactly one of the strings in `domain:`.
+    #[serde(default)]
+    pub canonical_domain: Option<String>,
+    /// Compress responses with gzip + zstd. Renders Caddy's `encode`
+    /// handler before `reverse_proxy`. No-op when behind Cloudflare
+    /// (the edge already compresses); useful for direct-origin
+    /// deploys without a CDN in front.
+    #[serde(default)]
+    pub compression: bool,
+    /// Emit the `Strict-Transport-Security` header on every response.
+    /// **Default `true` for TLS sites** (`tls: auto` or `tls: cert`,
+    /// or proxy-level inheritance). Universal best practice once
+    /// you've committed to HTTPS — every modern browser pins the
+    /// site to HTTPS-only after the first visit. Set to `false` for
+    /// the rare case where you serve mixed HTTP/HTTPS or are
+    /// migrating off the TLS path.
+    #[serde(default = "default_hsts")]
+    pub hsts: bool,
+    /// Path-prefix routing. When set, this service's route only
+    /// matches requests where the URL path starts with this prefix
+    /// (Caddy `path` matcher; `*` is allowed at the end). Lets two
+    /// services share a hostname:
+    ///
+    /// ```yaml
+    /// services:
+    ///   - name: api
+    ///     domain: example.com
+    ///     path_prefix: /api/*
+    ///     run: { port: 8080 }
+    ///   - name: web
+    ///     domain: example.com   # same host
+    ///     run: { port: 3000 }
+    /// ```
+    ///
+    /// Yoink orders routes so path-constrained ones come before
+    /// catch-all ones — first match wins, as Caddy does.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
     pub run: ServiceRun,
 }
 
@@ -347,6 +642,25 @@ pub struct ServiceRun {
     /// triggers a redeploy via the spec hash.
     #[serde(default)]
     pub files: Vec<String>,
+}
+
+impl Default for ServiceRun {
+    fn default() -> Self {
+        Self {
+            port: None,
+            healthcheck_path: None,
+            healthcheck_timeout: default_healthcheck_timeout(),
+            replicas: default_replicas(),
+            drain_timeout: default_drain_timeout(),
+            entrypoint: None,
+            cmd: Vec::new(),
+            options: RunOptions::default(),
+            publish: Vec::new(),
+            binds: Vec::new(),
+            volumes: Vec::new(),
+            files: Vec::new(),
+        }
+    }
 }
 
 /// Per-container runtime options. **All security-relevant fields
@@ -612,6 +926,7 @@ impl Config {
         cfg.config_dir = path.parent().map(std::path::Path::to_path_buf);
         cfg.merge_includes()?;
         cfg.normalize_image_references()?;
+        crate::proxy::inject_implicit_proxy(&mut cfg)?;
         cfg.validate()?;
         cfg.topo_sort_services()?;
         Ok(cfg)
@@ -620,6 +935,7 @@ impl Config {
     pub fn parse_str(text: &str) -> Result<Self, ConfigError> {
         let mut config: Self = yaml_serde::from_str(text)?;
         config.normalize_image_references()?;
+        crate::proxy::inject_implicit_proxy(&mut config)?;
         config.validate()?;
         config.topo_sort_services()?;
         Ok(config)

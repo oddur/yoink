@@ -1885,6 +1885,25 @@ async fn collect_stdout_stderr(
     Ok((stdout, stderr))
 }
 
+/// `parse_inspect` (and `ContainerInfo`'s port rendering) format each
+/// port-bindings entry as `"<host_port>:<container_port>/<proto>"`.
+/// Find the entry whose container port matches `wanted` and return
+/// the host port. Used by both the unregistry transport and the
+/// proxy admin client to look up an ephemeral published port.
+#[must_use]
+pub fn parse_published_port(entries: &[String], wanted: u16) -> Option<u16> {
+    let suffix = format!(":{wanted}/");
+    for entry in entries {
+        if let Some(idx) = entry.find(&suffix) {
+            let host_port = &entry[..idx];
+            if let Ok(p) = host_port.parse::<u16>() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 /// Cheap random hex suffix for one-shot probe container names so two
 /// concurrent deploys can't collide.
 pub(crate) fn rand_hex() -> String {
