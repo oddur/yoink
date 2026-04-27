@@ -10,7 +10,8 @@ Yoink lives in a populated neighborhood. Pick the tool that fits your scale and 
 1 host, 1 app → **plain `docker compose`** is fine.
 1-3 hosts, Rails/Django/Phoenix-shaped app → **[Kamal](https://kamal-deploy.org)**.
 1-10 hosts, multi-service, want a web UI + agents on each host → **[Komodo](https://komo.do)**.
-1-10 hosts, multi-service, want a single binary with no control plane → **yoink**.
+1-10 hosts, multi-service, want a built-in WireGuard mesh + per-host daemon → **[Uncloud](https://uncloud.run)**.
+1-10 hosts, multi-service, want a single binary with no control plane and no agents → **yoink**.
 Many hosts, autoscaling, multi-tenant, "real" infrastructure team → **Kubernetes**.
 {{< /callout >}}
 
@@ -66,6 +67,27 @@ Komodo is a fellow Rust-built deploy/management tool for self-hosted containers,
 **Pick Komodo when**: you want a UI for non-CLI users, you're managing more hosts than fit in one operator's head, RBAC matters, and the overhead of running a database + a web service + per-host agents is worth it for the control-plane affordances.
 
 **Pick yoink when**: a single binary on your laptop is the entire control surface, the git repo is the source of truth, and you'd rather not operate yet another service-with-database to deploy your services. The CLI/TUI shape works best for 1–3 operators who are already comfortable in a terminal.
+
+## vs. [Uncloud](https://uncloud.run)
+
+Uncloud is in the same neighborhood as yoink — small fleet, multi-service, deliberate-not-Kubernetes. The biggest split is again **ceremony**: Uncloud installs a per-host daemon (`uncloudd`) on every managed machine and stitches them into a WireGuard mesh; yoink is a one-binary client that talks to docker over plain ssh.
+
+| | **yoink** | **Uncloud** |
+|---|---|---|
+| Architecture | Single client binary; talks to docker on each host over ssh | Per-host daemon (`uncloudd`) on every managed machine, peer-to-peer (no master) |
+| Always-on services to operate | None | One daemon per host (auto-installed by `uncloud machine init`) |
+| Cross-host networking | None — yoink relies on docker's per-host networks; cross-host is your routing problem (Tailscale, public DNS, …) | First-class — Uncloud builds a WireGuard mesh between machines, services dial each other by name across hosts |
+| Reverse proxy / public ingress | None — pairs with caddy / Traefik / your own | First-class — built-in Caddy-based ingress with auto-TLS |
+| State of truth | The git repo's `yoink.yaml` | Cluster state lives in the daemon mesh; YAML config is also supported |
+| Drift detection | ✓ (`yoink.spec_hash` label) | ✓ (compares running state to declared spec) |
+| Multi-host service replicas | ✓ (per-host counts, `services[].hosts:` whitelist) | ✓ (cluster-aware scheduling) |
+| Onboarding a new host | Already works if you can ssh into it | `uncloud machine init` to install + join the mesh |
+| What yoink leaves to other tools that Uncloud bundles | cross-host networking, ingress / TLS | — |
+| Best fit | "I have ssh access to my hosts and want a deploy tool that respects that" | "I want a self-hosted lightweight cluster with mesh + ingress baked in" |
+
+**Pick Uncloud when**: cross-host service-to-service networking matters (your api on one box talking to your worker on another), you'd rather have ingress + auto-TLS bundled than wire it up yourself, and you're OK with running a daemon per host as the price of those affordances.
+
+**Pick yoink when**: you already have a routing answer (Tailscale, a single edge box running caddy, public-DNS-everywhere), you don't want any always-on yoink-specific service running on the host, and the per-host docker daemon over ssh is enough surface area to manage from. The two tools converge on "small fleet of containers, opinionated defaults" — diverge on whether the deploy tool also owns the network fabric.
 
 ## vs. plain `docker compose`
 
