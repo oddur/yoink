@@ -20,21 +20,42 @@ This is the **standalone mode** — see [Three deploy modes](/docs/guide/deploy-
 
 {{% steps %}}
 
-### Write a `yoink.yaml`
+### Generate a `yoink.yaml`
 
-Drop this next to your `Dockerfile`. The `image:` is a bare name (no registry prefix) — that signals "I'm building locally."
+```sh
+yoink init my-server
+```
+
+That produces a `yoink.yaml` with every field already filled in. Yoink reads what's around the cwd — your `Dockerfile`, `git remote get-url origin`, `~/.ssh/config` — and infers the right answer for each field. Output looks like:
+
+```
+✓ wrote yoink.yaml (15 lines, validates clean)
+
+inferred:
+  service   my-tool                         (cwd)
+  image     ghcr.io/you/my-tool             (git remote)
+  host      deploy@my-server                (positional arg)
+  port      3000 with /health healthcheck   (Dockerfile EXPOSE)
+  user      hono                            (Dockerfile USER)
+
+next:
+  yoink validate
+  yoink up --tag my-tool=$(git rev-parse HEAD)
+```
+
+The summary tells you exactly what was inferred and where each value came from. If something's wrong, edit the one line in `yoink.yaml`. Common overrides via flags: `--service`, `--image`, `--port`, `--no-port`. See [the CLI reference](/docs/reference/cli) for the full surface.
+
+If the host can't be inferred from `~/.ssh/config`, pass it as a positional arg as shown. `--interactive` engages stdio prompts as a fallback.
+
+For this walkthrough we'll change one line: edit `image:` to a bare name (no registry prefix) so we can use **standalone mode** — build locally, ship directly to the host, no registry involved:
 
 ```yaml
-# yoink.yaml
-hosts:
-  - { address: my-server, user: deploy }   # tailnet hostname
-
 services:
   - name: my-tool
-    image: my-tool                         # bare name, no registry prefix
+    image: my-tool       # bare name, no registry prefix
     tag: dev
     build:
-      context: .                           # `.` = same directory as yoink.yaml
+      context: .         # build the Dockerfile next to this yoink.yaml
     run:
       port: 8080
 ```
