@@ -1,17 +1,24 @@
 ---
-title: Three deploy modes
+title: Deploy modes
 weight: 2
 ---
 
-Yoink supports three ways of getting a container image to a host. Pick the one that fits your setup; they're not mutually exclusive (mix per-service or per-environment).
+Yoink treats **where the image is built** and **how it gets to the host** as independent choices. Both axes are first-class — pick the combination that fits, mix per-service or per-environment.
 
-| | Image origin | Build | Distribution | When it fits |
-|---|---|---|---|---|
-| **CI-built (default)** | CI builds + pushes on every commit | external | `docker pull` from registry | Production with multiple hosts and an existing CI/CD pipeline |
-| **Local-build, kamal-style** | Operator's machine | `yoink build --push` | `docker pull` from registry | Indie / one-person team that wants the full deploy loop in one tool, willing to keep a registry |
-| **Standalone (no registry)** | Operator's machine | `yoink up --build --no-registry` (one command) | Ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar over ssh — only changed layers cross the wire (tarball fallback) | Rapid iteration on a single host; air-gapped; low-ceremony tools/utilities |
+**Build origin:**
+- **In CI.** GitHub Actions / GitLab / etc. builds and tags the image on every merge. Operator config has no `build:` block — yoink just pulls and rolls. Fits production with an existing CI/CD pipeline.
+- **On the operator's machine.** A `build:` block on the service tells yoink to run `docker build` locally before deploying. Same `yoink up` flow either way; a config can mix CI-built infrastructure (`caddy`, `redis`) with locally-built app code. Fits indie / one-person teams and rapid local iteration.
 
-Pick by service if you want — `yoink build` only runs against services with a `build:` block, so a config can mix CI-built infrastructure (`caddy`, `redis`) with locally-built app code.
+**Distribution:**
+- **Via a container registry.** The standard path: `docker push` to a registry (real, self-hosted, or pull-through), `docker pull` from each host. Registry-protocol dedup means only changed layers cross the wire. Fits multi-host production, audit, and tag-based rollback.
+- **Direct to host, no registry.** `--no-registry` ships the locally-built image straight to each host over SSH. By default this uses an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar so you still get layer-level dedup — only the changed blobs cross the wire on redeploy. Fits rapid iteration, hobby/indie/prototype hosts, and air-gapped environments where opening a registry is overkill.
+
+| Build origin → / Distribution ↓ | In CI | On operator's machine |
+|---|---|---|
+| **Via registry** | CI pushes, hosts pull. The default for production. | `yoink build --push` then `yoink up`. Kamal-style. |
+| **Direct to host (no registry)** | Less common, but valid: CI builds then runs `yoink up --no-registry --transport=unregistry --tag api=<sha>`. | `yoink up --build --no-registry`, one command. The standalone loop. |
+
+The four cells share a deploy engine — drift detection, healthcheck-gated rolling swap, dependency-ordered waves work the same regardless of how the image arrived.
 
 ## CI-built — the default
 
