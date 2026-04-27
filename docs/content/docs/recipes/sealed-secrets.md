@@ -5,6 +5,8 @@ weight: 1
 
 The default secrets path. One sealed file committed to the repo, one key per environment, decrypted at deploy time with no remote service in the loop.
 
+> **Want to try it before touching your real config?** Clone the repo and run [`examples/sealed-secrets/`](https://github.com/oddur/yoink/tree/main/examples/sealed-secrets) — a self-contained 5-step walkthrough against your laptop's docker daemon (no ssh, no registry). It exercises every step below end-to-end with an alpine container.
+
 ## One-time setup
 
 1. **Generate a key.** Run on your laptop:
