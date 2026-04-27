@@ -21,7 +21,7 @@ Heavily inspired by [k9s](https://k9scli.io/) and [lazydocker](https://github.co
 | **Hosts** | per-host preflight (ssh, daemon version, kernel/OS) + aggregate CPU/mem across the host. Drill in for a per-host table. |
 | **HostDetail** | every running container on a host (yoink-managed *or not*) with live stats, plus a rolling per-host docker-events panel at the bottom. |
 | **Services** | one row per configured service with replica count + image. Drill in for `ServiceDetail` (every replica across every host) → `ServiceHistory` (every past deploy → roll back from here). |
-| **ContainerDetail** | k9s-style "describe": image, command, env (secrets redacted), ports, mounts, networks, security profile (cap_drop / read_only / pids_limit), restart count, **5-minute history charts** for CPU% + Mem%, and another for net rx/tx rate. `p` opens a `docker top` modal listing in-container processes. |
+| **ContainerDetail** | k9s-style "describe": image, command, env (secrets redacted), ports, mounts, networks, security profile (cap_drop / read_only / pids_limit), restart count, three **5-minute history charts** (CPU%, Mem, mirrored net tx/rx), and a `NET ↓rx ↑tx` cumulative line in the card. `p` opens a `docker top` modal listing in-container processes. |
 | **Logs** | a multiplexed live tail of every yoink-managed container (auto-piped through [`hl`](https://github.com/pamburus/hl) when present). `/` filters substring, `g`/`G` jump to top/bottom, `y` yanks the visible buffer to the system clipboard via OSC-52. |
 | **ContainerLogs** | same shape, scoped to one container. |
 | **Resources** | three sub-tabs (`Images`, `Volumes`, `Networks`) covering everything lazydocker exposes. Per-row remove with `d`; per-tab `P` prune (`A` for the aggressive image prune that goes beyond `<none>:<none>`). |
@@ -64,12 +64,17 @@ Heavily inspired by [k9s](https://k9scli.io/) and [lazydocker](https://github.co
 
 The detail pane renders four kinds of information for a single container:
 
-1. **Header card** — image, state (colored), command, restart count, started/finished/exit-code timestamps.
-2. **5-minute history charts** — left panel plots CPU% (cyan) and either Mem% (magenta) when a memory cap is set or absolute MB when uncapped, sharing a 0–100 y-axis when both metrics are percentages. Right panel plots network rx (green) / tx (yellow) rates derived from successive cumulative-bytes samples.
+1. **Header card** — image, state (colored), command, restart count, started/finished/exit-code timestamps. The right column has live `CPU` / `MEM` gauges and a `NET ↓rx ↑tx` cumulative-bytes line ("how much has this thing transferred since start").
+2. **5-minute history charts** — three side-by-side panels, each with the latest sampled value baked into its title so it's readable without squinting at the rightmost edge:
+   - **CPU %** (cyan) — own y-axis scaled to peak CPU
+   - **Mem** (magenta) — own y-axis. % when memory is capped, MB when uncapped
+   - **net tx / rx** (yellow / green) — btop-style mirrored: `tx` (outgoing) plots above the zero line, `rx` (incoming) mirrored below. The two series can never overlap. Title shows current rates: `↑1.2MB/s ↓340KB/s`. Y-axis labels carry the direction arrow on each side.
 3. **Runtime + security blocks** — published ports, mounts, attached networks, then `cap_drop` / `cap_add` / `security_opt` / `read_only` / `pids_limit` / effective `user` so you can see at a glance whether this container is hardened.
 4. **Env + labels** — sorted KEY=value with secret-ish keys (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*API_KEY*`, `*PRIVATE_KEY*`, `*DSN*`) auto-redacted; full label table including the `yoink.*` set.
 
 Plus, at the bottom of the pane, a rolling tail of the container's logs.
+
+**History is collected for every container, all the time** — a background poller samples `docker stats` for every running container across every configured host every 2 seconds, regardless of which view you're currently on. So when you drill into a container's detail pane, the chart is already populated with up to 5 minutes of context instead of starting from zero. Stale entries (containers that stopped and aged out) are GC'd automatically.
 
 | key | action |
 |---|---|

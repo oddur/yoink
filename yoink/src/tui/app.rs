@@ -213,8 +213,10 @@ impl View {
                 "  r            refresh",
                 "  esc          back to host detail",
                 "",
-                "the bottom card shows 5-minute history charts:",
-                "  cpu% + mem% (left) and net rx/tx rate (right)",
+                "5-minute history charts (collected for every container",
+                "across every host, even when not viewing them):",
+                "  cpu%   ·   mem   ·   net (tx ↑ above / rx ↓ below)",
+                "current values appear in each chart title.",
             ],
             View::Services => vec![
                 "services",
