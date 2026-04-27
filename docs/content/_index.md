@@ -4,7 +4,7 @@ layout: docs
 toc: false
 ---
 
-A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts. **Batteries and best practices included** — `age`-sealed secrets, hardened container defaults, healthcheck-gated rolling swaps, drift detection, dependency-ordered waves, all on by default with no plugins to install. Sits between [Kamal](https://kamal-deploy.org) and Kubernetes — opinionated about the same things Kamal is, borrowing the few Kubernetes ideas that actually pay off at this scale.
+A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts. **Low ceremony**: drop a `yoink.yaml` next to your code describing where the app should go, and `yoink up`. **Batteries and best practices included** — `age`-sealed secrets, hardened container defaults, healthcheck-gated rolling swaps, drift detection, dependency-ordered waves, all on by default with no plugins to install. Sits between [Kamal](https://kamal-deploy.org) and Kubernetes — opinionated about the same things Kamal is, borrowing the few Kubernetes ideas that actually pay off at this scale.
 
 ```
 yoink up                  # reconcile every service in dep order
