@@ -30,11 +30,23 @@ module:
 # Top-level menu. Hextra renders this as the main nav.
 menu:
   main:
-    - name: Docs
-      pageRef: /docs
+    - name: Intro
+      pageRef: /docs/intro
       weight: 1
-    - name: Search
+    - name: Start
+      pageRef: /docs/start
+      weight: 2
+    - name: Guide
+      pageRef: /docs/guide
+      weight: 3
+    - name: Recipes
+      pageRef: /docs/recipes
+      weight: 4
+    - name: Reference
+      pageRef: /docs/reference
       weight: 5
+    - name: Search
+      weight: 9
       params:
         type: search
     - name: GitHub

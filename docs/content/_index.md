@@ -14,12 +14,12 @@ yoink rollback api        # roll back to the previous version
 ```
 
 {{< cards >}}
-  {{< card link="/docs/getting-started" title="Getting started" subtitle="Install, drop a yoink.yaml in your repo, deploy." icon="lightning-bolt" >}}
-  {{< card link="/docs/deploy-modes" title="Three deploy modes" subtitle="CI-built, kamal-style local-build, no-registry standalone." icon="server" >}}
-  {{< card link="/docs/security-defaults" title="Sane security defaults" subtitle="cap_drop=ALL, read-only rootfs, no-new-privileges, etc." icon="shield-check" >}}
-  {{< card link="/docs/pairing" title="Pairing with Tailscale + caddy-docker-proxy" subtitle="What yoink owns vs. what it leaves to other tools." icon="link" >}}
-  {{< card link="/docs/cli" title="CLI reference" subtitle="Every subcommand and flag." icon="terminal" >}}
-  {{< card link="/docs/tui" title="TUI guide" subtitle="Keybinds, panes, drift detection, deploy history." icon="desktop-computer" >}}
+  {{< card link="/docs/start/first-deploy" title="Five-minute first deploy" subtitle="Drop a yoink.yaml next to your Dockerfile, run one command." icon="lightning-bolt" >}}
+  {{< card link="/docs/intro/compared" title="Is this for me?" subtitle="vs Kamal, vs Kubernetes, vs plain compose. When yoink is the right answer, when it isn't." icon="adjustments" >}}
+  {{< card link="/docs/guide/deploy-modes" title="Three deploy modes" subtitle="CI-built, kamal-style local-build, no-registry standalone." icon="server" >}}
+  {{< card link="/docs/guide/security-defaults" title="Sane security defaults" subtitle="cap_drop=ALL, read-only rootfs, no-new-privileges, init=tini, …" icon="shield-check" >}}
+  {{< card link="/docs/recipes" title="Recipes" subtitle="Staging alongside prod, self-hosted registry, Infisical secrets, PR-comment dry-run." icon="clipboard-list" >}}
+  {{< card link="/docs/reference" title="Reference" subtitle="Every CLI flag, every config field, every TUI keybind." icon="document-text" >}}
 {{< /cards >}}
 
 ## Why it exists
@@ -28,16 +28,11 @@ Kamal is a lovely fit for "one app, one binary per host" but starts to creak the
 
 `yoink` is the thinnest tool that gives you the Kubernetes ideas that actually matter at small scale, while keeping Kamal's "one binary, ssh into the host, drive Docker directly" simplicity:
 
-- **Multiple services per host.** Declare them, deploy them, prune the ones that fall out of config.
-- **Replicas.** Want two `api` containers behind a reverse proxy? Set `replicas: 2`. Healthcheck-gated rolling swap.
-- **Per-service network tiers.** Each service joins a named network; only services on the same network can dial each other. Basic blast-radius isolation without a CNI plugin.
-- **Dependency-ordered deploys.** Services declare `depends_on:` and `yoink up` runs them in topological-sort waves (independent services in parallel).
-- **Drift detection.** Every effective spec (image, env, networks, mounts, options, file content) hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
-- **k9s-style TUI.** A `ratatui` dashboard with one-key reconcile, prune, kill, shell-into, debug-sidecar, log filter. Keyboard-only.
+- **Multiple services per host** with replicas + dependency-ordered deploys (`depends_on:` topo-sort)
+- **Per-service network tiers** for blast-radius isolation without a CNI plugin
+- **Drift detection.** Every effective spec hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
+- **Three deploy modes**: CI-built (the default), local-build kamal-style with `yoink build --push`, or fully standalone with `yoink up --build --no-registry` (no CI, no registry — drop a `yoink.yaml` next to your Dockerfile and go)
+- **Sane security defaults**: cap_drop=ALL, no-new-privileges, read-only rootfs, init=tini, tmpfs noexec, binds default :ro. Override per service when needed.
+- **k9s-style TUI** with deploy history, one-press rollback, drift cells, logs auto-piped through `hl`
 
-## What it deliberately doesn't do
-
-- No control plane, no agent on the hosts. yoink is a single Rust binary on your laptop or in CI.
-- No service discovery, no scheduling — Docker's network alias DNS is plenty for a few services on a host.
-- No multi-cluster, no HA, no auto-scaling. One operator, one config, one deploy at a time.
-- No reverse proxy, secret store, load balancer, or stateful-accessory orchestration. Use the right tool for each.
+Read more in the [intro](/docs/intro), or skip ahead to [first deploy](/docs/start/first-deploy).
