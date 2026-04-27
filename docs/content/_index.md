@@ -1,5 +1,6 @@
 ---
 title: yoink
+layout: docs
 toc: false
 ---
 
