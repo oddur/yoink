@@ -236,9 +236,16 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         canonical_domain: None,
         compression: false,
         path_prefix: None,
+        hsts: false, // proxy itself doesn't serve TLS; this field is irrelevant
         run: ServiceRun {
-            port: None,
-            healthcheck_path: None,
+            // Healthcheck probes Caddy's admin endpoint (`/config/`)
+            // on the container's :2019 from inside the proxy's first
+            // network. Eliminates the race where yoink-proxy is
+            // "started" per docker but Caddy's HTTP server hasn't
+            // bound yet — without this gate, the first /load can
+            // arrive before admin is up.
+            port: Some(ADMIN_PORT),
+            healthcheck_path: Some("/config/".to_string()),
             // Caddy serves :80 + :443 on the host. Admin API on :2019
             // is published on 127.0.0.1 with an ephemeral host port
             // (`:0:2019`) so it's reachable from the host (and only

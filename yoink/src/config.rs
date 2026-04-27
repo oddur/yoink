@@ -351,6 +351,10 @@ fn default_build_context() -> String {
     ".".to_string()
 }
 
+fn default_hsts() -> bool {
+    true
+}
+
 /// Discriminator for special-purpose services. Most services are
 /// regular app workloads (`None`); the only variant today is `Proxy`
 /// for the implicit `_proxy` service yoink synthesizes when any
@@ -524,6 +528,15 @@ pub struct ServiceConfig {
     /// deploys without a CDN in front.
     #[serde(default)]
     pub compression: bool,
+    /// Emit the `Strict-Transport-Security` header on every response.
+    /// **Default `true` for TLS sites** (`tls: auto` or `tls: cert`,
+    /// or proxy-level inheritance). Universal best practice once
+    /// you've committed to HTTPS — every modern browser pins the
+    /// site to HTTPS-only after the first visit. Set to `false` for
+    /// the rare case where you serve mixed HTTP/HTTPS or are
+    /// migrating off the TLS path.
+    #[serde(default = "default_hsts")]
+    pub hsts: bool,
     /// Path-prefix routing. When set, this service's route only
     /// matches requests where the URL path starts with this prefix
     /// (Caddy `path` matcher; `*` is allowed at the end). Lets two

@@ -822,9 +822,31 @@ async fn push_caddy_config(
         })?;
     crate::proxy::admin::push_config(host, ops, &json)
         .await
-        .map_err(|source| DeployError::Custom {
-            host: host.address.clone(),
-            detail: format!("push Caddy config: {source}"),
+        .map_err(|source| {
+            // When Caddy bounces /load, point the operator at the
+            // services that have a `caddy_extra_json:` block —
+            // those are the most likely sources of schema errors.
+            // Unattributed users would otherwise stare at a Caddy
+            // backtrace with no clue which service caused it.
+            let extras: Vec<&str> = config
+                .services
+                .iter()
+                .filter(|s| s.caddy_extra_json.is_some())
+                .map(|s| s.name.as_str())
+                .collect();
+            let hint = if extras.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\nhint: services with caddy_extra_json: {} — \
+                     run `yoink proxy-render` to inspect the rendered config",
+                    extras.join(", "),
+                )
+            };
+            DeployError::Custom {
+                host: host.address.clone(),
+                detail: format!("push Caddy config: {source}{hint}"),
+            }
         })?;
     Ok(())
 }

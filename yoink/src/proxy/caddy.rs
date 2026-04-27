@@ -62,7 +62,12 @@ where
         if let Some(redirect) = render_canonical_redirect_route(svc)? {
             routes.push(redirect);
         }
-        routes.push(render_route(svc, &container_names_for(&svc.name))?);
+        // A service serves TLS when its own `tls:` is Auto/Cert OR
+        // when proxy-level TLS is configured (every routed service
+        // inherits). Off explicitly disables. HSTS only emits when
+        // the operator's actually serving HTTPS.
+        let tls_active = !matches!(svc.tls, TlsMode::Off) || proxy_tls.is_some();
+        routes.push(render_route(svc, &container_names_for(&svc.name), tls_active)?);
     }
 
     // Auto :80 → :443 redirect when proxy-level TLS is in play. Caddy
@@ -331,7 +336,7 @@ fn redirect_route_http_to_https() -> Value {
     })
 }
 
-fn render_route(svc: &ServiceConfig, containers: &[String]) -> Result<Value> {
+fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) -> Result<Value> {
     let port = svc.run.port.ok_or_else(|| {
         anyhow!(
             "service {:?} has `domain:` but no `run.port` (should have been caught \
@@ -384,6 +389,23 @@ fn render_route(svc: &ServiceConfig, containers: &[String]) -> Result<Value> {
             "handler": "encode",
             "encodings": {"gzip": {}, "zstd": {}},
             "prefer": ["zstd", "gzip"],
+        }));
+    }
+
+    // HSTS for TLS sites. Default-on: every browser pins HTTPS-only
+    // after first visit. One year + includeSubDomains is the
+    // standard prod setting (preload-eligible). `hsts: false` opts
+    // out for the rare mixed-protocol case.
+    if svc.hsts && tls_active {
+        handle.push(json!({
+            "handler": "headers",
+            "response": {
+                "set": {
+                    "Strict-Transport-Security": [
+                        "max-age=31536000; includeSubDomains"
+                    ]
+                }
+            }
         }));
     }
 
@@ -606,9 +628,96 @@ services:
         let handlers = json["apps"]["http"]["servers"]["main"]["routes"][0]["handle"]
             .as_array()
             .unwrap();
-        assert_eq!(handlers.len(), 2);
+        // forward_auth (operator), headers (HSTS, default-on), reverse_proxy.
+        assert_eq!(handlers.len(), 3);
         assert_eq!(handlers[0]["handler"], "forward_auth");
-        assert_eq!(handlers[1]["handler"], "reverse_proxy");
+        assert_eq!(handlers[1]["handler"], "headers");
+        assert_eq!(handlers[2]["handler"], "reverse_proxy");
+    }
+
+    #[test]
+    fn hsts_default_on_for_tls_auto() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec![], None).expect("render");
+        let handlers = json["apps"]["http"]["servers"]["main"]["routes"][0]["handle"]
+            .as_array()
+            .unwrap();
+        let hsts = handlers
+            .iter()
+            .find(|h| h["handler"] == "headers")
+            .expect("HSTS handler should be present");
+        let value = &hsts["response"]["set"]["Strict-Transport-Security"][0];
+        assert!(
+            value.as_str().unwrap().contains("max-age=31536000"),
+            "got: {value}"
+        );
+    }
+
+    #[test]
+    fn hsts_skipped_for_tls_off() {
+        let mut cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    tls: off
+    run: { port: 8080 }
+"#,
+        );
+        // Force the proxy block in (no TLS sites + no email might
+        // otherwise trip a different validation path).
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            ..Default::default()
+        });
+        let json = render(&cfg, |_| vec![], None).expect("render");
+        let handlers = json["apps"]["http"]["servers"]["main"]["routes"][0]["handle"]
+            .as_array()
+            .unwrap();
+        assert!(
+            handlers.iter().all(|h| h["handler"] != "headers"),
+            "no HSTS expected when tls: off"
+        );
+    }
+
+    #[test]
+    fn hsts_opt_out_via_field() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    hsts: false
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec![], None).expect("render");
+        let handlers = json["apps"]["http"]["servers"]["main"]["routes"][0]["handle"]
+            .as_array()
+            .unwrap();
+        assert!(handlers.iter().all(|h| h["handler"] != "headers"));
     }
 
     #[test]

@@ -2050,10 +2050,100 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
         config.services.len(),
         config.hosts.len()
     );
+    // Caddy schema validation: render the proxy config and run it
+    // through `caddy validate` in an ephemeral container. Catches
+    // schema errors (invalid `caddy_extra_json`, bad TLS config,
+    // unknown handler module) BEFORE deploy time. Best-effort —
+    // skips silently if docker isn't on the operator's machine.
+    if yoink::proxy::proxy_enabled(config) {
+        validate_proxy_render(config).await?;
+    }
     if check_hosts {
         cmd_preflight(config).await?;
     }
     Ok(())
+}
+
+async fn validate_proxy_render(config: &Config) -> Result<()> {
+    let bundle = load_secrets_bundle(config).await?;
+    let json = match yoink::proxy::caddy::render(config, |_| Vec::new(), bundle.as_ref()) {
+        Ok(j) => j,
+        Err(e) => {
+            anyhow::bail!("render Caddy config: {e}");
+        }
+    };
+    let body = serde_json::to_string(&json).context("serialize rendered config")?;
+
+    // Probe for a local docker daemon. Skip gracefully if absent.
+    let docker_avail = tokio::process::Command::new("docker")
+        .arg("version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success());
+    if !docker_avail {
+        eprintln!(
+            "  (skipping Caddy schema check — docker not available locally; \
+             pass --check-hosts or run on a host with docker installed)"
+        );
+        return Ok(());
+    }
+
+    let image = config
+        .proxy
+        .as_ref()
+        .map_or_else(|| "caddy:2".to_string(), yoink::config::ProxyConfig::resolved_image);
+    let mut child = tokio::process::Command::new("docker")
+        // JSON is Caddy's native config format — no `--adapter` flag.
+        // (`--adapter caddyfile` would convert from Caddyfile syntax;
+        // we feed JSON directly.)
+        .args([
+            "run", "--rm", "-i",
+            &image,
+            "caddy", "validate", "--config", "/dev/stdin",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn `docker run caddy validate`")?;
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(body.as_bytes())
+            .await
+            .context("write rendered config to caddy validate stdin")?;
+        // Drop closes stdin → caddy reads EOF → validation runs.
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .context("wait on `docker run caddy validate`")?;
+    if output.status.success() {
+        println!("✓ Caddy config schema valid");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let extras: Vec<&str> = config
+            .services
+            .iter()
+            .filter(|s| s.caddy_extra_json.is_some())
+            .map(|s| s.name.as_str())
+            .collect();
+        let hint = if extras.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nhint: services with caddy_extra_json: {} — \
+                 run `yoink proxy-render` to inspect the rendered config",
+                extras.join(", "),
+            )
+        };
+        anyhow::bail!("Caddy rejected the rendered config:\n{stderr}{hint}");
+    }
 }
 
 async fn cmd_proxy_render(config: &Config) -> Result<()> {
