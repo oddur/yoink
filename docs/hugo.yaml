@@ -3,7 +3,7 @@
 # Hextra theme is pulled in as a Hugo module — `hugo mod tidy` resolves
 # it from the registry; `hugo --gc --minify` builds for prod.
 baseURL: "https://oddur.github.io/yoink/"
-title: yoink
+title: 🪝 yoink
 languageCode: en-us
 
 # Hextra wants Goldmark with unsafe HTML enabled for callouts, and

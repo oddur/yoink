@@ -13,4 +13,6 @@ Yoink's docs are organized [Diataxis](https://diataxis.fr/)-style: an **intro** 
   {{< card link="/docs/guide" title="Guide" subtitle="Deploy modes, security defaults, drift detection, pairing with Tailscale + caddy." icon="book-open" >}}
   {{< card link="/docs/recipes" title="Recipes" subtitle="Task-oriented how-tos: staging alongside prod, self-hosted registry, Infisical secrets, PR-comment dry-run." icon="clipboard-list" >}}
   {{< card link="/docs/reference" title="Reference" subtitle="Every CLI flag, every config field, every TUI keybind." icon="document-text" >}}
+  {{< card link="/docs/examples" title="Examples" subtitle="Three complete annotated yoink.yaml configs: hobby tool, polyglot stack, production." icon="duplicate" >}}
+  {{< card link="/docs/troubleshooting" title="Troubleshooting" subtitle="Error message → likely cause → fix." icon="exclamation-circle" >}}
 {{< /cards >}}
