@@ -95,6 +95,14 @@ enum Command {
         /// Forward `--no-cache` to `docker build`.
         #[arg(long)]
         no_cache: bool,
+        /// Run `docker push <image>:<tag>` after a successful build.
+        /// Use this when `image:` points at a real remote registry
+        /// (`ghcr.io/you/api`, `4db05qgnlk.registry.depot.dev/api`,
+        /// etc.) and you want the kamal-style "build locally, deploy
+        /// from registry" loop in a single command. Operator must
+        /// already be `docker login`'d to the target registry.
+        #[arg(long)]
+        push: bool,
     },
     /// Show what's running where (across all services).
     Status {
@@ -412,7 +420,8 @@ async fn run(cli: Cli) -> Result<()> {
             tag,
             allow_dirty,
             no_cache,
-        } => cmd_build(&config, &services, &tag, allow_dirty, no_cache).await,
+            push,
+        } => cmd_build(&config, &services, &tag, allow_dirty, no_cache, push).await,
         Command::Status { json } => cmd_status(&config, json).await,
         Command::Rollback { service, tag } => cmd_rollback(&config, service, tag).await,
         Command::Prune { dry_run } => cmd_prune(&config, dry_run).await,
@@ -674,6 +683,7 @@ async fn cmd_build(
     tag_args: &[String],
     allow_dirty: bool,
     no_cache: bool,
+    push: bool,
 ) -> Result<()> {
     let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
     let services_filter = services_filter(services);
@@ -695,7 +705,7 @@ async fn cmd_build(
             continue;
         }
         let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
-        yoink::build::build_service(config, svc, &tag, no_cache)
+        yoink::build::build_service(config, svc, &tag, no_cache, push)
             .await
             .with_context(|| format!("build {}", svc.name))?;
         built_any = true;

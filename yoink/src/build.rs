@@ -30,6 +30,11 @@ pub enum BuildError {
     UnknownService(String),
     #[error("`docker build` for {service:?} exited with status {status}")]
     DockerBuildFailed { service: String, status: String },
+    #[error(
+        "`docker push` for {service:?} exited with status {status} \
+         (is the operator logged into the registry? `docker login <registry>`)"
+    )]
+    DockerPushFailed { service: String, status: String },
     #[error("`docker save` for {image:?} exited with status {status}")]
     DockerSaveFailed { image: String, status: String },
     #[error("failed to spawn `{program}`: {source}")]
@@ -78,12 +83,16 @@ pub fn resolve_service_tag(
 }
 
 /// Build one service, tagging the result on the operator's local
-/// daemon as `<image>:<tag>`. Stderr surfaces verbatim on failure.
+/// daemon as `<image>:<tag>`. When `push` is `true`, follow the
+/// build with `docker push <image>:<tag>` so the image lands in a
+/// real registry — that's the kamal-style "build locally, deploy
+/// from registry" loop. Stderr surfaces verbatim on failure.
 pub async fn build_service(
     config: &Config,
     service: &ServiceConfig,
     tag: &str,
     no_cache: bool,
+    push: bool,
 ) -> Result<(), BuildError> {
     let build = service
         .build
@@ -128,6 +137,25 @@ pub async fn build_service(
             service: service.name.clone(),
             status: status.to_string(),
         });
+    }
+
+    if push {
+        eprintln!("yoink build {}: docker push {image_ref}", service.name);
+        let push_status = Command::new("docker")
+            .arg("push")
+            .arg(&image_ref)
+            .status()
+            .await
+            .map_err(|source| BuildError::Spawn {
+                program: "docker".into(),
+                source,
+            })?;
+        if !push_status.success() {
+            return Err(BuildError::DockerPushFailed {
+                service: service.name.clone(),
+                status: push_status.to_string(),
+            });
+        }
     }
     Ok(())
 }

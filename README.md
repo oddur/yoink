@@ -159,52 +159,84 @@ Staging usually wants to deploy whatever's on `main`, while prod tracks `live`. 
 
 The image identity is the same across envs; only the runtime configuration differs.
 
-## Standalone mode (no CI, no registry)
+## Three deploy modes
 
-The default story (push image to a registry → `yoink up` pulls it on each host) is the right answer when you have CI and many hosts. It's the wrong answer when you're an indie developer who just wants their thing running on a server, or when you're rapidly iterating on a Dockerfile and don't want a 5-minute CI loop between every change.
+Yoink supports three ways of getting a container image to a host. Pick the one that fits your setup; they're not mutually exclusive (mix per-service or per-environment).
 
-Yoink supports a "build locally, ship directly to hosts, skip the registry" mode. Two new pieces:
+| | Image origin | Build | Distribution | When it fits |
+|---|---|---|---|---|
+| **CI-built (default)** | CI (GitHub Actions, Depot, etc.) builds + pushes on every commit | external | `docker pull` from registry | Production with multiple hosts and an existing CI/CD pipeline |
+| **Local-build, kamal-style** | Operator's machine | `yoink build --push` | `docker pull` from registry | Indie / one-person team that wants the full deploy loop in one tool, willing to keep a registry |
+| **Standalone (no registry)** | Operator's machine | `yoink build` | `docker save \| docker load` over ssh | Rapid iteration on a single host; air-gapped; "I just want this thing running" |
+
+Pick by service if you want — `yoink build` only runs against services with a `build:` block, so a config can mix CI-built infrastructure (`caddy`, `redis`) with locally-built app code.
+
+### CI-built — the default
+
+Operator config has no `build:` block; CI builds the image and pushes it to a registry on every merge. `yoink up` pulls and rolls. This is what every example so far in this README has been doing — `image: ghcr.io/you/api` with `--tag api=<sha>` overriding tag at deploy time.
+
+### Local-build, kamal-style
 
 ```yaml
 services:
   - name: api
-    image: my-app                    # bare name — no registry prefix
-    tag: dev                         # any string — yoink just tags it
-    build:                           # tells `yoink build` how to produce the image
-      context: .                     # build context (default ".")
-      dockerfile: Dockerfile         # default — `Dockerfile` in context root
+    image: ghcr.io/you/api          # real registry path
+    tag: dev
+    build:                          # tells `yoink build` how to produce the image
+      context: .
+      dockerfile: Dockerfile
       args:
         RUST_VERSION: "1.95"
-      target: runtime                # multi-stage build target (optional)
     run:
       port: 8080
 ```
 
-Then:
+```sh
+docker login ghcr.io                 # one-time
+yoink build api --push               # docker build → docker push ghcr.io/you/api:dev
+yoink up --service api               # docker pull on each host → rolling swap
+```
+
+`yoink build --push` runs `docker build` against your local docker daemon, tagging as `<image>:<tag>` (which equals the registry path because of how `image:` is configured), then runs `docker push`. After that the standard deploy path takes over — exactly like kamal, except the build step is a separate command (so you can build without pushing for CI of your own; or push without rebuilding for re-tagging).
+
+Two-step instead of one-shot is deliberate: `yoink build && yoink up` is the explicit version of `kamal deploy`, and the separation lets you run them on different machines (build on a beefy laptop, deploy from a thin runner) when you want to.
+
+### Standalone (no registry)
+
+```yaml
+services:
+  - name: api
+    image: my-app                   # bare name — no registry prefix
+    tag: dev
+    build:
+      context: .
+    run:
+      port: 8080
+```
 
 ```sh
-yoink build api                      # docker build → tag local image as my-app:dev
+yoink build api                     # docker build → tag local image as my-app:dev
 yoink up --no-registry --service api # save+load to each host (no docker pull)
 ```
 
-What `--no-registry` does: for every selected service × applicable host, yoink runs `docker save <image>:<tag>` against the **operator's local docker daemon**, captures the tarball, and streams it into the host's docker daemon via the same ssh+bollard transport (calling `POST /images/load` directly). After the load completes, the host has the image in its local cache, and the rest of the deploy flow (which already short-circuits when an image is locally present) runs unchanged — healthcheck-gated rolling swap, drift detection, the works.
+What `--no-registry` does: for every (service, host) the deploy targets, yoink runs `docker save <image>:<tag>` against the operator's local docker daemon, captures the tarball, and streams it into the host's docker daemon via the same ssh+bollard transport that `up` already uses (calling `POST /images/load`). After the load completes, the host has the image in its local cache, and the rest of the deploy flow (which already short-circuits when an image is locally present) runs unchanged — healthcheck-gated rolling swap, drift detection, the works.
 
-### When this fits
+**Standalone mode fits when**:
 
-- **Rapid iteration on a single host.** Edit Dockerfile → `yoink build api && yoink up --no-registry --service api` → see it running on the box. ~15 seconds for a small image, ~1 minute for a larger one. No registry to set up, no CI to wait on.
-- **Hobby / indie / prototype deployments.** "I just want this thing on a server" — no build pipeline, no registry account, no auth dance.
-- **Air-gapped or restricted-network hosts.** The host doesn't need outbound network access to anything but the operator's ssh.
+- Rapid iteration on a single host. Edit Dockerfile → `yoink build api && yoink up --no-registry --service api` → see it running on the box. ~15 seconds for a small image. No registry to set up, no CI to wait on.
+- Hobby / indie / prototype deployments. "I just want this thing on a server" — no build pipeline, no registry account.
+- Air-gapped or restricted-network hosts. The host doesn't need outbound network access to anything but the operator's ssh.
 
-### When it doesn't
+**It doesn't fit when**:
 
-- **Many hosts.** N hosts = N save+load streams (each gets the full tarball). A registry is a hub that lets each host pull the missing layers in parallel from a closer point. For 1-3 hosts the difference is small; at 10+ hosts a registry is meaningfully faster.
-- **Large images.** Every `--no-registry` deploy ships the full image tarball over ssh per host. A 200MB Rust binary is fine; a 2GB Java or Node app gets uglier each push.
-- **You want rollback by tag.** `--no-registry` mode relies on the host's local image cache to find old generations. `docker image prune` blows that away. A registry keeps every pushed tag indefinitely.
-- **Auditability matters.** A registry has a record of "image `<sha256:…>` was pushed at time T by user U." `--no-registry` is invisible to anything but the local docker daemons.
+- Many hosts. N hosts = N save+load streams. A registry is a hub that lets each host pull the missing layers in parallel from a closer point. For 1-3 hosts the difference is small; at 10+ hosts a registry is meaningfully faster.
+- Large images. Every deploy ships the full image tarball over ssh per host. A 200MB Rust binary is fine; a 2GB Java or Node app gets uglier each deploy.
+- You want rollback by tag. `--no-registry` mode relies on the host's local image cache for older generations; `docker image prune` blows that away. A registry keeps every pushed tag indefinitely.
+- Auditability matters. A registry has a record of "image `<sha256:…>` was pushed at time T." `--no-registry` is invisible outside the local docker daemons.
 
 ### Self-hosted registry as a yoink service
 
-The middle ground: run a `registry:2` container on one of your hosts, expose it via tailscale, and use that as your registry. Operator config:
+The middle ground between "real remote registry" and "no registry at all": run `registry:2` as a yoink-managed service on one of your hosts, expose it via tailscale, point `image:` at the tailnet hostname.
 
 ```yaml
 services:
@@ -219,11 +251,16 @@ services:
       options:
         memory: "256Mi"
 
-# Then point yoink at it like any other registry. Tailscale ACLs are
-# the auth surface — no docker login / registry password needed.
-registry:
-  server: registry.my-tailnet.ts.net:5000
+  - name: api
+    image: registry.my-tailnet.ts.net:5000/api
+    tag: dev
+    build:
+      context: .
 ```
+
+Then `yoink build api --push` pushes to your tailnet registry; `yoink up --service api` pulls from it. Tailscale ACLs are the registry's auth surface — no `docker login` / registry password needed if your tailnet is correctly scoped. Persistent storage via the `registry-data` volume.
+
+Best for "I want a registry but I don't want to pay for one and I don't want to run it on a separate machine."
 
 Recipe — not yoink-specific code. Best for "I want a registry but I don't want to pay for one and I don't want to run it on a separate machine."
 
