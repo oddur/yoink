@@ -4,7 +4,7 @@ layout: docs
 toc: false
 ---
 
-A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts. Sits between [Kamal](https://kamal-deploy.org) and Kubernetes — opinionated about the same things Kamal is, borrowing the few Kubernetes ideas that actually pay off at this scale.
+A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts. **Batteries and best practices included** — `age`-sealed secrets, hardened container defaults, healthcheck-gated rolling swaps, drift detection, dependency-ordered waves, all on by default with no plugins to install. Sits between [Kamal](https://kamal-deploy.org) and Kubernetes — opinionated about the same things Kamal is, borrowing the few Kubernetes ideas that actually pay off at this scale.
 
 ```
 yoink up                  # reconcile every service in dep order
@@ -36,6 +36,7 @@ Kamal is a lovely fit for "one app, one binary per host" but starts to creak the
 - **Drift detection.** Every effective spec hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
 - **Three deploy modes**: CI-built (the default), local-build kamal-style with `yoink build --push`, or fully standalone with `yoink up --build --no-registry` (no CI, no registry — drop a `yoink.yaml` next to your Dockerfile and go)
 - **Sane security defaults**: cap_drop=ALL, no-new-privileges, read-only rootfs, init=tini, tmpfs noexec, binds default :ro. Override per service when needed.
+- **Sealed secrets out of the box**: commit a single `secrets.age` file, decrypt with one key from `YOINK_AGE_KEY` (env in CI, file on your laptop). No remote vault needed. Infisical is opt-in for teams already running one.
 - **k9s-style TUI** with deploy history, one-press rollback, drift cells, logs auto-piped through `hl`
 
 Read more in the [intro](/docs/intro), or skip ahead to [first deploy](/docs/start/first-deploy).

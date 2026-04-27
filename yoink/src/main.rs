@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -309,6 +309,52 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Manage `age`-sealed secrets (the batteries-included default).
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsAction,
+    },
+}
+
+/// Subcommands for `yoink secrets`.
+#[derive(clap::Subcommand)]
+enum SecretsAction {
+    /// Generate a fresh age identity. Prints the public recipient
+    /// (commit this to `yoink.yaml` under `secrets.recipients:`) and
+    /// writes the secret key to `~/.config/yoink/age.key` (override
+    /// with `--out`). Never commit the secret key.
+    Keygen {
+        /// Path to write the secret key to. Default
+        /// `~/.config/yoink/age.key`. Refuses to overwrite an existing
+        /// file unless `--force`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Overwrite an existing identity at `--out`.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Decrypt the sealed file into `$EDITOR`, then re-seal on save.
+    /// Creates the file if it doesn't exist yet.
+    Edit,
+    /// Decrypt and print the sealed file. Values are masked unless
+    /// `--reveal` is passed; keys are always shown.
+    Show {
+        /// Print the actual secret values instead of masks.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// One-shot: read a plaintext dotenv from `--in` (or stdin),
+    /// seal against the recipients in `yoink.yaml`, write to
+    /// `secrets.age` (or `--out`).
+    Seal {
+        /// Plaintext dotenv input. `-` (or unset) reads from stdin.
+        #[arg(long, value_name = "PATH")]
+        r#in: Option<PathBuf>,
+        /// Output path. Defaults to the configured `secrets.file:`
+        /// (or `secrets.age` next to `yoink.yaml`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 /// Subcommands for `yoink lock`.
@@ -399,6 +445,19 @@ fn log_file_path() -> PathBuf {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    // `secrets keygen` and `completions` are bootstrap commands —
+    // they shouldn't require an existing `yoink.yaml`.
+    if let Command::Completions { shell } = cli.command {
+        cmd_completions(shell);
+        return Ok(());
+    }
+    if let Command::Secrets {
+        action: SecretsAction::Keygen { out, force },
+    } = cli.command
+    {
+        return cmd_secrets_keygen(out, force);
+    }
+
     let config = Config::load_from_path(&cli.config)
         .with_context(|| format!("loading {}", cli.config.display()))?;
 
@@ -486,6 +545,7 @@ async fn run(cli: Cli) -> Result<()> {
             cmd_completions(shell);
             Ok(())
         }
+        Command::Secrets { action } => cmd_secrets(&config, action),
         Command::Tui { mode, mouse } => cmd_tui(&config, cli.config.clone(), mode, mouse).await,
     }
 }
@@ -903,13 +963,9 @@ async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
 }
 
 async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
-    let Some(cfg) = &config.secrets else {
-        return Ok(None);
-    };
-    let bundle = secrets::fetch_secrets(cfg, cfg.domain.as_deref())
+    secrets::load_bundle(config)
         .await
-        .context("fetch secrets from Infisical")?;
-    Ok(Some(bundle))
+        .context("load secrets bundle")
 }
 
 /// Resolve `(service, optional host)` to exactly one running container
@@ -1849,7 +1905,10 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
                 })
             }).collect::<Vec<_>>(),
             "registry_server": config.registry.as_ref().map(|r| r.server.clone()),
-            "secrets_provider": config.secrets.as_ref().map(|s| s.provider.clone()),
+            "secrets_provider": config.secrets.as_ref().map(|s| match s {
+                yoink::config::SecretsConfig::Age { .. } => "age",
+                yoink::config::SecretsConfig::Infisical { .. } => "infisical",
+            }),
         },
         "hosts": hosts_json,
         "issues": issues,
@@ -1980,4 +2039,197 @@ fn cmd_completions(shell: clap_complete::Shell) {
     let mut cmd = Cli::command();
     let bin_name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, bin_name, &mut io::stdout());
+}
+
+fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
+    match action {
+        SecretsAction::Keygen { out, force } => cmd_secrets_keygen(out, force),
+        SecretsAction::Edit => cmd_secrets_edit(config),
+        SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
+        SecretsAction::Seal { r#in, out } => cmd_secrets_seal(config, r#in.as_deref(), out),
+    }
+}
+
+fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
+    use yoink::sealed;
+    let path = match out {
+        Some(p) => p,
+        None => sealed::default_identity_path()?,
+    };
+    if path.exists() && !force {
+        return Err(anyhow::anyhow!(
+            "{} already exists — pass --force to overwrite",
+            path.display()
+        ));
+    }
+    let (secret, public) = sealed::keygen();
+    let body = format!(
+        "# created: {}\n# public key: {public}\n{secret}\n",
+        chrono_like_now(),
+    );
+    sealed::write_atomically(&path, body.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("wrote identity to {}", path.display());
+    println!("public recipient: {public}");
+    println!();
+    println!("Add this to yoink.yaml:");
+    println!();
+    println!("  secrets:");
+    println!("    provider: age");
+    println!("    recipients:");
+    println!("      - {public}");
+    Ok(())
+}
+
+fn cmd_secrets_edit(config: &Config) -> Result<()> {
+    use yoink::sealed;
+    let (file_override, recipients) = expect_age_block(config)?;
+    let path = sealed::resolve_sealed_path(config, file_override.as_deref());
+    let plaintext = if path.exists() {
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read sealed file {}", path.display()))?;
+        let identity = sealed::load_identity()?;
+        sealed::unseal(&bytes, &identity)?
+    } else {
+        String::from("# yoink secrets — KEY=value, one per line\n")
+    };
+    let edited = open_in_editor(&plaintext)?;
+    let parsed = sealed::parse_dotenv(&edited)?;
+    let canonical = sealed::render_dotenv(&parsed);
+    let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
+    sealed::write_atomically(&path, &sealed_bytes)?;
+    println!("sealed {} key(s) to {}", parsed.len(), path.display());
+    Ok(())
+}
+
+fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
+    use yoink::config::SecretsConfig;
+    use yoink::sealed;
+    let SecretsConfig::Age { file, .. } = expect_secrets_provider_age(config)? else {
+        unreachable!()
+    };
+    let path = sealed::resolve_sealed_path(config, file.as_deref());
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read sealed file {}", path.display()))?;
+    let identity = sealed::load_identity()?;
+    let plaintext = sealed::unseal(&bytes, &identity)?;
+    let parsed = sealed::parse_dotenv(&plaintext)?;
+    for (k, v) in &parsed {
+        if reveal {
+            println!("{k}={v}");
+        } else {
+            println!("{k}={}", mask_value(v));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_secrets_seal(
+    config: &Config,
+    input: Option<&Path>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use yoink::sealed;
+    let (file_override, recipients) = expect_age_block(config)?;
+    let plaintext = match input {
+        Some(p) if p.as_os_str() != "-" => std::fs::read_to_string(p)
+            .with_context(|| format!("read input {}", p.display()))?,
+        _ => {
+            use std::io::Read;
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+    };
+    let parsed = sealed::parse_dotenv(&plaintext)?;
+    let canonical = sealed::render_dotenv(&parsed);
+    let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
+    let target = out
+        .unwrap_or_else(|| sealed::resolve_sealed_path(config, file_override.as_deref()));
+    sealed::write_atomically(&target, &sealed_bytes)?;
+    println!("sealed {} key(s) to {}", parsed.len(), target.display());
+    Ok(())
+}
+
+fn expect_secrets_provider_age(
+    config: &Config,
+) -> Result<&yoink::config::SecretsConfig> {
+    use yoink::config::SecretsConfig;
+    match config.secrets.as_ref() {
+        Some(s @ SecretsConfig::Age { .. }) => Ok(s),
+        Some(SecretsConfig::Infisical { .. }) => Err(anyhow::anyhow!(
+            "yoink.yaml configures `provider: infisical` — `yoink secrets` only manages age-sealed files"
+        )),
+        None => Err(anyhow::anyhow!(
+            "no `secrets:` block in yoink.yaml — add `secrets: {{ provider: age, recipients: [...] }}` first (see `yoink secrets keygen`)"
+        )),
+    }
+}
+
+fn expect_age_block(config: &Config) -> Result<(Option<String>, &Vec<String>)> {
+    use yoink::config::SecretsConfig;
+    let SecretsConfig::Age { file, recipients } = expect_secrets_provider_age(config)? else {
+        unreachable!()
+    };
+    if recipients.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no `secrets.recipients:` configured — add at least one age public key (`age1...`) to yoink.yaml"
+        ));
+    }
+    Ok((file.clone(), recipients))
+}
+
+fn open_in_editor(initial: &str) -> Result<String> {
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let path = dir.join(format!("yoink-secrets-{pid}.env"));
+    std::fs::write(&path, initial)
+        .with_context(|| format!("create scratch file {}", path.display()))?;
+
+    // Tighten permissions before the editor opens it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let status = std::process::Command::new(&editor)
+        .arg(&path)
+        .status()
+        .with_context(|| format!("launch editor {editor:?}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        return Err(anyhow::anyhow!(
+            "editor {editor:?} exited with {status} — aborting"
+        ));
+    }
+
+    let edited = std::fs::read_to_string(&path)
+        .with_context(|| format!("read edited file {}", path.display()))?;
+    let _ = std::fs::remove_file(&path);
+    Ok(edited)
+}
+
+fn mask_value(s: &str) -> String {
+    let visible: usize = if s.len() <= 4 { 0 } else { 2 };
+    let prefix: String = s.chars().take(visible).collect();
+    let masked = "•".repeat(s.chars().count().saturating_sub(visible).min(16));
+    format!("{prefix}{masked}")
+}
+
+fn chrono_like_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    format!("unix={secs}")
 }

@@ -37,7 +37,23 @@ hosts:
 
 ## Secrets
 
-Configures the secret provider. Currently `infisical` is the only supported provider.
+Two providers, selected by the `provider:` tag.
+
+### `provider: age` (default, batteries-included)
+
+A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env, for CI), `YOINK_AGE_KEY_FILE` (path), or `~/.config/yoink/age.key`.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `provider` | string | required | `age` |
+| `recipients` | list of string | `[]` | Public age recipients (`age1...`) used when sealing/editing. Decryption only needs one matching identity. |
+| `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. |
+
+Bootstrap: `yoink secrets keygen` writes the private key + prints the public recipient. See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
+
+### `provider: infisical` (opt-in)
+
+Talks to Infisical's REST API directly — for teams already running an Infisical instance.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|

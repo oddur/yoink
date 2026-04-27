@@ -79,6 +79,15 @@ yoink lock                               inspect / release the per-host deploy l
                                          after a crashed deploy left a sentinel container)
 yoink completions <shell>                generate shell completions (bash/zsh/fish/...)
 
+yoink secrets keygen                     generate an age identity at ~/.config/yoink/age.key
+                                         and print the public recipient
+  --out <PATH>                           override the destination
+  --force                                overwrite an existing identity
+yoink secrets edit                       decrypt secrets.age into $EDITOR, re-seal on save
+yoink secrets show [--reveal]            print KEY=value (values masked unless --reveal)
+yoink secrets seal --in <PATH>           seal a plaintext dotenv (or read from stdin)
+  --out <PATH>                           override the output path
+
 yoink tui                                interactive ratatui dashboard (see TUI page)
 ```
 

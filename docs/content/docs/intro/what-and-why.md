@@ -13,7 +13,7 @@ yoink history api         # who deployed what, when
 yoink rollback api        # roll back to the previous version
 ```
 
-A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts. Sits between [Kamal](https://kamal-deploy.org) and Kubernetes — opinionated about the same things Kamal is, borrowing the few Kubernetes ideas that actually pay off at this scale.
+A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts. **Batteries and best practices included** — the boring-but-important pieces (sealed secrets, hardened container defaults, healthcheck-gated rolling swaps, drift detection, dependency-ordered waves) are all on by default with no plugins to install. Sits between [Kamal](https://kamal-deploy.org) and Kubernetes — opinionated about the same things Kamal is, borrowing the few Kubernetes ideas that actually pay off at this scale.
 
 ## Why it exists
 
@@ -28,6 +28,7 @@ Kamal is a lovely fit for "one app, one binary per host" but starts to creak the
 - **Drift detection.** Every effective spec (image, env, networks, mounts, options, file content) hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
 - **Three deploy modes.** CI-built (the default), kamal-style local-build with `yoink build --push`, or fully standalone with `yoink up --build --no-registry` — no CI, no registry, drop a `yoink.yaml` next to your Dockerfile and go.
 - **Sane security defaults.** cap_drop=ALL, no-new-privileges, read-only rootfs, init=tini, tmpfs noexec, binds default :ro. Override per service when needed.
+- **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI, `~/.config/yoink/age.key` on your laptop). No remote vault required. Infisical stays available as an opt-in for teams already running it.
 - **k9s-style TUI.** A `ratatui` dashboard with one-key reconcile, prune, kill, shell-into, debug-sidecar, log filter, deploy history with one-press rollback. Keyboard-only.
 
 ## What it deliberately doesn't do
