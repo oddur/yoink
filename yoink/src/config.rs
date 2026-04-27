@@ -507,6 +507,24 @@ pub struct ServiceConfig {
     /// See <https://caddyserver.com/docs/json/apps/http/servers/routes/handle/>.
     #[serde(default)]
     pub caddy_extra_json: Option<String>,
+    /// Like `caddy_extra_json:` but takes Caddyfile syntax — the
+    /// friendlier shape Caddy's docs and ecosystem use:
+    ///
+    /// ```yaml
+    /// caddy_extra_caddyfile: |
+    ///   forward_auth authelia:9091 {
+    ///     uri /api/verify?rd=https://auth.example.com
+    ///     copy_headers Remote-User Remote-Groups Remote-Email
+    ///   }
+    /// ```
+    ///
+    /// Yoink shells out to `caddy adapt --adapter caddyfile` (in an
+    /// ephemeral container) at render time to convert the snippet to
+    /// JSON, then splices the resulting handlers into the route.
+    /// Requires docker on the operator's machine. Cannot be combined
+    /// with `caddy_extra_json:` on the same service — pick one shape.
+    #[serde(default)]
+    pub caddy_extra_caddyfile: Option<String>,
     /// Talk to the backend over HTTP/2 cleartext (`h2c`). Renders a
     /// `transport: { protocol: http, versions: [h2c] }` block on the
     /// auto-generated `reverse_proxy` handler. Required for native

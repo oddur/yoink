@@ -2066,12 +2066,12 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
 
 async fn validate_proxy_render(config: &Config) -> Result<()> {
     let bundle = load_secrets_bundle(config).await?;
-    let json = match yoink::proxy::caddy::render(config, |_| Vec::new(), bundle.as_ref()) {
-        Ok(j) => j,
-        Err(e) => {
-            anyhow::bail!("render Caddy config: {e}");
-        }
-    };
+    let mut config = config.clone();
+    yoink::proxy::caddy::expand_caddyfile_snippets(&mut config)
+        .await
+        .context("expand caddy_extra_caddyfile snippets")?;
+    let json = yoink::proxy::caddy::render(&config, |_| Vec::new(), bundle.as_ref())
+        .context("render Caddy config")?;
     let body = serde_json::to_string(&json).context("serialize rendered config")?;
 
     // Probe for a local docker daemon. Skip gracefully if absent.
@@ -2156,7 +2156,11 @@ async fn cmd_proxy_render(config: &Config) -> Result<()> {
     // `client_auth.trust_pool_secret` references resolve. Empty
     // upstream lookup → render uses service-name fallbacks.
     let bundle = load_secrets_bundle(config).await?;
-    let json = yoink::proxy::caddy::render(config, |_| Vec::new(), bundle.as_ref())
+    let mut config = config.clone();
+    yoink::proxy::caddy::expand_caddyfile_snippets(&mut config)
+        .await
+        .context("expand caddy_extra_caddyfile snippets")?;
+    let json = yoink::proxy::caddy::render(&config, |_| Vec::new(), bundle.as_ref())
         .context("render Caddy config")?;
     let pretty = serde_json::to_string_pretty(&json).context("serialize rendered config")?;
     println!("{pretty}");

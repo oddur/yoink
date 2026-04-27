@@ -789,6 +789,17 @@ async fn push_caddy_config(
     config: &Config,
     secrets: Option<&SecretsBundle>,
 ) -> Result<(), DeployError> {
+    // Expand any `caddy_extra_caddyfile:` snippets to JSON. Mutates a
+    // local clone so the caller's view of config stays unchanged.
+    let mut config = config.clone();
+    crate::proxy::caddy::expand_caddyfile_snippets(&mut config)
+        .await
+        .map_err(|source| DeployError::Custom {
+            host: host.address.clone(),
+            detail: format!("expand caddy_extra_caddyfile: {source}"),
+        })?;
+    let config = &config;
+
     // Build the upstream-name lookup by querying each routed service's
     // current containers on this host. Includes the just-started
     // replica AND (briefly) the old one — Caddy reloads gracefully.

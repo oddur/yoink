@@ -232,6 +232,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         tls_cert_secret: None,
         tls_key_secret: None,
         caddy_extra_json: None,
+        caddy_extra_caddyfile: None,
         upstream_h2c: false,
         canonical_domain: None,
         compression: false,

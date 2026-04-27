@@ -37,10 +37,16 @@ Containers are named in upstream entries (not IPs), so a container restart with 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `domain` | string \| list | — | Hostname(s); presence enables proxying. |
+| `path_prefix` | string | — | Match this path glob in addition to `domain:` so multiple services can share a hostname. Yoink orders routes so path-constrained ones come before catch-alls. |
 | `tls` | `auto` \| `off` \| `cert` | `auto` | `auto` = ACME via Let's Encrypt. `off` = HTTP only. `cert` = inline cert from sealed secrets. |
 | `tls_cert_secret` | string | — | Sealed-secret name holding the PEM cert (for `tls: cert`). |
 | `tls_key_secret` | string | — | Sealed-secret name holding the PEM private key (for `tls: cert`). |
-| `caddy_extra_json` | string (JSON) | — | Raw Caddy handler JSON merged into this site's route, before the auto-generated `reverse_proxy`. Escape hatch for advanced features (auth, rate limit, headers). |
+| `upstream_h2c` | bool | `false` | Talk to backend over HTTP/2 cleartext. Required for native gRPC backends (Tonic, grpc-go, grpc-java). |
+| `compression` | bool | `false` | Emit `encode gzip zstd`. No-op behind a CDN. |
+| `canonical_domain` | string | — | One of the `domain:` entries. Yoink 308-redirects every other entry to it (apex/www patterns). |
+| `hsts` | bool | `true` for TLS sites | Emit `Strict-Transport-Security: max-age=31536000; includeSubDomains`. Default-on best practice. |
+| `caddy_extra_json` | string (JSON) | — | Raw Caddy handler JSON merged into the route. Routes auto-wrapped in `subroute`. See the [snippets cookbook](/docs/recipes/caddy-snippets). |
+| `caddy_extra_caddyfile` | string (Caddyfile) | — | Same as above but in Caddyfile syntax. Yoink shells out to `caddy adapt` at render time (needs docker on operator). Mutually exclusive with `caddy_extra_json:`. |
 
 `run.port:` is required when `domain:` is set — the proxy needs to know which container port to forward to. `run.healthcheck_path:` (if set) is reused as Caddy's active health check URI.
 
@@ -52,6 +58,7 @@ Containers are named in upstream entries (not IPs), so a container restart with 
 | `email` | string | — | Let's Encrypt registration email. **Required when any service uses `tls: auto`.** Unused when `proxy.tls:` is set. |
 | `image` | string | `caddy:2` | Override to use an [`xcaddy`](https://github.com/caddyserver/xcaddy)-built image with plugins (rate-limit, l4, redis-storage, …). |
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. Persisted across proxy restarts. |
+| `bind` | string | — (all interfaces) | Host IP to bind `:80` and `:443` to. Common use: bind to a Tailscale IP so the proxy is reachable only over the tailnet. Admin port stays on `127.0.0.1` regardless. |
 | `tls` | block (see below) | — | Proxy-level TLS — every routed service inherits this cert (and optional mTLS) by default. |
 
 ### `proxy.tls:` block

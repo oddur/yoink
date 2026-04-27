@@ -250,6 +250,114 @@ where
     Ok(config)
 }
 
+/// Expand every `caddy_extra_caddyfile:` snippet in `cfg` into its
+/// JSON form (mutating the service's `caddy_extra_json` slot in
+/// place). Shells out to `docker run --rm -i caddy:2 caddy adapt`
+/// for each snippet — requires docker on the operator's machine.
+///
+/// Caller pattern: clone the config, expand, then render. Render
+/// stays sync because all docker spawning happens here.
+pub async fn expand_caddyfile_snippets(
+    cfg: &mut crate::config::Config,
+) -> anyhow::Result<()> {
+    for svc in &mut cfg.services {
+        let Some(caddyfile) = svc.caddy_extra_caddyfile.take() else {
+            continue;
+        };
+        if svc.caddy_extra_json.is_some() {
+            return Err(anyhow!(
+                "service {:?}: caddy_extra_caddyfile and caddy_extra_json are \
+                 mutually exclusive — pick one",
+                svc.name,
+            ));
+        }
+        let handlers = adapt_snippet_to_handlers(&caddyfile, &svc.name).await?;
+        svc.caddy_extra_json = Some(handlers);
+    }
+    Ok(())
+}
+
+async fn adapt_snippet_to_handlers(snippet: &str, svc_name: &str) -> anyhow::Result<String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    // Caddyfile requires a top-level site block; wrap the user's
+    // bare directives so `caddy adapt` accepts the snippet.
+    let wrapped = format!(":80 {{\n{snippet}\n}}\n");
+
+    // `caddy adapt` doesn't support stdin via `--config -`; it
+    // requires a real file. Write the wrapped snippet to a tempfile
+    // inside the container, then adapt against it. Container writes
+    // to /tmp (writable in the default caddy:2 image).
+    let mut child = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-i",
+            "--entrypoint",
+            "sh",
+            "caddy:2",
+            "-c",
+            "cat > /tmp/snippet.caddyfile && \
+             caddy adapt --config /tmp/snippet.caddyfile --adapter caddyfile",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "service {svc_name:?}: spawn `docker run caddy adapt` (is docker installed?)"
+            )
+        })?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(wrapped.as_bytes())
+        .await
+        .with_context(|| format!("service {svc_name:?}: write Caddyfile to adapt stdin"))?;
+    let output = child
+        .wait_with_output()
+        .await
+        .with_context(|| format!("service {svc_name:?}: wait on caddy adapt"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "service {svc_name:?}: caddy adapt rejected the Caddyfile snippet:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+
+    // Adapter output is a full Caddy JSON config. Caddy may emit one
+    // route per directive (e.g. `respond /robots.txt ...` becomes a
+    // route with a path matcher) OR pile multiple directives into
+    // one route's handle list — depends on directive ordering rules.
+    // To preserve everything, take the full routes list and wrap it
+    // in a single `subroute` handler, which `normalize_extra_json`
+    // will then splice into the service's site-block.
+    let parsed: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("service {svc_name:?}: parse caddy adapt output"))?;
+    let routes = parsed
+        .pointer("/apps/http/servers/srv0/routes")
+        .ok_or_else(|| {
+            anyhow!(
+                "service {svc_name:?}: caddy adapt output didn't contain a routes list \
+                 at apps/http/servers/srv0/routes. Snippet may be empty."
+            )
+        })?
+        .clone();
+    // Single subroute wrapping all of Caddy's generated routes.
+    // normalize_extra_json's "handler form" branch passes this
+    // through verbatim into the site-block handle array.
+    let wrapped = json!([{
+        "handler": "subroute",
+        "routes": routes,
+    }]);
+    serde_json::to_string(&wrapped)
+        .with_context(|| format!("service {svc_name:?}: serialize adapted handlers"))
+}
+
 /// Extract each `-----BEGIN CERTIFICATE-----` block from a PEM bundle
 /// and return its base64-encoded DER body (the inner base64 content
 /// without headers / whitespace). Caddy 2's `tls.ca_pool.source.inline`
