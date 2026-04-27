@@ -1,0 +1,4 @@
+# Hugo build outputs + caches — regenerated on every build.
+public/
+resources/_gen/
+.hugo_build.lock
