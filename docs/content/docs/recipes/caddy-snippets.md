@@ -197,7 +197,7 @@ Force every request to a holding page for the duration of a maintenance window.
 **Caddyfile:**
 ```yaml
 caddy_extra_caddyfile: |
-  respond "Backtrack is undergoing scheduled maintenance. Back at 14:00 UTC." 503
+  respond "This service is undergoing scheduled maintenance. Back at 14:00 UTC." 503
 ```
 
 **JSON:**
@@ -206,7 +206,7 @@ caddy_extra_json: |
   [{
     "handler": "static_response",
     "status_code": 503,
-    "body": "Backtrack is undergoing scheduled maintenance. Back at 14:00 UTC.",
+    "body": "This service is undergoing scheduled maintenance. Back at 14:00 UTC.",
     "headers": {"Content-Type": ["text/plain; charset=utf-8"]}
   }]
 ```

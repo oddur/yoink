@@ -99,7 +99,7 @@ services:
       port: 50051
 ```
 
-This is the configuration backtrack uses today: Tonic + Axum behind Cloudflare with origin-pull mTLS, single `upstream_h2c: true` covers both gRPC and the REST surface.
+A common shape: Tonic + Axum behind Cloudflare with origin-pull mTLS — a single `upstream_h2c: true` covers both gRPC and the REST surface.
 
 ## See also
 

@@ -757,7 +757,7 @@ mod tests {
             sanitize_service_name("oddur/yoink-secrets").as_deref(),
             Some("oddur-yoink-secrets")
         );
-        assert_eq!(sanitize_service_name("backtrack").as_deref(), Some("backtrack"));
+        assert_eq!(sanitize_service_name("my-app").as_deref(), Some("my-app"));
     }
 
     #[test]

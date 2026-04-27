@@ -84,8 +84,6 @@ Note: `proxy.email:` isn't required when no service uses `tls: auto`. ACME is im
 
 By default, anyone who knows your origin IP can hit it directly with a `Host:` header — bypassing Cloudflare's WAF, rate limits, bot blocks, etc. **Origin-pull mTLS** fixes that: the origin requires every request to present a Cloudflare-signed client certificate. Anything else gets a TLS handshake error.
 
-This is what backtrack runs in production.
-
 ### One-time setup
 
 Cloudflare provides a static **Origin Pull CA bundle** that signs every cert their edge presents to your origin:
