@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
+  "packages": [
+    "rustup@latest",
+    "libiconv@latest",
+    "openssl@latest",
+    "pkg-config@latest",
+    "go-task@latest",
+    "sccache@latest",
+    "hugo@latest",
+    "go@1.23"
+  ],
+  "shell": {
+    "init_hook": [
+      "projectDir=$(dirname $(readlink -f \"$0\"))",
+      "export LIBRARY_PATH=$LIBRARY_PATH:\"$projectDir/nix/profile/default/lib\"",
+      "export LIBRARY_PATH=\"/opt/homebrew/opt/bzip2/lib:$LIBRARY_PATH\"",
+      "rustup default 1.95.0 2>/dev/null",
+      "if command -v sccache &>/dev/null; then export RUSTC_WRAPPER=sccache; unset SCCACHE_WEBDAV_ENDPOINT SCCACHE_WEBDAV_TOKEN; fi"
+    ],
+    "scripts": {
+      "test": "task test",
+      "check": "task check"
+    }
+  }
+}

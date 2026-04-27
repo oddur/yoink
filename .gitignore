@@ -2,3 +2,5 @@ target/
 *.swp
 .DS_Store
 /dist/
+.devbox/
+.direnv/
