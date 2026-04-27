@@ -136,7 +136,7 @@ The hardened defaults make new containers prod-safe out of the box. Override per
 | `init` | bool | `true` | Run with tini as PID 1 (zombie reaping + proper SIGTERM). |
 | `tmpfs` | map of string | `{}` | `mount_path: "size=N,mode=NNNN"`. Auto-applies `noexec,nosuid,nodev`. |
 | `restart` | string | `unless-stopped` | Docker restart policy. |
-| `user` | string | unset | UID/GID override (`"1000:1000"`, `"redis"`). |
+| `user` | string | `"65534:65534"` (nobody) | UID/GID. Default runs non-root. Override with `"0:0"` for images that genuinely need root, or a specific uid:gid (`"1000:1000"`, `"redis"`) when the image has pre-baked file ownership. |
 | `network_aliases` | list of string | `[name]` | Extra DNS names on the attached networks. |
 
 See [Security defaults](/docs/guide/security-defaults) for the full picture.

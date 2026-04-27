@@ -412,11 +412,16 @@ pub struct RunOptions {
     pub tmpfs: BTreeMap<String, String>,
     #[serde(default)]
     pub restart: Option<String>,
-    /// Override the container's effective user (e.g. `"0:0"` for an
-    /// image that genuinely needs root, or `"1000:1000"` for a
-    /// non-root unprivileged uid). When unset, docker honors the
-    /// image's `USER` directive.
-    #[serde(default)]
+    /// Override the container's effective user.
+    /// **Default: `"65534:65534"` (nobody:nogroup)** — yoink runs every
+    /// new container as a non-root unprivileged uid so a process
+    /// breakout doesn't immediately give the attacker file-system
+    /// access through the few mounts (tmpfs, binds) the hardened
+    /// profile leaves writable. Override with `"0:0"` for images that
+    /// genuinely need root (host-metrics collectors, otel reading
+    /// `/proc`), or with a different non-root uid if 65534 collides
+    /// with the image's pre-baked file ownership.
+    #[serde(default = "default_user")]
     pub user: Option<String>,
     /// Run `tini` as PID 1 (docker's `--init`). **Default: `true`.**
     /// Most app images run their language runtime as PID 1, which
@@ -445,6 +450,16 @@ fn default_init() -> bool {
     true
 }
 
+/// Default `user:` value for runtime containers. `nobody:nogroup` on
+/// most distros (alpine, debian-slim, ubuntu, distroless). Operators
+/// who need root (otel, host-metrics) opt out via `user: "0:0"`;
+/// images with pre-baked file ownership for a specific uid override
+/// to that uid (`"redis"`, `"1000:1000"`, etc.).
+#[allow(clippy::unnecessary_wraps)]
+fn default_user() -> Option<String> {
+    Some("65534:65534".to_string())
+}
+
 // Wrapped in `Option<i64>` because that's what the field expects;
 // clippy's `unnecessary_wraps` lint is wrong here.
 #[allow(clippy::unnecessary_wraps)]
@@ -465,7 +480,7 @@ impl Default for RunOptions {
             read_only: default_read_only(),
             tmpfs: BTreeMap::new(),
             restart: None,
-            user: None,
+            user: default_user(),
             init: default_init(),
         }
     }
@@ -1548,5 +1563,55 @@ services:
             .unwrap()
             .join("examples/yoink.yaml");
         let _ = Config::load_from_path(&path).expect("examples/yoink.yaml must parse");
+    }
+
+    #[test]
+    fn run_options_default_runs_as_non_root() {
+        // The whole hardened-defaults profile in one assertion. If
+        // any of these flip silently the security-defaults docs and
+        // the actual runtime drift apart.
+        let opts = RunOptions::default();
+        assert_eq!(opts.user.as_deref(), Some("65534:65534"));
+        assert_eq!(opts.cap_drop, vec!["ALL"]);
+        assert_eq!(opts.security_opt, vec!["no-new-privileges:true"]);
+        assert!(opts.read_only);
+        assert!(opts.init);
+        assert_eq!(opts.pids_limit, Some(1024));
+    }
+
+    #[test]
+    fn services_inherit_non_root_default_when_user_unset() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: api
+    image: i
+    tag: v1
+    run: { port: 8080 }
+"#;
+        let c = Config::parse_str(s).unwrap();
+        assert_eq!(
+            c.services[0].run.options.user.as_deref(),
+            Some("65534:65534")
+        );
+    }
+
+    #[test]
+    fn services_can_override_user_to_root() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: otel
+    image: i
+    tag: v1
+    run:
+      port: 13133
+      options:
+        user: "0:0"
+"#;
+        let c = Config::parse_str(s).unwrap();
+        assert_eq!(c.services[0].run.options.user.as_deref(), Some("0:0"));
     }
 }
