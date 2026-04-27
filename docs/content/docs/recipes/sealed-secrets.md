@@ -26,6 +26,14 @@ The default secrets path. One sealed file committed to the repo, one key per env
 
 3. **Add the secret key as a GitHub secret** named `YOINK_AGE_KEY`. Paste the contents of `AGE-SECRET-KEY-1...` (just the key line, not the comment header).
 
+   **Recommended**: instead of pasting your laptop key, generate a separate CI-only identity that doesn't touch disk:
+
+   ```sh
+   yoink secrets keygen --ci
+   ```
+
+   This prints a new secret + public key without saving anything locally. Paste the secret into the GitHub secret, add the public key to `secrets.recipients:`. See [AGE secrets in GitHub Actions](/docs/recipes/age-in-github-actions) for the full workflow.
+
 4. **Add `secrets.age` to your repo and commit it.** The next step creates it.
 
 ## Sealing values
@@ -97,6 +105,16 @@ When yoink needs to decrypt, it looks in this order:
 Stop at the first one set. Override at any layer.
 
 ## Rotating a key
+
+```sh
+yoink secrets rotate
+```
+
+Generates a new identity, re-seals `secrets.age` against [existing recipients + new public key], and prints the new secret + public for pasting into a GitHub Actions secret. The transitional state has both keys able to decrypt — no deploy outage during the swap.
+
+After CI is decrypting fine with the new key, remove the old recipient from `yoink.yaml` and run `yoink secrets edit` (save without changes) to drop it from the sealed file.
+
+If you want to do it manually:
 
 1. `yoink secrets keygen --out new.key` — generate a new identity.
 2. Add the new public key to `secrets.recipients:` *alongside* the old one.

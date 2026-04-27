@@ -294,8 +294,25 @@ fn needs_quoting(s: &str) -> bool {
 }
 
 /// Atomic write: write to `<path>.tmp` and rename. Creates parent
-/// directories as needed.
+/// directories as needed. Use [`write_atomically_secret`] for files
+/// that must never be world-readable, even briefly.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SealedError> {
+    write_atomically_inner(path, bytes, None)
+}
+
+/// Like [`write_atomically`], but on Unix opens the tempfile with
+/// mode `0o600` from the start (no TOCTOU window between create and
+/// chmod) and the rename brings the tightened perms with it. On
+/// non-Unix platforms behaves like the regular variant.
+pub fn write_atomically_secret(path: &Path, bytes: &[u8]) -> Result<(), SealedError> {
+    write_atomically_inner(path, bytes, Some(0o600))
+}
+
+fn write_atomically_inner(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> Result<(), SealedError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -313,15 +330,41 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SealedError> {
     tmp_name.push(&fname);
     tmp_name.push(".tmp");
     tmp.set_file_name(tmp_name);
-    std::fs::write(&tmp, bytes).map_err(|source| SealedError::Write {
-        path: tmp.clone(),
-        source,
-    })?;
+
+    write_with_mode(&tmp, bytes, mode)?;
     std::fs::rename(&tmp, path).map_err(|source| SealedError::Write {
         path: path.to_path_buf(),
         source,
     })?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_with_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), SealedError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    if let Some(m) = mode {
+        opts.mode(m);
+    }
+    let mut file = opts.open(path).map_err(|source| SealedError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.write_all(bytes).map_err(|source| SealedError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_with_mode(path: &Path, bytes: &[u8], _mode: Option<u32>) -> Result<(), SealedError> {
+    std::fs::write(path, bytes).map_err(|source| SealedError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]

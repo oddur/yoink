@@ -332,6 +332,14 @@ enum SecretsAction {
         /// Overwrite an existing identity at `--out`.
         #[arg(long)]
         force: bool,
+        /// CI mode: generate a separate identity for CI to use
+        /// independently of the operator's laptop key. Prints the
+        /// secret key to stdout (for pasting into a GitHub Actions
+        /// secret named `YOINK_AGE_KEY`) but does NOT save it to
+        /// disk. Lets you rotate CI's identity without re-keying the
+        /// operator's laptop.
+        #[arg(long)]
+        ci: bool,
     },
     /// Decrypt the sealed file into `$EDITOR`, then re-seal on save.
     /// Creates the file if it doesn't exist yet.
@@ -355,6 +363,13 @@ enum SecretsAction {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Generate a new identity and re-seal `secrets.age` against
+    /// both the existing recipients AND the new public key. Prints
+    /// the new secret for pasting into a GitHub Actions secret. After
+    /// CI is updated to the new key, edit `yoink.yaml` to remove the
+    /// old recipient and run `yoink secrets edit` (just save without
+    /// changes) to re-seal under the new recipients only.
+    Rotate,
 }
 
 /// Subcommands for `yoink lock`.
@@ -445,17 +460,8 @@ fn log_file_path() -> PathBuf {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    // `secrets keygen` and `completions` are bootstrap commands —
-    // they shouldn't require an existing `yoink.yaml`.
-    if let Command::Completions { shell } = cli.command {
-        cmd_completions(shell);
-        return Ok(());
-    }
-    if let Command::Secrets {
-        action: SecretsAction::Keygen { out, force },
-    } = cli.command
-    {
-        return cmd_secrets_keygen(out, force);
+    if let Some(result) = run_bootstrap(&cli.command) {
+        return result;
     }
 
     let config = Config::load_from_path(&cli.config)
@@ -2041,17 +2047,54 @@ fn cmd_completions(shell: clap_complete::Shell) {
     clap_complete::generate(shell, &mut cmd, bin_name, &mut io::stdout());
 }
 
-fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
-    match action {
-        SecretsAction::Keygen { out, force } => cmd_secrets_keygen(out, force),
-        SecretsAction::Edit => cmd_secrets_edit(config),
-        SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
-        SecretsAction::Seal { r#in, out } => cmd_secrets_seal(config, r#in.as_deref(), out),
+/// Subcommands that don't need a `yoink.yaml`. Returns `Some(result)`
+/// to short-circuit `run`'s config-load step, or `None` to fall
+/// through.
+fn run_bootstrap(command: &Command) -> Option<Result<()>> {
+    match command {
+        Command::Completions { shell } => {
+            cmd_completions(*shell);
+            Some(Ok(()))
+        }
+        Command::Secrets {
+            action: SecretsAction::Keygen { out, force, ci },
+        } => Some(cmd_secrets_keygen(out.clone(), *force, *ci)),
+        _ => None,
     }
 }
 
-fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
+fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
+    match action {
+        SecretsAction::Keygen { out, force, ci } => cmd_secrets_keygen(out, force, ci),
+        SecretsAction::Edit => cmd_secrets_edit(config),
+        SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
+        SecretsAction::Seal { r#in, out } => cmd_secrets_seal(config, r#in.as_deref(), out),
+        SecretsAction::Rotate => cmd_secrets_rotate(config),
+    }
+}
+
+fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool, ci: bool) -> Result<()> {
     use yoink::sealed;
+    let (secret, public) = sealed::keygen();
+    if ci {
+        if out.is_some() {
+            return Err(anyhow::anyhow!(
+                "--ci is incompatible with --out (the secret is intentionally not saved to disk)"
+            ));
+        }
+        println!("CI identity (paste this into a GitHub Actions secret named YOINK_AGE_KEY):");
+        println!();
+        println!("{secret}");
+        println!();
+        println!("Public recipient (add to yoink.yaml under `secrets.recipients:`):");
+        println!();
+        println!("  - {public}");
+        println!();
+        println!("This secret was NOT written to disk. The terminal scrollback is now");
+        println!("the only copy outside GitHub — paste it into the secret and clear");
+        println!("scrollback when done.");
+        return Ok(());
+    }
     let path = match out {
         Some(p) => p,
         None => sealed::default_identity_path()?,
@@ -2062,17 +2105,11 @@ fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
             path.display()
         ));
     }
-    let (secret, public) = sealed::keygen();
     let body = format!(
         "# created: {}\n# public key: {public}\n{secret}\n",
         chrono_like_now(),
     );
-    sealed::write_atomically(&path, body.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    sealed::write_atomically_secret(&path, body.as_bytes())?;
     println!("wrote identity to {}", path.display());
     println!("public recipient: {public}");
     println!();
@@ -2152,6 +2189,61 @@ fn cmd_secrets_seal(
         .unwrap_or_else(|| sealed::resolve_sealed_path(config, file_override.as_deref()));
     sealed::write_atomically(&target, &sealed_bytes)?;
     println!("sealed {} key(s) to {}", parsed.len(), target.display());
+    Ok(())
+}
+
+fn cmd_secrets_rotate(config: &Config) -> Result<()> {
+    use yoink::sealed;
+
+    let (file_override, current_recipients) = expect_age_block(config)?;
+    let path = sealed::resolve_sealed_path(config, file_override.as_deref());
+    if !path.exists() {
+        return Err(anyhow::anyhow!(
+            "{} doesn't exist — nothing to rotate. `yoink secrets edit` to create it first",
+            path.display()
+        ));
+    }
+
+    // Decrypt with the current identity before generating the new key.
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read sealed file {}", path.display()))?;
+    let identity = sealed::load_identity()?;
+    let plaintext = sealed::unseal(&bytes, &identity)?;
+    let parsed = sealed::parse_dotenv(&plaintext)?;
+    let canonical = sealed::render_dotenv(&parsed);
+
+    // Generate the new identity. The secret never lands on disk.
+    let (new_secret, new_public) = sealed::keygen();
+
+    // Re-seal under [current recipients ∪ new_public].
+    let mut next: Vec<String> = current_recipients.clone();
+    if !next.iter().any(|r| r == &new_public) {
+        next.push(new_public.clone());
+    }
+    let resealed = sealed::seal(canonical.as_bytes(), &next)?;
+    sealed::write_atomically(&path, &resealed)?;
+
+    println!(
+        "re-sealed {} key(s) to {} ({} recipients)",
+        parsed.len(),
+        path.display(),
+        next.len()
+    );
+    println!();
+    println!("New CI identity (paste into GitHub Actions secret YOINK_AGE_KEY):");
+    println!();
+    println!("{new_secret}");
+    println!();
+    println!("New public recipient (add to yoink.yaml under `secrets.recipients:`):");
+    println!();
+    println!("  - {new_public}");
+    println!();
+    println!("Next steps:");
+    println!("  1. Add the new recipient to yoink.yaml so future edits include it.");
+    println!("  2. Update the YOINK_AGE_KEY GitHub secret to the value above.");
+    println!("  3. Once CI is happily decrypting with the new key, remove the OLD");
+    println!("     recipient from yoink.yaml and run `yoink secrets edit` (save");
+    println!("     without changes) to drop it from the sealed file.");
     Ok(())
 }
 
