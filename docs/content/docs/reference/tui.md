@@ -1,6 +1,6 @@
 ---
 title: TUI
-weight: 7
+weight: 3
 ---
 
 ```sh
@@ -8,6 +8,10 @@ yoink tui
 ```
 
 Heavily inspired by [k9s](https://k9scli.io/). Keyboard-driven panes for dashboard (drift across all services), hosts (per-host detail with live CPU/mem), services (per-service detail with replica info), container logs (live tail with `/` filter), per-container detail (env, mounts, healthcheck, networks, security profile), service deploy history.
+
+![yoink TUI dashboard](https://github.com/user-attachments/assets/bcf956b1-937a-43d7-92f6-0f24a1d0cd98)
+
+![yoink TUI container detail](https://github.com/user-attachments/assets/36d3cc00-355c-482b-addc-454a0070b58e)
 
 ## Operator gestures from the dashboard
 

@@ -13,6 +13,8 @@ yoink history api         # who deployed what, when
 yoink rollback api        # roll back to the previous version
 ```
 
+![yoink TUI](https://github.com/user-attachments/assets/bcf956b1-937a-43d7-92f6-0f24a1d0cd98)
+
 {{< cards >}}
   {{< card link="/docs/start/first-deploy" title="Five-minute first deploy" subtitle="Drop a yoink.yaml next to your Dockerfile, run one command." icon="lightning-bolt" >}}
   {{< card link="/docs/intro/compared" title="Is this for me?" subtitle="vs Kamal, vs Kubernetes, vs plain compose. When yoink is the right answer, when it isn't." icon="adjustments" >}}
