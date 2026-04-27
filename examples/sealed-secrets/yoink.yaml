@@ -1,12 +1,15 @@
 # Sealed-secrets test fixture — runs entirely against the operator's
 # local docker daemon. No ssh, no registry, no remote infrastructure.
+# Identity + sealed file both live in this directory (gitignored), so
+# the fixture is self-contained and doesn't touch ~/.config.
 #
 # Setup:
-#   1. yoink secrets keygen
+#   1. yoink secrets keygen --out age.key
 #   2. Replace `recipients:` below with the public key keygen printed.
-#   3. printf 'GREETING=hello sealed world\n' | yoink secrets seal
-#   4. yoink up
-#   5. yoink exec demo -- env | grep GREETING
+#   3. export YOINK_AGE_KEY_FILE=$(pwd)/age.key
+#   4. printf 'GREETING=hello sealed world\n' | yoink secrets seal
+#   5. yoink up
+#   6. yoink exec demo -- env | grep GREETING
 #      → GREETING=hello sealed world
 
 deploy:
