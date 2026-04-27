@@ -2281,21 +2281,28 @@ fn open_in_editor(initial: &str) -> Result<String> {
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
         .unwrap_or_else(|_| "vi".to_string());
+    // `$EDITOR` commonly carries flags (`code --wait`, `nvim --noplugin`,
+    // `emacsclient -nw`). Treat the whole string as a shell-style cmd
+    // by splitting on ASCII whitespace; the first token is the program
+    // and the rest are forwarded as args before the scratch path.
+    let mut tokens = editor.split_ascii_whitespace();
+    let program = tokens
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("EDITOR/VISUAL is empty"))?;
+    let editor_args: Vec<&str> = tokens.collect();
 
     let dir = std::env::temp_dir();
     let pid = std::process::id();
     let path = dir.join(format!("yoink-secrets-{pid}.env"));
-    std::fs::write(&path, initial)
+
+    // Open the scratch file with mode 0600 from creation — never let
+    // the plaintext sit on disk world-readable, even briefly. On
+    // non-Unix the regular create path applies (no perm model).
+    write_scratch_file(&path, initial.as_bytes())
         .with_context(|| format!("create scratch file {}", path.display()))?;
 
-    // Tighten permissions before the editor opens it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-
-    let status = std::process::Command::new(&editor)
+    let status = std::process::Command::new(program)
+        .args(&editor_args)
         .arg(&path)
         .status()
         .with_context(|| format!("launch editor {editor:?}"))?;
@@ -2310,6 +2317,41 @@ fn open_in_editor(initial: &str) -> Result<String> {
         .with_context(|| format!("read edited file {}", path.display()))?;
     let _ = std::fs::remove_file(&path);
     Ok(edited)
+}
+
+/// Create the scratch file for the editor flow with mode 0600 from
+/// creation on Unix (no chmod-after-write window). `O_EXCL` rejects
+/// pre-existing files — defends against a symlink-in-/tmp attack
+/// pointing yoink at a privileged path. Stale scratch files from a
+/// crashed previous run are removed first.
+fn write_scratch_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    // A previous yoink crash could leave the file around — same PID
+    // collisions are vanishingly unlikely but `create_new` would
+    // refuse, so clear first. Removing a symlink an attacker planted
+    // is fine: the subsequent `create_new` proves we own the inode.
+    let _ = std::fs::remove_file(path);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("open {} (O_EXCL, mode 0600)", path.display()))?;
+        f.write_all(contents)
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
 }
 
 fn mask_value(s: &str) -> String {

@@ -87,10 +87,13 @@ yoink secrets keygen                     generate an age identity. Default: prin
                                          instead of stdout. Make sure PATH is
                                          gitignored.
   --force                                overwrite an existing identity at --out
-yoink secrets edit                       decrypt secrets.age into $EDITOR, re-seal on save
+yoink secrets edit                       decrypt the configured sealed file into
+                                         $EDITOR, re-seal on save (path comes from
+                                         `secrets.file:`; defaults to secrets.age)
 yoink secrets show [--reveal]            print KEY=value (values masked unless --reveal)
 yoink secrets seal --in <PATH>           seal a plaintext dotenv (or read from stdin)
-  --out <PATH>                           override the output path
+  --out <PATH>                           override the output path (defaults to
+                                         the configured `secrets.file:`)
 yoink secrets rotate                     generate a new identity and re-seal under
                                          [existing recipients + new public]; prints
                                          the new secret for pasting into CI

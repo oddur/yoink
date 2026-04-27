@@ -1359,9 +1359,11 @@ secrets:
   project_id: p
   environment: prod
 "#;
-        // serde's untagged enum rejection ends up as a Parse error,
-        // not a validate Invalid error. Either is fine — we just want
-        // to confirm bogus providers don't load.
+        // `SecretsConfig` is a tagged enum (`#[serde(tag = "provider")]`);
+        // an unknown discriminator like "vault" fails during serde
+        // deserialization, so this surfaces as a Parse error (not a
+        // post-parse validate error). Either branch confirms bogus
+        // providers don't load — the test only cares that they don't.
         let err = Config::parse_str(s).unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_) | ConfigError::Invalid(_)));
     }
