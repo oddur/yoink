@@ -40,6 +40,12 @@ pub enum DockerError {
         #[source]
         source: bollard::errors::Error,
     },
+    /// Pre-bollard ssh probe failed — surfaces a classified hint
+    /// (e.g. Tailscale auth URL, permission denied with ssh-add
+    /// pointer) instead of letting bollard hang for 120s waiting on
+    /// an interactive prompt the operator can't see.
+    #[error("ssh probe failed for {host}: {detail}")]
+    SshProbe { host: String, detail: String },
     #[error("scripted fake exhausted: no response left for {0}")]
     FakeExhausted(&'static str),
     #[error("invalid response from docker: {0}")]
@@ -647,6 +653,19 @@ impl RealDockerOps {
                 source,
             })?
         } else {
+            // Probe ssh first. Without this, bollard's SSH transport
+            // happily blocks for `timeout_secs` (120 by default)
+            // waiting on interactive prompts (Tailscale auth check,
+            // password, host-key TOFU) that yoink can't see — the
+            // TUI just hangs on "(loading…)". Probing gives us a
+            // classified, actionable error string before bollard
+            // ever opens the long-lived connection.
+            crate::ssh_probe::probe(host)
+                .await
+                .map_err(|detail| DockerError::SshProbe {
+                    host: host.address.clone(),
+                    detail,
+                })?;
             Docker::connect_with_ssh(&key, self.timeout_secs, bollard::API_DEFAULT_VERSION, None)
                 .map_err(|source| DockerError::Connect {
                     host: host.address.clone(),

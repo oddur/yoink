@@ -25,6 +25,31 @@ The lock auto-expires after ~30s of stale heartbeat. Wait, then retry. If it per
 ssh deploy@<host> 'docker rm -f yoink-lock'
 ```
 
+## `yoink up` / `yoink tui` hangs silently with no output
+
+Almost always an interactive ssh prompt yoink can't surface — bollard's SSH transport spawns its own `ssh` client and swallows stderr, so when ssh prompts for an extra check the connection just blocks.
+
+Run `yoink preflight` to get a classified error. The two common cases:
+
+**Tailscale SSH "additional check required":**
+```
+✗ backtrack-eu-1: ssh probe failed: Tailscale SSH requires an additional
+  check — open this URL in a browser, then re-run:
+    https://login.tailscale.com/a/<token>
+```
+
+Open the URL, approve the device, re-run the command. (Tailscale SSH gates new sessions through a browser tap when ACLs require it.)
+
+**Permission denied:**
+```
+✗ host-x: ssh probe failed: permission denied — check the ssh key
+  (`ssh-add -l`) and that the deploy user is configured on the host
+```
+
+Add the key with `ssh-add ~/.ssh/id_ed25519` (or whichever) and re-run.
+
+`yoink preflight` is the canonical "why can't I reach the host" diagnostic — it does an explicit `ssh -o BatchMode=yes user@host true` first and translates common stderr patterns. The classifier covers Tailscale auth, permission denied, connection timeout, host key changes, DNS / hostname resolution, and connection refused.
+
 ## `Authenticate to Infisical: dial tcp ... i/o timeout`
 
 The Infisical instance is on the tailnet. Join it.

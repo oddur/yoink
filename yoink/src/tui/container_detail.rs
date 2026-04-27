@@ -68,10 +68,14 @@ impl ContainerDetailState {
 
     pub fn apply(&mut self, data: ContainerDetailRefresh) {
         self.last_error = data.error;
+        // Flip loaded unconditionally so the pane renders the error
+        // path (which already exists at the top of `render`) instead
+        // of looping on `(loading…)`. Last-known good inspect/stats
+        // stay around to ride out transient blips.
+        self.loaded = true;
         if self.last_error.is_none() {
             self.inspect = data.inspect;
             self.stats = data.stats;
-            self.loaded = true;
         }
     }
 

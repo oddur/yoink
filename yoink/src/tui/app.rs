@@ -303,9 +303,12 @@ enum Update {
     Dashboard(DashboardRefresh),
     /// Result of `schedule_history_refresh` — per-service container
     /// list across every host, drives the History pane's table.
+    /// `errors` carries per-host failure strings so the pane can
+    /// surface them instead of silently dropping unreachable hosts.
     ServiceHistory {
         service: String,
         rows: Vec<super::history::HistoryRow>,
+        errors: Vec<String>,
     },
     /// Push notification from a host's `docker events` stream. Triggers
     /// an immediate refresh of whichever pane is currently visible.
@@ -313,6 +316,19 @@ enum Update {
         host: Host,
         event: DockerEvent,
     },
+    /// Background task wants to surface a one-line message in the
+    /// toast ring (top-right of the breadcrumb). Used for silent
+    /// failures the operator otherwise wouldn't see — log streams
+    /// dying, event subscriptions failing, secrets loader blowing up.
+    Toast(String),
+}
+
+/// Auto-pop error overlay carrying the full text (including URLs
+/// that wouldn't fit in the one-line footer). Title goes in the
+/// modal border; body is the multi-line message.
+struct ErrorModal {
+    title: String,
+    lines: Vec<String>,
 }
 
 /// Background-task → run-loop messages. Events stream into the
@@ -565,6 +581,13 @@ pub struct App {
     /// `?` toggles a modal help overlay listing keybinds for the
     /// current view. Cleared on Esc and on any view transition.
     show_help: bool,
+    /// Auto-pop modal for the first occurrence of a long error
+    /// string that doesn't fit in the footer (e.g. an ssh-probe
+    /// failure carrying a Tailscale auth URL). Dismissed with Esc;
+    /// fingerprint is added to `shown_errors` so the same error
+    /// won't re-pop on every refresh.
+    error_modal: Option<ErrorModal>,
+    shown_errors: std::collections::HashSet<String>,
     /// `Some` while a kill-confirmation modal is open over the
     /// current view. The user confirms with `y` (or Enter) and
     /// cancels with anything else. Cleared on transition.
@@ -617,6 +640,8 @@ pub struct App {
     hosts_in_flight: bool,
     host_detail_in_flight: bool,
     dashboard_in_flight: bool,
+    container_detail_in_flight: bool,
+    history_in_flight: bool,
     update_tx: UnboundedSender<Update>,
     update_rx: UnboundedReceiver<Update>,
 
@@ -660,6 +685,8 @@ impl App {
             logs: LogsState::new(),
             shell: None,
             show_help: false,
+            error_modal: None,
+            shown_errors: std::collections::HashSet::new(),
             kill_target: None,
             reconcile_target: None,
             prune_target: false,
@@ -676,6 +703,8 @@ impl App {
             hosts_in_flight: false,
             host_detail_in_flight: false,
             dashboard_in_flight: false,
+            container_detail_in_flight: false,
+            history_in_flight: false,
             update_tx,
             update_rx,
             log_tasks: Vec::new(),
@@ -746,6 +775,32 @@ impl App {
         while self.toasts.len() > TOAST_CAP {
             self.toasts.pop_front();
         }
+    }
+
+    /// Show an auto-pop error modal — once per unique error. Used
+    /// when an error string is too long to fit in the one-line
+    /// footer (Tailscale auth URL, multi-line ssh-probe output,
+    /// etc.). Operator dismisses with Esc; the same error won't
+    /// re-pop on subsequent refresh ticks.
+    ///
+    /// **Why first-line fingerprinting:** the first line is the
+    /// classified hint (e.g. `ssh probe failed: Tailscale SSH
+    /// requires an additional check — open this URL...`), which
+    /// stays stable across token regenerations in the URL on
+    /// subsequent lines. Hashing the full body would make every
+    /// token rotation re-pop the same modal the operator just
+    /// dismissed.
+    fn show_error_modal_once(&mut self, title: &str, body: &str) {
+        let first_line = body.lines().next().unwrap_or("").to_string();
+        let fp = format!("{title}|{first_line}");
+        if !self.shown_errors.insert(fp) {
+            return;
+        }
+        let lines: Vec<String> = body.lines().map(str::to_string).collect();
+        self.error_modal = Some(ErrorModal {
+            title: title.to_string(),
+            lines,
+        });
     }
 
     /// Open the reconcile-confirm modal for `service`. Resolves the
@@ -926,6 +981,7 @@ impl App {
     fn spawn_secrets_loader(&self) {
         let config = self.config.clone();
         let slot = self.secrets.clone();
+        let tx = self.update_tx.clone();
         tokio::spawn(async move {
             match crate::secrets::load_bundle(&config).await {
                 Ok(Some(bundle)) => {
@@ -938,6 +994,9 @@ impl App {
                 }
                 Err(e) => {
                     warn!(error = %e, "secrets load for drift detection failed; column will stay '?'");
+                    let _ = tx.send(Update::Toast(format!(
+                        "✗ secrets load failed: {e} (drift column → ?)"
+                    )));
                 }
             }
         });
@@ -956,6 +1015,10 @@ impl App {
                     Ok(rx) => rx,
                     Err(e) => {
                         warn!(host = %host.address, error = %e, "subscribe_events failed");
+                        let _ = tx.send(Update::Toast(format!(
+                            "✗ events stream {}: {e}",
+                            host.address
+                        )));
                         return;
                     }
                 };
@@ -970,6 +1033,12 @@ impl App {
                         return;
                     }
                 }
+                // Stream ended without an explicit error — usually
+                // means the host went away. Surface it.
+                let _ = tx.send(Update::Toast(format!(
+                    "✗ events stream {} ended (host probably unreachable)",
+                    host.address
+                )));
             });
             self.event_tasks.push(task);
         }
@@ -1012,6 +1081,18 @@ impl App {
         }
         if self.show_help && key.code == KeyCode::Esc {
             self.show_help = false;
+            return false;
+        }
+
+        // Auto-pop error modal: Esc / Enter dismisses. Captured
+        // before view-specific keys so the operator can't
+        // accidentally drive the underlying view while the modal's
+        // open. The fingerprint stays in `shown_errors`, so the
+        // same error won't re-pop after dismissal.
+        if self.error_modal.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.error_modal = None;
+            }
             return false;
         }
 
@@ -1649,23 +1730,51 @@ impl App {
     /// `Update::ServiceHistory` back to the run loop. Mirrors the CLI
     /// `cmd_history` query.
     fn schedule_history_refresh(&mut self, service: String) {
+        if self.history_in_flight {
+            return;
+        }
+        self.history_in_flight = true;
         let ops = self.ops.clone();
         let hosts: Vec<Host> = self.config.hosts.iter().map(Host::from).collect();
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
             let label = format!("yoink.service={service}");
+            // Fan out per-host fetches in parallel — sequential here
+            // multiplies the ssh-probe timeout by the host count
+            // (3 hosts down × 8s = 24s total before the operator
+            // sees anything). `StatusReport::collect` already does
+            // the same thing for the dashboard.
+            let futs = hosts.into_iter().map(|host| {
+                let ops = ops.clone();
+                let label = label.clone();
+                async move {
+                    let result = ops.list_containers_by_label(&host, &label).await;
+                    (host, result)
+                }
+            });
+            let results = futures_util::future::join_all(futs).await;
             let mut rows: Vec<super::history::HistoryRow> = Vec::new();
-            for host in hosts {
-                if let Ok(containers) = ops.list_containers_by_label(&host, &label).await {
-                    for c in containers {
-                        rows.push(super::history::HistoryRow::from_container(
-                            &host.address,
-                            &c,
-                        ));
+            let mut errors: Vec<String> = Vec::new();
+            for (host, result) in results {
+                match result {
+                    Ok(containers) => {
+                        for c in containers {
+                            rows.push(super::history::HistoryRow::from_container(
+                                &host.address,
+                                &c,
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", host.address));
                     }
                 }
             }
-            let _ = tx.send(Update::ServiceHistory { service, rows });
+            let _ = tx.send(Update::ServiceHistory {
+                service,
+                rows,
+                errors,
+            });
         });
     }
 
@@ -1772,9 +1881,13 @@ impl App {
     }
 
     fn schedule_container_detail_refresh(&mut self) {
+        if self.container_detail_in_flight {
+            return;
+        }
         let Some((host, container)) = self.container_detail.target().cloned() else {
             return;
         };
+        self.container_detail_in_flight = true;
         let ops = self.ops.clone();
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
@@ -1825,8 +1938,16 @@ impl App {
                 {
                     self.container_detail.apply(*data);
                 }
+                self.container_detail_in_flight = false;
             }
             Update::Dashboard(data) => {
+                // Long error strings (ssh-probe with a Tailscale auth
+                // URL, multi-line bollard errors) get auto-popped as a
+                // modal so the URL is actually visible — the one-line
+                // footer truncates anything longer than the terminal.
+                if let Some(err) = data.error.as_deref() {
+                    self.show_error_modal_once("connection error", err);
+                }
                 // Services & ServiceDetail share the same StatusReport
                 // as Dashboard. Clone it into both before handing the
                 // original off to dashboard's apply (which moves it).
@@ -1843,10 +1964,16 @@ impl App {
                 self.dashboard.apply(data);
                 self.dashboard_in_flight = false;
             }
-            Update::ServiceHistory { service, rows } => {
-                self.history.apply(&service, rows);
+            Update::ServiceHistory {
+                service,
+                rows,
+                errors,
+            } => {
+                self.history.apply(&service, rows, errors);
+                self.history_in_flight = false;
             }
             Update::Event { host, event } => self.on_docker_event(&host, &event),
+            Update::Toast(msg) => self.push_toast(msg),
         }
     }
 
@@ -1903,6 +2030,7 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "failed to collect status for log streams");
+                self.push_toast(format!("✗ log collect failed: {e}"));
                 return;
             }
         };
@@ -1932,6 +2060,10 @@ impl App {
             Ok(rx) => rx,
             Err(e) => {
                 warn!(host = %host.address, container = %container, error = %e, "open_log_stream failed");
+                self.push_toast(format!(
+                    "✗ logs {}/{container}: {e}",
+                    host.address
+                ));
                 return;
             }
         };
@@ -2140,6 +2272,17 @@ impl App {
             } else {
                 super::ui::render_log_modal(frame, &title, &lines, success, failure);
             }
+        }
+
+        // Render last so it sits on top of everything else when a
+        // long error needs the operator's attention. Lines stay
+        // verbatim — the modal sizes to the longest line so URLs
+        // are guaranteed to fit (clamped by terminal width).
+        if let Some(modal) = &self.error_modal {
+            let mut body: Vec<&str> = modal.lines.iter().map(String::as_str).collect();
+            body.push("");
+            body.push("[Esc] / Enter   dismiss");
+            super::ui::render_modal(frame, &modal.title, &body);
         }
     }
 }

@@ -516,6 +516,7 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
     Ok(())
 }
 
+
 // `UpOptions` mirrors the `up` subcommand's flags 1:1. The bool count
 // is the actual CLI surface; rolling them into an enum would just hide
 // the same surface area at higher cognitive cost.

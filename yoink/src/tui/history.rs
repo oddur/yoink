@@ -61,6 +61,10 @@ pub struct HistoryState {
     rows: Vec<HistoryRow>,
     table: TableState,
     loaded: bool,
+    /// Per-host failures from the last refresh. Surfaced in the
+    /// footer so the operator can tell "no history for this service"
+    /// from "the host is unreachable".
+    errors: Vec<String>,
 }
 
 impl HistoryState {
@@ -83,14 +87,16 @@ impl HistoryState {
 
     /// Apply a fresh fetch result. Sorts newest-first and pins the
     /// selection to the first row when the previous selection no
-    /// longer fits.
-    pub fn apply(&mut self, service: &str, mut rows: Vec<HistoryRow>) {
+    /// longer fits. `errors` carries per-host failures so the pane
+    /// can distinguish "no containers found" from "host unreachable".
+    pub fn apply(&mut self, service: &str, mut rows: Vec<HistoryRow>, errors: Vec<String>) {
         if self.service.as_deref() != Some(service) {
             // Result raced a different transition — the user moved on.
             return;
         }
         rows.sort_by_key(|r| std::cmp::Reverse(r.when_unix));
         self.rows = rows;
+        self.errors = errors;
         self.loaded = true;
         if self.rows.is_empty() {
             self.table.select(None);
@@ -153,6 +159,12 @@ impl HistoryState {
         ];
         let rows: Vec<Row<'_>> = if !self.loaded {
             vec![Row::new(vec![Cell::from("(loading…)")])]
+        } else if self.rows.is_empty() && !self.errors.is_empty() {
+            // All hosts errored — make that obvious instead of
+            // implying the service has no history.
+            vec![Row::new(vec![Cell::from(
+                "(no history reachable — every host failed; see footer for details)",
+            )])]
         } else if self.rows.is_empty() {
             vec![Row::new(vec![Cell::from(
                 "(no history — service has no yoink-managed containers on any host)",
@@ -191,9 +203,17 @@ impl HistoryState {
             .block(Block::default().borders(Borders::ALL).title("history"));
         frame.render_stateful_widget(table, layout[1], &mut self.table);
 
-        let footer = Paragraph::new(
-            "↑↓/jk navigate · r rollback to selected (running rows are skipped) · R refresh · esc back",
-        );
+        let footer_text = if self.errors.is_empty() {
+            "↑↓/jk navigate · r rollback to selected (running rows are skipped) · R refresh · esc back".to_string()
+        } else {
+            format!("⚠ {} host(s) unreachable: {}", self.errors.len(), self.errors.join(" · "))
+        };
+        let footer_style = if self.errors.is_empty() {
+            ratatui::style::Style::default()
+        } else {
+            ratatui::style::Style::default().fg(ratatui::style::Color::Yellow)
+        };
+        let footer = Paragraph::new(footer_text).style(footer_style);
         frame.render_widget(footer, layout[2]);
     }
 }
@@ -225,16 +245,28 @@ mod tests {
                 row("h", "v3", "running", 300),
                 row("h", "v2", "exited", 200),
             ],
+            Vec::new(),
         );
         let versions: Vec<&str> = s.rows.iter().map(|r| r.version.as_str()).collect();
         assert_eq!(versions, vec!["v3", "v2", "v1"]);
     }
 
     #[test]
+    fn apply_with_errors_distinguishes_from_empty() {
+        let mut s = HistoryState::new();
+        s.set_service("api".into());
+        // All hosts errored — rows empty but errors non-empty.
+        s.apply("api", Vec::new(), vec!["h1: connection refused".into()]);
+        assert!(s.rows.is_empty());
+        assert!(s.loaded);
+        assert_eq!(s.errors.len(), 1);
+    }
+
+    #[test]
     fn apply_for_other_service_is_dropped() {
         let mut s = HistoryState::new();
         s.set_service("api".into());
-        s.apply("web", vec![row("h", "v1", "running", 100)]);
+        s.apply("web", vec![row("h", "v1", "running", 100)], Vec::new());
         assert!(s.rows.is_empty());
         assert!(!s.loaded);
     }
@@ -249,6 +281,7 @@ mod tests {
                 row("h", "v3", "running", 300),
                 row("h", "v2", "exited", 200),
             ],
+            Vec::new(),
         );
         // Default selection is row 0 → running → no target.
         assert_eq!(s.selected_rollback_target(), None);
@@ -269,6 +302,7 @@ mod tests {
                 row("h", "v3", "running", 300),
                 row("h", "v2", "exited", 200),
             ],
+            Vec::new(),
         );
         s.select_next();
         s.select_next();
