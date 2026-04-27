@@ -2708,8 +2708,15 @@ async fn forward_through_hl(
     //   --sync-interval-ms 100  cadence at which the follow loop drains
     //   --input-info=none drop the leading "[in:0]" prefix hl adds when
     //                     it thinks there could be multiple inputs
+    // Honour NO_COLOR (clig.dev) even inside the TUI's log pane:
+    // when set, ask `hl` for plain text so the panes render uncoloured.
+    let hl_color = if std::env::var_os("NO_COLOR").is_some() {
+        "--color=never"
+    } else {
+        "--color=always"
+    };
     let mut child = match Command::new("hl")
-        .arg("--color=always")
+        .arg(hl_color)
         .arg("--paging=never")
         .arg("--follow")
         .arg("--sync-interval-ms=100")

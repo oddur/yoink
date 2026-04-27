@@ -1,4 +1,25 @@
-use std::io::{self, Write};
+// Output discipline (clig.dev: stdout vs stderr).
+//
+// - **stdout** holds the *primary result* of a command — anything a
+//   downstream program might want to consume. `yoink dump`'s JSON,
+//   `yoink history`'s rows, `yoink status`'s table, `yoink pull`'s
+//   ✓/✗ lines. If you're tempted to `| jq` or `| grep` it, it goes
+//   here.
+// - **stderr** holds *progress, status, and diagnostic* output —
+//   everything else. Deploy events, "rolling back service…", the
+//   summary line after `yoink up` (a human report, not a machine
+//   record), warnings, errors. Routing these to stderr keeps stdout
+//   pipeable.
+//
+// The `--quiet`/`-q` flag suppresses informational stderr lines (one
+// `-q` for most, `-qq` for everything except the bail-out error).
+// `--verbose`/`-v` raises `tracing` log verbosity but does not
+// affect the stdout/stderr split.
+//
+// Colour follows `NO_COLOR` (clig.dev) and TTY detection. The `hl`
+// log highlighter spawned from the TUI inherits the same decision.
+
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -20,7 +41,22 @@ use yoink::tui::{self, Mode};
 #[command(
     name = "yoink",
     version,
-    about = "Small, opinionated container deploy CLI."
+    about = "Small, opinionated container deploy CLI.",
+    long_about = "Small, opinionated container deploy CLI.\n\
+                  \n\
+                  CONFIGURATION:\n\
+                  Precedence: CLI flags > environment variables > yoink.yaml > defaults.\n\
+                  \n\
+                  ENVIRONMENT VARIABLES:\n  \
+                    RUST_LOG               raw tracing filter (overrides --verbose)\n  \
+                    YOINK_AGE_KEY          age secret key (raw, AGE-SECRET-KEY-1…)\n  \
+                    YOINK_AGE_KEY_FILE     path to an age secret key file\n  \
+                    EDITOR / VISUAL        editor for `yoink secrets edit`\n  \
+                    NO_COLOR               disable coloured output (any value)\n  \
+                    PAGER                  pager command for long output (default: less)\n  \
+                    XDG_STATE_HOME / HOME  log file directory (TUI mode)\n\
+                  \n\
+                  Run any subcommand with --help for details."
 )]
 struct Cli {
     /// Path to the yoink.yaml config file.
@@ -31,8 +67,42 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Suppress informational stderr output (-q most, -qq all but errors).
+    /// Does not affect stdout — primary results stay readable.
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    quiet: u8,
+
+    /// When to colour output. `auto` (the default) detects whether the
+    /// destination is a terminal; `always` forces colour, `never`
+    /// disables it. Honours `NO_COLOR` regardless.
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
+    color: ColorChoice,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum ColorChoice {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorChoice {
+    /// Resolve to a concrete on/off decision for a given output stream.
+    /// Honours `NO_COLOR` (clig.dev) which always wins over `auto`.
+    fn enabled(self, stream_is_tty: bool) -> bool {
+        if std::env::var_os("NO_COLOR").is_some() {
+            return false;
+        }
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => stream_is_tty,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -299,6 +369,10 @@ enum Command {
         /// Maximum entries to print.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Output format. `text` is the default human-readable table;
+        /// `json` is a stable schema for piping to `jq`.
+        #[arg(long, value_enum, default_value_t = TableFormat::Text)]
+        format: TableFormat,
     },
     /// `htop`-style snapshot of every running yoink-managed container
     /// across all hosts, sorted by CPU% descending. Single shot —
@@ -307,6 +381,10 @@ enum Command {
         /// Maximum rows to print.
         #[arg(long, default_value_t = 30)]
         limit: usize,
+        /// Output format. `text` is the default human-readable table;
+        /// `json` is a stable schema for piping to `jq`.
+        #[arg(long, value_enum, default_value_t = TableFormat::Text)]
+        format: TableFormat,
     },
     /// List every docker network across all configured hosts.
     Networks {
@@ -444,10 +522,93 @@ enum LockAction {
     },
 }
 
+/// Quiet level: 0 = normal, 1 = `-q` (status lines suppressed),
+/// 2+ = `-qq` (everything but the bail-out error suppressed).
+/// Set once at startup and read via [`quiet_level`] from anywhere.
+static QUIET: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn quiet_level() -> u8 {
+    QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Use in place of `eprintln!` for *informational* progress lines.
+/// Suppressed at `-q` and above. Errors and warnings should remain
+/// `eprintln!` so they always reach the user.
+macro_rules! info_eprintln {
+    ($($arg:tt)*) => {{
+        if $crate::quiet_level() == 0 {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
+/// Page `content` through `$PAGER` when stdout is a TTY (clig.dev:
+/// "Use pagers for lengthy output"). Falls back to `less -FIRX` when
+/// `$PAGER` is unset and to a plain print when `less` is unavailable
+/// or stdout is piped. The `-FIRX` flags make `less` quit if the
+/// content fits on one screen and avoid clearing it on exit.
+fn page_output(content: &str) {
+    use std::process::{Command, Stdio};
+
+    if !io::stdout().is_terminal() {
+        print!("{content}");
+        return;
+    }
+    let pager_cmd = std::env::var("PAGER").unwrap_or_else(|_| "less -FIRX".to_string());
+    let mut parts = pager_cmd.split_whitespace();
+    let Some(bin) = parts.next() else {
+        print!("{content}");
+        return;
+    };
+    let args: Vec<&str> = parts.collect();
+    let Ok(mut child) = Command::new(bin)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .spawn()
+    else {
+        // Pager binary not on PATH — print directly rather than fail.
+        print!("{content}");
+        return;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(content.as_bytes());
+    }
+    let _ = child.wait();
+}
+
+/// TTY-gated interactive confirmation for destructive operations
+/// (clig.dev: severe changes require non-trivial confirmation). When
+/// stdin is a TTY, prompts for a literal "yes". When stdin is not a
+/// TTY (CI, scripts), errors out telling the caller to pass `--yes`.
+fn confirm_destructive(prompt: &str) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "{prompt}\n\nstdin is not a TTY — pass --yes to confirm non-interactively."
+        );
+    }
+    eprint!("{prompt}\nType 'yes' to confirm: ");
+    io::stderr().flush().ok();
+    let mut buf = String::new();
+    io::stdin()
+        .read_line(&mut buf)
+        .context("read confirmation from stdin")?;
+    if buf.trim() != "yes" {
+        anyhow::bail!("aborted");
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let is_tui = matches!(cli.command, Command::Tui { .. });
+    QUIET.store(cli.quiet, std::sync::atomic::Ordering::Relaxed);
+    // `--color` is parsed and exposed for future colored output; today
+    // only `NO_COLOR` is read, by both `tracing` (env-detected) and the
+    // TUI's `hl` spawn. Calling `enabled()` here keeps the value alive
+    // for clap's --help validation but otherwise is a no-op until a
+    // colored output path actually consults it.
+    let _ = cli.color.enabled(io::stderr().is_terminal());
     init_logging(cli.verbose, is_tui);
 
     match run(cli).await {
@@ -514,6 +675,7 @@ fn log_file_path() -> PathBuf {
     PathBuf::from("/tmp/yoink-tui.log")
 }
 
+#[allow(clippy::too_many_lines)] // one big match dispatch; splitting buys nothing
 async fn run(cli: Cli) -> Result<()> {
     if let Some(result) = run_bootstrap(&cli.command) {
         return result;
@@ -596,8 +758,12 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Pull { service, tag, host } => {
             cmd_pull(&config, &service, tag.as_deref(), host.as_deref()).await
         }
-        Command::History { service, limit } => cmd_history(&config, &service, limit).await,
-        Command::Top { limit } => cmd_top(&config, limit).await,
+        Command::History {
+            service,
+            limit,
+            format,
+        } => cmd_history(&config, &service, limit, format).await,
+        Command::Top { limit, format } => cmd_top(&config, limit, format).await,
         Command::Networks { host } => cmd_networks(&config, host.as_deref()).await,
         Command::Volumes { host } => cmd_volumes(&config, host.as_deref()).await,
         Command::Dump { log_tail } => cmd_dump(&config, log_tail).await,
@@ -985,7 +1151,7 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
             })?
     };
 
-    eprintln!("rolling {service} back to tag {resolved_tag}");
+    info_eprintln!("rolling {service} back to tag {resolved_tag}");
     let services_arg = std::slice::from_ref(&service);
     let tag_arg = format!("{service}={resolved_tag}");
     let tag_args = std::slice::from_ref(&tag_arg);
@@ -1386,6 +1552,16 @@ enum DryRunFormat {
     Json,
 }
 
+/// Output format for read-only listings (`history`, `top`, …). `text`
+/// is the default human-readable table; `json` is a stable schema for
+/// pipelines.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum TableFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 /// CLI shape for `--transport`; mirrors `yoink::transport::Transport` so
 /// the value-enum stays bound to the binary surface.
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
@@ -1435,15 +1611,15 @@ async fn cmd_restart(config: &Config, service: &str, host_filter: Option<&str>) 
     let ops = build_real_ops(config, None).await?;
     let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
     let drain = std::time::Duration::from_secs(10);
-    eprintln!("stopping {}@{container} (drain {drain:?})…", host.address);
+    info_eprintln!("stopping {}@{container} (drain {drain:?})…", host.address);
     ops.stop_container(&host, &container, drain)
         .await
         .with_context(|| format!("stop {}@{container}", host.address))?;
-    eprintln!("starting {}@{container}…", host.address);
+    info_eprintln!("starting {}@{container}…", host.address);
     ops.start_container(&host, &container)
         .await
         .with_context(|| format!("start {}@{container}", host.address))?;
-    eprintln!("ok");
+    info_eprintln!("ok");
     Ok(())
 }
 
@@ -1456,17 +1632,15 @@ async fn cmd_kill(
     let ops = build_real_ops(config, None).await?;
     let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
     if !yes {
-        eprintln!(
-            "about to SIGKILL {}/{container} — the in-process drain is skipped. \
-             pass --yes to confirm.",
+        confirm_destructive(&format!(
+            "about to SIGKILL {}/{container} — the in-process drain is skipped.",
             host.address
-        );
-        anyhow::bail!("aborted");
+        ))?;
     }
     ops.kill_container(&host, &container)
         .await
         .with_context(|| format!("kill {}@{container}", host.address))?;
-    eprintln!("killed {}/{container}", host.address);
+    info_eprintln!("killed {}/{container}", host.address);
     Ok(())
 }
 
@@ -1503,7 +1677,7 @@ async fn cmd_pull(
             let credentials = credentials.clone();
             let ops = &ops;
             async move {
-                eprintln!(
+                info_eprintln!(
                     "→ {}: pulling {}",
                     host.address,
                     yoink::docker::image_reference(&image, &tag),
@@ -1531,7 +1705,12 @@ async fn cmd_pull(
     Ok(())
 }
 
-async fn cmd_history(config: &Config, service: &str, limit: usize) -> Result<()> {
+async fn cmd_history(
+    config: &Config,
+    service: &str,
+    limit: usize,
+    format: TableFormat,
+) -> Result<()> {
     let ops = build_real_ops(config, None).await?;
     let label = format!("yoink.service={service}");
     // Fan out across hosts. Each call returns running + exited
@@ -1545,13 +1724,12 @@ async fn cmd_history(config: &Config, service: &str, limit: usize) -> Result<()>
             anyhow::Ok((host.address, containers))
         }
     });
-    let mut entries: Vec<(i64, String, String, String, String, String)> = Vec::new();
+    let mut entries: Vec<(Option<i64>, String, String, String, String, String)> = Vec::new();
     for r in futures_util::future::join_all(probes).await {
         let (host_addr, containers) = r?;
         for c in containers {
-            // Sort key = deployed-at when present, else created_unix,
-            // else zero (puts it at the bottom).
-            let when = c.yoink_deployed_at.or(c.created_unix).unwrap_or(0);
+            // Sort key = deployed-at when present, else created_unix.
+            let when = c.yoink_deployed_at.or(c.created_unix);
             entries.push((
                 when,
                 host_addr.clone(),
@@ -1562,21 +1740,49 @@ async fn cmd_history(config: &Config, service: &str, limit: usize) -> Result<()>
             ));
         }
     }
-    entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0.unwrap_or(0)));
     if entries.is_empty() {
         anyhow::bail!("no yoink-managed containers found for service {service:?}");
     }
-    println!(
-        "{:<22}  {:<28}  {:<10}  {:<10}  {:<10}  when",
-        "host", "container", "version", "state", "deployed-by"
-    );
-    for (when, host_addr, name, version, state, by) in entries.into_iter().take(limit) {
-        let when_str = if when > 0 {
-            output::format_relative_time(Some(when))
-        } else {
-            "?".into()
-        };
-        println!("{host_addr:<22}  {name:<28}  {version:<10}  {state:<10}  {by:<10}  {when_str}");
+    let trimmed: Vec<_> = entries.into_iter().take(limit).collect();
+
+    match format {
+        TableFormat::Json => {
+            let out: Vec<serde_json::Value> = trimmed
+                .iter()
+                .map(|(when, host, name, version, state, by)| {
+                    serde_json::json!({
+                        "host": host,
+                        "container": name,
+                        "version": version,
+                        "state": state,
+                        "deployed_by": by,
+                        "deployed_at_unix": when,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        TableFormat::Text => {
+            use std::fmt::Write as _;
+            let mut buf = String::new();
+            writeln!(
+                buf,
+                "{:<22}  {:<28}  {:<10}  {:<10}  {:<10}  when",
+                "host", "container", "version", "state", "deployed-by"
+            )?;
+            for (when, host_addr, name, version, state, by) in trimmed {
+                let when_str = match when {
+                    Some(t) if t > 0 => output::format_relative_time(Some(t)),
+                    _ => "?".into(),
+                };
+                writeln!(
+                    buf,
+                    "{host_addr:<22}  {name:<28}  {version:<10}  {state:<10}  {by:<10}  {when_str}"
+                )?;
+            }
+            page_output(&buf);
+        }
     }
     Ok(())
 }
@@ -1591,7 +1797,7 @@ struct TopRow {
     created: Option<i64>,
 }
 
-async fn cmd_top(config: &Config, limit: usize) -> Result<()> {
+async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<()> {
     use yoink::output::{format_bytes, format_relative_time};
     let ops = build_real_ops(config, None).await?;
     let report = StatusReport::collect(&ops, config)
@@ -1650,25 +1856,48 @@ async fn cmd_top(config: &Config, limit: usize) -> Result<()> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    println!(
-        "{:<22}  {:<14}  {:<28}  {:>6}  {:>20}  created",
-        "host", "service", "container", "cpu%", "mem"
-    );
-    for r in rows.into_iter().take(limit) {
-        let mem_str = match r.mem_limit {
-            Some(limit) if limit > 0 => {
-                format!("{} / {}", format_bytes(r.mem_used), format_bytes(limit))
+    let trimmed: Vec<TopRow> = rows.into_iter().take(limit).collect();
+
+    match format {
+        TableFormat::Json => {
+            let out: Vec<serde_json::Value> = trimmed
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "host": r.host,
+                        "service": r.service,
+                        "container": r.container,
+                        "cpu_pct": r.cpu_pct,
+                        "mem_used_bytes": r.mem_used,
+                        "mem_limit_bytes": r.mem_limit,
+                        "created_unix": r.created,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        TableFormat::Text => {
+            println!(
+                "{:<22}  {:<14}  {:<28}  {:>6}  {:>20}  created",
+                "host", "service", "container", "cpu%", "mem"
+            );
+            for r in trimmed {
+                let mem_str = match r.mem_limit {
+                    Some(limit) if limit > 0 => {
+                        format!("{} / {}", format_bytes(r.mem_used), format_bytes(limit))
+                    }
+                    _ => format_bytes(r.mem_used),
+                };
+                let created_str = format_relative_time(r.created);
+                let cpu = r.cpu_pct;
+                let host = r.host;
+                let service = r.service;
+                let container = r.container;
+                println!(
+                    "{host:<22}  {service:<14}  {container:<28}  {cpu:>5.1}%  {mem_str:>20}  {created_str}"
+                );
             }
-            _ => format_bytes(r.mem_used),
-        };
-        let created_str = format_relative_time(r.created);
-        let cpu = r.cpu_pct;
-        let host = r.host;
-        let service = r.service;
-        let container = r.container;
-        println!(
-            "{host:<22}  {service:<14}  {container:<28}  {cpu:>5.1}%  {mem_str:>20}  {created_str}"
-        );
+        }
     }
     Ok(())
 }
