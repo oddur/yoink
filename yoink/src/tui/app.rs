@@ -323,6 +323,14 @@ enum Update {
     Toast(String),
 }
 
+/// Auto-pop error overlay carrying the full text (including URLs
+/// that wouldn't fit in the one-line footer). Title goes in the
+/// modal border; body is the multi-line message.
+struct ErrorModal {
+    title: String,
+    lines: Vec<String>,
+}
+
 /// Background-task → run-loop messages. Events stream into the
 /// progress modal as they fire; `Done` flips the modal into a
 /// dismissible "finished" state with the final ✓/✗ summary.
@@ -573,6 +581,13 @@ pub struct App {
     /// `?` toggles a modal help overlay listing keybinds for the
     /// current view. Cleared on Esc and on any view transition.
     show_help: bool,
+    /// Auto-pop modal for the first occurrence of a long error
+    /// string that doesn't fit in the footer (e.g. an ssh-probe
+    /// failure carrying a Tailscale auth URL). Dismissed with Esc;
+    /// fingerprint is added to `shown_errors` so the same error
+    /// won't re-pop on every refresh.
+    error_modal: Option<ErrorModal>,
+    shown_errors: std::collections::HashSet<String>,
     /// `Some` while a kill-confirmation modal is open over the
     /// current view. The user confirms with `y` (or Enter) and
     /// cancels with anything else. Cleared on transition.
@@ -670,6 +685,8 @@ impl App {
             logs: LogsState::new(),
             shell: None,
             show_help: false,
+            error_modal: None,
+            shown_errors: std::collections::HashSet::new(),
             kill_target: None,
             reconcile_target: None,
             prune_target: false,
@@ -758,6 +775,26 @@ impl App {
         while self.toasts.len() > TOAST_CAP {
             self.toasts.pop_front();
         }
+    }
+
+    /// Show an auto-pop error modal — once per unique error. Used
+    /// when an error string is too long to fit in the one-line
+    /// footer (Tailscale auth URL, multi-line ssh-probe output,
+    /// etc.). Operator dismisses with Esc; the same error won't
+    /// re-pop on subsequent refresh ticks. The fingerprint keys on
+    /// the first line of the body, so token-regeneration in the URL
+    /// doesn't count as a different error.
+    fn show_error_modal_once(&mut self, title: &str, body: &str) {
+        let first_line = body.lines().next().unwrap_or("").to_string();
+        let fp = format!("{title}|{first_line}");
+        if !self.shown_errors.insert(fp) {
+            return;
+        }
+        let lines: Vec<String> = body.lines().map(str::to_string).collect();
+        self.error_modal = Some(ErrorModal {
+            title: title.to_string(),
+            lines,
+        });
     }
 
     /// Open the reconcile-confirm modal for `service`. Resolves the
@@ -1038,6 +1075,18 @@ impl App {
         }
         if self.show_help && key.code == KeyCode::Esc {
             self.show_help = false;
+            return false;
+        }
+
+        // Auto-pop error modal: Esc / Enter dismisses. Captured
+        // before view-specific keys so the operator can't
+        // accidentally drive the underlying view while the modal's
+        // open. The fingerprint stays in `shown_errors`, so the
+        // same error won't re-pop after dismissal.
+        if self.error_modal.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.error_modal = None;
+            }
             return false;
         }
 
@@ -1872,6 +1921,13 @@ impl App {
                 self.container_detail_in_flight = false;
             }
             Update::Dashboard(data) => {
+                // Long error strings (ssh-probe with a Tailscale auth
+                // URL, multi-line bollard errors) get auto-popped as a
+                // modal so the URL is actually visible — the one-line
+                // footer truncates anything longer than the terminal.
+                if let Some(err) = data.error.as_deref() {
+                    self.show_error_modal_once("connection error", err);
+                }
                 // Services & ServiceDetail share the same StatusReport
                 // as Dashboard. Clone it into both before handing the
                 // original off to dashboard's apply (which moves it).
@@ -2196,6 +2252,17 @@ impl App {
             } else {
                 super::ui::render_log_modal(frame, &title, &lines, success, failure);
             }
+        }
+
+        // Render last so it sits on top of everything else when a
+        // long error needs the operator's attention. Lines stay
+        // verbatim — the modal sizes to the longest line so URLs
+        // are guaranteed to fit (clamped by terminal width).
+        if let Some(modal) = &self.error_modal {
+            let mut body: Vec<&str> = modal.lines.iter().map(String::as_str).collect();
+            body.push("");
+            body.push("[Esc] / Enter   dismiss");
+            super::ui::render_modal(frame, &modal.title, &body);
         }
     }
 }
