@@ -11,8 +11,7 @@
 //! crashes.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
@@ -23,7 +22,8 @@ use tracing::warn;
 
 use super::oci_push::{self, OciPushError};
 use super::tunnel::{SshTunnel, TunnelError};
-use crate::docker_ops::{DockerError, DockerOps, Host};
+use crate::docker_ops::{DockerError, DockerOps, Host, rand_hex};
+use crate::ssh_probe;
 
 /// Image used for the ephemeral on-host registry sidecar.
 ///
@@ -67,6 +67,15 @@ pub enum UnregistryError {
     InvalidImageRef { image_ref: String },
     #[error("registry endpoint at 127.0.0.1:{port} did not respond within {timeout:?}")]
     RegistryNotReady { port: u16, timeout: Duration },
+    #[error("ssh pre-flight failed: {0}")]
+    SshProbe(String),
+}
+
+fn docker_err(host: &Host, source: DockerError) -> UnregistryError {
+    UnregistryError::Docker {
+        host: host.address.clone(),
+        source,
+    }
 }
 
 /// Push `image_ref` (already present in the operator's local docker
@@ -93,39 +102,22 @@ pub async fn push(
 
     ensure_sidecar_image(ops, host).await?;
 
-    let sidecar_name = format!(
-        "yoink-unregistry-{}-{}",
-        rand_hex_short(),
-        epoch_secs() % 100_000
-    );
+    let sidecar_name = format!("yoink-unregistry-{}", rand_hex());
     let body = sidecar_create_body();
 
     ops.create_container(host, &sidecar_name, body)
         .await
-        .map_err(|source| UnregistryError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
-
-    // Drop guard reaps the container on every exit path (Ok, Err,
-    // panic). Disarmed at the end of the happy path so we can do an
-    // ordered cleanup with proper error surfacing.
+        .map_err(|e| docker_err(host, e))?;
     let cleanup = SidecarCleanup::new(ops, host, &sidecar_name);
 
     ops.start_container(host, &sidecar_name)
         .await
-        .map_err(|source| UnregistryError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
+        .map_err(|e| docker_err(host, e))?;
 
     let detail = ops
         .inspect_container(host, &sidecar_name)
         .await
-        .map_err(|source| UnregistryError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
+        .map_err(|e| docker_err(host, e))?;
     tracing::debug!(
         "unregistry sidecar {sidecar_name} ports from inspect: {:?}",
         detail.ports
@@ -137,6 +129,12 @@ pub async fn push(
             }
         })?;
 
+    // Pre-flight ssh so we surface classified errors (Tailscale auth,
+    // permission denied, …) instead of the tunnel's generic "didn't
+    // become reachable" timeout. Same probe `yoink preflight` uses.
+    ssh_probe::probe(host)
+        .await
+        .map_err(UnregistryError::SshProbe)?;
     let tunnel = SshTunnel::open(&host.user, &host.address, host_port, READY_TIMEOUT).await?;
 
     // End-to-end probe: a TCP-level readiness check on the SSH tunnel
@@ -242,22 +240,11 @@ async fn wait_for_registry_ready(
 }
 
 async fn ensure_sidecar_image(ops: &dyn DockerOps, host: &Host) -> Result<(), UnregistryError> {
-    let present = ops
-        .image_present(host, UNREGISTRY_IMAGE, UNREGISTRY_TAG)
-        .await
-        .map_err(|source| UnregistryError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
-    if present {
-        return Ok(());
-    }
+    // `pull_image` is idempotent — a separate `image_present` check
+    // would only add a round-trip for the same answer.
     ops.pull_image(host, UNREGISTRY_IMAGE, UNREGISTRY_TAG, None)
         .await
-        .map_err(|source| UnregistryError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
+        .map_err(|e| docker_err(host, e))?;
     Ok(())
 }
 
@@ -325,16 +312,15 @@ fn parse_published_port(entries: &[String], wanted: u16) -> Option<u16> {
 }
 
 
-/// RAII guard that force-removes the sidecar on Drop unless explicitly
-/// disarmed via [`SidecarCleanup::run_now`]. We split armed/disarmed
-/// from the actual async cleanup because `Drop` can't `.await` — the
-/// async path runs only on the happy path; the panic / early-return
-/// paths fall through to a synchronous `tokio::spawn` best-effort.
+/// RAII guard that force-removes the sidecar if Drop runs before
+/// [`SidecarCleanup::run_now`] consumes it. `run_now` is the happy-path
+/// async cleanup that surfaces removal errors to the caller; the Drop
+/// path covers panics and early returns, where the sidecar is left to
+/// `auto_remove: true` plus the next deploy's label sweep.
 struct SidecarCleanup<'a> {
     ops: &'a dyn DockerOps,
     host: Host,
     name: String,
-    armed: AtomicBool,
 }
 
 impl<'a> SidecarCleanup<'a> {
@@ -343,55 +329,30 @@ impl<'a> SidecarCleanup<'a> {
             ops,
             host: host.clone(),
             name: name.to_string(),
-            armed: AtomicBool::new(true),
         }
     }
 
     async fn run_now(self) {
-        self.armed.store(false, Ordering::SeqCst);
-        if let Err(e) = self
+        let result = self
             .ops
             .force_remove_container(&self.host, &self.name)
-            .await
-        {
-            warn!(
-                "failed to remove unregistry sidecar {} on {}: {e}",
-                self.name, self.host.address
-            );
+            .await;
+        // Skip the Drop log — we already ran cleanup synchronously.
+        std::mem::forget(self);
+        if let Err(e) = result {
+            warn!("failed to remove unregistry sidecar: {e}");
         }
     }
 }
 
 impl Drop for SidecarCleanup<'_> {
     fn drop(&mut self) {
-        if !self.armed.load(Ordering::SeqCst) {
-            return;
-        }
-        // We're on an error / panic path; can't .await here. The
-        // sidecar is `auto_remove: true` and will reap shortly after
-        // its process exits, but we don't have a reliable way to stop
-        // it from this context. A startup sweep on the next deploy
-        // catches this case via the `yoink.role=unregistry-ephemeral`
-        // label. Log a hint so operators aren't surprised.
         warn!(
             "unregistry sidecar {} on {} not cleaned up synchronously; \
              will be reaped on the next deploy via label sweep",
             self.name, self.host.address
         );
     }
-}
-
-fn rand_hex_short() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    format!("{:06x}", nanos & 0xff_ffff)
-}
-
-fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]

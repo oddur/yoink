@@ -28,7 +28,6 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
-use std::sync::Mutex;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -109,35 +108,28 @@ pub async fn push_image(
     // last (it references all of them and the registry rejects it
     // until the referents exist). Run blob pushes with bounded
     // concurrency to overlap HEAD round-trips with PUT bodies.
-    let summary = Mutex::new(PushSummary::default());
     let mut blobs: Vec<&str> = Vec::with_capacity(manifest.layers.len() + 1);
     blobs.push(manifest.config.digest.as_str());
     for layer in &manifest.layers {
         blobs.push(layer.digest.as_str());
     }
 
-    let results: Vec<Result<(), OciPushError>> = futures_util::stream::iter(blobs)
+    let per_blob: Vec<Result<PushSummary, OciPushError>> = futures_util::stream::iter(blobs)
         .map(|digest| {
             let client = &client;
             let layout = &layout;
-            let summary = &summary;
-            async move {
-                let mut local = PushSummary::default();
-                push_one_blob(client, base_url, repo, digest, layout, &mut local).await?;
-                let mut s = summary.lock().expect("PushSummary mutex never poisoned");
-                s.blobs_uploaded += local.blobs_uploaded;
-                s.blobs_skipped += local.blobs_skipped;
-                s.bytes_uploaded += local.bytes_uploaded;
-                Ok(())
-            }
+            async move { push_one_blob(client, base_url, repo, digest, layout).await }
         })
         .buffer_unordered(BLOB_CONCURRENCY)
         .collect()
         .await;
-    for r in results {
-        r?;
+    let mut summary = PushSummary::default();
+    for r in per_blob {
+        let s = r?;
+        summary.blobs_uploaded += s.blobs_uploaded;
+        summary.blobs_skipped += s.blobs_skipped;
+        summary.bytes_uploaded += s.bytes_uploaded;
     }
-    let summary = summary.into_inner().expect("mutex consumed");
 
     // Push manifest under <repo>:<tag>.
     let manifest_url = format!("{base_url}/v2/{repo}/manifests/{tag}");
@@ -180,9 +172,7 @@ async fn push_one_blob(
     repo: &str,
     digest: &str,
     layout: &OciLayout,
-    summary: &mut PushSummary,
-) -> Result<(), OciPushError> {
-    // 1. HEAD to check existence.
+) -> Result<PushSummary, OciPushError> {
     let head_url = format!("{base_url}/v2/{repo}/blobs/{digest}");
     let head_resp = client
         .head(&head_url)
@@ -193,8 +183,11 @@ async fn push_one_blob(
             source,
         })?;
     if head_resp.status().is_success() {
-        summary.blobs_skipped += 1;
-        return Ok(());
+        return Ok(PushSummary {
+            blobs_uploaded: 0,
+            blobs_skipped: 1,
+            bytes_uploaded: 0,
+        });
     }
     if head_resp.status() != reqwest::StatusCode::NOT_FOUND {
         let status = head_resp.status();
@@ -206,7 +199,6 @@ async fn push_one_blob(
         });
     }
 
-    // 2. Blob is missing — initiate upload.
     let blob_bytes = layout
         .blobs
         .get(digest)
@@ -243,17 +235,15 @@ async fn push_one_blob(
             status: init_resp.status(),
         })?;
 
-    // The Location header may be relative (`/v2/<repo>/blobs/uploads/<uuid>`)
-    // or absolute. Resolve against the base url for the relative case.
+    // Location header may be relative or absolute per the OCI spec.
     let upload_url = if location.starts_with("http://") || location.starts_with("https://") {
         location
     } else {
         format!("{base_url}{location}")
     };
 
-    // 3. PUT with `?digest=<digest>` to finalize the upload in one shot
-    //    (monolithic upload — simpler than chunked PATCH; unregistry
-    //    accepts both).
+    // Monolithic upload (PUT with ?digest=) — simpler than chunked
+    // PATCH; unregistry accepts both.
     let separator = if upload_url.contains('?') { '&' } else { '?' };
     let put_url = format!("{upload_url}{separator}digest={digest}");
     let blob_len = blob_bytes.len() as u64;
@@ -277,9 +267,11 @@ async fn push_one_blob(
         });
     }
 
-    summary.blobs_uploaded += 1;
-    summary.bytes_uploaded += blob_len;
-    Ok(())
+    Ok(PushSummary {
+        blobs_uploaded: 1,
+        blobs_skipped: 0,
+        bytes_uploaded: blob_len,
+    })
 }
 
 /// In-memory view of an OCI image layout extracted from a docker-save
