@@ -1,0 +1,48 @@
+# Sealed-secrets test fixture — runs entirely against the operator's
+# local docker daemon. No ssh, no registry, no remote infrastructure.
+#
+# Setup:
+#   1. yoink secrets keygen
+#   2. Replace `recipients:` below with the public key keygen printed.
+#   3. printf 'GREETING=hello sealed world\n' | yoink secrets seal
+#   4. yoink up
+#   5. yoink exec demo -- env | grep GREETING
+#      → GREETING=hello sealed world
+
+deploy:
+  networks: [demo]
+
+# The synthetic `local` host routes through bollard's local socket
+# transport — no ssh, no remote credentials needed. The user value
+# is unused for the local host but the schema requires a string.
+hosts:
+  - address: local
+    user: local
+
+secrets:
+  provider: age
+  recipients:
+    # Replace with the public key from `yoink secrets keygen`. The
+    # placeholder below is intentionally invalid so an unconfigured
+    # `yoink up` fails loudly instead of silently sealing nothing.
+    - age1REPLACE_ME_WITH_YOUR_PUBLIC_KEY
+
+services:
+  - name: demo
+    image: alpine
+    tag: "3.20"
+    networks: [demo]
+    # Inject the sealed value as an env var of the same name.
+    secrets: [GREETING]
+    run:
+      cmd:
+        - sh
+        - -c
+        - |
+          echo "demo container started — GREETING is set in env."
+          echo "verify with: yoink exec demo -- env | grep GREETING"
+          # Keep the container alive so the operator can exec into it.
+          sleep infinity
+      options:
+        memory: "32Mi"
+        cpus: "0.1"
