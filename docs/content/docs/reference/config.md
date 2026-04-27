@@ -49,7 +49,7 @@ A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deplo
 | `recipients` | list of string | `[]` | Public age recipients (`age1...`) used when sealing/editing. Decryption only needs one matching identity. |
 | `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. |
 
-Bootstrap: `yoink secrets keygen` writes the private key + prints the public recipient. See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
+Bootstrap: `yoink secrets keygen` prints a fresh identity to stdout (operator decides where to save the secret); `--out PATH` writes it to a file at mode 0600. See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
 
 ### `provider: infisical` (opt-in)
 
