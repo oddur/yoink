@@ -75,6 +75,8 @@ secrets:
 
 Auth: `INFISICAL_TOKEN` (machine identity) or a logged-in `infisical login` session. Self-hosted instances: pass `--domain=https://infisical.your.domain` in the argv.
 
+PEM certs and private keys round-trip cleanly — Infisical's dotenv emitter wraps them in single quotes spanning multiple lines, and yoink's dotenv parser handles that shape natively. No wrapper script needed.
+
 ### HashiCorp Vault
 
 ```yaml
@@ -216,14 +218,24 @@ KEY=value
 QUOTED="value with spaces"
 SINGLE_QUOTED='value'
 export PREFIX_OK=true     # leading `export ` stripped
+
+# Quoted values may span multiple lines — useful for PEM certs and
+# private keys, which is what `infisical export --format=dotenv`,
+# `doppler secrets download --format env`, and shell `set` emit
+# without you having to do anything.
+TLS_CERT='-----BEGIN CERTIFICATE-----
+MIIErDCCA5SgAwIBAgIUd...
+-----END CERTIFICATE-----'
 ```
+
+A UTF-8 BOM at the start (`\xEF\xBB\xBF`) is silently stripped — Windows tooling sometimes emits one.
 
 **JSON** (stdout starting with `{`):
 
 ```json
-{"KEY":"value","QUOTED":"value with spaces","NUMBER":42}
+{"KEY":"value","QUOTED":"value with spaces","NESTED_NULL_DROPPED":null}
 ```
 
-Top-level must be an object. Numbers and booleans are stringified; `null` values are dropped.
+Top-level must be an object of `string → string` pairs. `null` values are dropped. **Non-string scalars (numbers, booleans) and nested objects/arrays are a hard error** — silently stringifying `8080` to `"8080"` or `true` to `"true"` masks operator typos and produces values consumers don't expect. If you genuinely need a numeric or boolean secret, emit it as a JSON string at the source.
 
 A malformed bundle is a hard error — yoink would rather fail loud than silently drop a typo'd export.
