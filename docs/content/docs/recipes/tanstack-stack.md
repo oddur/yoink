@@ -12,6 +12,8 @@ This is the "indie one-shot" pattern — single laptop, single host, no CI, no D
 - A host with Docker installed and key-based ssh login. A fresh Hetzner / DigitalOcean / Linode box qualifies.
 - yoink, node, and docker on your laptop.
 
+> **Local-only iteration?** yoink is a remote-deploy tool by design — destructive commands target ssh hosts, not your laptop's docker daemon (read-only commands like `yoink tui` / `yoink status` do work locally). For pure local development loops, reach for Docker Compose; come back to yoink when you have a host to ship to. If you genuinely want yoink against a "local" VM, expose its docker daemon over SSH (Colima, OrbStack) and treat it as a remote host — no special syntax.
+
 ## Step 1: scaffold the app
 
 ```sh
