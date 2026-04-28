@@ -201,6 +201,23 @@ pub struct ProxyConfig {
     /// See `XcaddyConfig` for shape.
     #[serde(default)]
     pub xcaddy: Option<XcaddyConfig>,
+    /// Top-level Caddy JSON config snippet, deep-merged into the
+    /// rendered config before `/load`. Escape hatch for global
+    /// settings yoink doesn't model as typed fields:
+    /// - `apps.http.servers.srv0.trusted_proxies` /
+    ///   `client_ip_headers` to read the real client IP from
+    ///   `CF-Connecting-IP` (paired with the
+    ///   `WeidiDeng/caddy-cloudflare-ip` plugin).
+    /// - `storage` for shared ACME state (e.g. `caddy-storage-redis`).
+    /// - `apps.cache` for `caddy-storage-redis`-backed
+    ///   `cache-handler` configuration.
+    /// - `apps.crowdsec` / `apps.coraza` global app blocks.
+    ///
+    /// The string is parsed as JSON; merge is recursive on objects
+    /// (user-supplied keys win on conflict, base values are preserved
+    /// at non-overlapping keys). Validation rejects non-object JSON.
+    #[serde(default)]
+    pub config_extra: Option<String>,
 }
 
 /// Build inputs for an on-host xcaddy compile. The resulting image is

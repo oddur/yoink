@@ -129,7 +129,25 @@ That gets you in-process caching with the upstream's `Cache-Control` headers as 
 
 **Advanced backends (Redis, Badger, etcd):**
 
-The default in-memory backend is per-proxy-instance, no shared state. For multi-host shared cache or persistent cache across proxy restarts, the plugin supports Redis/Badger/etcd backends — but those require a top-level `cache` app config block in Caddy, which yoink doesn't yet expose as a typed field. Same situation as [multi-host LE certs](/docs/recipes/multi-host-redis-storage): drop `proxy.xcaddy:` for this case and use `proxy.image:` with a hand-built image that bakes both the plugin compile and a bootstrap `Caddyfile`/JSON entrypoint. Track yoink issues for `proxy.config_extra:` if you need shared cache.
+The default in-memory backend is per-proxy-instance, no shared state. For multi-host shared cache or persistent cache across proxy restarts, the plugin supports Redis/Badger/etcd backends via a top-level `cache` app block. That goes through [`proxy.config_extra:`](/docs/guide/proxy#proxyconfig_extra-block--global-caddy-config-escape-hatch):
+
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/caddyserver/cache-handler
+  config_extra: |
+    {
+      "apps": {
+        "cache": {
+          "redis": {"url": "redis://redis:6379"}
+        }
+      }
+    }
+```
+
+Yoink deep-merges this into the rendered Caddy config; the `apps.cache` block lands alongside `apps.http` without clobbering yoink's routes.
 
 ### Multi-host LE certs (`caddy-storage-redis`)
 
@@ -166,7 +184,7 @@ Wire the provider's API key as a sealed secret and reference it from `caddy_extr
 
 ## Plugin landscape
 
-A non-exhaustive map of caddy plugins worth knowing about — yoink doesn't model these natively, so the plugin route is the answer when you need them. Each is a one-line addition to `proxy.xcaddy.plugins:`; the upstream README documents the directive shape to drop into `caddy_extra_json:` per service.
+A non-exhaustive map of caddy plugins worth knowing about — yoink doesn't model these natively, so the plugin route is the answer when you need them. Each is a one-line addition to `proxy.xcaddy.plugins:`; the upstream README documents the directive shape to drop into `caddy_extra_json:` per service. Plugins that need top-level Caddy app config (e.g. global storage, server-level `trusted_proxies`) plug into [`proxy.config_extra:`](/docs/guide/proxy#proxyconfig_extra-block--global-caddy-config-escape-hatch).
 
 - **[`caddyserver/cache-handler`](https://github.com/caddyserver/cache-handler)** — RFC-compliant HTTP caching at the proxy. See the worked recipe above. Skip if you're behind a CDN edge.
 - **[`mholt/caddy-ratelimit`](https://github.com/mholt/caddy-ratelimit)** — In-process rate limiting per-IP, per-header, or per-zone. See the worked recipe above. Pair with a CDN's edge limiter for two-layer defense; use solo when the proxy is your only public surface.
@@ -176,6 +194,7 @@ A non-exhaustive map of caddy plugins worth knowing about — yoink doesn't mode
 - **[`hslatman/caddy-crowdsec-bouncer`](https://github.com/hslatman/caddy-crowdsec-bouncer)** — Enforces [CrowdSec](https://www.crowdsec.net/) community-IP blocklists at the proxy. Cheap/free DDoS-bot and credential-stuffing mitigation when you're not behind a managed edge. Needs a CrowdSec local API instance reachable from the proxy (run it as another yoink service).
 - **[`caddy-dns/*`](https://github.com/caddy-dns)** — DNS-01 ACME challenge providers (cloudflare, route53, digitalocean, hetzner, dozens more). Required for wildcard certs. See the worked recipe above.
 - **[`pberkel/caddy-storage-redis`](https://github.com/pberkel/caddy-storage-redis)** — Shared ACME storage backend for multi-host fleets. See the [redis-storage recipe](/docs/recipes/multi-host-redis-storage).
+- **[`WeidiDeng/caddy-cloudflare-ip`](https://github.com/WeidiDeng/caddy-cloudflare-ip)** — Auto-refreshing Cloudflare IP-range trust source. Drop in when running behind Cloudflare so the real client IP propagates correctly to logs, geo-IP, and IP-aware rate limits — pairs with `trusted_proxies` in `proxy.config_extra:`. See the [Origin Certs recipe](/docs/recipes/cloudflare-origin-certs#real-client-ip-from-cf-connecting-ip).
 
 For the broader ecosystem, [caddy's own module index](https://caddyserver.com/download) lets you browse every published module.
 

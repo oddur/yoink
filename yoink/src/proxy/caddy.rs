@@ -248,7 +248,36 @@ where
         entry["certificates"] = json!({ "load_pem": pem_entries });
     }
 
+    // Apply `proxy.config_extra:` last, after every yoink-managed
+    // section is in place. Merge is deep-recursive on objects (extras
+    // win at leaves; existing yoink keys at non-overlapping paths
+    // survive). Validated as a JSON object at config-load time.
+    if let Some(extra) = cfg.proxy.as_ref().and_then(|p| p.config_extra.as_deref()) {
+        let extra_value: Value = serde_json::from_str(extra)
+            .map_err(|e| anyhow!("proxy.config_extra is not valid JSON: {e}"))?;
+        deep_merge(&mut config, extra_value);
+    }
+
     Ok(config)
+}
+
+/// Deep-merge `src` into `dst`. Both objects → merge keys (recurse
+/// where both sides are objects, src wins on scalar leaves and arrays).
+/// Non-object src wholesale replaces dst at this position.
+fn deep_merge(dst: &mut Value, src: Value) {
+    match (dst, src) {
+        (Value::Object(dst_map), Value::Object(src_map)) => {
+            for (k, v) in src_map {
+                match dst_map.get_mut(&k) {
+                    Some(existing) => deep_merge(existing, v),
+                    None => {
+                        dst_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, src) => *slot = src,
+    }
 }
 
 /// Expand every `caddy_extra_caddyfile:` snippet in `cfg` into its
@@ -970,5 +999,77 @@ services:
         let json1 = render(&cfg, |_| vec!["api-1".into()], None).unwrap();
         let json2 = render(&cfg, |_| vec!["api-1".into()], None).unwrap();
         assert_eq!(config_fingerprint(&json1), config_fingerprint(&json2));
+    }
+
+    #[test]
+    fn config_extra_merges_into_rendered_config() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  config_extra: |
+    {
+      "storage": {"module": "redis", "address": "redis:6379"},
+      "apps": {
+        "http": {
+          "servers": {
+            "main": {
+              "trusted_proxies": {"source": "cloudflare"},
+              "client_ip_headers": ["CF-Connecting-IP"]
+            }
+          }
+        }
+      }
+    }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        // Top-level escape hatch keys land where the user put them.
+        assert_eq!(json["storage"]["module"].as_str(), Some("redis"));
+        assert_eq!(
+            json["apps"]["http"]["servers"]["main"]["trusted_proxies"]["source"].as_str(),
+            Some("cloudflare"),
+        );
+        assert_eq!(
+            json["apps"]["http"]["servers"]["main"]["client_ip_headers"][0].as_str(),
+            Some("CF-Connecting-IP"),
+        );
+        // Yoink-managed siblings under the same `main` server survive
+        // the merge — routes were not clobbered.
+        let routes = json["apps"]["http"]["servers"]["main"]["routes"]
+            .as_array()
+            .expect("routes array");
+        assert!(!routes.is_empty(), "yoink routes preserved across merge");
+    }
+
+    #[test]
+    fn config_extra_user_keys_win_on_conflict() {
+        // User explicitly overrides yoink's default admin block.
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  config_extra: |
+    {"admin": {"listen": "127.0.0.1:9999"}}
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        assert_eq!(json["admin"]["listen"].as_str(), Some("127.0.0.1:9999"));
     }
 }

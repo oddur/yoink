@@ -72,6 +72,26 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
     }
 
     if let Some(p) = cfg.proxy.as_ref()
+        && let Some(extra) = p.config_extra.as_deref()
+    {
+        match serde_json::from_str::<serde_json::Value>(extra) {
+            Ok(serde_json::Value::Object(_)) => {}
+            Ok(_) => {
+                return Err(ConfigError::Invalid(
+                    "proxy.config_extra must be a JSON object (top-level Caddy \
+                     config keys like `apps`, `storage`, `admin`)"
+                        .to_string(),
+                ));
+            }
+            Err(e) => {
+                return Err(ConfigError::Invalid(format!(
+                    "proxy.config_extra is not valid JSON: {e}"
+                )));
+            }
+        }
+    }
+
+    if let Some(p) = cfg.proxy.as_ref()
         && let Some(x) = &p.xcaddy
     {
         if p.image.is_some() {
@@ -507,6 +527,39 @@ services:
         });
         let err = inject_implicit_proxy(&mut cfg).unwrap_err();
         assert!(format!("{err}").contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn config_extra_must_be_a_json_object() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            config_extra: Some("[1, 2, 3]".into()),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(
+            format!("{err}").contains("must be a JSON object"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_extra_must_be_valid_json() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            config_extra: Some("{not json".into()),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(format!("{err}").contains("not valid JSON"), "got: {err}");
     }
 
     #[test]

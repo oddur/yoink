@@ -138,6 +138,41 @@ curl https://api.example.com/health
 # → 200 OK
 ```
 
+## Real client IP from `CF-Connecting-IP`
+
+Cloudflare proxies, so by default your origin (and Caddy access logs, Coraza, any rate-limit handler) sees Cloudflare's edge IPs in `RemoteAddr`. That's almost never what you want — log analytics, geo-IP, app-side rate limits, and any IP-based abuse handling all collapse to "every request is from Cloudflare." The fix is two lines: a caddy plugin that auto-refreshes Cloudflare's IP ranges, plus a `proxy.config_extra:` block telling Caddy to trust those ranges as proxies and read the real IP from `CF-Connecting-IP`.
+
+```yaml
+proxy:
+  email: ops@example.com
+  tls:
+    cert_secret: CF_ORIGIN_CERT
+    key_secret:  CF_ORIGIN_KEY
+    client_auth:
+      mode: require_and_verify
+      trust_pool_secret: CF_ORIGIN_PULL_CA
+  xcaddy:
+    plugins:
+      - github.com/WeidiDeng/caddy-cloudflare-ip
+  config_extra: |
+    {
+      "apps": {
+        "http": {
+          "servers": {
+            "main": {
+              "trusted_proxies": {"source": "cloudflare"},
+              "client_ip_headers": ["CF-Connecting-IP"]
+            }
+          }
+        }
+      }
+    }
+```
+
+[`caddy-cloudflare-ip`](https://github.com/WeidiDeng/caddy-cloudflare-ip) is the Caddy module that registers a `cloudflare` source for `trusted_proxies` and refreshes the IP list periodically. Without it, `trusted_proxies: {source: cloudflare}` would fail at config load.
+
+This pairs with the origin-pull mTLS above for a clean two-layer story: the origin only TLS-terminates for Cloudflare (mTLS), and within that pipe the real client IP propagates correctly via `CF-Connecting-IP`.
+
 ## Cloudflare side
 
 Make sure the zone's SSL mode is **Full (strict)** (Cloudflare → SSL/TLS → Overview). This is what asks Cloudflare to validate the origin cert.

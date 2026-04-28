@@ -67,44 +67,26 @@ The published port on Tailscale's IP makes Redis reachable from `prod-2` and `pr
 
 ## Wire caddy's storage backend
 
-`proxy.xcaddy:` gets the plugin compiled in. Telling caddy to *use* Redis instead of the local `/data` volume needs a top-level `storage` block in caddy's config — and yoink doesn't yet expose that as a typed field.
-
-Until yoink ships a `proxy.storage:` field, the practical path is to drop `proxy.xcaddy:` for this case and use `proxy.image:` with a hand-built image that bakes both the plugin compile and a storage-bootstrap entrypoint:
-
-```dockerfile
-# Dockerfile.caddy-redis
-FROM caddy:2-builder AS builder
-RUN xcaddy build --with github.com/pberkel/caddy-storage-redis
-
-FROM caddy:2
-COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-COPY caddy-bootstrap.json /etc/caddy/bootstrap.json
-ENTRYPOINT ["caddy", "run", "--resume", "--config", "/etc/caddy/bootstrap.json"]
-```
-
-`caddy-bootstrap.json`:
-
-```json
-{
-  "storage": {
-    "module": "redis",
-    "address": "redis:6379"
-  },
-  "admin": {"listen": ":2019"}
-}
-```
-
-Build it once (locally or in CI), push to a registry your hosts can reach, and reference it from `proxy.image:`:
+`proxy.xcaddy:` compiles the plugin in. `proxy.config_extra:` hands caddy the top-level `storage` block that tells it to *use* Redis instead of the local `/data` volume:
 
 ```yaml
 proxy:
-  image: ghcr.io/me/caddy-redis:2.7
   email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/pberkel/caddy-storage-redis
+  config_extra: |
+    {
+      "storage": {
+        "module": "redis",
+        "address": "redis:6379"
+      }
+    }
 ```
 
-Caddy's `--resume` flag loads the bootstrap config first; yoink's `/load` push then layers the rendered routing config on top. The storage block stays Redis-backed across reloads.
+Yoink deep-merges that JSON into the rendered Caddy config before `/load`-ing it. The `storage` block sits at the top level alongside `admin` and `apps`, which is exactly where Caddy expects it. See the [`config_extra:` reference](/docs/guide/proxy#proxyconfig_extra-block--global-caddy-config-escape-hatch) for merge semantics.
 
-> Why not `proxy.xcaddy:` here? Because xcaddy bakes plugins in but not entrypoints or bootstrap files. The redis-storage path needs both. A future yoink release will likely add `proxy.storage:` as a typed field, at which point this whole section collapses to a one-line `proxy.xcaddy:` config. Track yoink issues for the cleaner path.
+Every proxy host now reads ACME state from the shared Redis instead of its local `/data` volume. The `yoink_caddy_data` named volume becomes empty — but you can leave it; it does no harm.
 
 ## Tailscale on every host
 

@@ -80,6 +80,43 @@ Containers are named in upstream entries (not IPs), so a container restart with 
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. Persisted across proxy restarts. |
 | `bind` | string | — (all interfaces) | Host IP to bind `:80` and `:443` to. Common use: bind to a Tailscale IP so the proxy is reachable only over the tailnet. Admin port stays on `127.0.0.1` regardless. |
 | `tls` | block (see below) | — | Proxy-level TLS — every routed service inherits this cert (and optional mTLS) by default. |
+| `config_extra` | string (JSON) | — | Top-level Caddy JSON snippet, deep-merged into the rendered config before `/load`. Escape hatch for global settings yoink doesn't model as typed fields — `trusted_proxies`, `storage`, plugin app blocks. See the [`config_extra:` block](#proxyconfig_extra-block--global-caddy-config-escape-hatch). |
+
+### `proxy.config_extra:` block — global Caddy config escape hatch
+
+Caddy has many global config knobs yoink doesn't model as typed fields: server-level `trusted_proxies` and `client_ip_headers`, top-level `storage` (for shared ACME state across hosts), top-level app blocks for plugins like `cache-handler` and `coraza`. `config_extra:` takes a raw JSON snippet and **deep-merges** it into the rendered Caddy config before yoink pushes to `/load`.
+
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/WeidiDeng/caddy-cloudflare-ip
+  config_extra: |
+    {
+      "apps": {
+        "http": {
+          "servers": {
+            "main": {
+              "trusted_proxies": {"source": "cloudflare"},
+              "client_ip_headers": ["CF-Connecting-IP"]
+            }
+          }
+        }
+      }
+    }
+```
+
+The yoink-rendered server is named `main`, so global server-scoped settings live under `apps.http.servers.main`.
+
+Merge semantics:
+
+- The string is parsed as JSON and validated as an object at config-load time (non-object JSON, invalid JSON, or arrays at the top level are rejected).
+- Merge is recursive on objects: if both sides have an object at the same key, yoink merges their children; otherwise the user-supplied value wins.
+- Yoink's own keys at non-overlapping paths are preserved — e.g. setting `apps.http.servers.main.trusted_proxies` doesn't clobber the `routes` array yoink generates from your services.
+- User wins on every leaf conflict: setting `admin.listen` to your own value overrides yoink's default `0.0.0.0:2019`. Yoink trusts you.
+
+Use it for plugin-specific top-level config too — for example, `caddy-storage-redis` for shared ACME state across a fleet ([recipe](../recipes/multi-host-redis-storage)), `caddyserver/cache-handler` advanced backends, `coraza` global directives, `crowdsec` agent connection settings.
 
 ### `proxy.xcaddy:` block — caddy plugins without a registry
 
