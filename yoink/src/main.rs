@@ -351,12 +351,15 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
-    /// Forward a published container port to the laptop over SSH.
+    /// Forward a container port to the laptop over SSH.
     ///
-    /// Only services with a `publish:` entry are supported — yoink
-    /// reuses the host's existing `docker-proxy` binding and just
-    /// bridges with `ssh -L`. For containers that don't publish
-    /// (api / web behind Caddy) use `yoink shell <service>` instead.
+    /// Auto-mode: when the service has a matching `publish:` entry,
+    /// yoink reuses the host's existing `docker-proxy` binding and
+    /// just bridges with `ssh -L` (~50 ms). When it doesn't (api /
+    /// web behind Caddy), yoink spawns an ephemeral `alpine/socat`
+    /// sidecar on the target's docker network and tunnels through
+    /// that (~2 s warm-start). Either way the operator gets a
+    /// `localhost:N` URL.
     ///
     /// Usage shapes:
     ///   yoink pf pgadmin               # service has 1 publish; LOCAL = OS-assigned
@@ -368,9 +371,10 @@ enum Command {
         service: String,
         /// Either `LOCAL:CONTAINER` or just `CONTAINER` (LOCAL defaults
         /// to the same number as CONTAINER, or use `0:CONTAINER` /
-        /// `--local 0` to ask the OS for a free port). Optional when the
-        /// service has exactly one `publish:` entry — that entry's
-        /// container port is used.
+        /// `--local 0` to ask the OS for a free port). Optional when
+        /// the service has exactly one `publish:` entry (that entry's
+        /// container port is used) or no `publish:` block at all but
+        /// declares `run.port:` (the healthcheck port is used).
         #[arg(value_name = "[LOCAL:]CONTAINER_PORT")]
         port: Option<String>,
         /// Pin to a specific host when the service runs on multiple.

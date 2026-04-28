@@ -1,6 +1,6 @@
 ---
 title: Port-forward to any service
-weight: 13
+weight: 8
 ---
 
 `yoink pf <service>` opens a tunnel from your laptop to a container port — the same shape `kubectl port-forward` gives you, reusing the SSH connection yoink already has to the host. Two paths under the hood, picked automatically:
@@ -38,9 +38,10 @@ In other words: the security posture and the debugging posture stop fighting. Th
 
 Anything yoink runs:
 
-- **Published** (pgadmin on `127.0.0.1:5050:80`, the operator UI): published path. Fastest.
-- **Caddy-fronted, sealed-network** (api on the `api` network, no `publish:`): sidecar path. ~500 ms cold-start; ~5 MB image pulled once per host.
+- **Published** (pgadmin on `127.0.0.1:5050:80`, the operator UI): published path. ~50 ms cold-start.
+- **Caddy-fronted, sealed-network** (api on the `api` network, no `publish:`): sidecar path. ~1–2 s cold-start (image pull + container start), ~50 ms warm; ~5 MB image pulled once per host.
 - **Multi-network** (web on `web` + `otel`): sidecar joins the first declared network and the operator dials the service's docker DNS alias.
+- **Replicated** (`replicas: 2`): the published path is sticky to one replica (one host port → one container); the sidecar path round-robins across replicas via docker DNS. See [Replicas](#replicas) below for caveats.
 
 ## CLI
 
@@ -83,12 +84,17 @@ Three keys plus a visual indicator on every row whose service has a tunnel open:
 | `o` / `O` | Open the active port-forward URL in the system browser. Works in **any** view; falls back to the most-recently-opened tunnel when the focused row has no forward of its own. |
 | `F` (Shift-F) | Close every active port-forward. Sidecars are force-removed; ssh children killed. The footer band disappears. |
 
-Forwarded service rows show a cyan `↦` prefix on the service cell across the Dashboard, HostDetail, and Services panes — at-a-glance "is this thing tunneled?" without needing to read the footer.
+Forwarded rows show a cyan `↦` prefix on the service cell — at-a-glance "is this thing tunneled?" without needing to read the footer. The marker scope follows how the tunnel was opened:
+
+- **From a Dashboard / HostDetail / ContainerDetail row** — the operator pressed `f` on a specific replica. Only that replica gets the marker. The other replicas of the same service render unmarked, so a `web-1`/`web-2` pair shows which one you're tunneled through.
+- **From the Services pane** or **the CLI** (no row context) — every replica of the service gets the marker. Useful when the operator just cares "is `api` reachable?" rather than "which `api` am I hitting?"
 
 ```
-host          service      container             state    ...
-backtrack-eu-1 ↦ api       api-186bd0cd-0       running  ...
-backtrack-eu-1   web        web-13584766-0       running  ...
+host            service      container             state    ...
+backtrack-eu-1  ↦ web        web-13584766-0       running  ...   ← f pressed here
+backtrack-eu-1    web        web-13584766-1       running  ...
+backtrack-eu-1  ↦ api        api-186bd0cd-0       running  ...   ← yoink pf api on the CLI
+backtrack-eu-1  ↦ api        api-186bd0cd-1       running  ...   ← marked too (CLI = all replicas)
 ```
 
 Sidecars themselves are filtered out of the container lists (their names start with `yoink-pf-`); they exist for the duration of the tunnel and aren't user-facing.
@@ -100,6 +106,23 @@ While any tunnel is open, a one-line footer band stays visible across every pane
 ```
 
 The band is hard to miss on purpose — open tunnels are the kind of thing operators forget about and accidentally leave running between sessions. Yoink's TUI exit (`q` / Ctrl-C) closes every tunnel cleanly: ssh children die synchronously, sidecar containers force-remove via the `auto_remove: true` belt-and-braces.
+
+## Replicas
+
+Services with `replicas: > 1` get one container per replica (`web-13584766-0`, `web-13584766-1`, …). How `pf` reaches them depends on the path:
+
+- **Published path.** `docker-proxy` is bound to a specific host port that ultimately maps to a specific container, so traffic is sticky to one replica for the duration of the tunnel.
+- **Sidecar path.** The sidecar dials the service's docker DNS alias (`socat tcp:web:3000`). Inside docker, that name resolves round-robin across all healthy replicas — so a given TCP connection through the sidecar may land on any one of them. The tunnel is *to a specific sidecar*, but the sidecar's outbound connection is *across the replica set*.
+
+The TUI's `↦` marker reflects which row the operator pressed `f` on — useful as a "this is the tunnel I opened" cue, not a guarantee that "every byte goes to this replica" through the sidecar path.
+
+Flags that influence which replica a connection lands on:
+
+- **`--host <ADDRESS>`** — restricts both the published path and the sidecar's network attachment to replicas on that host. With one replica per host this is enough to pin a tunnel.
+- **`--replica <N>` (0-based)** — currently validates range only (errors if `>= replicas`). Defaults to `0`. Sticky per-replica routing in the sidecar path is follow-up work — it would require the sidecar to dial the target container's IP rather than the service alias.
+- **TUI: select the row first, then press `f`.** Marks the focused replica with `↦`; same routing semantics as the CLI otherwise.
+
+For deterministic single-replica access today: use the published path (`publish:` per replica with distinct host ports), pin via `--host`, or run the service with `replicas: 1`.
 
 ## How it works
 
