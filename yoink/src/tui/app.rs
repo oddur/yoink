@@ -161,6 +161,8 @@ impl View {
             "  q / Ctrl-C    quit yoink",
             "  d h s l       dashboard / hosts / services / logs",
             "  R e           resources / encrypted-secrets",
+            "  E             edit config in $EDITOR (jumps to focused service/host)",
+            "  ~             show drift detail for the focused service",
             "  Tab / S-Tab   cycle modes forward / backward",
             "  ?             toggle this help overlay",
             "",
@@ -401,6 +403,13 @@ enum Update {
         container: String,
         result: Result<crate::docker_ops::ProcessTable, String>,
     },
+    /// Result of a drift-modal fetch — the matching `ServiceDiff`
+    /// for `(host, service)` produced by `diff::compute`.
+    Drift {
+        host: Host,
+        service: String,
+        result: super::drift::DriftRefresh,
+    },
     /// Batch of `(host_address, container_name, stats)` samples produced
     /// by the always-on background stats poller. Each sample is folded
     /// into the per-container `StatsHistory` so that opening a
@@ -548,6 +557,7 @@ pub async fn run(
         ops,
         mode,
         hl_available,
+        mouse,
     )
     .await;
     let restore = restore_terminal(&mut terminal, mouse);
@@ -608,6 +618,7 @@ async fn run_loop(
     ops: Arc<dyn DockerOps>,
     mode: Mode,
     hl_available: bool,
+    mouse: bool,
 ) -> Result<()> {
     let mut app = App::new(config, config_path, ops, View::from(mode), hl_available);
     // Schedule the first round of background fetches so each pane has data
@@ -630,11 +641,15 @@ async fn run_loop(
     // matters when the shell view is up and `inner` is None; the
     // branch is gated so it's a no-op otherwise.
     let mut shell_spin_tick = interval(Duration::from_millis(125));
+    // 10fps spinner animation; cheap because ratatui's diff renderer
+    // only writes changed cells, but the redraw rate is the floor.
+    let mut throbber_tick = interval(Duration::from_millis(100));
     fast_tick.tick().await;
     hosts_tick.tick().await;
     resources_tick.tick().await;
     config_tick.tick().await;
     shell_spin_tick.tick().await;
+    throbber_tick.tick().await;
 
     loop {
         terminal.draw(|f| app.render(f))?;
@@ -645,6 +660,27 @@ async fn run_loop(
                     Some(Ok(Event::Key(key))) => {
                         if app.on_key(key).await {
                             return Ok(());
+                        }
+                        if let Some(target) = app.take_pending_editor() {
+                            // Run the editor synchronously — the operator
+                            // is *editing*; nothing else should fire while
+                            // the alt-screen is torn down.
+                            restore_terminal(terminal, mouse)
+                                .context("restore terminal for $EDITOR")?;
+                            let status = super::editor::run_editor(&target);
+                            *terminal = setup_terminal(mouse)
+                                .context("re-setup terminal after $EDITOR")?;
+                            terminal.clear().context("clear terminal after $EDITOR")?;
+                            match status {
+                                Ok(s) if !s.success() => app.push_toast(format!(
+                                    "✗ editor exited with status {s}"
+                                )),
+                                Err(e) => app.push_toast(format!("✗ editor failed: {e}")),
+                                _ => {}
+                            }
+                            // Pick up edits immediately rather than
+                            // waiting for the next reload tick.
+                            app.maybe_reload_config();
                         }
                     }
                     Some(Ok(Event::Mouse(m))) => app.on_mouse(m),
@@ -675,6 +711,9 @@ async fn run_loop(
             }
             _ = config_tick.tick() => {
                 app.maybe_reload_config();
+            }
+            _ = throbber_tick.tick() => {
+                app.tick_throbber();
             }
             Some(update) = app.update_rx.recv() => {
                 app.apply_update(update);
@@ -734,6 +773,11 @@ pub struct App {
     /// current view. The user confirms with `y` (or Enter) and
     /// cancels with anything else. Cleared on transition.
     kill_target: Option<(Host, String)>,
+    /// Drift inspection modal — populated by pressing `~` on a
+    /// drifted row. The fetch runs in the background and lands via
+    /// `Update::Drift`; the modal is rendered on top of whatever
+    /// view was active.
+    drift: super::drift::DriftState,
     /// `Some((service, tag))` while a reconcile-confirmation modal
     /// is open. `y` / Enter confirms; anything else cancels.
     reconcile_target: Option<(String, String)>,
@@ -822,6 +866,18 @@ pub struct App {
     /// Path to the root `yoink.yaml`. Re-read every `CONFIG_RELOAD_TICK`
     /// so on-disk edits flow into the running TUI.
     config_path: std::path::PathBuf,
+    /// Cached source-of-truth label for the chrome (e.g. "yoink(*)") —
+    /// shell-outs to `git` happen on the config-reload tick, not every
+    /// render. `None` = not in a git repo, or git isn't installed.
+    config_source: Option<String>,
+    /// Set when the operator pressed `E` to edit the config in
+    /// `$EDITOR`. Drained by `run_loop`, which suspends the alt-
+    /// screen, runs the editor synchronously, and re-enters the TUI.
+    pending_editor: Option<super::editor::EditorTarget>,
+    /// Drives the spinner glyph in `loading…` rows. Advanced on a
+    /// dedicated 100 ms tick so the animation looks alive even when
+    /// the slower data ticks aren't firing.
+    throbber_state: throbber_widgets_tui::ThrobberState,
     hl_available: bool,
 }
 
@@ -857,6 +913,7 @@ impl App {
             error_modal: None,
             shown_errors: std::collections::HashSet::new(),
             kill_target: None,
+            drift: super::drift::DriftState::default(),
             reconcile_target: None,
             prune_target: false,
             reconcile_all_target: false,
@@ -886,8 +943,95 @@ impl App {
             log_tx,
             log_rx,
             event_tasks: Vec::new(),
+            config_source: super::chrome::config_source(&config_path),
             config_path,
+            pending_editor: None,
+            throbber_state: throbber_widgets_tui::ThrobberState::default(),
             hl_available,
+        }
+    }
+
+    /// Drained by `run_loop` after each key event. When `Some`, the
+    /// outer loop suspends the TUI, runs `$EDITOR` on the target,
+    /// and re-enters the alt-screen + raw mode.
+    pub fn take_pending_editor(&mut self) -> Option<super::editor::EditorTarget> {
+        self.pending_editor.take()
+    }
+
+    /// Advance the loading-spinner glyph one frame.
+    pub fn tick_throbber(&mut self) {
+        self.throbber_state.calc_next();
+    }
+
+    /// Build the editor jump target for the current view. Falls back
+    /// to "open at line 1" when the focused object isn't a service or
+    /// host (e.g. the dashboard or the secrets pane), or when the
+    /// matching block can't be located in the root config file.
+    fn editor_target_for_current_view(&self) -> super::editor::EditorTarget {
+        let yaml = std::fs::read_to_string(&self.config_path).unwrap_or_default();
+        let line = match &self.view {
+            View::ServiceDetail(name) | View::ServiceHistory(name) => {
+                super::editor::find_service_line(&yaml, name)
+            }
+            View::HostDetail(host) => super::editor::find_host_line(&yaml, &host.address),
+            View::ContainerDetail { container, .. } | View::ContainerLogs { container, .. } => {
+                // Look up the service this container belongs to: try
+                // each declared service name as a `<name>-` prefix and
+                // pick the longest match. Service names in the same
+                // file are unique, so there's at most one valid hit.
+                self.config
+                    .services
+                    .iter()
+                    .filter(|s| {
+                        container == s.name.as_str()
+                            || container.starts_with(&format!("{}-", s.name))
+                    })
+                    .max_by_key(|s| s.name.len())
+                    .and_then(|s| super::editor::find_service_line(&yaml, &s.name))
+            }
+            _ => None,
+        };
+        super::editor::EditorTarget {
+            path: self.config_path.clone(),
+            line,
+        }
+    }
+
+    /// Resolve the focused `(host, service)` pair for the drift
+    /// modal. Each list view exposes its selected row; the container
+    /// detail view falls back to the inspected container's
+    /// `yoink.service` label. `None` when the current view has no
+    /// notion of a focused row (Logs / Resources / Secrets).
+    fn drift_focus(&self) -> Option<(Host, String)> {
+        let host_for = |addr: &str| -> Option<Host> {
+            self.config
+                .hosts
+                .iter()
+                .find(|h| h.address == addr)
+                .map(Host::from)
+        };
+        match &self.view {
+            View::Dashboard => {
+                let row = self.dashboard.selected()?;
+                let service = row.service?;
+                host_for(&row.host).map(|h| (h, service))
+            }
+            View::HostDetail(host) => self
+                .host_detail
+                .selected_service()
+                .map(|s| (host.clone(), s)),
+            View::ServiceDetail(svc) => {
+                let row = self.service_detail.selected_row()?;
+                Some((row.host, svc.clone()))
+            }
+            View::ContainerDetail { host, .. } => {
+                let labels = &self.container_detail.inspect()?.labels;
+                labels
+                    .get("yoink.service")
+                    .cloned()
+                    .map(|s| (host.clone(), s))
+            }
+            _ => None,
         }
     }
 
@@ -895,8 +1039,11 @@ impl App {
     /// actually changed. Silent no-op on parse errors so a half-saved
     /// edit doesn't blank the dashboard; the next tick will catch the
     /// finished edit. If `hosts:` changed we tear down and respawn the
-    /// docker-events subscriptions.
+    /// docker-events subscriptions. Also refreshes the chrome's git
+    /// "from <repo>(*)" label, which piggybacks on this slow tick so
+    /// `git status` doesn't run at render rate.
     fn maybe_reload_config(&mut self) {
+        self.config_source = super::chrome::config_source(&self.config_path);
         let mut new_config = match Config::load_from_path(&self.config_path) {
             Ok(c) => c,
             Err(e) => {
@@ -1390,6 +1537,14 @@ impl App {
             return false;
         }
 
+        // Drift modal: Esc dismisses, anything else falls through so
+        // the operator can keep typing into the underlying view (e.g.
+        // press `~` again on a different focus, or navigate away).
+        if self.drift.is_visible() && matches!(key.code, KeyCode::Esc) {
+            self.drift.clear();
+            return false;
+        }
+
         // Kill-confirmation modal: `y` / Enter confirms, anything else
         // dismisses. Captured before view-specific keys so a stray `j`
         // can't both dismiss and select-next.
@@ -1578,6 +1733,23 @@ impl App {
                 // already used for refresh; the per-view handler can
                 // map capital R to other things if needed).
                 self.transition(View::Resources).await;
+                return false;
+            }
+            // Capital `E` jumps into `$EDITOR` at the focused service /
+            // host's line in the config (lowercase `e` is taken by
+            // Secrets). The actual suspend + resume happens in
+            // `run_loop` so the alt-screen plumbing stays in one place.
+            KeyCode::Char('E') => {
+                self.pending_editor = Some(self.editor_target_for_current_view());
+                return false;
+            }
+            // `~` opens the drift modal for the focused (host, service).
+            // Shows the same `+`/`-`/`~` per-field diff `yoink up --plan`
+            // produces — without leaving the TUI. Esc closes.
+            KeyCode::Char('~') => {
+                if let Some((host, service)) = self.drift_focus() {
+                    self.open_drift(host, service);
+                }
                 return false;
             }
             // Tab / Shift-Tab cycle through the top-level modes
@@ -2617,7 +2789,70 @@ impl App {
                     self.push_toast(format!("✗ docker top {container}: {e}"));
                 }
             },
+            Update::Drift {
+                host,
+                service,
+                result,
+            } => {
+                self.drift.apply(&host, &service, result);
+            }
         }
+    }
+
+    /// Open the drift modal for `(host, service)` and spawn the
+    /// background fetch. The fetch reuses `diff::compute` so the
+    /// modal shows exactly what `yoink up --plan --service <name>`
+    /// would print on the CLI side. Tag overrides default to the
+    /// running container's `yoink.version` for git-versioned
+    /// services where `service.tag` is absent — otherwise
+    /// `compute` would error with `TagMissing`, which is correct
+    /// for `yoink up` but useless for "what changed".
+    fn open_drift(&mut self, host: Host, service: String) {
+        self.drift.set_target(host.clone(), service.clone());
+        let ops = self.ops.clone();
+        let config = self.config.clone();
+        let secrets = self.secrets.clone();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let bundle = secrets.read().await.clone();
+            let mut overrides = std::collections::BTreeMap::new();
+            // For services with no `tag:` in config, fall back to the
+            // running replica's tag so the diff isolates the env/label
+            // change instead of erroring on a missing tag.
+            if let Some(svc) = config.services.iter().find(|s| s.name == service)
+                && svc.tag.is_none()
+                && let Ok(containers) = ops
+                    .list_containers_by_label(&host, &format!("yoink.service={service}"))
+                    .await
+                && let Some(running) = containers
+                    .iter()
+                    .find(|c| c.is_running())
+                    .and_then(|c| c.yoink_version.clone())
+            {
+                overrides.insert(service.clone(), running);
+            }
+            let services_filter = std::slice::from_ref(&service);
+            let result = match crate::diff::compute(
+                ops.as_ref(),
+                &config,
+                &overrides,
+                Some(services_filter),
+                bundle.as_deref(),
+            )
+            .await
+            {
+                Ok(report) => Ok(report
+                    .services
+                    .into_iter()
+                    .find(|d| d.host == host.address && d.service == service)),
+                Err(e) => Err(format!("{e}")),
+            };
+            let _ = tx.send(Update::Drift {
+                host,
+                service,
+                result,
+            });
+        });
     }
 
     /// React to a `docker events` push by refreshing whichever pane is
@@ -2771,7 +3006,16 @@ impl App {
             "Secrets",
         ];
         let selected_tab = Some(self.view.top_section());
-        super::ui::render_header(frame, header_area, &tabs, selected_tab, &crumbs, &right);
+        super::ui::render_header(
+            frame,
+            header_area,
+            &tabs,
+            selected_tab,
+            &crumbs,
+            &right,
+            self.config.slug.as_deref(),
+            self.config_source.as_deref(),
+        );
 
         let secrets = self.secrets.try_read().ok().and_then(|g| g.clone());
         match &self.view {
@@ -2782,9 +3026,12 @@ impl App {
                     &self.config,
                     secrets.as_deref(),
                     &self.container_history,
+                    &self.throbber_state,
                 );
             }
-            View::Hosts => self.hosts.render(frame, pane_area, &self.config),
+            View::Hosts => self
+                .hosts
+                .render(frame, pane_area, &self.config, &self.throbber_state),
             View::HostDetail(host) => {
                 let events: Vec<String> = self
                     .host_events
@@ -2798,6 +3045,7 @@ impl App {
                     secrets.as_deref(),
                     &events,
                     &self.container_history,
+                    &self.throbber_state,
                 );
             }
             View::ContainerDetail { host, container } => {
@@ -2812,16 +3060,28 @@ impl App {
                 let history: Option<&StatsHistory> = self
                     .container_history
                     .get(&(host.address.clone(), container.clone()));
-                self.container_detail.render(frame, split[0], history);
+                self.container_detail
+                    .render(frame, split[0], history, &self.throbber_state);
                 self.logs.render(frame, split[1], &self.config);
             }
-            View::Services => self.services.render(frame, pane_area, &self.config),
+            View::Services => self.services.render(
+                frame,
+                pane_area,
+                &self.config,
+                &self.throbber_state,
+            ),
             View::ServiceDetail(_) => {
-                self.service_detail
-                    .render(frame, pane_area, &self.config, secrets.as_deref());
+                self.service_detail.render(
+                    frame,
+                    pane_area,
+                    &self.config,
+                    secrets.as_deref(),
+                    &self.throbber_state,
+                );
             }
             View::ServiceHistory(_) => {
-                self.history.render(frame, pane_area);
+                self.history
+                    .render(frame, pane_area, &self.throbber_state);
             }
             View::Logs | View::ContainerLogs { .. } => {
                 self.logs.render(frame, pane_area, &self.config);
@@ -2840,10 +3100,12 @@ impl App {
             }
             View::Secrets => {
                 self.secrets_state.ensure_loaded(&self.config, false);
-                self.secrets_state.render(frame, pane_area);
+                self.secrets_state
+                    .render(frame, pane_area, &self.throbber_state);
             }
             View::Resources => {
-                self.resources.render(frame, pane_area, &self.config);
+                self.resources
+                    .render(frame, pane_area, &self.config, &self.throbber_state);
             }
         }
 
@@ -3001,15 +3263,19 @@ impl App {
                 JobKind::Prune => "prune".to_string(),
             };
             let title = format!(
-                " {header}{} ",
+                "{header}{}",
                 match &progress.finished {
-                    None => " (running…)".to_string(),
-                    Some(Ok(_)) => " (done — esc to close)".to_string(),
-                    Some(Err(_)) => " (failed — esc to close)".to_string(),
+                    None => " · running",
+                    Some(Ok(_)) => " · done — esc to close",
+                    Some(Err(_)) => " · failed — esc to close",
                 },
             );
             let success = matches!(progress.finished, Some(Ok(_)));
             let failure = matches!(progress.finished, Some(Err(_)));
+            let running_throbber = progress
+                .finished
+                .is_none()
+                .then_some(&self.throbber_state);
             // ReconcileAll gets a status table on top of the scrolling
             // log so concurrent waves don't make the operator hunt for
             // "where is service X right now?".
@@ -3025,10 +3291,22 @@ impl App {
                     &lines,
                     success,
                     failure,
+                    running_throbber,
                 );
             } else {
-                super::ui::render_log_modal(frame, &title, &lines, success, failure);
+                super::ui::render_log_modal(
+                    frame,
+                    &title,
+                    &lines,
+                    success,
+                    failure,
+                    running_throbber,
+                );
             }
+        }
+
+        if self.drift.is_visible() {
+            super::drift::render_modal(frame, &self.drift, &self.throbber_state);
         }
 
         // Render last so it sits on top of everything else when a

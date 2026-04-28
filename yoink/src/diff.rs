@@ -14,7 +14,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::config::Config;
-use crate::deploy::{DeployError, build_desired_spec, container_name};
+use crate::deploy::{self, DeployError, build_desired_spec, container_name};
 use crate::docker;
 use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, Host};
 use crate::secrets::SecretsBundle;
@@ -55,14 +55,45 @@ pub enum ChangeKind {
     /// No matching container with the same `yoink.service` label.
     Create { desired_image: String },
     /// Existing container has the service label but a different
-    /// `spec_hash`.
+    /// `spec_hash`. `fields` is empty when we couldn't inspect the
+    /// running container (transient docker error) — the hash drift
+    /// is still authoritative; only the per-field breakdown is
+    /// best-effort.
     Update {
         current_hash: String,
         current_image: String,
         desired_image: String,
+        #[serde(default, skip_serializing_if = "FieldDiff::is_empty")]
+        fields: FieldDiff,
     },
     /// Spec hash matches — nothing for `yoink up` to do.
     NoOp { current_hash: String },
+}
+
+/// Per-field diff between a running container and its desired spec.
+/// Keys only — values may carry secret material in env, and hashes
+/// hide it for labels too. Operators get "what changed" without
+/// risking a sealed secret leaking into a PR comment.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FieldDiff {
+    pub env_added: Vec<String>,
+    pub env_removed: Vec<String>,
+    pub env_changed: Vec<String>,
+    pub labels_added: Vec<String>,
+    pub labels_removed: Vec<String>,
+    pub labels_changed: Vec<String>,
+}
+
+impl FieldDiff {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.env_added.is_empty()
+            && self.env_removed.is_empty()
+            && self.env_changed.is_empty()
+            && self.labels_added.is_empty()
+            && self.labels_removed.is_empty()
+            && self.labels_changed.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +143,7 @@ impl DiffReport {
     }
 }
 
+#[allow(clippy::too_many_lines)] // single-pass diff over services × hosts; splitting hides the data flow
 pub async fn compute(
     ops: &dyn DockerOps,
     config: &Config,
@@ -119,20 +151,28 @@ pub async fn compute(
     services_filter: Option<&[String]>,
     secrets: Option<&SecretsBundle>,
 ) -> Result<DiffReport, DiffError> {
-    // Snapshot every host's yoink-managed containers, exactly like
-    // `deploy::reconcile` does in its pre-flight pass.
-    let mut snapshot: BTreeMap<String, Vec<ContainerInfo>> = BTreeMap::new();
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
-        let containers = ops
-            .list_containers_by_label(&host, "yoink.managed=true")
-            .await
-            .map_err(|source| DiffError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
-        snapshot.insert(host.address.clone(), containers);
-    }
+    // Snapshot every host's yoink-managed containers in parallel —
+    // for an N-host fleet this is one round-trip instead of N. Same
+    // fan-out shape `deploy::reconcile` and the prune path use.
+    let snapshot: BTreeMap<String, Vec<ContainerInfo>> = {
+        let futs = config.hosts.iter().map(|host_cfg| {
+            let host = Host::from(host_cfg);
+            async move {
+                let containers = ops
+                    .list_containers_by_label(&host, "yoink.managed=true")
+                    .await
+                    .map_err(|source| DiffError::Docker {
+                        host: host.address.clone(),
+                        source,
+                    })?;
+                Ok::<_, DiffError>((host.address, containers))
+            }
+        });
+        futures_util::future::try_join_all(futs)
+            .await?
+            .into_iter()
+            .collect()
+    };
 
     let selected: BTreeSet<&str> = match services_filter {
         Some(f) => f.iter().map(String::as_str).collect(),
@@ -197,10 +237,22 @@ pub async fn compute(
                     },
                     Some(c) => {
                         owned.insert((host.clone(), c.name.clone()));
+                        let fields = inspect_field_diff(
+                            ops,
+                            &Host::from(host_cfg),
+                            &c.name,
+                            svc,
+                            &tag,
+                            &desired_hash,
+                            secrets,
+                        )
+                        .await
+                        .unwrap_or_default();
                         ChangeKind::Update {
                             current_hash: c.yoink_spec_hash.clone().unwrap_or_default(),
                             current_image: c.image.clone(),
                             desired_image: desired_image.clone(),
+                            fields,
                         }
                     }
                 }
@@ -229,6 +281,80 @@ pub async fn compute(
     }
 
     Ok(DiffReport { services, orphans })
+}
+
+/// Inspect the running container, parse its env into a key/value map,
+/// and return a key-only diff against the desired env+labels. Errors
+/// are swallowed (`Default::default()` returned) — the dry-run is
+/// informational and the hash drift is still authoritative.
+async fn inspect_field_diff(
+    ops: &dyn DockerOps,
+    host: &Host,
+    container: &str,
+    service: &crate::config::ServiceConfig,
+    tag: &str,
+    desired_hash: &str,
+    secrets: Option<&SecretsBundle>,
+) -> Result<FieldDiff, DockerError> {
+    let detail = ops.inspect_container(host, container).await?;
+    let current_env = detail.env_map();
+    let desired_env = deploy::build_env(service, secrets);
+    let (env_added, env_removed, env_changed) = diff_kv(&current_env, &desired_env);
+
+    let desired_labels = deploy::build_labels(service, tag, desired_hash);
+    let (mut labels_added, mut labels_removed, mut labels_changed) =
+        diff_kv(&detail.labels, &desired_labels);
+    // Suppress the labels yoink itself manages so the operator doesn't
+    // see them in every diff:
+    //   - `yoink.version` / `yoink.spec_hash` are already shown via the
+    //     dedicated tag/spec_hash diff lines.
+    //   - `yoink.deployed-*` are audit labels written at deploy time
+    //     (see `deploy::audit_labels`), kept out of `build_labels` so
+    //     the spec_hash isn't poisoned. Without this filter every
+    //     Update would report them as `removed` since they're in the
+    //     running container but not in `desired_labels`.
+    labels_added.retain(|k| !is_yoink_managed_label(k));
+    labels_removed.retain(|k| !is_yoink_managed_label(k));
+    labels_changed.retain(|k| !is_yoink_managed_label(k));
+
+    Ok(FieldDiff {
+        env_added,
+        env_removed,
+        env_changed,
+        labels_added,
+        labels_removed,
+        labels_changed,
+    })
+}
+
+/// Labels yoink manages on its own and that the field-diff suppresses
+/// from added/removed/changed lists. These are either represented by
+/// other parts of the diff (`yoink.version`, `yoink.spec_hash` ↔ the
+/// tag and `spec_hash` columns) or by design absent from `build_labels`
+/// (`yoink.deployed-*` audit labels — see `deploy::audit_labels`).
+fn is_yoink_managed_label(k: &str) -> bool {
+    matches!(k, "yoink.version" | "yoink.spec_hash") || k.starts_with("yoink.deployed-")
+}
+
+fn diff_kv(
+    current: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, String>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    for (k, v) in desired {
+        match current.get(k) {
+            None => added.push(k.clone()),
+            Some(cv) if cv != v => changed.push(k.clone()),
+            _ => {}
+        }
+    }
+    let removed: Vec<String> = current
+        .keys()
+        .filter(|k| !desired.contains_key(*k))
+        .cloned()
+        .collect();
+    (added, removed, changed)
 }
 
 // ---------------------------------------------------------------------
@@ -360,18 +486,65 @@ fn text_row(d: &ServiceDiff) -> String {
             current_hash,
             current_image,
             desired_image,
-        } => format!(
-            "~ {:18} {} → {}    {current_image} → {desired_image}",
-            d.service,
-            short(current_hash),
-            short(&d.desired_hash),
-        ),
+            fields,
+        } => {
+            let head = format!(
+                "~ {:18} {} → {}    {current_image} → {desired_image}",
+                d.service,
+                short(current_hash),
+                short(&d.desired_hash),
+            );
+            let detail = field_diff_lines(fields, "      ");
+            if detail.is_empty() {
+                head
+            } else {
+                format!("{head}\n{detail}")
+            }
+        }
         ChangeKind::NoOp { current_hash } => format!(
             "= {:18} {}              (no change)",
             d.service,
             short(current_hash)
         ),
     }
+}
+
+/// Render a `FieldDiff` as `+`/`-`/`~` lines, indented by `indent`.
+/// Empty when nothing changed at the env/label level.
+fn field_diff_lines(fields: &FieldDiff, indent: &str) -> String {
+    if fields.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    let mut group = |label: &str, added: &[String], removed: &[String], changed: &[String]| {
+        if added.is_empty() && removed.is_empty() && changed.is_empty() {
+            return;
+        }
+        let mut parts = Vec::new();
+        for k in added {
+            parts.push(format!("+ {k}"));
+        }
+        for k in removed {
+            parts.push(format!("- {k}"));
+        }
+        for k in changed {
+            parts.push(format!("~ {k}"));
+        }
+        lines.push(format!("{indent}{label}: {}", parts.join(", ")));
+    };
+    group(
+        "env",
+        &fields.env_added,
+        &fields.env_removed,
+        &fields.env_changed,
+    );
+    group(
+        "labels",
+        &fields.labels_added,
+        &fields.labels_removed,
+        &fields.labels_changed,
+    );
+    lines.join("\n")
 }
 
 fn markdown_cells(d: &ServiceDiff) -> (&'static str, String, String) {
@@ -383,6 +556,7 @@ fn markdown_cells(d: &ServiceDiff) -> (&'static str, String, String) {
             current_hash,
             current_image,
             desired_image,
+            fields: _,
         } => (
             "🟡",
             format!("`{}` → `{}`", short(current_hash), short(&d.desired_hash)),
@@ -427,6 +601,7 @@ mod tests {
                 current_hash: "0123456789".into(),
                 current_image: "img:v1".into(),
                 desired_image: "img:v2".into(),
+                fields: FieldDiff::default(),
             },
         }
     }
@@ -521,5 +696,47 @@ mod tests {
         let r = diff_with(vec![noop("a", "h1")], vec![]);
         let m = r.render(Format::Markdown);
         assert!(m.contains("_No changes._"));
+    }
+
+    #[test]
+    fn text_render_shows_field_diff_under_update() {
+        let mut row = update("api", "h1");
+        if let ChangeKind::Update { ref mut fields, .. } = row.change {
+            fields.env_added = vec!["DATABASE_POOL_SIZE".into()];
+            fields.env_changed = vec!["LOG_LEVEL".into()];
+            fields.labels_removed = vec!["yoink.caddy.tls".into()];
+        }
+        let t = diff_with(vec![row], vec![]).render(Format::Text);
+        assert!(t.contains("env: + DATABASE_POOL_SIZE, ~ LOG_LEVEL"));
+        assert!(t.contains("labels: - yoink.caddy.tls"));
+    }
+
+    #[test]
+    fn is_yoink_managed_label_recognises_audit_and_spec_keys() {
+        assert!(is_yoink_managed_label("yoink.version"));
+        assert!(is_yoink_managed_label("yoink.spec_hash"));
+        assert!(is_yoink_managed_label("yoink.deployed-by"));
+        assert!(is_yoink_managed_label("yoink.deployed-at"));
+        // Other yoink labels (caddy, custom user labels under yoink.*)
+        // remain visible in the diff.
+        assert!(!is_yoink_managed_label("yoink.caddy.domain"));
+        assert!(!is_yoink_managed_label("yoink.service"));
+        assert!(!is_yoink_managed_label("org.opencontainers.image.description"));
+    }
+
+    #[test]
+    fn diff_kv_classifies_added_removed_changed() {
+        let mut current = BTreeMap::new();
+        current.insert("KEEP".into(), "same".into());
+        current.insert("CHANGE".into(), "old".into());
+        current.insert("REMOVE".into(), "gone".into());
+        let mut desired = BTreeMap::new();
+        desired.insert("KEEP".into(), "same".into());
+        desired.insert("CHANGE".into(), "new".into());
+        desired.insert("ADD".into(), "fresh".into());
+        let (added, removed, changed) = diff_kv(&current, &desired);
+        assert_eq!(added, vec!["ADD"]);
+        assert_eq!(removed, vec!["REMOVE"]);
+        assert_eq!(changed, vec!["CHANGE"]);
     }
 }

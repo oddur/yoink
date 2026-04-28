@@ -2,8 +2,11 @@
 //! rendering.
 
 mod app;
+mod chrome;
 mod container_detail;
 mod dashboard;
+mod drift;
+mod editor;
 mod history;
 mod host_detail;
 mod hosts;

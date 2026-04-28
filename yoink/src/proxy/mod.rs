@@ -216,6 +216,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
     ServiceConfig {
         name: PROXY_SERVICE_NAME.to_string(),
         image,
+        description: None,
         kind: Some(ServiceKind::Proxy),
         build: None,
         tag,

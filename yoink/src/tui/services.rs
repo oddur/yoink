@@ -106,7 +106,13 @@ impl ServicesState {
             .collect()
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, config: &Config) {
+    pub fn render(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        config: &Config,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         let layout = pane_layout(area);
         let header = Paragraph::new(format!(
             "yoink services · {} declared · ↑↓ select · enter for instances",
@@ -125,7 +131,7 @@ impl ServicesState {
         let visible = self.visible_indices();
         clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from("(loading…)")])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
         } else if visible.is_empty() && !self.service_names.is_empty() {
             vec![Row::new(vec![Cell::from("(no services match filter)")])]
         } else {
@@ -359,6 +365,7 @@ impl ServiceDetailState {
         area: ratatui::layout::Rect,
         config: &Config,
         secrets: Option<&SecretsBundle>,
+        throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         let layout = pane_layout(area);
         let header_text = match &self.service {
@@ -383,7 +390,7 @@ impl ServiceDetailState {
         let visible = self.visible_indices();
         clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from("(loading…)")])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
         } else if self.rows.is_empty() {
             vec![Row::new(vec![Cell::from("(no instances)")])]
         } else if visible.is_empty() {

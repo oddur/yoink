@@ -5,6 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, TableState};
+use throbber_widgets_tui::{Throbber, ThrobberState};
 
 use crate::config::Config;
 use crate::deploy;
@@ -16,6 +17,62 @@ use crate::secrets::SecretsBundle;
 #[must_use]
 pub fn bold() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
+}
+
+fn throbber_glyph_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Animated "loading…" line, shared by every pane that drops a
+/// placeholder row while a docker fetch is in flight. Drives off the
+/// `throbber-widgets-tui` crate so the spinner glyph rotates with the
+/// app's `ThrobberState` (advanced once per fast UI tick) — clearly
+/// distinguishing "still working" from "stuck on an old result".
+#[must_use]
+pub fn loading_line(state: &ThrobberState) -> Line<'static> {
+    throbber_with_label(state, " loading…")
+}
+
+/// Same as [`loading_line`] but with a caller-supplied label.
+/// Use it when "loading" is the wrong word (e.g. " running…",
+/// " pulling…") so the spinner reads naturally for the action
+/// it's animating.
+#[must_use]
+pub fn throbber_with_label(state: &ThrobberState, label: &'static str) -> Line<'static> {
+    Throbber::default()
+        .label(label)
+        .style(Style::default().fg(Color::DarkGray))
+        .throbber_style(throbber_glyph_style())
+        .to_line(state)
+}
+
+/// Just the rotating throbber glyph — useful when you need to embed
+/// the spinner inside a richer line (a modal title, a status table
+/// row) where the surrounding spans already carry their own styling.
+#[must_use]
+pub fn throbber_span(state: &ThrobberState) -> Span<'static> {
+    Throbber::default()
+        .throbber_style(throbber_glyph_style())
+        .to_symbol_span(state)
+}
+
+/// Compose a modal title `Line`. When `throbber` is `Some` (job is
+/// still in flight) a rotating glyph is prepended so the operator
+/// has a visible "still working" cue independent of the streaming
+/// log — a streaming log that has stalled for 30 seconds looks the
+/// same as a finished one until the spinner stops moving.
+#[must_use]
+fn modal_title(title: &str, throbber: Option<&ThrobberState>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::raw(" "));
+    if let Some(state) = throbber {
+        spans.push(throbber_span(state));
+    }
+    spans.push(Span::raw(title.to_string()));
+    spans.push(Span::raw(" "));
+    Line::from(spans)
 }
 
 /// Drift cell shared by every list view (dashboard, host detail,
@@ -162,6 +219,13 @@ pub fn split_with_header(area: Rect) -> (Rect, Rect) {
 /// top-level section labels; `selected_tab` is the currently active
 /// index (or `None` to dim the whole bar — used inside drill-down
 /// views that don't map cleanly to a single top-level tab).
+///
+/// `slug` is rendered centered in the top border in bold red — a
+/// loud, always-visible reminder that the operator opted into
+/// (e.g. "PRODUCTION — TREAD CAREFULLY") for configs where typing
+/// `up` should give pause. `source` shows where the config came from
+/// (typically "<git-repo>" or "<git-repo>(*)" when dirty), aligned
+/// right in the top border.
 #[allow(clippy::too_many_arguments)]
 pub fn render_header(
     frame: &mut Frame<'_>,
@@ -170,10 +234,12 @@ pub fn render_header(
     selected_tab: Option<usize>,
     crumbs: &[String],
     right: &str,
+    slug: Option<&str>,
+    source: Option<&str>,
 ) {
     use ratatui::widgets::Tabs;
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Gray))
         .title(Line::from(Span::styled(
@@ -182,6 +248,26 @@ pub fn render_header(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
+    if let Some(text) = slug.map(str::trim).filter(|s| !s.is_empty()) {
+        block = block.title(
+            Line::from(Span::styled(
+                format!(" {text} "),
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .centered(),
+        );
+    }
+    if let Some(text) = source.map(str::trim).filter(|s| !s.is_empty()) {
+        block = block.title(
+            Line::from(Span::styled(
+                format!(" {text} "),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .right_aligned(),
+        );
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -463,13 +549,16 @@ pub fn render_vertical_scrollbar(
 /// Big centered modal that displays a streaming log, auto-scrolled
 /// so the newest line is always visible. `success` / `failure` tint
 /// the border (green / red) once the producing task is done — both
-/// false means "still running".
+/// false means "still running". When `throbber` is `Some` the title
+/// gets a leading spinner glyph so the operator can distinguish
+/// "still working" from "frozen".
 pub fn render_log_modal(
     frame: &mut Frame<'_>,
     title: &str,
     lines: &[String],
     success: bool,
     failure: bool,
+    throbber: Option<&ThrobberState>,
 ) {
     let area = frame.area();
     // 90% of the available area, capped at 120×40 so the modal feels
@@ -495,7 +584,7 @@ pub fn render_log_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .title(title.to_string());
+        .title(modal_title(title, throbber));
 
     // Auto-scroll: keep the newest line glued to the bottom.
     let inner_height = modal_area.height.saturating_sub(2) as usize;
@@ -516,6 +605,7 @@ pub fn render_log_modal(
 /// scrolling event log below. Used for `JobKind::ReconcileAll` so
 /// concurrent waves are legible at a glance — the status table is the
 /// "where is everyone right now?" overview, the log is the detail.
+#[allow(clippy::too_many_arguments)]
 pub fn render_status_log_modal(
     frame: &mut Frame<'_>,
     title: &str,
@@ -523,6 +613,7 @@ pub fn render_status_log_modal(
     lines: &[String],
     success: bool,
     failure: bool,
+    throbber: Option<&ThrobberState>,
 ) {
     let area = frame.area();
     let modal_width = (area.width.saturating_sub(4)).clamp(40, 120);
@@ -546,7 +637,7 @@ pub fn render_status_log_modal(
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .title(title.to_string());
+        .title(modal_title(title, throbber));
     frame.render_widget(Clear, modal_area);
     frame.render_widget(&outer, modal_area);
 

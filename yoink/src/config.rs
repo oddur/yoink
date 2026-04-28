@@ -40,6 +40,13 @@ pub enum ConfigError {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Optional banner text rendered in the TUI's top chrome on every
+    /// view. Use it to mark a config — typically `"PRODUCTION — TREAD
+    /// CAREFULLY"` — so an operator can't miss what they're pointed at.
+    /// Free-form: anything goes, but keep it short (the chrome reserves
+    /// a single line).
+    #[serde(default)]
+    pub slug: Option<String>,
     #[serde(default)]
     pub deploy: DeployDefaults,
     #[serde(default)]
@@ -429,6 +436,12 @@ pub enum TlsMode {
 pub struct ServiceConfig {
     pub name: String,
     pub image: String,
+    /// Human-readable summary of what this service does. Written to every
+    /// container as `org.opencontainers.image.description` (the OCI standard
+    /// label key) so the TUI can surface it for both yoink-deployed and
+    /// 3rd-party OCI-compliant containers via a single label lookup.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Special-purpose service marker. Set automatically on the
     /// implicit `_proxy` service; users do not write this.
     #[serde(default)]

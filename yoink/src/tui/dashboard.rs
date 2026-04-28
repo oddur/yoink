@@ -183,6 +183,7 @@ impl DashboardState {
         config: &Config,
         secrets: Option<&SecretsBundle>,
         history: &HashMap<(String, String), StatsHistory>,
+        throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         let layout = pane_layout(area);
 
@@ -196,7 +197,7 @@ impl DashboardState {
             Paragraph::new(format!("yoink dashboard · services: {services}")).style(bold());
         frame.render_widget(header, layout[0]);
 
-        let rows = self.build_rows(config, secrets, history);
+        let rows = self.build_rows(config, secrets, history, throbber);
         let widths = [
             Constraint::Length(18), // host
             Constraint::Length(14), // service
@@ -252,17 +253,16 @@ impl DashboardState {
         config: &Config,
         secrets: Option<&SecretsBundle>,
         history: &HashMap<(String, String), StatsHistory>,
+        throbber: &throbber_widgets_tui::ThrobberState,
     ) -> Vec<Row<'static>> {
         let Some(report) = &self.report else {
             // No cached report. If the first fetch already finished
             // and errored (loaded=true), don't pretend we're still
             // loading — the error footer carries the detail.
-            let cell = if self.loaded {
-                "(no data — see error in footer)"
-            } else {
-                "(loading…)"
-            };
-            return vec![Row::new(vec![Cell::from(cell)])];
+            if self.loaded {
+                return vec![Row::new(vec![Cell::from("(no data — see error in footer)")])];
+            }
+            return vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])];
         };
         let mut rows: Vec<Row<'_>> = Vec::new();
         for host in &report.hosts {

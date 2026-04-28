@@ -212,6 +212,24 @@ enum Command {
         /// up). Combine with `--service <name>` to limit blast radius.
         #[arg(long)]
         force: bool,
+        /// Use `git rev-parse --short HEAD` as the tag for every
+        /// selected service (or every service when `--service` is
+        /// omitted). Equivalent to `--service x --tag $(git rev-parse
+        /// --short HEAD)` per service. Conflicts with bare `--tag`.
+        #[arg(long, conflicts_with = "tag")]
+        here: bool,
+        /// Friendlier alias for `--dry-run`. Mirrors `terraform plan`:
+        /// print what would change and exit without mutating. With
+        /// the default `--format text`, output reads as a per-service
+        /// summary; `--format markdown` is suitable for PR comments.
+        #[arg(long, conflicts_with = "watch")]
+        plan: bool,
+        /// Re-reconcile whenever the config changes on disk. Polls
+        /// every 2s — same cadence as the TUI's reload tick. Pairs
+        /// with `--build --no-registry --service <name>` for the
+        /// edit-save-deploy inner loop. Ctrl-C exits.
+        #[arg(long)]
+        watch: bool,
     },
     /// Build one or more services' images via `docker build` against
     /// the operator's local docker daemon. Tags the result as
@@ -305,7 +323,11 @@ enum Command {
     Version { service: String },
     /// Drop into an interactive PTY shell inside a service's container
     /// (k9s-style, terminal-side). Picks `bash` when present, falls
-    /// back to `sh`. Exit with `exit` or Ctrl-D.
+    /// back to `sh`. With multiple replicas and no `--host`, picks the
+    /// first healthy replica. Exit with `exit` or Ctrl-D.
+    ///
+    /// Aliased as `ssh` for muscle memory.
+    #[command(alias = "ssh")]
     Shell {
         /// Service name as declared in the config.
         service: String,
@@ -453,11 +475,32 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Internal: print field values for shell completion. Hidden
+    /// because it's plumbing for the bash/zsh snippet documented in
+    /// the CLI reference; operators don't invoke it directly.
+    #[command(name = "__complete", hide = true)]
+    Complete {
+        #[arg(value_enum)]
+        what: CompleteKind,
+    },
     /// Manage `age`-sealed secrets (the batteries-included default).
     Secrets {
         #[command(subcommand)]
         action: SecretsAction,
     },
+}
+
+/// What `yoink __complete` lists. Drives the dynamic-completion
+/// snippets in the CLI reference docs — extend as new shell-completion
+/// needs surface.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CompleteKind {
+    Services,
+    Hosts,
+    /// Yoink config files reachable from the current working
+    /// directory. Walked depth-first, ranked by recency. Powers
+    /// `yoink -c <TAB>`.
+    Configs,
 }
 
 /// Subcommands for `yoink secrets`.
@@ -725,6 +768,9 @@ async fn run(cli: Cli) -> Result<()> {
             transport,
             build,
             force,
+            here,
+            plan,
+            watch,
         } => {
             cmd_up(
                 &config,
@@ -738,6 +784,10 @@ async fn run(cli: Cli) -> Result<()> {
                     transport: transport.into(),
                     build,
                     force,
+                    here,
+                    plan,
+                    watch,
+                    config_path: &cli.config,
                 },
             )
             .await
@@ -806,6 +856,10 @@ async fn run(cli: Cli) -> Result<()> {
             cmd_completions(shell);
             Ok(())
         }
+        Command::Complete { what } => {
+            cmd_complete(&config, what);
+            Ok(())
+        }
         Command::Secrets { action } => cmd_secrets(&config, action),
         Command::Tui { mode, mouse } => cmd_tui(&config, cli.config.clone(), mode, mouse).await,
         Command::Init { .. } => unreachable!("init handled by run_bootstrap"),
@@ -838,9 +892,8 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
     Ok(())
 }
 
-// `UpOptions` mirrors the `up` subcommand's flags 1:1. The bool count
-// is the actual CLI surface; rolling them into an enum would just hide
-// the same surface area at higher cognitive cost.
+// Each bool is a discrete CLI flag; collapsing them would just hide
+// the same surface area behind an enum.
 #[allow(clippy::struct_excessive_bools)]
 struct UpOptions<'a> {
     services: &'a [String],
@@ -852,22 +905,105 @@ struct UpOptions<'a> {
     transport: yoink::transport::Transport,
     build: bool,
     force: bool,
+    /// Pin every selected service to the current git short SHA.
+    here: bool,
+    /// Friendlier alias for `dry_run` — same machinery, different name.
+    plan: bool,
+    /// Re-reconcile on config-file change. Drives the watch loop in
+    /// `cmd_up` after the initial run completes.
+    watch: bool,
+    /// Source path for the watch loop's `Config::load_from_path` polling.
+    /// Always set when `watch` is true; ignored otherwise.
+    config_path: &'a std::path::Path,
 }
 
-#[allow(clippy::too_many_lines)] // borderline (6 lines over); split if it grows further
 async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
+    let dry_run = up.dry_run || up.plan;
+
+    do_up_once(config, &up, dry_run).await?;
+    if !up.watch {
+        return Ok(());
+    }
+    if dry_run {
+        // The watch loop only makes sense when we're actually
+        // mutating — otherwise it would re-print the same diff every
+        // 2s. Reject rather than silently spin.
+        anyhow::bail!("--watch and --plan/--dry-run are mutually exclusive");
+    }
+
+    eprintln!("● watching {} for changes (Ctrl-C to exit)", up.config_path.display());
+    let mut last_config = config.clone();
+    let mut last_error: Option<String> = None;
+    let mut tick = tokio::time::interval(WATCH_TICK);
+    tick.tick().await; // burn the immediate first fire
+    let ctrlc = tokio::signal::ctrl_c();
+    tokio::pin!(ctrlc);
+    loop {
+        tokio::select! {
+            _ = &mut ctrlc => {
+                eprintln!("\n✗ watch interrupted");
+                break;
+            }
+            _ = tick.tick() => {
+                let next = match Config::load_from_path(up.config_path) {
+                    Ok(c) => {
+                        // Surface the recovery once so the operator
+                        // knows yoink is happy again.
+                        if last_error.is_some() {
+                            eprintln!("● config OK — resuming");
+                            last_error = None;
+                        }
+                        c
+                    }
+                    Err(e) => {
+                        // Print the parse error once per *unique*
+                        // message — a half-saved edit shouldn't fill
+                        // the terminal with the same error every 2s.
+                        let msg = format!("✗ config reload failed: {e}");
+                        if last_error.as_deref() != Some(msg.as_str()) {
+                            eprintln!("{msg}");
+                            last_error = Some(msg);
+                        }
+                        continue;
+                    }
+                };
+                if next == last_config {
+                    continue;
+                }
+                eprintln!("● config changed — reconciling");
+                if let Err(e) = do_up_once(&next, &up, dry_run).await {
+                    eprintln!("✗ reconcile failed: {e:#}");
+                }
+                last_config = next;
+            }
+        }
+    }
+    Ok(())
+}
+
+const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[allow(clippy::too_many_lines)]
+async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Result<()> {
     use yoink::docker_ops::Host;
     use yoink::lock::HostLock;
-    let UpOptions {
+    let &UpOptions {
         services,
         tag_args,
         allow_dirty,
-        dry_run,
         format,
         no_registry,
         transport,
         build,
         force,
+        here,
+        // `dry_run` arrives as a separate parameter (collapsed with
+        // `plan` upstream); `plan`, `watch`, `config_path` are
+        // handled by the caller.
+        dry_run: _,
+        plan: _,
+        watch: _,
+        config_path: _,
     } = up;
 
     // Load bundle first so build_real_ops can reuse it for any
@@ -877,7 +1013,25 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
     // their own clone for the duration of the deploy.
     let ops: std::sync::Arc<dyn DockerOps> =
         std::sync::Arc::new(build_real_ops(config, bundle.as_ref()).await?);
-    let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
+    // `--here`: resolve current git short SHA and inject as per-service
+    // `name=tag` overrides so the rest of the pipeline treats it like
+    // any other explicit tag — and `parse_tag_overrides`'s bare-tag-
+    // without-service guard doesn't fire.
+    let here_overrides: Vec<String> = if here {
+        let cwd = std::env::current_dir().context("--here: read current directory")?;
+        let sha = git::current_short_sha(&cwd)
+            .context("--here: resolve git short SHA from current directory")?;
+        let names: Vec<&str> = if services.is_empty() {
+            config.services.iter().map(|s| s.name.as_str()).collect()
+        } else {
+            services.iter().map(String::as_str).collect()
+        };
+        names.iter().map(|n| format!("{n}={sha}")).collect()
+    } else {
+        Vec::new()
+    };
+    let tag_args: Vec<String> = tag_args.iter().chain(here_overrides.iter()).cloned().collect();
+    let tag_overrides = parse_tag_overrides(&tag_args, services, allow_dirty)?;
 
     let services_filter = services_filter(services);
 
@@ -1201,6 +1355,10 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
             transport: yoink::transport::Transport::Auto,
             build: false,
             force: false,
+            here: false,
+            plan: false,
+            watch: false,
+            config_path: std::path::Path::new(""),
         },
     )
     .await
@@ -1274,44 +1432,67 @@ async fn build_real_ops(
 /// via the `yoink.service=<name>` label. Errors with the candidate set
 /// when the user doesn't pin a host on a multi-replica service, so an
 /// `exec` or `logs` command can't accidentally hit the wrong replica.
+/// Every running replica of `service` (optionally filtered to a host).
+/// Used by both the strict `resolve_running_container` (errors on >1)
+/// and the replica-aware shell/logs paths (auto-pick / multiplex).
+/// Per-host listings run in parallel — for a fleet of N hosts this is
+/// one round-trip instead of N. Same fan-out shape used elsewhere in
+/// the CLI (deploy.rs, prune, prefetch).
+async fn list_running_replicas(
+    ops: &dyn DockerOps,
+    config: &Config,
+    service: &str,
+    host_filter: Option<&str>,
+) -> Result<Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>> {
+    use yoink::docker_ops::Host;
+    let label = format!("yoink.service={service}");
+    let futs = config
+        .hosts
+        .iter()
+        .filter(|h| host_filter.is_none_or(|f| f == h.address))
+        .map(|host_cfg| {
+            let host = Host::from(host_cfg);
+            let label = &label;
+            async move {
+                let containers = ops
+                    .list_containers_by_label(&host, label)
+                    .await
+                    .with_context(|| format!("list containers on {}", host.address))?;
+                anyhow::Ok((host, containers))
+            }
+        });
+    let per_host = futures_util::future::try_join_all(futs).await?;
+    let mut candidates = Vec::new();
+    for (host, containers) in per_host {
+        for c in containers {
+            if c.is_running() {
+                candidates.push((host.clone(), c));
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+/// Strict resolver — errors on zero or many candidates. Used by gestures
+/// that target *one* container (`exec`, `restart`, `version`, `logs`
+/// without multiplexing).
 async fn resolve_running_container(
     ops: &dyn DockerOps,
     config: &Config,
     service: &str,
     host_filter: Option<&str>,
 ) -> Result<(yoink::docker_ops::Host, String)> {
-    use yoink::docker_ops::Host;
-    let label = format!("yoink.service={service}");
-    let mut candidates: Vec<(Host, String)> = Vec::new();
-    for host_cfg in &config.hosts {
-        if let Some(filter) = host_filter
-            && filter != host_cfg.address
-        {
-            continue;
-        }
-        let host = Host::from(host_cfg);
-        let containers = ops
-            .list_containers_by_label(&host, &label)
-            .await
-            .with_context(|| format!("list containers on {}", host.address))?;
-        for c in containers {
-            if c.is_running() {
-                candidates.push((host.clone(), c.name));
-            }
-        }
-    }
+    let candidates = list_running_replicas(ops, config, service, host_filter).await?;
     match candidates.len() {
-        0 => anyhow::bail!(
-            "no running container with yoink.service={service}{}",
-            host_filter
-                .map(|h| format!(" on host {h}"))
-                .unwrap_or_default()
-        ),
-        1 => Ok(candidates.into_iter().next().expect("len == 1")),
+        0 => Err(no_replicas_err(service, host_filter)),
+        1 => {
+            let (h, c) = candidates.into_iter().next().expect("len == 1");
+            Ok((h, c.name))
+        }
         _ => {
             let listing = candidates
                 .iter()
-                .map(|(h, n)| format!("  {} → {}", h.address, n))
+                .map(|(h, c)| format!("  {} → {}", h.address, c.name))
                 .collect::<Vec<_>>()
                 .join("\n");
             anyhow::bail!(
@@ -1319,6 +1500,33 @@ async fn resolve_running_container(
             )
         }
     }
+}
+
+/// Standard "no running replicas" error, shared by every gesture
+/// that targets a service by name (`shell`, `logs`, `exec`, …).
+fn no_replicas_err(service: &str, host_filter: Option<&str>) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no running container with yoink.service={service}{}",
+        host_filter
+            .map(|h| format!(" on host {h}"))
+            .unwrap_or_default()
+    )
+}
+
+/// Replica-aware picker: prefer the first explicitly healthy replica;
+/// fall back to the first running. The fall-back covers services with
+/// no `healthcheck_path:` (where `health_hint()` is always `None`) so
+/// `yoink shell <svc>` still works on them.
+fn pick_healthy_replica(
+    candidates: Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>,
+) -> Option<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)> {
+    if let Some(idx) = candidates
+        .iter()
+        .position(|(_, c)| c.health_hint() == Some("healthy"))
+    {
+        return candidates.into_iter().nth(idx);
+    }
+    candidates.into_iter().next()
 }
 
 async fn cmd_exec(
@@ -1352,32 +1560,103 @@ async fn cmd_logs(
     follow: bool,
     tail: u32,
 ) -> Result<()> {
-    let ops = build_real_ops(config, None).await?;
-    let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
+    let ops: std::sync::Arc<dyn DockerOps> =
+        std::sync::Arc::new(build_real_ops(config, None).await?);
+    let candidates = list_running_replicas(ops.as_ref(), config, service, host_filter).await?;
+    if candidates.is_empty() {
+        return Err(no_replicas_err(service, host_filter));
+    }
     if follow {
-        let mut rx = ops
-            .open_log_stream(&host, &container, tail)
-            .await
-            .with_context(|| format!("open log stream {}@{container}", host.address))?;
-        // Honor SIGINT cleanly so Ctrl-C doesn't dump a panic.
-        let ctrlc = tokio::signal::ctrl_c();
-        tokio::pin!(ctrlc);
-        loop {
-            tokio::select! {
-                line = rx.recv() => match line {
-                    Some(l) => println!("{}", l.message),
-                    None => break,
-                },
-                _ = &mut ctrlc => break,
-            }
-        }
+        cmd_logs_follow(ops, candidates, tail).await
     } else {
+        cmd_logs_tail(&*ops, candidates, tail).await
+    }
+}
+
+/// `[host/container] ` prefix, or empty when there's only one replica
+/// (preserved so shell pipelines piping `yoink logs` into `grep` keep
+/// working unchanged for the single-replica case).
+fn replica_prefix(host: &yoink::docker_ops::Host, info: &yoink::docker_ops::ContainerInfo, multi: bool) -> String {
+    if multi {
+        format!("[{}/{}] ", host.address, info.name)
+    } else {
+        String::new()
+    }
+}
+
+/// Multiplexed `--follow` path: one stream task per replica fanned
+/// into a shared mpsc. `drop(tx)` after the spawn loop closes the
+/// channel once every per-replica task exits.
+async fn cmd_logs_follow(
+    ops: std::sync::Arc<dyn DockerOps>,
+    candidates: Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>,
+    tail: u32,
+) -> Result<()> {
+    let multi = candidates.len() > 1;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    for (host, info) in candidates {
+        let ops = ops.clone();
+        let tx = tx.clone();
+        let prefix = replica_prefix(&host, &info, multi);
+        tokio::spawn(async move {
+            let mut stream = match ops.open_log_stream(&host, &info.name, tail).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    let _ = tx.send(format!("{prefix}log stream failed: {e}"));
+                    return;
+                }
+            };
+            while let Some(line) = stream.recv().await {
+                let formatted = if prefix.is_empty() {
+                    line.message
+                } else {
+                    format!("{prefix}{}", line.message)
+                };
+                if tx.send(formatted).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let ctrlc = tokio::signal::ctrl_c();
+    tokio::pin!(ctrlc);
+    loop {
+        tokio::select! {
+            line = rx.recv() => match line {
+                Some(s) => println!("{s}"),
+                None => break,
+            },
+            _ = &mut ctrlc => break,
+        }
+    }
+    Ok(())
+}
+
+/// One-shot tail path: fetch each replica's recent log buffer and
+/// print, prefixing per-line when there's >1 replica. `fetch_recent_logs`
+/// returns lines with trailing newlines preserved, so prefixes are
+/// inserted before each `\n`-delimited segment.
+async fn cmd_logs_tail(
+    ops: &dyn DockerOps,
+    candidates: Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>,
+    tail: u32,
+) -> Result<()> {
+    let multi = candidates.len() > 1;
+    for (host, info) in candidates {
         let lines = ops
-            .fetch_recent_logs(&host, &container, tail)
+            .fetch_recent_logs(&host, &info.name, tail)
             .await
-            .with_context(|| format!("fetch logs {}@{container}", host.address))?;
+            .with_context(|| format!("fetch logs {}@{}", host.address, info.name))?;
+        let prefix = replica_prefix(&host, &info, multi);
         for l in lines {
-            print!("{l}");
+            if prefix.is_empty() {
+                print!("{l}");
+            } else {
+                for raw in l.split_inclusive('\n') {
+                    print!("{prefix}{raw}");
+                }
+            }
         }
     }
     Ok(())
@@ -1422,8 +1701,25 @@ async fn cmd_pty(
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 
     let ops: std::sync::Arc<dyn DockerOps> = std::sync::Arc::new(build_real_ops(config, None).await?);
-    let (host, container) =
-        resolve_running_container(ops.as_ref(), config, service, host_filter).await?;
+    // For shell, we don't need a single-replica guarantee — pick a
+    // healthy replica (or the first running one) and tell the operator
+    // which one we landed on.
+    let candidates = list_running_replicas(ops.as_ref(), config, service, host_filter).await?;
+    if candidates.is_empty() {
+        return Err(no_replicas_err(service, host_filter));
+    }
+    let multi = candidates.len() > 1;
+    let (host, info) =
+        pick_healthy_replica(candidates).expect("non-empty checked above");
+    let container = info.name.clone();
+    if multi {
+        eprintln!(
+            "→ {}/{} ({})",
+            host.address,
+            container,
+            info.health_hint().unwrap_or("running"),
+        );
+    }
 
     let (cols, rows) = size().context("query terminal size")?;
 
@@ -2539,6 +2835,30 @@ fn cmd_completions(shell: clap_complete::Shell) {
     clap_complete::generate(shell, &mut cmd, bin_name, &mut io::stdout());
 }
 
+/// Print one value per line. Output is consumed by the bash/zsh
+/// snippet in the CLI reference; stays terse on purpose. `Configs`
+/// is handled in `run_bootstrap` because completing config paths is
+/// the one case that *must* work without a config already loaded.
+fn cmd_complete(config: &Config, what: CompleteKind) {
+    match what {
+        CompleteKind::Services => {
+            for svc in &config.services {
+                println!("{}", svc.name);
+            }
+        }
+        CompleteKind::Hosts => {
+            for host in &config.hosts {
+                println!("{}", host.address);
+            }
+        }
+        CompleteKind::Configs => {
+            // Bootstrap should have caught this; render anyway in
+            // case someone calls through `run()` directly.
+            yoink::completion::print_yoink_configs();
+        }
+    }
+}
+
 /// Subcommands that don't need a `yoink.yaml`. Returns `Some(result)`
 /// to short-circuit `run`'s config-load step, or `None` to fall
 /// through.
@@ -2546,6 +2866,15 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
     match command {
         Command::Completions { shell } => {
             cmd_completions(*shell);
+            Some(Ok(()))
+        }
+        Command::Complete {
+            what: CompleteKind::Configs,
+        } => {
+            // Configs completion *cannot* depend on a config already
+            // existing — the whole point is to find one to use. Run
+            // before the load step in `run()`.
+            yoink::completion::print_yoink_configs();
             Some(Ok(()))
         }
         Command::Secrets {
@@ -2943,3 +3272,4 @@ fn chrono_like_now() -> String {
         .unwrap_or_default();
     format!("unix={secs}")
 }
+
