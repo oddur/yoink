@@ -1,6 +1,6 @@
 ---
 title: Cloudflare Origin Certificates
-weight: 10
+weight: 13
 ---
 
 If you're already on Cloudflare's edge, **Origin Certificates** are the simplest TLS story for your origin hosts: free, valid for 15 years, no ACME, no Let's Encrypt rate limits, no port-80 reachability requirement. Yoink supports them out of the box.

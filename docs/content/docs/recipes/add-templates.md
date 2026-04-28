@@ -107,3 +107,9 @@ typos surface as clear errors instead of silently using empty values.
   the cached SHA. Otherwise pass a pinned `@<sha>`.
 - **"rendered file failed yoink validation"**: bug in the template;
   please report it (or open a PR if it's one of the bundled ones).
+
+## See also
+
+- [Authoring templates for `yoink add`](/docs/recipes/authoring-templates) — write your own bundled or 3rd-party templates.
+- [TanStack Start + postgres from scratch](/docs/recipes/tanstack-stack) — `yoink add` in an end-to-end recipe.
+- [Sealed secrets (age)](/docs/recipes/sealed-secrets) — how the secrets that templates seal get decrypted at deploy time.

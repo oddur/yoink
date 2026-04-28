@@ -633,7 +633,11 @@ impl ContainerDetailState {
         inspect: &ContainerDetail,
         stats: Option<&ContainerStats>,
     ) {
-        let block = Block::default().borders(Borders::ALL).title(" container ");
+        let title = format!(
+            " yoink container · {} · esc back · t top · y yank ",
+            inspect.name,
+        );
+        let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 

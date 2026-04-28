@@ -187,7 +187,7 @@ The multiplexed Logs view aggregates a live tail from **every yoink-managed cont
 | `↑↓` / `PgUp` `PgDn` | scroll line / page (auto-follow disengages while scrolling away from bottom) |
 | `g` / `G` / `End` | jump to top / bottom (resumes auto-follow) |
 | `/` | begin filter input — Enter applies, Esc cancels (live-typed, case-insensitive substring) |
-| `k` | clear the buffer (next ticks repopulate) |
+| `c` | clear the buffer (next ticks repopulate) |
 | `r` | restart streams (re-opens log pipes if any died) |
 | `y` | yank the visible buffer to the system clipboard via OSC-52 |
 

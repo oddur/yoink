@@ -236,3 +236,9 @@ Switch to `provider: command` and let yoink shell out to your secret manager's C
 - **Secrets that must NOT live in a git history** (regulatory) — anything that's a managed service.
 
 The CLI-driven path covers sops, Doppler, 1Password, HashiCorp Vault, AWS Secrets Manager, the Infisical CLI, Bitwarden, and anything else that emits dotenv or JSON on stdout. See [external secrets via CLI](/docs/recipes/secrets-external-cli).
+
+## See also
+
+- [AGE secrets in GitHub Actions](/docs/recipes/age-in-github-actions) — wiring `YOINK_AGE_KEY` into a CI runner.
+- [External secrets via CLI](/docs/recipes/secrets-external-cli) — the `provider: command` escape hatch.
+- [Configuration reference](/docs/reference/config) — full schema for the `secrets:` block.

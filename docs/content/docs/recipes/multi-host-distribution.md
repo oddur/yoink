@@ -1,6 +1,6 @@
 ---
 title: Multi-host distribution
-weight: 5
+weight: 9
 ---
 
 How services spread across hosts when you scale beyond one box. Two knobs: `replicas` (per host) and `services[].hosts` (which hosts run a service).
@@ -126,3 +126,9 @@ Wave ordering (`depends_on`) is global — `redis` finishes its host fan-out bef
 ## Pruning
 
 `yoink prune` walks every host independently, removing containers and images that don't match any current service definition. A service that used to run on `prod-eu-2` but is now pinned to `prod-eu-1` gets cleaned up on `prod-eu-2` automatically.
+
+## See also
+
+- [Run staging alongside prod](/docs/recipes/staging-alongside-prod) — same primitives, separate `yoink.yaml` per environment.
+- [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage) — proxy-side coordination when more than one host fronts the same domain.
+- [Configuration reference](/docs/reference/config) — full `hosts:` / `replicas:` / `pin:` schema.

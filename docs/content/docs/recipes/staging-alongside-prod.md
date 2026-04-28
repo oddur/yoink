@@ -1,6 +1,6 @@
 ---
 title: Run staging alongside prod
-weight: 1
+weight: 10
 ---
 
 Common scenario: you want a `staging` environment that mirrors `prod` for pre-merge verification, ideally on the same hardware to avoid paying for a second machine. yoink doesn't have a built-in `environment` concept — instead you use **two config files** that don't collide.
@@ -106,3 +106,9 @@ yoink -c yoink.staging.yaml tui       # editing staging's secrets
 ```
 
 Rotation, recipients, and the `YOINK_AGE_KEY` env var are independent per environment — staging can have a different CI key than prod, scoped via `recipients:`.
+
+## See also
+
+- [Sealed secrets (age)](/docs/recipes/sealed-secrets) — per-environment recipients and rotation.
+- [Multi-host distribution](/docs/recipes/multi-host-distribution) — when staging-vs-prod isn't enough and you need fine-grained host pinning.
+- [Pre-merge dry-run on every PR](/docs/recipes/pr-comment-dry-run) — catch staging/prod diffs at review time.

@@ -217,6 +217,20 @@ yoink up --watch --build --no-registry --service my-tool
 
 The 2 s cadence matches the TUI's reload tick. Reconcile errors are reported to stderr but don't abort the loop — fix the config and the next save kicks off another attempt.
 
+## Boolean-flag conventions
+
+yoink uses three deliberately distinct shapes for boolean flags:
+
+| Shape | Meaning | Examples |
+|---|---|---|
+| `--<verb>` | Enable an additive behavior. Off by default. | `--build`, `--watch`, `--push`, `--json`, `--force` |
+| `--no-<thing>` | Suppress a default-on behavior. | `--no-registry` (skip the registry pull), `--no-port` (skip port/healthcheck inference), `--no-secrets` (skip identity bootstrap), `--no-cache` (skip docker build cache) |
+| `--allow-<safety>` | Override a safety guard. The default refuses; `--allow-X` opts in. | `--allow-dirty` (deploy with a dirty git tree) |
+
+Same rules for new flags: `--allow-X` only when there's a guard to bypass; `--no-X` only when the default is on; otherwise plain `--<verb>`. Avoid `--skip-X` / `--without-X` — they overlap with `--no-X`.
+
+`--yes` is the standard non-interactive override for confirmation prompts; it does not enable destructive behavior on its own (the action is what enables it).
+
 ## Dynamic shell completion
 
 `yoink completions <shell>` emits static completions (subcommand names, flag names, value enums). For *dynamic* values — service names, host addresses, config file paths — yoink ships a hidden `__complete` helper that prints one value per line:

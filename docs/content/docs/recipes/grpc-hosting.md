@@ -1,6 +1,6 @@
 ---
 title: gRPC hosting
-weight: 9
+weight: 14
 ---
 
 Native gRPC backends speak HTTP/2. To route gRPC traffic from clients (which terminate at Caddy with TLS) all the way through to the backend, Caddy needs to dial the upstream as **HTTP/2 cleartext** (h2c). One field in yoink turns this on:

@@ -11,6 +11,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use throbber_widgets_tui::ThrobberState;
 
 use crate::doctor::{Finding, Severity};
 
@@ -73,7 +74,12 @@ impl DoctorState {
     }
 }
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut DoctorState) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut DoctorState,
+    throbber: &ThrobberState,
+) {
     if !state.is_open() {
         return;
     }
@@ -95,11 +101,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut DoctorState) {
     match &state.status {
         Status::Closed => {}
         Status::Loading => {
-            let p = Paragraph::new("running checks…").style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::ITALIC),
-            );
+            let p = Paragraph::new(super::ui::throbber_with_label(throbber, " running checks…"));
             frame.render_widget(p, body);
         }
         Status::Loaded(findings) => {

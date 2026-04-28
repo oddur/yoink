@@ -1,6 +1,6 @@
 ---
 title: Caddy snippets cookbook
-weight: 12
+weight: 15
 ---
 
 `caddy_extra_json:` (and `caddy_extra_caddyfile:`) are yoink's escape hatch for Caddy features that aren't deploy primitives — auth, rate limiting, headers, redirects, IP allowlists, body limits, etc. Yoink models the routing graph; Caddy models the traffic handling. This page is the lookup table for the most common patterns.

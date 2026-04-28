@@ -1,6 +1,6 @@
 ---
 title: TanStack Start + postgres from scratch
-weight: 5
+weight: 2
 ---
 
 A TanStack Start app deploying alongside a managed postgres, built locally and shipped without a registry. Five files, three commands, working stack on the host in about ten minutes. Adding more accessories (redis, meilisearch, …) is the same shape — `yoink add <name>`, paste the connection block.
@@ -276,3 +276,10 @@ include:
 Each project's repo keeps its `services/<project>.yaml` fragment alongside its code; the host config aggregates them. `yoink up` from the host config sees every project's services as one cluster. Per-project deploys are still possible — `yoink up --service project-a-app` from inside the host config — they just need to run from the directory with the central `yoink.yaml`.
 
 Coordination cost: every project's CI runner needs the host config's age identity (or the per-project services need to ship their own `provider: command` entry that the host config inherits).
+
+## See also
+
+- [Drop-in templates with `yoink add`](/docs/recipes/add-templates) — adding redis / meilisearch alongside postgres.
+- [Port-forward to any service](/docs/recipes/port-forward) — full background on the `yoink pf` verify step.
+- [Sealed secrets (age)](/docs/recipes/sealed-secrets) — what `yoink init` set up, and how to back up the key.
+- [Edit-save-deploy with `--watch`](/docs/recipes/watch-mode) — turn the redeploy command into a save-triggered loop.

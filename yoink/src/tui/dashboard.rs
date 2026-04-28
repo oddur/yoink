@@ -202,8 +202,10 @@ impl DashboardState {
             .map(|s| s.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let header =
-            Paragraph::new(format!("yoink dashboard · services: {services}")).style(bold());
+        let header = Paragraph::new(format!(
+            "yoink dashboard · services: {services} · ↑↓ select · enter detail · ? help"
+        ))
+        .style(bold());
         frame.render_widget(header, layout[0]);
 
         let rows = self.build_rows(config, secrets, history, forwards, throbber);

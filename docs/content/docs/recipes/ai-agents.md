@@ -1,6 +1,6 @@
 ---
 title: Driving yoink from an AI agent
-weight: 13
+weight: 17
 ---
 
 Yoink is unusually well-suited to being driven by AI coding agents (Claude Code, Cursor, Aider, OpenAI Codex, GitHub Copilot Workspace, Devin, …) because **its entire control surface is a CLI binary plus YAML files in your repo** — no web dashboard, no REST API to learn, no interactive prompts to navigate. Anything an agent can do at a terminal, it can do with yoink.
@@ -71,3 +71,8 @@ A couple of honest limitations:
 - **No streaming structured output.** `yoink up` emits human-readable progress lines. The exit code tells you success/failure; for richer machine-readable output, use `--dry-run --format=markdown` or parse `yoink status`.
 
 These are tractable; if you hit a friction point that an agent can't work around, [open an issue](https://github.com/oddur/yoink/issues).
+
+## See also
+
+- [Pre-merge dry-run on every PR](/docs/recipes/pr-comment-dry-run) — agent-readable plan output via `yoink up --dry-run --format=markdown`.
+- [CLI reference](/docs/reference/cli) — every subcommand surface an agent might drive.

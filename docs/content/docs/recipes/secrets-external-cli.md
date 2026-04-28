@@ -1,6 +1,6 @@
 ---
 title: External secrets via CLI
-weight: 2
+weight: 6
 ---
 
 `provider: command` is yoink's bring-your-own-tool secrets path. Yoink invokes the configured command, reads the resulting bundle from stdout, and feeds it to the same machinery that `provider: age` uses. No first-party integrations to maintain, no SDK to vendor — operators wire whatever secret store they already run.
@@ -243,3 +243,9 @@ A UTF-8 BOM at the start (`\xEF\xBB\xBF`) is silently stripped — Windows tooli
 Top-level must be an object of `string → string` pairs. `null` values are dropped. **Non-string scalars (numbers, booleans) and nested objects/arrays are a hard error** — silently stringifying `8080` to `"8080"` or `true` to `"true"` masks operator typos and produces values consumers don't expect. If you genuinely need a numeric or boolean secret, emit it as a JSON string at the source.
 
 A malformed bundle is a hard error — yoink would rather fail loud than silently drop a typo'd export.
+
+## See also
+
+- [Sealed secrets (age)](/docs/recipes/sealed-secrets) — yoink's batteries-included default; `provider: command` is the escape hatch when this isn't enough.
+- [AGE secrets in GitHub Actions](/docs/recipes/age-in-github-actions) — CI plumbing if your `provider:` is age.
+- [Configuration reference: secrets](/docs/reference/config) — full schema for `provider: command`.

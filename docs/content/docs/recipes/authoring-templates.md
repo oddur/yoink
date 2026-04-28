@@ -262,3 +262,8 @@ notes: <markdown-template>      # optional
 ```
 
 For the rendered service fragment, see [Config reference](/docs/reference/config) — that's the same shape an operator writes by hand in `yoink.yaml`.
+
+## See also
+
+- [Drop-in templates with `yoink add`](/docs/recipes/add-templates) — operator-side reference for `yoink add`.
+- [Configuration reference](/docs/reference/config) — schema for the rendered service fragment.

@@ -120,7 +120,14 @@ pub fn render_modal(
     } else if let Some(diff) = state.diff.as_ref() {
         body_lines(diff)
     } else {
-        vec![Line::from("(no data)")]
+        // Not loading, no error, no diff loaded yet — usually means
+        // the modal opened against a service we haven't fetched diff
+        // for, or the diff is genuinely empty. Distinguish from the
+        // "still fetching" case so the user knows what's happening.
+        vec![Line::from(Span::styled(
+            "(no diff available — open from the dashboard to populate)",
+            Style::default().fg(Color::DarkGray),
+        ))]
     };
 
     frame.render_widget(Clear, rect);

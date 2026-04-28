@@ -1,6 +1,6 @@
 ---
 title: Port-forward to any service
-weight: 8
+weight: 12
 ---
 
 `yoink pf <service>` opens a tunnel from your laptop to a container port — the same shape `kubectl port-forward` gives you, reusing the SSH connection yoink already has to the host. Two paths under the hood, picked automatically:
@@ -147,3 +147,9 @@ What both paths share:
 - **Same auth path as everything else.** If `yoink up` works against the host, `yoink pf` works. No separate SSH config, no extra keys.
 - **No image dependencies on the target.** Whether the target is `FROM scratch` or full Debian, `pf` reaches it the same way (the published path doesn't enter the target; the sidecar speaks docker DNS to it).
 - **Loopback-only on the host.** Both the published path and the sidecar's published port bind `127.0.0.1` — the laptop reaches them through SSH; nothing fronts the public internet.
+
+## See also
+
+- [Secure by default](/docs/guide/security-defaults) — why `publish:` should be the exception, not the rule.
+- [TanStack Start + postgres](/docs/recipes/tanstack-stack) — end-to-end recipe that uses `yoink pf` to verify the deploy.
+- [CLI reference: pf](/docs/reference/cli) — full flag surface.

@@ -1,6 +1,6 @@
 ---
 title: Edit-save-deploy with `--watch`
-weight: 5
+weight: 8
 ---
 
 `yoink up --watch` re-reconciles whenever the config file (or any include fragment) changes on disk. Combined with `--build --no-registry`, it gives you a hot-reload loop for prod-like development without CI, a registry, or a deploy command in your shell history.
@@ -58,3 +58,9 @@ yoink up --watch --build --no-registry         # ok, ship it on every save
 Polling means up to 2 s of latency between save and reconcile. For an editor flow that's typically below the threshold of "did I actually save?" — but if you're chaining `yoink up --watch` into a tighter feedback loop (test runner, screen recorder), be aware of the floor.
 
 The reconcile itself is cheap when nothing changed: `compute_spec_hash` short-circuits the no-op path before any image pull or container swap. So the cost of a fired but no-op reconcile is one round-trip per host.
+
+## See also
+
+- [TanStack Start + postgres](/docs/recipes/tanstack-stack) — uses `--build --no-registry` as the deploy loop; pair with `--watch` for save-to-deploy.
+- [Three deploy modes](/docs/guide/deploy-modes) — when local-build vs. CI-build vs. standalone fits.
+- [CLI reference: up](/docs/reference/cli) — `--watch` and the rest of the `yoink up` flag surface.

@@ -209,7 +209,7 @@ pub async fn cmd_add(
     );
 
     if !opts.yes && interactive && !confirm("Proceed?", true)? {
-        eprintln!("aborted.");
+        eprintln!("  ✗ aborted");
         return Ok(AddOutcome::default());
     }
 
@@ -530,16 +530,16 @@ async fn pick_from_index() -> Result<String> {
 }
 
 fn confirm(prompt: &str, default_yes: bool) -> Result<bool> {
-    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    eprint!("{prompt} {suffix} ");
-    io::stderr().flush().ok();
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
-    let answer = buf.trim().to_ascii_lowercase();
-    if answer.is_empty() {
-        return Ok(default_yes);
-    }
-    Ok(matches!(answer.as_str(), "y" | "yes"))
+    let kind = if default_yes {
+        crate::prompt::ConfirmKind::DefaultYes
+    } else {
+        crate::prompt::ConfirmKind::DefaultNo
+    };
+    // Callers gate this on their own `interactive` flag, so the TTY
+    // case is the only one that reaches here in practice — but routing
+    // through the shared helper means a non-TTY slip-through gets the
+    // safe default rather than blocking on a dead stdin.
+    crate::prompt::confirm(prompt, kind, false)
 }
 
 /// Loose semver `<` for the "you need a newer yoink" warning. Treats

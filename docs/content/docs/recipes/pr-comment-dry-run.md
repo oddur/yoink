@@ -1,6 +1,6 @@
 ---
 title: Pre-merge dry-run on every PR
-weight: 4
+weight: 7
 ---
 
 `yoink up --dry-run --format=markdown` connects to each host, computes the diff between the running spec and what would deploy, and emits a markdown summary. Pipe that into a sticky GitHub PR comment and reviewers see exactly what the deploy will change before merging.
@@ -101,3 +101,8 @@ jobs:
 
 - Dry-run reads from the host (it computes the diff against running containers), so the PR runner needs the same auth path your deploy runner does — tailnet membership + whatever secret-resolution your `provider:` setup needs (`YOINK_AGE_KEY` for age, the configured manager's CLI + token for `command`).
 - The `--tag` overrides have to match what your deploy workflow will pass. If staging/prod diverge, run two dry-runs against the right host set.
+
+## See also
+
+- [AGE secrets in GitHub Actions](/docs/recipes/age-in-github-actions) — wiring `YOINK_AGE_KEY` into the runner so dry-run can decrypt.
+- [Driving yoink from an AI agent](/docs/recipes/ai-agents) — how the dry-run output reads to a reviewer (human or otherwise).

@@ -1827,7 +1827,13 @@ impl App {
             return false;
         }
         match key.code {
-            KeyCode::Char('d') => {
+            // Lowercase `d` is dashboard nav from anywhere EXCEPT the
+            // Secrets and Resources panes — both bind `d` to delete the
+            // selected item, and a delete key shouldn't surprise-route
+            // to a pane switch when the operator's intent is "remove."
+            KeyCode::Char('d')
+                if !matches!(self.view, View::Secrets | View::Resources) =>
+            {
                 self.transition(View::Dashboard).await;
                 return false;
             }
@@ -2160,7 +2166,7 @@ impl App {
                     })
                     .await;
                 }
-                KeyCode::Char('k') => self.logs.clear(),
+                KeyCode::Char('c') => self.logs.clear(),
                 KeyCode::Char('y') => self.copy_logs_to_clipboard(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
                 KeyCode::Up => self.logs.scroll_up(1),
@@ -2305,7 +2311,7 @@ impl App {
                     self.start_service_log_streams().await;
                 }
                 KeyCode::Char('y') => self.copy_logs_to_clipboard(),
-                KeyCode::Char('k') => self.logs.clear(),
+                KeyCode::Char('c') => self.logs.clear(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
                 KeyCode::Up => self.logs.scroll_up(1),
                 KeyCode::Down => self.logs.scroll_down(1),
@@ -3702,7 +3708,12 @@ impl App {
         }
 
         if self.doctor.is_open() {
-            super::doctor::render(frame, frame.area(), &mut self.doctor);
+            super::doctor::render(
+                frame,
+                frame.area(),
+                &mut self.doctor,
+                &self.throbber_state,
+            );
         }
 
         // Render last so it sits on top of everything else when a

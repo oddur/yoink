@@ -1,6 +1,6 @@
 ---
 title: AGE secrets in GitHub Actions
-weight: 2
+weight: 5
 ---
 
 How to use age-sealed secrets from a CI workflow. The whole integration is one env var.
@@ -129,3 +129,9 @@ Recipients (who can decrypt) and values (what's stored) are independent — an i
 - **`age decryption failed: no matching key`** — CI's secret doesn't match any recipient in `secrets.age`. Either the GitHub secret wasn't updated after a rotation, or you forgot to re-seal after adding the new recipient. Run `yoink secrets show` locally with the same key to confirm.
 - **`no age identity found`** — the workflow forgot the `env: YOINK_AGE_KEY:` block on the deploy step.
 - **`workflow logs leak the values`** — never use `yoink secrets show --reveal` in CI; never `echo $DATABASE_URL` in a step. GitHub auto-masks values that match registered secrets, but yoink-decrypted plaintext isn't registered.
+
+## See also
+
+- [Sealed secrets (age)](/docs/recipes/sealed-secrets) — full mental model for the keypair shape.
+- [External secrets via CLI](/docs/recipes/secrets-external-cli) — when GitHub Secrets isn't where your secrets live.
+- [Pre-merge dry-run on every PR](/docs/recipes/pr-comment-dry-run) — same `YOINK_AGE_KEY` setup, applied to PR-time validation.

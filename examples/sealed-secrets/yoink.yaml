@@ -4,8 +4,8 @@
 # the fixture is self-contained and doesn't touch ~/.config.
 #
 # Setup:
-#   1. yoink secrets keygen --out age.key
-#   2. Replace `recipients:` below with the public key keygen printed.
+#   1. yoink secrets key generate --out age.key
+#   2. Replace `recipients:` below with the public key it printed.
 #   3. export YOINK_AGE_KEY_FILE=$(pwd)/age.key
 #   4. printf 'GREETING=hello sealed world\n' | yoink secrets seal
 #   5. yoink up
@@ -25,7 +25,7 @@ hosts:
 secrets:
   provider: age
   recipients:
-    # Replace with the public key from `yoink secrets keygen`. The
+    # Replace with the public key from `yoink secrets key generate`. The
     # placeholder below is intentionally invalid so an unconfigured
     # `yoink up` fails loudly instead of silently sealing nothing.
     - age1REPLACE_ME_WITH_YOUR_PUBLIC_KEY

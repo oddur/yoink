@@ -20,10 +20,10 @@ cd examples/sealed-secrets
 
 # 1. Generate an age identity into this directory.
 #    `--out` writes age.key (mode 0o600) and prints the public
-#    recipient. Without `--out`, keygen prints the secret to stdout
-#    and you save it yourself — yoink never writes to a global
-#    location like ~/.config/yoink/age.key (multi-project safety).
-yoink secrets keygen --out age.key
+#    recipient. Without `--out`, the default writes to
+#    ~/.config/yoink/keys/<recipient>.key (use `--print` for
+#    piping into a CI secret store).
+yoink secrets key generate --out age.key
 
 # 2. Paste the public key into yoink.yaml under `secrets.recipients:`,
 #    replacing the `age1REPLACE_ME_...` placeholder.
@@ -50,7 +50,7 @@ Both `age.key` and `secrets.age` are gitignored. Tear down with `rm age.key secr
 ## What this exercises
 
 - `secrets.provider: age` schema parsing
-- `yoink secrets keygen / seal` round-trip on disk
+- `yoink secrets key generate / seal` round-trip on disk
 - The deploy-time decryption path (`secrets::load_bundle`)
 - Per-service `secrets:` injection as env vars
 - spec_hash inclusion of secret values — change the value, re-seal, run `yoink up` again, and the container is replaced (rather than reused) because the hash differs.

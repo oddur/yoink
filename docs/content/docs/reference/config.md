@@ -9,6 +9,7 @@ Full schema for `yoink.yaml`. Canonical source: [`yoink/src/config.rs`](https://
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
+| `slug` | string (optional) | unset | Banner shown in the TUI's top chrome — use to mark a config (e.g. `"PRODUCTION — TREAD CAREFULLY"`) so the operator can't miss which environment they're pointed at. Keep it short (single line). |
 | `hosts` | list of [Host](#host) | required | One or more deploy targets. |
 | `deploy` | [Deploy](#deploy) | `{}` | Cross-service defaults (networks, etc.). |
 | `secrets` | [Secrets](#secrets) | unset | Secret provider config. Required if any service uses `secrets:` / `env_from_secrets:`. |
