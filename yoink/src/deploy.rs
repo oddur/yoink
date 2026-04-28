@@ -1240,6 +1240,14 @@ pub async fn ensure_host_networks(
 ///
 /// Errors here are returned to the caller; the inline per-service
 /// `pull_image` would have failed identically anyway.
+///
+/// `skip_locally_built`: callers should pass `true`. Services with a
+/// `build:` block are local-only by definition — `yoink build` tags
+/// them in the operator's docker daemon, and `load_images_to_hosts`
+/// is responsible for shipping them. Trying to `docker pull` such an
+/// image would 404 on every registry. The parameter is preserved
+/// rather than hardcoded for the rare caller that has separately
+/// pushed their builds and prefers to pull-everything.
 pub async fn prefetch_images(
     ops: Arc<dyn DockerOps>,
     config: &Config,

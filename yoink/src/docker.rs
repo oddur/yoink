@@ -32,6 +32,22 @@ pub fn image_reference(image: &str, tag: &str) -> String {
     }
 }
 
+/// Returns the registry hostname embedded in an image reference, or
+/// `None` for bare names that resolve against Docker Hub library.
+///
+/// Per OCI spec: the substring before the first `/` is treated as a
+/// hostname iff it contains `.`, `:`, or equals `localhost`. Anything
+/// else is a Docker Hub image reference and has no embedded host.
+///
+/// Examples: `postgres → None`, `ghcr.io/u/a → Some("ghcr.io")`,
+/// `localhost:5000/x → Some("localhost:5000")`,
+/// `4db05qgnlk.registry.depot.dev/api → Some("4db05qgnlk.registry.depot.dev")`.
+#[must_use]
+pub fn image_registry_host(image: &str) -> Option<&str> {
+    let head = image.split_once('/').map_or(image, |(h, _)| h);
+    (head == "localhost" || head.contains('.') || head.contains(':')).then_some(head)
+}
+
 #[derive(Debug, Error)]
 pub enum BuildError {
     #[error("invalid memory value {0:?}: expected like \"512m\", \"512Mi\", or \"1Gi\"")]
@@ -591,6 +607,28 @@ mod tests {
         assert_eq!(
             image_reference("registry.example.com/bt-api", "sha256:abc123"),
             "registry.example.com/bt-api@sha256:abc123",
+        );
+    }
+
+    #[test]
+    fn image_registry_host_classification() {
+        assert_eq!(image_registry_host("postgres"), None);
+        assert_eq!(image_registry_host("redis"), None);
+        // user/repo on Docker Hub: still no embedded host (no `.`/`:`/localhost).
+        assert_eq!(image_registry_host("library/postgres"), None);
+        assert_eq!(image_registry_host("ghcr.io/u/a"), Some("ghcr.io"));
+        assert_eq!(
+            image_registry_host("4db05qgnlk.registry.depot.dev/api"),
+            Some("4db05qgnlk.registry.depot.dev"),
+        );
+        assert_eq!(image_registry_host("localhost/x"), Some("localhost"));
+        assert_eq!(
+            image_registry_host("localhost:5000/x"),
+            Some("localhost:5000"),
+        );
+        assert_eq!(
+            image_registry_host("docker.io/library/postgres"),
+            Some("docker.io"),
         );
     }
 

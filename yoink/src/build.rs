@@ -251,11 +251,24 @@ pub async fn save_and_load_to_host(
     Ok(total.load(Ordering::Relaxed))
 }
 
-/// Pre-flight for `yoink up --no-registry`: for every selected
-/// service × applicable host, stream `docker save` from the
-/// operator's local daemon into the host's daemon via
-/// `import_image`. Memory stays bounded regardless of image size
-/// (`ReaderStream` chunk size, 8 KiB).
+/// Pre-flight for any deploy that has locally-built images: for every
+/// selected service × applicable host, stream `docker save` from the
+/// operator's local daemon into the host's daemon via `import_image`.
+/// Memory stays bounded regardless of image size (`ReaderStream`
+/// chunk size, 8 KiB).
+///
+/// `only_buildable` controls which services participate:
+/// - `true` (the default for plain `yoink up`): only services with a
+///   `build:` block are shipped — their image:tag exists only in the
+///   operator's local daemon, so this is the only way to reach the
+///   host. Services without `build:` are pulled normally by the host
+///   from their registry.
+/// - `false` (the `--no-registry` mode): every selected service is
+///   shipped from local, regardless of whether it has a `build:`
+///   block. Used for offline / airgapped workflows where the operator
+///   wants to bypass all registry pulls. The operator must have every
+///   image available locally (`docker pull` ahead of time, or pre-
+///   loaded tarballs).
 ///
 /// Per-image: parallel fan-out across all applicable hosts via
 /// `try_join_all`. Each host gets its own `docker save` process
@@ -268,9 +281,13 @@ pub async fn load_images_to_hosts(
     tag_overrides: &BTreeMap<String, String>,
     services_filter: Option<&[String]>,
     transport: Transport,
+    only_buildable: bool,
 ) -> anyhow::Result<()> {
     let mut by_image: BTreeMap<String, Vec<&crate::config::HostConfig>> = BTreeMap::new();
     for svc in config.selected_services(services_filter) {
+        if only_buildable && svc.build.is_none() {
+            continue;
+        }
         let tag = resolve_service_tag(svc, tag_overrides)?;
         let image_ref = docker::image_reference(&svc.image, &tag);
         let entry = by_image.entry(image_ref).or_default();
@@ -279,6 +296,9 @@ pub async fn load_images_to_hosts(
                 entry.push(host_cfg);
             }
         }
+    }
+    if by_image.is_empty() {
+        return Ok(());
     }
 
     // Best-effort sweep of leaked unregistry sidecars from previous

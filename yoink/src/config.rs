@@ -952,6 +952,46 @@ impl Config {
             .filter(move |svc| filter.is_none_or(|names| names.iter().any(|n| n == &svc.name)))
     }
 
+    /// True iff at least one service requires a `docker pull` at deploy
+    /// time (i.e., its image is not built locally). When false, every
+    /// service has a `build:` block — there is literally nothing to
+    /// pull, so the registry-pull phase + auth is dead weight.
+    ///
+    /// This is the predicate that drives auto `--no-registry`: when
+    /// false, plain `yoink up` behaves as if the operator had passed
+    /// `--no-registry`.
+    #[must_use]
+    pub fn any_service_requires_pull(&self) -> bool {
+        self.services.iter().any(|svc| svc.build.is_none())
+    }
+
+    /// Iterate the non-build services whose `image:` host matches the
+    /// configured registry. Empty when no `registry:` is set, no
+    /// service uses it, or every using service has a `build:` block.
+    /// Drives both `requires_configured_registry()` and the doctor's
+    /// orphan-registry check.
+    pub fn services_using_configured_registry(&self) -> impl Iterator<Item = &ServiceConfig> {
+        let server = self.registry.as_ref().map(|r| r.server.as_str());
+        self.services.iter().filter(move |svc| {
+            let Some(server) = server else { return false };
+            svc.build.is_none()
+                && crate::docker::image_registry_host(&svc.image)
+                    .is_some_and(|h| h.eq_ignore_ascii_case(server))
+        })
+    }
+
+    /// True iff some non-build service's image is hosted on the
+    /// configured registry, i.e. the configured creds will actually be
+    /// used at deploy time. Used by `yoink doctor` to flag orphan
+    /// `registry:` blocks; not used to drive auto `--no-registry`
+    /// (that's `any_service_requires_pull`, which is intentionally
+    /// narrower — Docker Hub library images like `postgres` should
+    /// still be host-pulled, not unregistry-shipped).
+    #[must_use]
+    pub fn requires_configured_registry(&self) -> bool {
+        self.services_using_configured_registry().next().is_some()
+    }
+
     pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.display().to_string(),
@@ -2023,5 +2063,121 @@ services:
 "#;
         let c = Config::parse_str(s).unwrap();
         assert_eq!(c.services[0].run.options.user.as_deref(), Some("0:0"));
+    }
+
+    #[test]
+    fn any_service_requires_pull_false_when_all_buildable() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: api
+    image: api
+    tag: dev
+    build: { context: . }
+    run: { port: 8080, healthcheck_path: / }
+  - name: web
+    image: web
+    tag: dev
+    build: { context: . }
+    run: { port: 3000, healthcheck_path: / }
+"#;
+        let c = Config::parse_str(s).unwrap();
+        assert!(!c.any_service_requires_pull());
+    }
+
+    #[test]
+    fn any_service_requires_pull_true_with_one_pulled() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: api
+    image: api
+    tag: dev
+    build: { context: . }
+    run: { port: 8080, healthcheck_path: / }
+  - name: db
+    image: postgres
+    tag: "16"
+    run: { port: 5432, healthcheck_path: / }
+"#;
+        let c = Config::parse_str(s).unwrap();
+        assert!(c.any_service_requires_pull());
+    }
+
+    #[test]
+    fn requires_configured_registry_true_when_image_is_on_configured_server() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+registry:
+  server: ghcr.io
+  username_secret: U
+  password_secret: P
+secrets:
+  provider: command
+  command: ["sh", "-c", "echo X=1"]
+services:
+  - name: api
+    image: ghcr.io/me/api
+    tag: v1
+    run: { port: 8080, healthcheck_path: / }
+"#;
+        let c = Config::parse_str(s).unwrap();
+        assert!(c.requires_configured_registry());
+    }
+
+    #[test]
+    fn requires_configured_registry_false_when_image_is_on_different_registry() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+registry:
+  server: 4db05qgnlk.registry.depot.dev
+  username_secret: U
+  password_secret: P
+secrets:
+  provider: command
+  command: ["sh", "-c", "echo X=1"]
+services:
+  - name: db
+    image: postgres
+    tag: "16"
+    run: { port: 5432, healthcheck_path: / }
+  - name: vendor
+    image: ghcr.io/u/vendor
+    tag: v1
+    run: { port: 9000, healthcheck_path: / }
+"#;
+        let c = Config::parse_str(s).unwrap();
+        assert!(!c.requires_configured_registry());
+    }
+
+    #[test]
+    fn requires_configured_registry_false_when_only_buildable_uses_server() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+registry:
+  server: ghcr.io
+  username_secret: U
+  password_secret: P
+secrets:
+  provider: command
+  command: ["sh", "-c", "echo X=1"]
+services:
+  - name: api
+    image: ghcr.io/me/api
+    tag: v1
+    build: { context: . }
+    run: { port: 8080, healthcheck_path: / }
+"#;
+        let c = Config::parse_str(s).unwrap();
+        // Buildable services don't drive a pull, so the configured
+        // registry's creds are never used.
+        assert!(!c.requires_configured_registry());
+        // And nothing requires a pull at all.
+        assert!(!c.any_service_requires_pull());
     }
 }

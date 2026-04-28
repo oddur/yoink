@@ -3927,7 +3927,7 @@ async fn reconcile_all(
         &overrides,
         None,
         secrets_ref,
-        false, // TUI deploys go through registries; locally-built path is CLI-only
+        true, // never try to pull `build:` services from a registry — they're local-only
         prefetch_cb,
     )
     .await

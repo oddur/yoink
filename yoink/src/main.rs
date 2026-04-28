@@ -219,11 +219,13 @@ enum Command {
         /// updated). Ignored when `--dry-run` isn't set.
         #[arg(long, value_enum, default_value_t = DryRunFormat::Text)]
         format: DryRunFormat,
-        /// Skip the registry-pull step. For each (host, image) pair,
-        /// ship the locally-built image to the host directly (no
-        /// external registry). Default transport is `unregistry` (see
-        /// `--transport`). Pair with `--build` for the one-shot
-        /// "edit Dockerfile, deploy" loop without CI or a registry.
+        /// Force local-only mode: ship every selected service's image
+        /// from the operator's docker daemon to each host, skipping
+        /// all registry pulls. Usually unnecessary — services with a
+        /// `build:` block ship from local automatically; this flag
+        /// widens that to non-build services too (offline / airgapped
+        /// deploys, or shipping a locally-modified public image).
+        /// Default transport is `unregistry` — see `--transport`.
         #[arg(long)]
         no_registry: bool,
         /// How `--no-registry` ships images to each host.
@@ -1360,17 +1362,33 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         }
     }
 
-    // No-registry pre-flight: save+load every selected image to every
-    // applicable host so the reconcile loop's `image_present` check
-    // short-circuits any registry pull. Failures here block the
-    // deploy ("forgot to `yoink build`?" / local daemon down).
-    if no_registry {
+    // Plain `yoink up` should work for every config shape — pure
+    // registry, pure local-build, or mixed. Two independent shipping
+    // paths cover every case:
+    //
+    //   1. `load_images_to_hosts` ships images from the operator's
+    //      local docker daemon. Always run when at least one service
+    //      has a `build:` block (those images live only locally).
+    //      `--no-registry` widens the filter to ship every selected
+    //      service (not just buildable ones) — useful for airgapped /
+    //      offline deploys.
+    //
+    //   2. `prefetch_images` (below, after host locks) pulls registry-
+    //      hosted images on each host. Skipped when `--no-registry` is
+    //      set or when no service requires a pull (every service has a
+    //      `build:` block, so there is nothing to pull). Always skips
+    //      `build:` services internally — they're never in any
+    //      registry by definition.
+    let has_buildable = config.services.iter().any(|s| s.build.is_some());
+    let needs_pull = config.any_service_requires_pull();
+    if has_buildable || no_registry {
         yoink::build::load_images_to_hosts(
             ops.as_ref(),
             config,
             &tag_overrides,
             services_filter,
             transport,
+            !no_registry,
         )
         .await?;
     }
@@ -1403,10 +1421,13 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         eprintln!("{}", output::format_deploy_event(service, &event));
     };
 
-    // Phase 0: prefetch all service images in parallel when this is
-    // a "deploy everything" run. Single-service deploys would gain
-    // nothing (one image to pull) so skip the wrapper.
-    if services_filter.is_none() {
+    // Phase 0: prefetch all registry-hosted service images in parallel
+    // when this is a "deploy everything" run. Single-service deploys
+    // would gain nothing (one image to pull) so skip the wrapper.
+    // Skipped entirely when `--no-registry` is set (the operator chose
+    // local-only mode) or when no service requires a pull (every
+    // service has a `build:` block — already shipped above).
+    if services_filter.is_none() && needs_pull && !no_registry {
         let prefetch_cb: std::sync::Arc<dyn Fn(deploy::DeployEvent) + Send + Sync> =
             std::sync::Arc::new(|e| {
                 eprintln!("{}", output::format_deploy_event(None, &e));
@@ -1417,7 +1438,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             &tag_overrides,
             services_filter,
             bundle.as_ref(),
-            no_registry,
+            true,
             prefetch_cb,
         )
         .await
