@@ -113,6 +113,13 @@ enum Command {
     /// zero prompts in the happy path. Pass HOST as a positional arg
     /// when ssh config can't infer one. `--interactive` engages a
     /// stdio prompt fallback.
+    ///
+    /// Also generates an age identity (saved to
+    /// `~/.config/yoink/keys/<recipient>.key`, mode 0600) and renders
+    /// the matching `secrets:` block into the new yoink.yaml — the
+    /// project is ready for `yoink secrets edit` and `yoink add`
+    /// immediately. Pass `--no-secrets` to skip. Back up the printed
+    /// key (it decrypts everything sealed in the repo).
     Init {
         /// Ssh target (e.g. `deploy@prod-eu-1` or just `prod-eu-1`).
         /// Optional when `~/.ssh/config` has a non-wildcard Host
@@ -139,6 +146,15 @@ enum Command {
         /// Override the inferred image reference.
         #[arg(long, value_name = "PATH")]
         image: Option<String>,
+        /// Skip generating an age identity. By default `init` writes
+        /// a fresh keypair to `~/.config/yoink/keys/<recipient>.key`
+        /// and renders the matching `secrets:` block into yoink.yaml,
+        /// so the project is ready for `yoink secrets edit` and
+        /// `yoink add` immediately. Use this flag when you'll bring
+        /// your own key, or when the project will use
+        /// `provider: command` for secrets.
+        #[arg(long)]
+        no_secrets: bool,
     },
     /// Verify Docker is reachable on each configured host.
     Preflight,
@@ -2898,6 +2914,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             port,
             no_port,
             image,
+            no_secrets,
         } => Some(yoink::init::cmd_init(yoink::init::InitOpts {
             host: host.clone(),
             force: *force,
@@ -2906,6 +2923,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             port: *port,
             no_port: *no_port,
             image: image.clone(),
+            no_secrets: *no_secrets,
         })),
         _ => None,
     }

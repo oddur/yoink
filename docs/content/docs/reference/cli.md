@@ -17,7 +17,11 @@ Every subcommand accepts:
 ## Subcommand reference
 
 ```
-yoink init [HOST]                        generate a starter yoink.yaml in cwd. Detects
+yoink init [HOST]                        generate a starter yoink.yaml in cwd, plus a
+                                         fresh age identity at
+                                         ~/.config/yoink/keys/<recipient>.key (mode 0600)
+                                         and a matching `secrets:` block in the yaml.
+                                         Detects
                                          Dockerfile (EXPOSE/USER/HEALTHCHECK) + git remote
                                          + ~/.ssh/config and writes a validated config
                                          with zero prompts. HOST optional when ssh config
@@ -29,6 +33,9 @@ yoink init [HOST]                        generate a starter yoink.yaml in cwd. D
   --port <N>                             override inferred port (Dockerfile EXPOSE or 8080)
   --no-port                              skip port + healthcheck (no HTTP surface)
   --image <PATH>                         override the inferred image reference
+  --no-secrets                           skip generating an age identity (use when bringing
+                                         your own key, or when the project will use
+                                         `provider: command` for secrets)
 
 yoink preflight                          verify Docker is reachable on each configured host
 

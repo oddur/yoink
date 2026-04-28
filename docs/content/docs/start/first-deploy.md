@@ -51,9 +51,18 @@ inferred:
   host      root@1.2.3.4                    (positional arg)
   port      3000 with /health healthcheck   (Dockerfile EXPOSE)
   user      hono                            (Dockerfile USER)
+
+────────────────────────────────────────────────────────────────────────
+  ⚠  BACK UP THIS KEY  —  do this BEFORE you seal any secrets
+────────────────────────────────────────────────────────────────────────
+  identity: /Users/you/.config/yoink/keys/age1abc….key
+  public:   age1abc…
+  …
 ```
 
 The summary tells you exactly what was inferred and where each value came from. Edit the line in `yoink.yaml` if anything's off.
+
+**About the age key**: `init` also generates an age identity for sealed secrets and saves it to `~/.config/yoink/keys/<recipient>.key`. yoink finds it automatically next time you run `yoink secrets edit` or `yoink up`. **The backup notice is the most important line in this output** — that key is the only thing that decrypts your sealed secrets, so paste it into your password manager before you forget. (If you don't want sealed secrets — e.g. you're using `provider: command` — pass `--no-secrets` to `init`.)
 
 For this walkthrough we'll change one thing: edit `image:` to a bare name (no registry prefix) so we can use **standalone mode** — build locally, ship directly to the host, no registry involved:
 
