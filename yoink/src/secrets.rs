@@ -296,60 +296,63 @@ async fn load_command_bundle(
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
 
-    // Wrap the whole drain+wait in a timeout so a wedged provider
-    // can't hang the deploy. On expiry, kill the child and surface
-    // a CommandTimeout — operator gets a clear "X did not finish
-    // within Ns" instead of a silent hang.
+    // Drain stdout + stderr concurrently so a child that fills the
+    // stderr pipe before exiting doesn't deadlock on us (we'd
+    // otherwise block reading stdout while it blocks on a full
+    // stderr pipe). The whole thing is wrapped in a timeout so a
+    // wedged provider can't hang the deploy.
     let drain = async {
-        // Drain stdout + stderr concurrently so a child that fills
-        // the stderr pipe before exiting doesn't deadlock on us
-        // (we'd otherwise block reading stdout while it blocks on
-        // a full stderr pipe).
         let stdout_fut = async {
-            if let Some(out) = stdout_pipe.as_mut() {
-                read_capped(out, COMMAND_OUTPUT_CAP).await
-            } else {
-                Ok(Vec::new())
+            match stdout_pipe.as_mut() {
+                Some(out) => read_capped(out, COMMAND_OUTPUT_CAP).await,
+                None => Ok(Vec::new()),
             }
         };
         let stderr_fut = async {
-            if let Some(err) = stderr_pipe.as_mut() {
-                read_capped(err, COMMAND_OUTPUT_CAP).await
-            } else {
-                Ok(Vec::new())
+            match stderr_pipe.as_mut() {
+                Some(err) => read_capped(err, COMMAND_OUTPUT_CAP).await,
+                None => Ok(Vec::new()),
             }
         };
-        let (stdout_res, stderr_res) = tokio::join!(stdout_fut, stderr_fut);
-        let stdout_buf = stdout_res.map_err(|()| SecretsError::CommandOutputCap {
-            command: pretty.clone(),
-            stream: "stdout",
-            cap: COMMAND_OUTPUT_CAP,
-        })?;
-        let stderr_buf = stderr_res.map_err(|()| SecretsError::CommandOutputCap {
-            command: pretty.clone(),
-            stream: "stderr",
-            cap: COMMAND_OUTPUT_CAP,
-        })?;
-        let status = child
-            .wait()
-            .await
-            .map_err(|source| SecretsError::CommandSpawn {
-                command: pretty.clone(),
-                source,
-            })?;
-        Ok::<_, SecretsError>((stdout_buf, stderr_buf, status))
+        tokio::join!(stdout_fut, stderr_fut)
     };
-    let (stdout_buf, stderr_buf, status) = if let Ok(res) =
-        tokio::time::timeout(COMMAND_TIMEOUT, drain).await
-    {
-        res?
-    } else {
-        // Best-effort kill; child may have already exited.
-        let _ = child.start_kill();
-        return Err(SecretsError::CommandTimeout {
-            command: pretty,
-            timeout: COMMAND_TIMEOUT,
-        });
+    let drain_result = tokio::time::timeout(COMMAND_TIMEOUT, drain).await;
+
+    // Always reap the child, no matter how the drain ended. Tokio's
+    // process::Child doesn't kill-on-drop by default; if we returned
+    // here without wait()-ing we'd leak a zombie + (in the cap/timeout
+    // cases) a still-running process blocked on closed pipes.
+    let (stdout_buf, stderr_buf, status) = match drain_result {
+        Ok((stdout_res, stderr_res)) => {
+            // Drain completed within the timeout. wait() should be
+            // ~immediate since we read both pipes to completion.
+            let status = child
+                .wait()
+                .await
+                .map_err(|source| SecretsError::CommandSpawn {
+                    command: pretty.clone(),
+                    source,
+                })?;
+            let stdout_buf = stdout_res.map_err(|()| SecretsError::CommandOutputCap {
+                command: pretty.clone(),
+                stream: "stdout",
+                cap: COMMAND_OUTPUT_CAP,
+            })?;
+            let stderr_buf = stderr_res.map_err(|()| SecretsError::CommandOutputCap {
+                command: pretty.clone(),
+                stream: "stderr",
+                cap: COMMAND_OUTPUT_CAP,
+            })?;
+            (stdout_buf, stderr_buf, status)
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(SecretsError::CommandTimeout {
+                command: pretty,
+                timeout: COMMAND_TIMEOUT,
+            });
+        }
     };
 
     if !status.success() {
@@ -742,6 +745,29 @@ mod tests {
         .unwrap();
         assert_eq!(bundle.get("A"), Some("1"));
         assert_eq!(bundle.get("B"), Some("two"));
+    }
+
+    #[tokio::test]
+    async fn load_command_bundle_caps_oversized_stdout() {
+        // Producer emits 11 MiB — over the 10 MiB COMMAND_OUTPUT_CAP.
+        // Verifies cap-hit returns CommandOutputCap *and* doesn't leak
+        // the child (the test runner would hang on an unwaited child
+        // if our refactor regressed).
+        let err = load_command_bundle(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "yes A | head -c 11534336".into(),
+            ],
+            SecretsFormat::Auto,
+            true,
+        )
+        .await
+        .unwrap_err();
+        let SecretsError::CommandOutputCap { stream, .. } = err else {
+            panic!("expected CommandOutputCap, got: {err:?}");
+        };
+        assert_eq!(stream, "stdout");
     }
 
     #[tokio::test]

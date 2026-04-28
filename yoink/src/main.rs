@@ -2705,21 +2705,36 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
 fn cmd_secrets_seal(config: &Config, input: Option<&Path>, out: Option<PathBuf>) -> Result<()> {
     use yoink::sealed;
     let (file_override, recipients) = expect_age_block(config)?;
+    // Cap input at 10 MiB regardless of source — protects against
+    // a wrong-file paste (a 5GB image) just as much as an unbounded
+    // stdin stream. Real secrets bundles are kilobytes.
+    const SEAL_INPUT_CAP: u64 = 10 * 1024 * 1024;
     let plaintext = match input {
         Some(p) if p.as_os_str() != "-" => {
-            std::fs::read_to_string(p).with_context(|| format!("read input {}", p.display()))?
+            use std::io::Read;
+            let f = std::fs::File::open(p)
+                .with_context(|| format!("open input {}", p.display()))?;
+            let mut buf = String::new();
+            f.take(SEAL_INPUT_CAP + 1)
+                .read_to_string(&mut buf)
+                .with_context(|| format!("read input {}", p.display()))?;
+            if buf.len() as u64 > SEAL_INPUT_CAP {
+                return Err(anyhow::anyhow!(
+                    "input file {} is larger than {SEAL_INPUT_CAP} bytes — refusing to seal an oversized bundle",
+                    p.display()
+                ));
+            }
+            buf
         }
         _ => {
             use std::io::Read;
-            // Cap stdin at 10 MiB so a runaway producer (cat-ed
-            // wrong file, infinite stream, etc.) can't OOM the host.
-            // Real secrets bundles are kilobytes.
-            const STDIN_CAP: u64 = 10 * 1024 * 1024;
             let mut buf = String::new();
-            io::stdin().take(STDIN_CAP + 1).read_to_string(&mut buf)?;
-            if buf.len() as u64 > STDIN_CAP {
+            io::stdin()
+                .take(SEAL_INPUT_CAP + 1)
+                .read_to_string(&mut buf)?;
+            if buf.len() as u64 > SEAL_INPUT_CAP {
                 return Err(anyhow::anyhow!(
-                    "stdin produced more than {STDIN_CAP} bytes — refusing to seal an oversized bundle"
+                    "stdin produced more than {SEAL_INPUT_CAP} bytes — refusing to seal an oversized bundle"
                 ));
             }
             buf
