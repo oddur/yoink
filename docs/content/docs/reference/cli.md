@@ -94,24 +94,32 @@ yoink lock                               inspect / release the per-host deploy l
                                          after a crashed deploy left a sentinel container)
 yoink completions <shell>                generate shell completions (bash/zsh/fish/...)
 
-yoink secrets keygen                     generate an age identity. Default: print
-                                         the secret to stdout (operator decides
-                                         where to save). Public recipient also
-                                         printed for committing to yoink.yaml.
-  --out <PATH>                           write the secret to PATH (mode 0600)
+yoink secrets key generate               generate an age keypair. Prints both
+                                         the IDENTITY (private, AGE-SECRET-KEY-1…)
+                                         and matching RECIPIENT (public, age1…) —
+                                         identity goes in your secret manager,
+                                         recipient gets committed to yoink.yaml.
+  --out <PATH>                           write the identity to PATH (mode 0600)
                                          instead of stdout. Make sure PATH is
-                                         gitignored.
+                                         gitignored. The recipient still prints
+                                         to stdout.
   --force                                overwrite an existing identity at --out
+yoink secrets key public                 re-derive the recipient from whichever
+                                         identity yoink would use right now
+                                         (sanity-check vs yoink.yaml)
 yoink secrets edit                       decrypt the configured sealed file into
                                          $EDITOR, re-seal on save (path comes from
                                          `secrets.file:`; defaults to secrets.age)
-yoink secrets show [--reveal]            print KEY=value (values masked unless --reveal)
+yoink secrets show [--reveal]            print KEY=value (values masked unless --reveal).
+                                         Refuses --reveal in CI ($CI set) unless
+                                         YOINK_ALLOW_REVEAL_IN_CI=1.
 yoink secrets seal --in <PATH>           seal a plaintext dotenv (or read from stdin)
   --out <PATH>                           override the output path (defaults to
                                          the configured `secrets.file:`)
-yoink secrets rotate                     generate a new identity and re-seal under
-                                         [existing recipients + new public]; prints
-                                         the new secret for pasting into CI
+yoink secrets rotate                     generate a new keypair and re-seal under
+                                         [existing recipients + new recipient];
+                                         prints the new identity for pasting into
+                                         your CI / secret manager
 
 yoink tui                                interactive ratatui dashboard (see TUI page)
 ```

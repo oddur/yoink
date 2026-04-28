@@ -47,4 +47,4 @@ ACME issuance, rolling-deploy-synchronized routing flips, and per-service `caddy
 | **operator → host connectivity** | Tailscale (or your SSH config) |
 | **CI → host connectivity** | Tailscale (or your SSH config) |
 | **stateful services** (postgres, etc.) | docker compose on the host |
-| **secrets** | yoink (age-sealed) or Infisical |
+| **secrets** | yoink (age-sealed) or any external CLI via `provider: command` |

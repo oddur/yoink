@@ -463,26 +463,15 @@ enum Command {
 /// Subcommands for `yoink secrets`.
 #[derive(clap::Subcommand)]
 enum SecretsAction {
-    /// Generate a fresh age identity. By default the secret key is
-    /// printed to stdout — operator decides where to save it
-    /// (typically a gitignored `age.key` next to the project's
-    /// `yoink.yaml`, OR pasted into a CI secret). The public
-    /// recipient is also printed for committing to `yoink.yaml`
-    /// under `secrets.recipients:`. Pass `--out PATH` to write the
-    /// secret to a specific file with mode 0o600 instead.
-    ///
-    /// Yoink intentionally does NOT default to a global location
-    /// like `~/.config/yoink/age.key` — multiple projects with
-    /// distinct identities would collide there.
-    Keygen {
-        /// Write the secret key to PATH (mode 0o600) instead of
-        /// printing it to stdout. Refuses to overwrite an existing
-        /// file unless `--force`. Make sure PATH is gitignored.
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// Overwrite an existing identity at `--out`.
-        #[arg(long)]
-        force: bool,
+    /// Manage the age identity used to (un)seal `secrets.age`. The
+    /// identity is just an X25519 keypair; the public half lands in
+    /// `secrets.recipients:` of `yoink.yaml`, and the private half
+    /// gets routed through whatever secret manager you already use
+    /// (GitHub Actions secret, 1Password, AWS Secrets Manager, …).
+    /// See `docs/recipes/secrets-*` for per-tool wiring.
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
     },
     /// Decrypt the sealed file into `$EDITOR`, then re-seal on save.
     /// Creates the file if it doesn't exist yet.
@@ -513,6 +502,36 @@ enum SecretsAction {
     /// old recipient and run `yoink secrets edit` (just save without
     /// changes) to re-seal under the new recipients only.
     Rotate,
+}
+
+#[derive(clap::Subcommand)]
+enum KeyAction {
+    /// Generate a fresh age identity. By default the secret key is
+    /// printed to stdout — operator decides where to route it
+    /// (gitignored file, GitHub Actions secret, 1Password item, …).
+    /// The public recipient is also printed for adding to
+    /// `secrets.recipients:` in `yoink.yaml`. Pass `--out PATH` to
+    /// write the secret to a specific file with mode 0o600 instead.
+    ///
+    /// Yoink intentionally does NOT default to a global location
+    /// like `~/.config/yoink/age.key` — multiple projects with
+    /// distinct identities would collide there.
+    Generate {
+        /// Write the secret key to PATH (mode 0o600) instead of
+        /// printing it to stdout. Refuses to overwrite an existing
+        /// file unless `--force`. Make sure PATH is gitignored.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Overwrite an existing identity at `--out`.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the public recipient (`age1…`) derived from the
+    /// currently-resolved identity. Useful for "is the key in my
+    /// shell the same one yoink.yaml expects?" sanity checks.
+    /// Identity resolution: `YOINK_AGE_KEY` (raw) →
+    /// `YOINK_AGE_KEY_FILE` (path) → `~/.config/yoink/age.key`.
+    Public,
 }
 
 /// Subcommands for `yoink lock`.
@@ -2275,7 +2294,7 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
             "registry_server": config.registry.as_ref().map(|r| r.server.clone()),
             "secrets_provider": config.secrets.as_ref().map(|s| match s {
                 yoink::config::SecretsConfig::Age { .. } => "age",
-                yoink::config::SecretsConfig::Infisical { .. } => "infisical",
+                yoink::config::SecretsConfig::Command { .. } => "command",
             }),
         },
         "hosts": hosts_json,
@@ -2530,8 +2549,10 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             Some(Ok(()))
         }
         Command::Secrets {
-            action: SecretsAction::Keygen { out, force },
-        } => Some(cmd_secrets_keygen(out.clone(), *force)),
+            action: SecretsAction::Key {
+                action: KeyAction::Generate { out, force },
+            },
+        } => Some(cmd_secrets_key_generate(out.clone(), *force)),
         Command::Init {
             host,
             force,
@@ -2555,7 +2576,10 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
 
 fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     match action {
-        SecretsAction::Keygen { out, force } => cmd_secrets_keygen(out, force),
+        SecretsAction::Key { action } => match action {
+            KeyAction::Generate { out, force } => cmd_secrets_key_generate(out, force),
+            KeyAction::Public => cmd_secrets_key_public(),
+        },
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
         SecretsAction::Seal { r#in, out } => cmd_secrets_seal(config, r#in.as_deref(), out),
@@ -2563,7 +2587,15 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     }
 }
 
-fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
+fn cmd_secrets_key_public() -> Result<()> {
+    use yoink::sealed;
+    let identity = sealed::load_identity()
+        .with_context(|| "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, or place one at ~/.config/yoink/age.key")?;
+    println!("{}", identity.to_public());
+    Ok(())
+}
+
+fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool) -> Result<()> {
     use yoink::sealed;
     let (secret, public) = sealed::keygen();
     let recipient_block =
@@ -2617,7 +2649,7 @@ fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
 fn cmd_secrets_edit(config: &Config) -> Result<()> {
     use yoink::sealed;
     let (file_override, recipients) = expect_age_block(config)?;
-    let path = sealed::resolve_sealed_path(config, file_override.as_deref());
+    let path = sealed::resolve_sealed_path(config, file_override.as_deref())?;
     let plaintext = if path.exists() {
         let bytes =
             std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
@@ -2638,10 +2670,24 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
 fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
     use yoink::config::SecretsConfig;
     use yoink::sealed;
+    if reveal
+        && let Some(ci_var) = detected_ci_env()
+        && !is_truthy_env("YOINK_ALLOW_REVEAL_IN_CI")
+    {
+        // CI runners log stdout into build artifacts that get
+        // shared / archived / scraped — `--reveal` printing real
+        // values there is almost always a mistake. Force operators
+        // to override consciously when they really mean it.
+        return Err(anyhow::anyhow!(
+            "refusing to print real secret values: detected CI environment (${ci_var} is set). \
+             If this is intentional (you're capturing the bundle into a managed secret store, \
+             not into build logs), set YOINK_ALLOW_REVEAL_IN_CI=1"
+        ));
+    }
     let SecretsConfig::Age { file, .. } = expect_secrets_provider_age(config)? else {
         unreachable!()
     };
-    let path = sealed::resolve_sealed_path(config, file.as_deref());
+    let path = sealed::resolve_sealed_path(config, file.as_deref())?;
     let bytes =
         std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
     let identity = sealed::load_identity()?;
@@ -2660,22 +2706,48 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
 fn cmd_secrets_seal(config: &Config, input: Option<&Path>, out: Option<PathBuf>) -> Result<()> {
     use yoink::sealed;
     let (file_override, recipients) = expect_age_block(config)?;
+    // Cap input at 10 MiB regardless of source — protects against
+    // a wrong-file paste (a 5GB image) just as much as an unbounded
+    // stdin stream. Real secrets bundles are kilobytes.
+    const SEAL_INPUT_CAP: u64 = 10 * 1024 * 1024;
     let plaintext = match input {
         Some(p) if p.as_os_str() != "-" => {
-            std::fs::read_to_string(p).with_context(|| format!("read input {}", p.display()))?
+            use std::io::Read;
+            let f = std::fs::File::open(p)
+                .with_context(|| format!("open input {}", p.display()))?;
+            let mut buf = String::new();
+            f.take(SEAL_INPUT_CAP + 1)
+                .read_to_string(&mut buf)
+                .with_context(|| format!("read input {}", p.display()))?;
+            if buf.len() as u64 > SEAL_INPUT_CAP {
+                return Err(anyhow::anyhow!(
+                    "input file {} is larger than {SEAL_INPUT_CAP} bytes — refusing to seal an oversized bundle",
+                    p.display()
+                ));
+            }
+            buf
         }
         _ => {
             use std::io::Read;
             let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf)?;
+            io::stdin()
+                .take(SEAL_INPUT_CAP + 1)
+                .read_to_string(&mut buf)?;
+            if buf.len() as u64 > SEAL_INPUT_CAP {
+                return Err(anyhow::anyhow!(
+                    "stdin produced more than {SEAL_INPUT_CAP} bytes — refusing to seal an oversized bundle"
+                ));
+            }
             buf
         }
     };
     let parsed = sealed::parse_dotenv(&plaintext)?;
     let canonical = sealed::render_dotenv(&parsed);
     let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
-    let target =
-        out.unwrap_or_else(|| sealed::resolve_sealed_path(config, file_override.as_deref()));
+    let target = match out {
+        Some(p) => p,
+        None => sealed::resolve_sealed_path(config, file_override.as_deref())?,
+    };
     sealed::write_atomically(&target, &sealed_bytes)?;
     println!("sealed {} key(s) to {}", parsed.len(), target.display());
     Ok(())
@@ -2685,7 +2757,7 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     use yoink::sealed;
 
     let (file_override, current_recipients) = expect_age_block(config)?;
-    let path = sealed::resolve_sealed_path(config, file_override.as_deref());
+    let path = sealed::resolve_sealed_path(config, file_override.as_deref())?;
     if !path.exists() {
         return Err(anyhow::anyhow!(
             "{} doesn't exist — nothing to rotate. `yoink secrets edit` to create it first",
@@ -2740,11 +2812,12 @@ fn expect_secrets_provider_age(config: &Config) -> Result<&yoink::config::Secret
     use yoink::config::SecretsConfig;
     match config.secrets.as_ref() {
         Some(s @ SecretsConfig::Age { .. }) => Ok(s),
-        Some(SecretsConfig::Infisical { .. }) => Err(anyhow::anyhow!(
-            "yoink.yaml configures `provider: infisical` — `yoink secrets` only manages age-sealed files"
+        Some(SecretsConfig::Command { .. }) => Err(anyhow::anyhow!(
+            "yoink.yaml configures `provider: command` — `yoink secrets` only manages age-sealed files. \
+             To rotate values in your external secret store, use that store's CLI directly."
         )),
         None => Err(anyhow::anyhow!(
-            "no `secrets:` block in yoink.yaml — add `secrets: {{ provider: age, recipients: [...] }}` first (see `yoink secrets keygen`)"
+            "no `secrets:` block in yoink.yaml — add `secrets: {{ provider: age, recipients: [...] }}` first (see `yoink secrets key generate`)"
         )),
     }
 }
@@ -2776,66 +2849,42 @@ fn open_in_editor(initial: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("EDITOR/VISUAL is empty"))?;
     let editor_args: Vec<&str> = tokens.collect();
 
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let path = dir.join(format!("yoink-secrets-{pid}.env"));
-
-    // Open the scratch file with mode 0600 from creation — never let
-    // the plaintext sit on disk world-readable, even briefly. On
-    // non-Unix the regular create path applies (no perm model).
-    write_scratch_file(&path, initial.as_bytes())
-        .with_context(|| format!("create scratch file {}", path.display()))?;
+    // tempfile::NamedTempFile gives us:
+    //   - randomized filename (no PID-predictable path another user
+    //     on the box could pre-create as a symlink)
+    //   - RAII cleanup, so the plaintext is removed even if a panic
+    //     unwinds past the explicit drop below
+    //   - O_EXCL semantics under the hood
+    let mut scratch = yoink::sealed::secret_tempfile_builder(Some(0o600))
+        .suffix(".env")
+        .prefix("yoink-secrets-")
+        .tempfile()
+        .context("create scratch file")?;
+    {
+        use std::io::Write as _;
+        scratch
+            .as_file_mut()
+            .write_all(initial.as_bytes())
+            .with_context(|| format!("write {}", scratch.path().display()))?;
+    }
 
     let status = std::process::Command::new(program)
         .args(&editor_args)
-        .arg(&path)
+        .arg(scratch.path())
         .status()
         .with_context(|| format!("launch editor {editor:?}"))?;
     if !status.success() {
-        let _ = std::fs::remove_file(&path);
         return Err(anyhow::anyhow!(
             "editor {editor:?} exited with {status} — aborting"
         ));
     }
 
-    let edited = std::fs::read_to_string(&path)
-        .with_context(|| format!("read edited file {}", path.display()))?;
-    let _ = std::fs::remove_file(&path);
+    let edited = std::fs::read_to_string(scratch.path())
+        .with_context(|| format!("read edited file {}", scratch.path().display()))?;
+    // Drop runs unlink(2); explicit `close()` would let us surface a
+    // cleanup error but we'd rather not fail the seal on a tmpfs hiccup.
+    drop(scratch);
     Ok(edited)
-}
-
-/// Create the scratch file for the editor flow with mode 0600 from
-/// creation on Unix (no chmod-after-write window). `O_EXCL` rejects
-/// pre-existing files — defends against a symlink-in-/tmp attack
-/// pointing yoink at a privileged path. Stale scratch files from a
-/// crashed previous run are removed first.
-fn write_scratch_file(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    // A previous yoink crash could leave the file around — same PID
-    // collisions are vanishingly unlikely but `create_new` would
-    // refuse, so clear first. Removing a symlink an attacker planted
-    // is fine: the subsequent `create_new` proves we own the inode.
-    let _ = std::fs::remove_file(path);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("create scratch file {}", path.display()))?;
-        f.write_all(contents)
-            .with_context(|| format!("write {}", path.display()))?;
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
-        Ok(())
-    }
 }
 
 fn mask_value(s: &str) -> String {
@@ -2843,6 +2892,47 @@ fn mask_value(s: &str) -> String {
     let prefix: String = s.chars().take(visible).collect();
     let masked = "•".repeat(s.chars().count().saturating_sub(visible).min(16));
     format!("{prefix}{masked}")
+}
+
+/// Returns the name of the first CI-environment env var that is set,
+/// or None for an interactive shell. The CI=1 convention is set by
+/// most providers but not all (some only set their own per-product
+/// var); checking the union catches more cases.
+fn detected_ci_env() -> Option<&'static str> {
+    const CI_ENV_VARS: &[&str] = &[
+        "CI",
+        "GITHUB_ACTIONS",
+        "GITLAB_CI",
+        "CIRCLECI",
+        "BUILDKITE",
+        "TRAVIS",
+        "TF_BUILD",          // Azure Pipelines
+        "TEAMCITY_VERSION",
+        "BITBUCKET_BUILD_NUMBER",
+        "DRONE",
+        "JENKINS_URL",
+    ];
+    CI_ENV_VARS
+        .iter()
+        .copied()
+        .find(|name| std::env::var_os(name).is_some())
+}
+
+/// Strict truthy parse for guard-override env vars. `"1"`, `"true"`,
+/// `"yes"`, `"on"` (case-insensitive) flip; everything else — empty
+/// string, `"0"`, `"false"`, `"no"`, `"off"`, unset — does not. Avoids
+/// the trap where a misconfigured workflow sets the override to an
+/// empty value (e.g. `FOO: ${{ secrets.MISSING }}`) and silently
+/// bypasses the guard.
+fn is_truthy_env(name: &str) -> bool {
+    let Some(raw) = std::env::var_os(name) else {
+        return false;
+    };
+    let s = raw.to_string_lossy();
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn chrono_like_now() -> String {

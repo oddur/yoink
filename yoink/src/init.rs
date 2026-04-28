@@ -20,7 +20,7 @@
 //! `--interactive` engages a small set of stdio prompts as a fallback.
 //!
 //! Cut from scope on purpose: secrets bootstrap (operators run
-//! `yoink secrets keygen` separately), multi-service / multi-host
+//! `yoink secrets key generate` separately), multi-service / multi-host
 //! flows, registry credentials, host preflight.
 
 use std::io::{self, IsTerminal, Write};

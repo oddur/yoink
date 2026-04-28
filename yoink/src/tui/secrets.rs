@@ -16,8 +16,9 @@
 //!     CLI (`yoink secrets edit`) — adding a multi-line text editor
 //!     to ratatui isn't worth the surface for the granularity
 //!     operators actually need mid-incident.
-//!   - Infisical is read-only here. The existing client doesn't
-//!     write; the panel renders a "use the web UI" hint instead.
+//!   - `provider: command` is read-only here. Rotation happens in
+//!     the external tool; the panel renders a hint pointing back at
+//!     the configured command.
 
 #![allow(clippy::doc_markdown)]
 
@@ -547,31 +548,37 @@ fn is_valid_key(key: &str) -> bool {
 fn load(config: &Config) -> LoadStatus {
     let Some(secrets_cfg) = &config.secrets else {
         return LoadStatus::Failed(
-            "no `secrets:` block in yoink.yaml — run `yoink secrets keygen` to bootstrap".into(),
+            "no `secrets:` block in yoink.yaml — run `yoink secrets key generate` to bootstrap".into(),
         );
     };
 
     match secrets_cfg {
-        SecretsConfig::Infisical { domain, .. } => {
-            // Read-only path. We don't decrypt; we just show the
-            // operator that the TUI doesn't manage Infisical writes.
-            let where_to = domain
-                .as_deref()
-                .unwrap_or("https://app.infisical.com");
+        SecretsConfig::Command { command, .. } => {
+            // Read-only path. The bundle comes from a third-party CLI
+            // we don't manage; rotation/edits happen in that tool's
+            // own UI/CLI, not here.
+            let pretty = command
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
             LoadStatus::Loaded(LoadedBundle {
                 values: BTreeMap::new(),
                 keys: Vec::new(),
-                title: format!("infisical (read-only — edit at {where_to})"),
+                title: format!("command (read-only — edit via {pretty})"),
                 write_target: None,
             })
         }
         SecretsConfig::Age { file, recipients } => {
-            let path = sealed::resolve_sealed_path(config, file.as_deref());
+            let path = match sealed::resolve_sealed_path(config, file.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return LoadStatus::Failed(e.to_string()),
+            };
             let identity = match sealed::load_identity() {
                 Ok(id) => id,
                 Err(e) => {
                     return LoadStatus::Failed(format!(
-                        "cannot read secrets: {e}\n\nFix locally with: yoink secrets keygen"
+                        "cannot read secrets: {e}\n\nFix locally with: yoink secrets key generate"
                     ));
                 }
             };
@@ -600,7 +607,7 @@ fn load(config: &Config) -> LoadStatus {
                     Ok(p) => p,
                     Err(e) => {
                         return LoadStatus::Failed(format!(
-                            "decrypt failed: {e}\n\nThe age identity yoink found doesn't match any recipient in {}.\nCheck YOINK_AGE_KEY or run `yoink secrets keygen` to inspect.",
+                            "decrypt failed: {e}\n\nThe age identity yoink found doesn't match any recipient in {}.\nCheck YOINK_AGE_KEY or run `yoink secrets key generate` to inspect.",
                             path.display()
                         ));
                     }

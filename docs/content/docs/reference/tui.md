@@ -150,7 +150,7 @@ View / add / edit / remove individual sealed secrets without leaving the TUI. Re
 | `d` | delete selected (with confirmation) |
 | `Esc` / `q` | back |
 
-When the provider is Infisical the pane is read-only — edits go via the Infisical web UI. When no age identity is available, the pane shows the failed-load reason + a remediation pointer. For bulk multi-line edits, drop to the CLI: `yoink secrets edit`.
+When `provider: command` is configured the pane is read-only — rotation happens in whichever external tool the configured CLI talks to. When no age identity is available, the pane shows the failed-load reason + a remediation pointer. For bulk multi-line edits, drop to the CLI: `yoink secrets edit`.
 
 ## Logs pane (`l`)
 

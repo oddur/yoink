@@ -58,21 +58,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Bring whatever your auth shape is. Tailscale + Infisical here:
+      # Bring whatever your auth shape is. Tailscale + age-sealed
+      # secrets here; swap in your `provider: command` setup if you
+      # use a managed store instead.
       - uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
-      - run: |
-          curl -1sLf 'https://dl.cloudsmith.io/public/infisical/infisical-cli/setup.deb.sh' | sudo -E bash
-          sudo apt-get install -y infisical
-          token=$(infisical login --method=universal-auth \
-            --client-id="${{ secrets.INFISICAL_CLIENT_ID }}" \
-            --client-secret="${{ secrets.INFISICAL_CLIENT_SECRET }}" \
-            --silent --plain)
-          echo "::add-mask::$token"
-          echo "INFISICAL_TOKEN=$token" >> "$GITHUB_ENV"
 
       - name: Install yoink
         env:
@@ -86,6 +79,7 @@ jobs:
       - name: Compute diff
         env:
           PR_SHA: ${{ github.event.pull_request.head.sha }}
+          YOINK_AGE_KEY: ${{ secrets.YOINK_AGE_KEY }}
         run: |
           yoink --config yoink.yaml up --dry-run --format=markdown \
             --tag api=$PR_SHA --tag web=$PR_SHA > diff.md
@@ -105,5 +99,5 @@ jobs:
 
 ## Limitations
 
-- Dry-run reads from the host (it computes the diff against running containers), so the PR runner needs the same auth path your deploy runner does — tailnet membership + Infisical creds.
+- Dry-run reads from the host (it computes the diff against running containers), so the PR runner needs the same auth path your deploy runner does — tailnet membership + whatever secret-resolution your `provider:` setup needs (`YOINK_AGE_KEY` for age, the configured manager's CLI + token for `command`).
 - The `--tag` overrides have to match what your deploy workflow will pass. If staging/prod diverge, run two dry-runs against the right host set.

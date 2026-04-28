@@ -3,7 +3,7 @@ title: Production-shape
 weight: 3
 ---
 
-A real prod-shape config: multiple hosts (in case you scale out later — one host today is fine), Infisical secrets, registry-pulled images that CI builds, fragmented across files for sanity, with a separate staging entry.
+A real prod-shape config: multiple hosts (in case you scale out later — one host today is fine), age-sealed secrets in the repo, registry-pulled images that CI builds, fragmented across files for sanity, with a separate staging entry.
 
 ## Layout
 
@@ -31,18 +31,21 @@ hosts:
   # add more as needed; replicas + services[].hosts handle distribution
   # — see /docs/recipes/multi-host-distribution
 
-# Infisical-resolved secrets, fetched once per `up` and folded into
-# spec_hash. See /docs/recipes/infisical-auth for the auth chain.
+# Age-sealed secrets committed to the repo. Decrypted once per `up`
+# from the identity in `YOINK_AGE_KEY` (CI) or `YOINK_AGE_KEY_FILE`
+# (laptop) and folded into spec_hash. See /docs/recipes/sealed-secrets
+# for the full flow; /docs/recipes/secrets-external-cli covers the
+# `provider: command` alternative if you'd rather pull from Doppler /
+# 1Password / Vault / AWS Secrets Manager / the Infisical CLI.
 secrets:
-  provider: infisical
-  project_id: <your-project-uuid>
-  environment: prod
-  domain: https://infisical.example.com   # omit for app.infisical.com
+  provider: age
+  recipients:
+    - age1examplepublickeyreplacewithyourown000000000000000000000000
 
-# Registry credentials live in Infisical too. Yoink looks up these
-# named secrets and passes them to docker as X-Registry-Auth on every
-# pull. Skip this block when running with `--no-registry` or when
-# pulling from public registries.
+# Registry credentials live in the same secrets bundle. Yoink looks up
+# these named keys and passes them to docker as X-Registry-Auth on
+# every pull. Skip this block when running with `--no-registry` or
+# when pulling from public registries.
 registry:
   server: ghcr.io
   username_secret: GHCR_USERNAME
@@ -181,8 +184,7 @@ Two repo workflows do the work. Skeleton:
 - run: |
     yoink up --tag api=${{ github.sha }} --tag web=${{ github.sha }}
   env:
-    INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
-    INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+    YOINK_AGE_KEY: ${{ secrets.YOINK_AGE_KEY }}
 ```
 
 ```yaml

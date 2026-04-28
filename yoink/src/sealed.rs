@@ -3,8 +3,8 @@
 //! Operators commit a single `secrets.age` file alongside `yoink.yaml`.
 //! Format inside the seal: dotenv (`KEY=value\n`). At deploy time
 //! yoink decrypts with one identity, parses the dotenv, and feeds the
-//! resulting `KEY -> VALUE` map to the same `SecretsBundle` machinery
-//! the Infisical path uses.
+//! resulting `KEY -> VALUE` map to the `SecretsBundle` machinery shared
+//! with the `provider: command` path.
 //!
 //! Identity resolution order (same code path locally and in CI):
 //!   1. `YOINK_AGE_KEY` env var — raw `AGE-SECRET-KEY-1...`
@@ -72,17 +72,48 @@ pub enum SealedError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "sealed file path {0:?} escapes the config directory — `secrets.file:` may not contain `..` or be absolute outside of yoink.yaml's directory"
+    )]
+    PathEscape(String),
+    #[error(
+        "age identity file {path} has permissive mode {mode:#o} — tighten with `chmod 600 {path_display}`"
+    )]
+    IdentityPermissive {
+        path: PathBuf,
+        path_display: String,
+        mode: u32,
+    },
 }
 
 /// Resolve where the sealed file lives. Honors `secrets.file:` when
 /// set, falls back to `<config_dir>/secrets.age`.
-#[must_use]
-pub fn resolve_sealed_path(config: &Config, file_override: Option<&str>) -> PathBuf {
+///
+/// Rejects `secrets.file:` values that contain `..` components or are
+/// absolute paths pointing outside the config directory — the value
+/// comes from a yaml that anyone with PR access can edit, and a
+/// `file: ../../../etc/passwd` should never become a sealed-file
+/// pointer (`yoink secrets edit` would happily overwrite it).
+pub fn resolve_sealed_path(
+    config: &Config,
+    file_override: Option<&str>,
+) -> Result<PathBuf, SealedError> {
     let base = config
         .config_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join(file_override.unwrap_or(DEFAULT_SEALED_FILENAME))
+    let raw = file_override.unwrap_or(DEFAULT_SEALED_FILENAME);
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return Err(SealedError::PathEscape(raw.to_string()));
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(SealedError::PathEscape(raw.to_string()));
+    }
+    Ok(base.join(candidate))
 }
 
 /// Default location of the operator's age identity.
@@ -115,6 +146,7 @@ pub fn load_identity() -> Result<x25519::Identity, SealedError> {
 }
 
 fn load_identity_from_file(path: &Path) -> Result<x25519::Identity, SealedError> {
+    check_identity_file_mode(path)?;
     let raw = std::fs::read_to_string(path).map_err(|source| SealedError::IdentityRead {
         path: path.to_path_buf(),
         source,
@@ -126,6 +158,35 @@ fn load_identity_from_file(path: &Path) -> Result<x25519::Identity, SealedError>
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .ok_or_else(|| SealedError::IdentityParse(format!("{} is empty", path.display())))?;
     parse_identity(key_line)
+}
+
+/// Refuse to load an age identity from a world-readable / group-readable
+/// file. The private half of an age key is bearer-secret material — if
+/// it lands in the local checkout with `0644` it's effectively shared
+/// with every other login on the box. CI runners typically materialize
+/// the key inside a tempfile they own; we just want a clear error
+/// before the operator pipes a leaked identity into yoink.
+#[cfg(unix)]
+fn check_identity_file_mode(path: &Path) -> Result<(), SealedError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path).map_err(|source| SealedError::IdentityRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(SealedError::IdentityPermissive {
+            path: path.to_path_buf(),
+            path_display: path.display().to_string(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_identity_file_mode(_path: &Path) -> Result<(), SealedError> {
+    Ok(())
 }
 
 fn parse_identity(raw: &str) -> Result<x25519::Identity, SealedError> {
@@ -293,6 +354,23 @@ fn needs_quoting(s: &str) -> bool {
             .any(|c| c.is_whitespace() || c == '#' || c == '"' || c == '\'')
 }
 
+/// `tempfile::Builder` configured for secrets-bearing scratch files:
+/// 0o600 perms on Unix from creation when `mode` is set, no public
+/// hole even momentarily. Shared between `write_atomically_secret`
+/// and the editor scratch file in the seal/edit CLI flow.
+#[must_use]
+pub fn secret_tempfile_builder(mode: Option<u32>) -> tempfile::Builder<'static, 'static> {
+    let mut b = tempfile::Builder::new();
+    #[cfg(unix)]
+    if let Some(m) = mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        b.permissions(std::fs::Permissions::from_mode(m));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    b
+}
+
 /// Atomic write: write to `<path>.tmp` and rename. Creates parent
 /// directories as needed. Use [`write_atomically_secret`] for files
 /// that must never be world-readable, even briefly.
@@ -313,58 +391,44 @@ fn write_atomically_inner(
     bytes: &[u8],
     mode: Option<u32>,
 ) -> Result<(), SealedError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|source| SealedError::Mkdir {
-            path: parent.to_path_buf(),
+    use std::io::Write as _;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    std::fs::create_dir_all(&parent).map_err(|source| SealedError::Mkdir {
+        path: parent.clone(),
+        source,
+    })?;
+
+    // Random tmp filename in the destination directory: same
+    // filesystem (rename(2) atomic) and RAII cleanup if we bail
+    // before persist().
+    let mut tmp = secret_tempfile_builder(mode)
+        .prefix(".yoink-")
+        .suffix(".tmp")
+        .tempfile_in(&parent)
+        .map_err(|source| SealedError::Write {
+            path: parent.clone(),
             source,
         })?;
-    }
-    let mut tmp = path.to_path_buf();
-    let fname = path
-        .file_name()
-        .map_or_else(|| std::ffi::OsString::from("yoink"), ToOwned::to_owned);
-    let mut tmp_name = std::ffi::OsString::new();
-    tmp_name.push(".");
-    tmp_name.push(&fname);
-    tmp_name.push(".tmp");
-    tmp.set_file_name(tmp_name);
-
-    write_with_mode(&tmp, bytes, mode)?;
-    std::fs::rename(&tmp, path).map_err(|source| SealedError::Write {
+    tmp.as_file_mut()
+        .write_all(bytes)
+        .map_err(|source| SealedError::Write {
+            path: tmp.path().to_path_buf(),
+            source,
+        })?;
+    tmp.as_file_mut()
+        .sync_all()
+        .map_err(|source| SealedError::Write {
+            path: tmp.path().to_path_buf(),
+            source,
+        })?;
+    tmp.persist(path).map_err(|e| SealedError::Write {
         path: path.to_path_buf(),
-        source,
+        source: e.error,
     })?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn write_with_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), SealedError> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    if let Some(m) = mode {
-        opts.mode(m);
-    }
-    let mut file = opts.open(path).map_err(|source| SealedError::Write {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.write_all(bytes).map_err(|source| SealedError::Write {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_with_mode(path: &Path, bytes: &[u8], _mode: Option<u32>) -> Result<(), SealedError> {
-    std::fs::write(path, bytes).map_err(|source| SealedError::Write {
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 #[cfg(test)]

@@ -1608,7 +1608,7 @@ services:
         let cfg = config_one_service();
         let env = build_env(&cfg.services[0], None);
         assert_eq!(env.get("LOG_LEVEL"), Some(&"info".into()));
-        assert!(!env.contains_key("INFISICAL_TOKEN"));
+        assert!(!env.contains_key("DATABASE_URL"));
     }
 
     #[test]

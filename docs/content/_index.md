@@ -38,7 +38,7 @@ Single-host PaaS tools (Kamal, Dokku) are wonderful for "one app, one host" but 
 - **Drift detection.** Every effective spec hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
 - **Three deploy modes**: CI-built (the default), local-build with `yoink build --push`, or fully standalone with `yoink up --build --no-registry` (no CI, no registry — drop a `yoink.yaml` next to your Dockerfile and go)
 - **Secure by default**: containers run as **non-root** (uid 65534) with cap_drop=ALL, no-new-privileges, read-only rootfs, init=tini, tmpfs noexec, binds default :ro. Override per service when an image genuinely needs root.
-- **Sealed secrets out of the box**: commit a single `secrets.age` file, decrypt with one key from `YOINK_AGE_KEY` (env in CI, file on your laptop). No remote vault needed. Infisical is opt-in for teams already running one.
+- **Sealed secrets out of the box**: commit a single `secrets.age` file, decrypt with one key from `YOINK_AGE_KEY` (env in CI, file on your laptop). No remote vault needed. For teams that prefer a managed store, `provider: command` shells out to whatever CLI you already use — Doppler, 1Password, Vault, AWS Secrets Manager, the Infisical CLI — no first-party SDK to vendor.
 - **CLI + YAML, no GUI**. Everything is a `yoink` subcommand or a `yoink.yaml` field — no web dashboard, no clicking. Identical experience on your laptop, in CI, and inside an AI coding agent like Claude Code or Cursor.
 - **k9s-style TUI** with deploy history, one-press rollback, drift cells, logs auto-piped through `hl`
 
