@@ -121,12 +121,24 @@ struct AgeBootstrap {
 /// public recipient is returned so the caller can render it into
 /// `yoink.yaml`.
 fn bootstrap_age_identity() -> Result<AgeBootstrap> {
+    let dir = crate::sealed::keys_dir().context("resolve ~/.config/yoink/keys/")?;
+    bootstrap_age_identity_in_dir(&dir)
+}
+
+/// Inner: writes into an explicit dir so tests can drive it against
+/// a tempdir without mutating `HOME`.
+fn bootstrap_age_identity_in_dir(dir: &Path) -> Result<AgeBootstrap> {
+    let (secret, public) = crate::sealed::keygen();
+    write_age_identity(dir, &secret, &public)
+}
+
+/// Innermost: deterministic keypair → on-disk file. Lets tests pin
+/// the public recipient and exercise the duplicate-detection branch.
+fn write_age_identity(dir: &Path, secret: &str, public: &str) -> Result<AgeBootstrap> {
     use crate::sealed;
-    let (secret, public) = sealed::keygen();
-    let dir = sealed::keys_dir().context("resolve ~/.config/yoink/keys/")?;
-    std::fs::create_dir_all(&dir)
+    std::fs::create_dir_all(dir)
         .with_context(|| format!("create {}", dir.display()))?;
-    let key_path = sealed::keys_dir_path_for(&public)?;
+    let key_path = dir.join(format!("{public}.key"));
     if key_path.exists() {
         // x25519 collisions are vanishingly unlikely; if this fires
         // it's almost certainly a `--force` re-init in the same
@@ -141,7 +153,10 @@ fn bootstrap_age_identity() -> Result<AgeBootstrap> {
     );
     sealed::write_atomically_secret(&key_path, body.as_bytes())
         .with_context(|| format!("write {}", key_path.display()))?;
-    Ok(AgeBootstrap { public, key_path })
+    Ok(AgeBootstrap {
+        public: public.to_string(),
+        key_path,
+    })
 }
 
 fn print_backup_warning(b: &AgeBootstrap) {
@@ -903,6 +918,76 @@ mod tests {
         // `parse_str` validates internally, so a clean parse implies
         // a valid config.
         Config::parse_str(&yaml).expect("parse + validate");
+    }
+
+    #[test]
+    fn bootstrap_writes_key_with_pubkey_filename_and_safe_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("keys");
+
+        let result = bootstrap_age_identity_in_dir(&dir).unwrap();
+
+        assert!(result.public.starts_with("age1"));
+        assert_eq!(
+            result.key_path.parent().unwrap(),
+            dir,
+            "key landed inside the dir we asked for"
+        );
+        assert_eq!(
+            result.key_path.file_stem().unwrap().to_str().unwrap(),
+            result.public,
+            "filename equals the public recipient — load_identity scan relies on this"
+        );
+
+        // The on-disk file contains the secret yoink generated. Reading
+        // it back and matching the public half is the round-trip
+        // contract that lets `yoink secrets edit` find this key after
+        // `yoink init` exits.
+        let body = std::fs::read_to_string(&result.key_path).unwrap();
+        assert!(
+            body.contains(&format!("# public: {}", result.public)),
+            "header should record the public recipient"
+        );
+        assert!(
+            body.lines().any(|l| l.starts_with("AGE-SECRET-KEY-1")),
+            "body should contain the AGE secret key"
+        );
+
+        // File mode is 0600 on unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let mode = std::fs::metadata(&result.key_path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o600, "private key file must be 0600");
+        }
+    }
+
+    #[test]
+    fn bootstrap_creates_keys_dir_when_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Two-level missing path — must be created without error.
+        let dir = tmp.path().join("config").join("yoink").join("keys");
+        assert!(!dir.exists());
+
+        let result = bootstrap_age_identity_in_dir(&dir).unwrap();
+
+        assert!(dir.is_dir());
+        assert!(result.key_path.exists());
+    }
+
+    #[test]
+    fn bootstrap_refuses_to_overwrite_existing_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("keys");
+        let (secret, public) = crate::sealed::keygen();
+
+        write_age_identity(&dir, &secret, &public).unwrap();
+
+        let err = write_age_identity(&dir, &secret, &public).unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "bail message should make the safety check obvious; got {err}"
+        );
     }
 
     #[test]

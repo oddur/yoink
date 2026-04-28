@@ -160,32 +160,50 @@ pub fn default_identity_path() -> Result<PathBuf, SealedError> {
 /// Pass `&[]` to skip the keys-dir scan (e.g. from contexts that don't
 /// have a config handy). Falls through env vars + legacy path only.
 pub fn load_identity(recipients: &[String]) -> Result<x25519::Identity, SealedError> {
-    if let Ok(raw) = env::var(AGE_KEY_ENV) {
+    load_identity_resolved(
+        env::var(AGE_KEY_ENV).ok(),
+        env::var(AGE_KEY_FILE_ENV).ok(),
+        &keys_dir()?,
+        &legacy_identity_path()?,
+        recipients,
+    )
+}
+
+/// Pure resolution logic — env values and paths are passed in instead
+/// of being read from process state. Tests drive this directly to
+/// avoid mutating `HOME` / `YOINK_AGE_KEY*`, which would race with
+/// other tests in the suite.
+fn load_identity_resolved(
+    env_key: Option<String>,
+    env_file: Option<String>,
+    keys_dir: &Path,
+    legacy_path: &Path,
+    recipients: &[String],
+) -> Result<x25519::Identity, SealedError> {
+    if let Some(raw) = env_key {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             return parse_identity(trimmed);
         }
     }
 
-    if let Ok(path) = env::var(AGE_KEY_FILE_ENV) {
+    if let Some(path) = env_file {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             return load_identity_from_file(Path::new(trimmed));
         }
     }
 
-    if !recipients.is_empty() {
-        let dir = keys_dir()?;
-        if let Some(identity) = scan_dir_for_match(&dir, recipients)? {
-            return Ok(identity);
-        }
+    if !recipients.is_empty()
+        && let Some(identity) = scan_dir_for_match(keys_dir, recipients)?
+    {
+        return Ok(identity);
     }
 
-    let legacy = legacy_identity_path()?;
-    if legacy.exists() {
-        return load_identity_from_file(&legacy);
+    if legacy_path.exists() {
+        return load_identity_from_file(legacy_path);
     }
-    Err(SealedError::NoIdentity(legacy))
+    Err(SealedError::NoIdentity(legacy_path.to_path_buf()))
 }
 
 /// Walk a keys dir looking for an identity whose public half is in
@@ -727,5 +745,161 @@ BAZ=plain
     #[cfg(not(unix))]
     fn write_key_file(dir: &Path, name: &str, contents: &str) {
         std::fs::write(dir.join(name), contents).unwrap();
+    }
+
+    // --- load_identity_resolved: full resolution-order coverage ---
+
+    #[test]
+    fn load_resolved_picks_keys_dir_when_recipient_matches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let (secret, public) = keygen();
+        write_key_file(&keys, &format!("{public}.key"), &secret);
+        let legacy = tmp.path().join("nonexistent-legacy.key");
+
+        let id = load_identity_resolved(None, None, &keys, &legacy, &[public.clone()])
+            .expect("scan match");
+        assert_eq!(id.to_public().to_string(), public);
+    }
+
+    #[test]
+    fn load_resolved_falls_back_to_legacy_when_keys_dir_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let legacy = tmp.path().join("age.key");
+        let (secret, public) = keygen();
+        // Write the legacy file at mode 0600 so the mode check passes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::write(&legacy, &secret).unwrap();
+            std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&legacy, &secret).unwrap();
+
+        // Recipients are non-empty (so dir scan would run) but the
+        // dir is empty — must fall through to legacy.
+        let id = load_identity_resolved(None, None, &keys, &legacy, &["age1other".into()])
+            .expect("legacy fallback");
+        assert_eq!(id.to_public().to_string(), public);
+    }
+
+    #[test]
+    fn load_resolved_empty_recipients_skips_dir_scan() {
+        // Regression test for the `secrets key public` bug: passing
+        // empty recipients used to make the dir scan no-op and fall
+        // through to legacy. That's the documented contract — keep it
+        // explicit so changing the contract requires a deliberate
+        // test edit.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let (secret, public) = keygen();
+        write_key_file(&keys, &format!("{public}.key"), &secret);
+        let legacy_missing = tmp.path().join("no-legacy.key");
+
+        // No env, no recipients, no legacy file — must fail loud
+        // rather than silently grab a key from the dir.
+        match load_identity_resolved(None, None, &keys, &legacy_missing, &[]) {
+            Err(SealedError::NoIdentity(_)) => {}
+            Err(other) => panic!("expected NoIdentity, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn load_resolved_env_key_beats_keys_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        // Stash a *different* identity in the keys dir; we expect
+        // env_key to win even when a matching key is on disk.
+        let (other_secret, other_public) = keygen();
+        write_key_file(&keys, &format!("{other_public}.key"), &other_secret);
+
+        let (env_secret, env_public) = keygen();
+        let legacy = tmp.path().join("nonexistent-legacy.key");
+
+        // Recipients name `other_public` so the dir scan WOULD match
+        // — but env_key takes precedence regardless.
+        let id = load_identity_resolved(
+            Some(env_secret),
+            None,
+            &keys,
+            &legacy,
+            &[other_public],
+        )
+        .expect("env wins");
+        assert_eq!(id.to_public().to_string(), env_public);
+    }
+
+    #[test]
+    fn load_resolved_env_file_beats_keys_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let (other_secret, other_public) = keygen();
+        write_key_file(&keys, &format!("{other_public}.key"), &other_secret);
+
+        let (env_secret, env_public) = keygen();
+        let env_file_path = tmp.path().join("env.key");
+        write_key_file(tmp.path(), "env.key", &env_secret);
+
+        let legacy = tmp.path().join("nonexistent-legacy.key");
+
+        let id = load_identity_resolved(
+            None,
+            Some(env_file_path.display().to_string()),
+            &keys,
+            &legacy,
+            &[other_public],
+        )
+        .expect("env file wins");
+        assert_eq!(id.to_public().to_string(), env_public);
+    }
+
+    #[test]
+    fn load_resolved_blank_env_vars_treated_as_unset() {
+        // Empty/whitespace YOINK_AGE_KEY shouldn't short-circuit the
+        // resolution chain — fall through as if the var wasn't set.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let (secret, public) = keygen();
+        write_key_file(&keys, &format!("{public}.key"), &secret);
+        let legacy = tmp.path().join("no-legacy.key");
+
+        let id = load_identity_resolved(
+            Some("   ".to_string()),
+            Some("\t".to_string()),
+            &keys,
+            &legacy,
+            &[public.clone()],
+        )
+        .expect("fallthrough past blank env");
+        assert_eq!(id.to_public().to_string(), public);
+    }
+
+    #[test]
+    fn load_resolved_no_match_anywhere_errors_with_legacy_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let legacy = tmp.path().join("expected-legacy-path.key");
+
+        match load_identity_resolved(
+            None,
+            None,
+            &keys,
+            &legacy,
+            &["age1nothing-matches".into()],
+        ) {
+            Err(SealedError::NoIdentity(p)) => assert_eq!(p, legacy),
+            Err(other) => panic!("expected NoIdentity, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 }
