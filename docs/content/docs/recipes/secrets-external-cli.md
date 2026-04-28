@@ -24,6 +24,26 @@ Stderr is captured and surfaced when the command exits non-zero. No shell interp
 
 ## Per-tool recipes
 
+### sops
+
+[sops](https://github.com/getsops/sops) is the most natural fit for teams that want sealed secrets in the repo (like the `provider: age` default) but with the extra capabilities sops layers on top:
+
+- **Per-key git diffs.** sops encrypts only values; key names stay plaintext. PR review of a secret change shows *which key* moved instead of "this opaque blob changed".
+- **Multi-cloud KMS as the root of trust.** Encrypt to AWS KMS, GCP KMS, Azure Key Vault, or Vault transit — decrypt via IAM role at deploy time, no private key on operator laptops.
+- **Per-value MAC** for tamper detection at the field level.
+- **Granular rotation.** `sops updatekeys` re-keys the data key without re-encrypting every value.
+- **Format flexibility.** Encrypts YAML / JSON / INI / dotenv / binary; supports nested structures.
+
+```yaml
+secrets:
+  provider: command
+  command: ["sops", "-d", "--output-type=dotenv", "secrets.enc.yaml"]
+```
+
+Pre-flight: `brew install sops` on the operator's laptop and CI runner; configure `.sops.yaml` with the encryption recipients (age key, KMS ARN, etc.). Editor flow stays on `sops edit secrets.enc.yaml` (yoink doesn't wrap it).
+
+Trade-off vs the bundled `provider: age`: sops is one extra binary to install, one extra `.sops.yaml` config to maintain, and (with cloud KMS) a network dependency at deploy time. Reach for sops when one of the bullets above is genuinely paying for that overhead — git-diff legibility for many secret reviewers, or KMS as the root of trust for compliance reasons. The `provider: age` default is sized for "small team, single source-of-truth repo, one private key per environment".
+
 ### Doppler
 
 ```yaml

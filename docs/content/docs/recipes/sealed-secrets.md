@@ -137,9 +137,11 @@ Manual flow:
 
 Switch to `provider: command` and let yoink shell out to your secret manager's CLI when you need:
 
-- Centralized rotation across many repos
-- An audit trail of who read which value when
-- Fine-grained ACLs (per-team, per-environment)
-- Secrets that must NOT live in a git history (regulatory)
+- **Per-key git diffs** instead of opaque-blob churn — use [sops](/docs/recipes/secrets-external-cli#sops). Same "sealed file in the repo" model, but only values are encrypted, so PR review shows which key moved.
+- **Cloud KMS as the root of trust** (AWS / GCP / Azure / Vault transit) so no private key ever lives on operator laptops — sops covers this too.
+- **Centralized rotation across many repos** — Doppler, 1Password, the Infisical CLI.
+- **An audit trail of who read which value when** — Doppler, Vault, AWS Secrets Manager.
+- **Fine-grained ACLs** (per-team, per-environment) — Vault, AWS SM, sops with KMS.
+- **Secrets that must NOT live in a git history** (regulatory) — anything that's a managed service.
 
-The CLI-driven path covers Doppler, 1Password, HashiCorp Vault, AWS Secrets Manager, the Infisical CLI, and anything else that emits dotenv or JSON on stdout. See [external secrets via CLI](/docs/recipes/secrets-external-cli).
+The CLI-driven path covers sops, Doppler, 1Password, HashiCorp Vault, AWS Secrets Manager, the Infisical CLI, Bitwarden, and anything else that emits dotenv or JSON on stdout. See [external secrets via CLI](/docs/recipes/secrets-external-cli).
