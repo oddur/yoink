@@ -128,7 +128,7 @@ For each replica of each service, yoink does:
 
 1. Resolve the desired tag, build the spec, compute `spec_hash`.
 2. Check the host snapshot — if a container with the matching name + `spec_hash` is already running, skip (no-op).
-3. Otherwise: pull the image (or skip when `--no-registry` made it locally present), create the new container with the resolved name (`<service>-<short_hash>` or `<service>-<short_hash>-<idx>` for replicas), start it.
+3. Otherwise: pull the image (or skip when an earlier `load_images_to_hosts` phase already shipped the build artifact, or when `--no-registry` forced local-only mode), create the new container with the resolved name (`<service>-<short_hash>` or `<service>-<short_hash>-<idx>` for replicas), start it.
 4. Probe the configured healthcheck (`healthcheck_path` HTTP GET, or a TCP-connect probe on `port` if no path is set). Retry on a backoff until it passes or `healthcheck_timeout` elapses.
 5. On healthy: stop the previous-generation container (waiting `drain_timeout` for graceful shutdown), then force-remove it.
 6. On healthcheck failure: leave the new container running but exited, leave the old one running, surface the error. The operator inspects via `yoink logs` / `yoink shell` and either fixes config or rolls back.

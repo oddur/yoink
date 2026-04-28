@@ -151,6 +151,7 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
     findings.extend(check_provider_command(config));
     findings.extend(check_keys_dir_perms());
     findings.extend(check_build_blocks(config));
+    findings.extend(check_registry_consistency(config));
     findings.extend(check_dockerfile_paths(config));
     findings.extend(check_proxied_services(config));
     findings.extend(check_tls_cert_secrets(config, bundle_ref));
@@ -273,6 +274,46 @@ fn is_likely_hub_library(image: &str) -> bool {
             | "traefik"
             | "busybox"
     )
+}
+
+// ---------- config: registry block consistency ----------
+
+/// Flag an orphan `registry:` block — set in config but no service
+/// actually references it. `yoink up` auto-skips the registry phase in
+/// that case, so the block is dead weight; doctor surfaces it so the
+/// operator can either remove it or wire a service to it.
+fn check_registry_consistency(config: &Config) -> Vec<Finding> {
+    let Some(reg) = &config.registry else {
+        return Vec::new();
+    };
+    let n = config.services_using_configured_registry().count();
+    if n > 0 {
+        vec![Finding::pass(
+            "config",
+            format!("registry `{}` is referenced by {n} service(s)", reg.server),
+        )]
+    } else {
+        vec![
+            Finding::warn(
+                "config",
+                format!(
+                    "`registry: {}` is configured but no service references it",
+                    reg.server
+                ),
+            )
+            .with_detail(
+                "`yoink up` won't use this registry — services without a `build:` \
+                 block pull from whatever host is embedded in their `image:` ref, \
+                 services with `build:` are shipped from the operator's local \
+                 docker daemon. The configured creds are dead weight.",
+            )
+            .with_fix(format!(
+                "drop the `registry:` block, or update a service's `image:` to \
+                 use this registry (e.g. `image: {}/your-app`)",
+                reg.server
+            )),
+        ]
+    }
 }
 
 // ---------- config: proxy + domain shape ----------
@@ -990,5 +1031,46 @@ mod tests {
         let f = check_build_blocks(&cfg);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::Pass);
+    }
+
+    #[test]
+    fn check_registry_consistency_passes_when_image_uses_configured_registry() {
+        let cfg = Config::parse_str(
+            "deploy:\n  networks: [yoink]\nhosts:\n  - { address: h, user: u }\n\
+             registry:\n  server: ghcr.io\n  username_secret: U\n  password_secret: P\n\
+             secrets: { provider: command, command: [sh, -c, \"echo X=1\"] }\n\
+             services:\n  - name: api\n    image: ghcr.io/me/api\n    tag: v1\n    run: { port: 8080, healthcheck_path: / }\n"
+        )
+        .unwrap();
+        let f = check_registry_consistency(&cfg);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Pass);
+        assert!(f[0].title.contains("ghcr.io"));
+    }
+
+    #[test]
+    fn check_registry_consistency_warns_on_orphan_registry_block() {
+        let cfg = Config::parse_str(
+            "deploy:\n  networks: [yoink]\nhosts:\n  - { address: h, user: u }\n\
+             registry:\n  server: 4db05qgnlk.registry.depot.dev\n  username_secret: U\n  password_secret: P\n\
+             secrets: { provider: command, command: [sh, -c, \"echo X=1\"] }\n\
+             services:\n  - name: db\n    image: postgres\n    tag: \"16\"\n    run: { port: 5432, healthcheck_path: / }\n"
+        )
+        .unwrap();
+        let f = check_registry_consistency(&cfg);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0].title.contains("no service references it"));
+    }
+
+    #[test]
+    fn check_registry_consistency_silent_without_registry_block() {
+        let cfg = Config::parse_str(
+            "deploy:\n  networks: [yoink]\nhosts:\n  - { address: h, user: u }\n\
+             services:\n  - name: api\n    image: ghcr.io/me/api\n    tag: v1\n    run: { port: 8080, healthcheck_path: / }\n"
+        )
+        .unwrap();
+        let f = check_registry_consistency(&cfg);
+        assert!(f.is_empty(), "no registry block → no finding (good or bad)");
     }
 }

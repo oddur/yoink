@@ -11,14 +11,14 @@ Yoink treats **where the image is built** and **how it gets to the host** as ind
 
 **Distribution:**
 - **Via a container registry.** The standard path: `docker push` to a registry (real, self-hosted, or pull-through), `docker pull` from each host. Registry-protocol dedup means only changed layers cross the wire. Fits multi-host production, audit, and tag-based rollback.
-- **Direct to host, no registry.** `--no-registry` ships the locally-built image straight to each host over SSH. By default this uses an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar so you still get layer-level dedup — only the changed blobs cross the wire on redeploy. Fits rapid iteration, hobby/indie/prototype hosts, and air-gapped environments where opening a registry is overkill.
+- **Direct to host, no registry.** Plain `yoink up` ships any service with a `build:` block straight from the operator's docker daemon to each host over SSH — no registry needed for those services. By default this uses an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar so you still get layer-level dedup — only the changed blobs cross the wire on redeploy. Fits rapid iteration, hobby/indie/prototype hosts, and air-gapped environments where opening a registry is overkill.
 
 | Build origin → / Distribution ↓ | In CI | On operator's machine |
 |---|---|---|
 | **Via registry** | CI pushes, hosts pull. The default for production. | `yoink build --push` then `yoink up` — the classic two-step build+deploy. |
-| **Direct to host (no registry)** | Less common, but valid: CI builds then runs `yoink up --no-registry --transport=unregistry --tag api=<sha>`. | `yoink up --build --no-registry`, one command. The standalone loop. |
+| **Direct to host (no registry)** | Less common, but valid: CI builds then runs `yoink up --transport=unregistry --tag api=<sha>` on a config whose service has a `build:` block (or pass `--no-registry` to force local shipping for non-build services too). | `yoink up --build`, one command. The standalone loop. |
 
-The four cells share a deploy engine — drift detection, healthcheck-gated rolling swap, dependency-ordered waves work the same regardless of how the image arrived.
+The four cells share a deploy engine — drift detection, healthcheck-gated rolling swap, dependency-ordered waves work the same regardless of how the image arrived. Mixed configs (some services pull from a registry, others ship from local) work out of the box: yoink detects which is which from the `build:` blocks and runs both paths in parallel under a single `yoink up`.
 
 ## CI-built — the default
 
@@ -52,7 +52,7 @@ Two-step instead of one-shot is deliberate: `yoink build && yoink up` keeps the 
 
 ## Standalone (no registry)
 
-The whole loop in one command for a low-ceremony tool repo: drop a `yoink.yaml` next to your `Dockerfile`, describe where the thing should land, run `yoink up --build --no-registry`. Build, ship, run. No CI to set up, no registry account, no auth dance.
+The whole loop in one command for a low-ceremony tool repo: drop a `yoink.yaml` next to your `Dockerfile`, describe where the thing should land, run `yoink up --build`. Build, ship, run. No CI to set up, no registry account, no auth dance.
 
 ```yaml
 # yoink.yaml — sits alongside the Dockerfile in your repo
@@ -70,7 +70,7 @@ services:
 ```
 
 ```sh
-yoink up --build --no-registry      # build + save+load + run, in one command
+yoink up --build                    # build + save+load + run, in one command
 ```
 
 That's it. Edit Dockerfile, rerun, watch the new version roll. Useful for utilities, internal admin tools, prototypes — anything where the GitHub Actions + container-registry overhead is more friction than the deploy is worth.
@@ -79,10 +79,12 @@ If you'd rather keep build and deploy as separate steps (e.g. share the build ar
 
 ```sh
 yoink build my-tool                                # docker build → tag local image as my-tool:dev
-yoink up --no-registry --service my-tool           # save+load to each host
+yoink up --service my-tool                         # save+load to each host
 ```
 
-What `--no-registry` does: for every (service, host) the deploy targets, yoink ships the locally-built image to the host without any external registry. By default it uses the **unregistry transport** (described below); pass `--transport tarball` to opt out and use the legacy whole-image stream.
+How yoink chooses: any service with a `build:` block is shipped from the operator's local docker daemon over SSH (the only place that image:tag exists). Any service without `build:` is pulled by each host from whatever registry is in its `image:` ref. You don't have to flag the choice — yoink figures it out per service. By default the local-shipping path uses the **unregistry transport** (described below); pass `--transport tarball` to opt out and use the legacy whole-image stream.
+
+If you want to force local-shipping for non-build services too — for offline / airgapped deploys, or to ship a locally-modified version of a public image — pass `--no-registry`. That widens the local-shipping path to every service and skips registry pulls entirely. You usually don't need it.
 
 ### How the unregistry transport works (default)
 
@@ -108,7 +110,7 @@ If the unregistry setup fails for any reason (host can't pull the unregistry ima
 ### Tarball transport (opt-out)
 
 ```sh
-yoink up --build --no-registry --transport tarball
+yoink up --build --transport tarball
 ```
 
 For each (service, host), streams `docker save <image>:<tag>` from the operator's local docker daemon directly into the host's docker daemon via the same SSH-tunnelled Docker API connection that `up` already uses (calling `POST /images/load`). The whole image crosses the wire every deploy — no dedup. Slower than unregistry on redeploy, but has zero dependencies on the host beyond docker. Useful when you can't pull the unregistry image (truly air-gapped hosts) or when you want to debug a transport issue.

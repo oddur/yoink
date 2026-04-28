@@ -9,14 +9,14 @@ weight: 2
 
 ```sh
 yoink init root@1.2.3.4              # generates yoink.yaml from your repo
-yoink up --build --no-registry       # builds locally, ships, runs
+yoink up --build                     # builds locally, ships, runs
 ```
 
-Done. `yoink init` reads your `Dockerfile`, `git remote`, and (optionally) `~/.ssh/config` to fill in every field. `yoink up` builds the image locally, ships it to the host over SSH (no registry needed), and runs it through a healthcheck-gated rolling deploy.
+Done. `yoink init` reads your `Dockerfile`, `git remote`, and (optionally) `~/.ssh/config` to fill in every field. `yoink up` builds the image locally, ships it to the host over SSH (no registry needed for services with a `build:` block), and runs it through a healthcheck-gated rolling deploy.
 
-> **One small edit between the two commands**, if you want the no-registry standalone path: open the generated `yoink.yaml` and change `image:` to a bare name (e.g. `my-tool`) so it doesn't include a registry prefix. The walkthrough below shows the full flow.
+> **One small edit between the two commands**, if you want the standalone path with no registry account at all: open the generated `yoink.yaml` and change `image:` to a bare name (e.g. `my-tool`) so it doesn't include a registry prefix. The walkthrough below shows the full flow.
 
-Edit a line of code, run `yoink up --build --no-registry` again — yoink rebuilds, ships only changed layers, rolls the new container behind the healthcheck. ~5–15 seconds for a small image.
+Edit a line of code, run `yoink up --build` again — yoink rebuilds, ships only changed layers, rolls the new container behind the healthcheck. ~5–15 seconds for a small image.
 
 ## Prerequisites
 
@@ -80,17 +80,17 @@ services:
 ### Run one command
 
 ```sh
-yoink up --build --no-registry
+yoink up --build
 ```
 
-Builds the image locally, ships it directly to the host over SSH, runs it through a healthcheck-gated rolling deploy.
+Builds the image locally, ships it directly to the host over SSH (the `build:` block tells yoink the image is local-only — no registry pull is attempted), and runs it through a healthcheck-gated rolling deploy.
 
 ### Iterate
 
 Edit code or Dockerfile. Re-run the same command:
 
 ```sh
-yoink up --build --no-registry
+yoink up --build
 ```
 
 Only changed layers cross the wire (yoink uses [unregistry-style](/docs/guide/deploy-modes#standalone-no-registry) layer-dedup transport). Healthcheck-gated swap; the old container only stops after the new one is healthy.
@@ -127,7 +127,7 @@ services:
       healthcheck_path: /health
 ```
 
-Point DNS at `1.2.3.4`. `yoink up --build --no-registry` again. `https://my-tool.example.com` serves with a Let's Encrypt cert. Yoink runs Caddy as a managed service alongside your app and renders its config from your `yoink.yaml`. See the [reverse proxy guide](/docs/guide/proxy) for the full surface.
+Point DNS at `1.2.3.4`. `yoink up --build` again. `https://my-tool.example.com` serves with a Let's Encrypt cert. Yoink runs Caddy as a managed service alongside your app and renders its config from your `yoink.yaml`. See the [reverse proxy guide](/docs/guide/proxy) for the full surface.
 
 ## Different SSH setups
 
@@ -137,7 +137,7 @@ Drop your SSH key once, then yoink takes over:
 
 ```sh
 ssh-copy-id root@1.2.3.4                  # asks for the root password once
-yoink up --build --no-registry
+yoink up --build
 ```
 
 ### Non-default key
