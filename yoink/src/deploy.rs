@@ -743,15 +743,23 @@ async fn finalize_one_host(
 
     // Caddy admin-API push: route the new replicas in (and the
     // proxy itself, after first deploy, into a serving state).
-    // Runs between healthcheck-pass and the old-replica stop so
-    // there's a brief window where both old + new serve — Caddy
-    // gracefully reloads, no in-flight requests dropped. Skipped
-    // for non-routed services and when the proxy isn't enabled.
+    // Runs between healthcheck-pass and the old-replica stop. We
+    // override the in-flight service's upstream names with the
+    // expected (post-deploy) replica names — see `push_caddy_config`
+    // for why we deliberately do NOT include the about-to-be-stopped
+    // old containers in the rendered upstreams.
     let triggers_caddy_load = crate::proxy::proxy_enabled(config)
         && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
             || crate::proxy::is_proxied(service));
     if triggers_caddy_load {
-        push_caddy_config(ops, &host, config, secrets).await?;
+        push_caddy_config(
+            ops,
+            &host,
+            config,
+            secrets,
+            Some((service.name.as_str(), &expected_names)),
+        )
+        .await?;
     }
 
     if !stop_first {
@@ -780,14 +788,74 @@ async fn finalize_one_host(
     })
 }
 
+/// Build the per-service upstream-name map fed into the Caddy config
+/// renderer. Pure-ish helper extracted for testability — the live
+/// daemon query is the only side effect.
+///
+/// For the in-flight service (currently being reconciled), the names
+/// come straight from `expected_names`. For every other routed
+/// service, query `list_containers_by_label` and filter to running.
+async fn build_upstream_names(
+    ops: &dyn DockerOps,
+    host: &Host,
+    routed: &[&ServiceConfig],
+    in_flight: Option<(&str, &std::collections::BTreeSet<String>)>,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, DeployError> {
+    let mut upstream_names: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for svc in routed {
+        let names: Vec<String> = if let Some((sname, expected)) = in_flight
+            && sname == svc.name.as_str()
+        {
+            expected.iter().cloned().collect()
+        } else {
+            let label = format!("yoink.service={}", svc.name);
+            let containers = ops.list_containers_by_label(host, &label).await.map_err(
+                |source| DeployError::Docker {
+                    host: host.address.clone(),
+                    source,
+                },
+            )?;
+            containers
+                .into_iter()
+                .filter(crate::docker_ops::ContainerInfo::is_running)
+                .map(|c| c.name)
+                .collect()
+        };
+        upstream_names.insert(svc.name.clone(), names);
+    }
+    Ok(upstream_names)
+}
+
 /// Render the Caddy config for `host`'s view of `config` and POST it
 /// to the proxy's admin API. Errors abort the deploy — old config
 /// stays active because Caddy's `/load` is atomic.
+///
+/// `in_flight_upstreams` carries `(service_name, expected_names)` for
+/// the service the caller is currently reconciling. For that service,
+/// the rendered upstream pool is forced to those exact container
+/// names — the old (about-to-be-stopped) replicas are NOT included.
+///
+/// **Why we deliberately exclude the old replicas:** the older shape
+/// queried `list_containers_by_label + is_running` for every service,
+/// which during the brief window between "new replicas healthy" and
+/// "old replicas stopped" returned BOTH sets. Caddy then carried the
+/// old container names in its upstream pool. After `swap_out_old`
+/// removed them, those names became unresolvable in Docker DNS and
+/// Caddy's active health checker logged "server misbehaving" forever
+/// (because no subsequent `/load` ever cleaned the pool).
+///
+/// Caddy's `/load` is graceful regardless of pool membership: existing
+/// TCP connections to old containers continue serving in-flight work
+/// until they close, and new requests route to the new containers.
+/// Including the old upstreams in the pool achieved nothing except
+/// creating the stale-DNS hole.
 async fn push_caddy_config(
     ops: &dyn DockerOps,
     host: &Host,
     config: &Config,
     secrets: Option<&SecretsBundle>,
+    in_flight_upstreams: Option<(&str, &std::collections::BTreeSet<String>)>,
 ) -> Result<(), DeployError> {
     // Expand any `caddy_extra_caddyfile:` snippets to JSON. Mutates a
     // local clone so the caller's view of config stays unchanged.
@@ -800,32 +868,13 @@ async fn push_caddy_config(
         })?;
     let config = &config;
 
-    // Build the upstream-name lookup by querying each routed service's
-    // current containers on this host. Includes the just-started
-    // replica AND (briefly) the old one — Caddy reloads gracefully.
     let routed: Vec<&ServiceConfig> = config
         .services
         .iter()
         .filter(|s| crate::proxy::is_proxied(s))
         .collect();
-    let mut upstream_names: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for svc in &routed {
-        let label = format!("yoink.service={}", svc.name);
-        let containers = ops
-            .list_containers_by_label(host, &label)
-            .await
-            .map_err(|source| DeployError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
-        let names: Vec<String> = containers
-            .into_iter()
-            .filter(crate::docker_ops::ContainerInfo::is_running)
-            .map(|c| c.name)
-            .collect();
-        upstream_names.insert(svc.name.clone(), names);
-    }
+    let upstream_names = build_upstream_names(ops, host, &routed, in_flight_upstreams).await?;
+
     let json = crate::proxy::caddy::render(config, |s| upstream_names.get(s).cloned().unwrap_or_default(), secrets)
         .map_err(|source| DeployError::Custom {
             host: host.address.clone(),
@@ -1762,6 +1811,169 @@ hooks:
         assert_eq!(name, "migrate");
         assert!(message.contains("ERROR: connection refused"));
         assert!(message.contains("applying 0001_init"));
+    }
+
+    /// Routed-service fixture: api has `domain:` so `is_proxied(api)` is
+    /// true. Bare config — no proxy block, but `proxy_enabled` returns
+    /// true for any service with a domain.
+    fn config_proxied_service() -> Config {
+        Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: latest
+    domain: api.example.test
+    tls: off
+    run:
+      port: 8080
+      healthcheck_path: /health
+      healthcheck_timeout: 60s
+      drain_timeout: 10s
+"#,
+        )
+        .unwrap()
+    }
+
+    fn container_with_state(name: &str, state: &str) -> ContainerInfo {
+        ContainerInfo {
+            host: "host-a".into(),
+            name: name.into(),
+            image: String::new(),
+            state: state.into(),
+            status_text: String::new(),
+            created_unix: None,
+            yoink_service: Some("api".into()),
+            yoink_version: None,
+            yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: BTreeMap::new(),
+        }
+    }
+
+    /// Regression: during a routed-service reconcile, the upstream
+    /// pool pushed to Caddy must contain ONLY the new (expected)
+    /// replica names — never the old containers that are about to be
+    /// stopped. Including the old names left them in Caddy's pool
+    /// after `swap_out_old`, where they became unresolvable in Docker
+    /// DNS and the active health checker logged "server misbehaving"
+    /// indefinitely (no subsequent /load ever cleaned the pool).
+    #[tokio::test]
+    async fn build_upstream_names_excludes_old_replicas_for_in_flight_service() {
+        let cfg = config_proxied_service();
+        let routed: Vec<&ServiceConfig> = cfg
+            .services
+            .iter()
+            .filter(|s| crate::proxy::is_proxied(s))
+            .collect();
+
+        // Both old AND new replicas show up as `running` if we ever
+        // queried — the override should bypass the query entirely.
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![
+            container_with_state("api-OLDHASH-0", "running"),
+            container_with_state("api-OLDHASH-1", "running"),
+            container_with_state("api-NEWHASH-0", "running"),
+            container_with_state("api-NEWHASH-1", "running"),
+        ]));
+
+        let mut expected: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        expected.insert("api-NEWHASH-0".into());
+        expected.insert("api-NEWHASH-1".into());
+
+        let host = Host {
+            user: "deploy".into(),
+            address: "host-a".into(),
+        };
+        let names =
+            build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            names.get("api"),
+            Some(&vec!["api-NEWHASH-0".to_string(), "api-NEWHASH-1".to_string()]),
+            "in-flight service must use expected_names, not the live container list"
+        );
+        // `list_containers_by_label` must NOT have been called for
+        // the in-flight service (the override short-circuits the
+        // daemon query).
+        let calls = ops.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                crate::docker_ops::RecordedCall::ListContainersByLabel(_, label)
+                if label == "yoink.service=api"
+            )),
+            "expected no list_containers_by_label call for in-flight service, got {calls:?}"
+        );
+    }
+
+    /// Counterpart: services NOT being reconciled keep their existing
+    /// behaviour (live `list_containers_by_label` filtered to running).
+    #[tokio::test]
+    async fn build_upstream_names_queries_other_services_live() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: api
+    image: img/api
+    tag: latest
+    domain: api.example.test
+    tls: off
+    run: { port: 8080, healthcheck_path: /health }
+  - name: web
+    image: img/web
+    tag: latest
+    domain: web.example.test
+    tls: off
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap();
+        let routed: Vec<&ServiceConfig> = cfg
+            .services
+            .iter()
+            .filter(|s| crate::proxy::is_proxied(s))
+            .collect();
+
+        let ops = FakeDockerOps::new();
+        // api: in-flight, query should be skipped via override.
+        // web: not in-flight, query should fire and filter to running.
+        ops.push_list_containers(Ok(vec![
+            container_with_state("web-OLDHASH-0", "running"),
+            container_with_state("web-OLDHASH-1", "exited"),
+        ]));
+
+        let mut expected: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        expected.insert("api-NEWHASH-0".into());
+
+        let host = Host {
+            user: "deploy".into(),
+            address: "host-a".into(),
+        };
+        let names =
+            build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            names.get("api"),
+            Some(&vec!["api-NEWHASH-0".to_string()]),
+        );
+        assert_eq!(
+            names.get("web"),
+            Some(&vec!["web-OLDHASH-0".to_string()]),
+            "exited containers must be filtered out for non-in-flight services"
+        );
     }
 
     #[tokio::test(start_paused = true)]
