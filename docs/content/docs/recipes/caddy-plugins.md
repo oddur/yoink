@@ -93,6 +93,44 @@ services:
     run: { port: 8080 }
 ```
 
+### HTTP caching (`caddyserver/cache-handler`)
+
+Cache responses at the proxy layer using [caddyserver/cache-handler](https://github.com/caddyserver/cache-handler) — RFC-compliant HTTP caching keyed by URL + `Vary` headers, honoring `Cache-Control` from the origin. The default in-memory backend ships sane defaults so a single-line plugin add and a per-route handler is enough to start caching.
+
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/caddyserver/cache-handler
+
+services:
+  - name: marketing
+    domain: www.example.com
+    caddy_extra_json: |
+      [{"handler": "cache"}]
+    run: { port: 8080 }
+```
+
+That gets you in-process caching with the upstream's `Cache-Control` headers as the source of truth. Marketing/blog HTML, static asset proxies, and APIs that emit `Cache-Control: public, max-age=…` all benefit immediately.
+
+**When you want caching:**
+
+- High-fanout responses (homepage, marketing pages, public API endpoints) where origin recompute is expensive.
+- Slow origins (Rails/Django/PHP rendering) sitting behind Caddy on the same host or a tailnet hop away.
+- Burst protection in front of a database-bound endpoint — even short TTLs (5-30s) collapse traffic spikes into one origin hit.
+- Asset proxies where the upstream is a slow blob store.
+
+**When you don't:**
+
+- **You're already on Cloudflare / Fastly / Bunny / a CDN edge** — they cache ahead of your origin proxy. Adding cache-handler is duplicated work for the same response, with worse hit rates because each yoink host has its own cold cache. Skip it. The exception is cache-warmup for purge events (your proxy keeps the response when the CDN re-fetches), but that's niche enough to defer.
+- **Responses are highly personalized** (per-user dashboards, signed-in feeds). Either the origin sets `Cache-Control: private` (and the cache handler skips them) or you carefully configure cache keys with `Vary: Authorization` — gets fragile fast.
+- **Strong consistency** is a hard requirement (e.g., financial state). Caching at the proxy adds a delay between writes and reads.
+
+**Advanced backends (Redis, Badger, etcd):**
+
+The default in-memory backend is per-proxy-instance, no shared state. For multi-host shared cache or persistent cache across proxy restarts, the plugin supports Redis/Badger/etcd backends — but those require a top-level `cache` app config block in Caddy, which yoink doesn't yet expose as a typed field. Same situation as [multi-host LE certs](/docs/recipes/multi-host-redis-storage): drop `proxy.xcaddy:` for this case and use `proxy.image:` with a hand-built image that bakes both the plugin compile and a bootstrap `Caddyfile`/JSON entrypoint. Track yoink issues for `proxy.config_extra:` if you need shared cache.
+
 ### Multi-host LE certs (`caddy-storage-redis`)
 
 Share ACME state via Redis so multiple proxies don't each hit Let's Encrypt's rate limits. See [Multi-host Let's Encrypt with Redis storage](/docs/recipes/multi-host-redis-storage) — same `proxy.xcaddy:` mechanism, plus a Redis service definition.
@@ -126,6 +164,21 @@ proxy:
 
 Wire the provider's API key as a sealed secret and reference it from `caddy_extra_json:` per service.
 
+## Plugin landscape
+
+A non-exhaustive map of caddy plugins worth knowing about — yoink doesn't model these natively, so the plugin route is the answer when you need them. Each is a one-line addition to `proxy.xcaddy.plugins:`; the upstream README documents the directive shape to drop into `caddy_extra_json:` per service.
+
+- **[`caddyserver/cache-handler`](https://github.com/caddyserver/cache-handler)** — RFC-compliant HTTP caching at the proxy. See the worked recipe above. Skip if you're behind a CDN edge.
+- **[`mholt/caddy-ratelimit`](https://github.com/mholt/caddy-ratelimit)** — In-process rate limiting per-IP, per-header, or per-zone. See the worked recipe above. Pair with a CDN's edge limiter for two-layer defense; use solo when the proxy is your only public surface.
+- **[`mholt/caddy-l4`](https://github.com/mholt/caddy-l4)** — Layer-4 (TCP/UDP) routing. Forward Postgres, SSH, custom protocols, gRPC-with-mTLS-passthrough through caddy. Yoink doesn't model L4 routes natively, so wiring requires custom Caddy admin pushes — the plugin compiles in cleanly via xcaddy, but configuration is on you.
+- **[`greenpau/caddy-security`](https://github.com/greenpau/caddy-security)** — SSO/AAA at the proxy: JWT validation, OAuth2 / OIDC, SAML, LDAP, per-route authorization policies. The "Authelia-as-a-plugin" option — useful when you want auth at the proxy without running an extra service. Pair with `forward_auth` (already supported in core caddy) or use the plugin's native `authenticate`/`authorize` directives for finer-grained policies.
+- **[`corazawaf/coraza-caddy`](https://github.com/corazawaf/coraza-caddy)** — ModSecurity-compatible Web Application Firewall. OWASP Core Rule Set out of the box, request inspection, virtual-patching for known CVEs. Most useful behind a non-WAF CDN, or as defence-in-depth even if you have one. Heavy compared to the rest of this list; benchmark before turning it on for hot endpoints.
+- **[`hslatman/caddy-crowdsec-bouncer`](https://github.com/hslatman/caddy-crowdsec-bouncer)** — Enforces [CrowdSec](https://www.crowdsec.net/) community-IP blocklists at the proxy. Cheap/free DDoS-bot and credential-stuffing mitigation when you're not behind a managed edge. Needs a CrowdSec local API instance reachable from the proxy (run it as another yoink service).
+- **[`caddy-dns/*`](https://github.com/caddy-dns)** — DNS-01 ACME challenge providers (cloudflare, route53, digitalocean, hetzner, dozens more). Required for wildcard certs. See the worked recipe above.
+- **[`pberkel/caddy-storage-redis`](https://github.com/pberkel/caddy-storage-redis)** — Shared ACME storage backend for multi-host fleets. See the [redis-storage recipe](/docs/recipes/multi-host-redis-storage).
+
+For the broader ecosystem, [caddy's own module index](https://caddyserver.com/download) lets you browse every published module.
+
 ## `proxy.xcaddy:` field reference
 
 | Field | Type | Default | Notes |
@@ -144,7 +197,7 @@ Mutually exclusive with `proxy.image:` — `image:` is the bring-your-own-image 
 Each fresh host pays the full xcaddy compile (~2-5 minutes for typical plugin sets — Go toolchain download, module fetches, link). Subsequent `up`s on that host are no-ops. Three implications:
 
 - **Adding a host to a fleet means that host pays the build cost once.** Fan-out is parallel across hosts so it's `max` not `sum`, but a fresh host's first deploy is slower than a cache-hit deploy.
-- **Set `RUST_LOG=info`** to see live build output. Yoink forwards bollard's build stream to `tracing::info!`. Without it, the operator stares at a blank terminal during the compile.
+- **Set `RUST_LOG=debug`** to see live build output. Yoink forwards bollard's build stream to `tracing::debug!`. Default INFO logging stays focused on deploy milestones; without DEBUG, the operator stares at a blank terminal during the compile.
 - If you want **build-once, ship-to-many** instead of build-on-each-host, that's not what this feature does — it's the per-host model precisely because we don't assume a registry. If you do have a registry, hand-build with xcaddy and use `proxy.image:` directly.
 
 ### Each host needs egress to Go's module proxy
@@ -219,16 +272,16 @@ Look for the module path printed by your plugin (e.g. `http.handlers.rate_limit`
 ### Watch a live build
 
 ```sh
-RUST_LOG=info yoink up
+RUST_LOG=debug yoink up
 ```
 
-The build stream is forwarded line-by-line through `tracing::info!`. You'll see Go module fetches, compile progress, and the final tag step.
+The build stream is forwarded line-by-line through `tracing::debug!`. You'll see Go module fetches, compile progress, and the final tag step.
 
 ### Build failed
 
 xcaddy errors are surfaced verbatim through the deploy error chain. Common shapes:
 
-- **`The command '/bin/sh -c xcaddy build ...' returned a non-zero code: 1`** — xcaddy compile failure. Re-run with `RUST_LOG=info` to see the actual Go error. Most often an incompatible plugin version or a transitive module pin clash.
+- **`The command '/bin/sh -c xcaddy build ...' returned a non-zero code: 1`** — xcaddy compile failure. Re-run with `RUST_LOG=debug` to see the actual Go error. Most often an incompatible plugin version or a transitive module pin clash.
 - **DNS / network errors during `go get`** — host can't reach `proxy.golang.org`. Fix host egress or override `GOPROXY` in a custom `builder_image:`.
 - **`module not found`** — typo in the module path, or you're using a private module without `GOPRIVATE` set on the builder.
 
