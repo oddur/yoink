@@ -77,7 +77,13 @@ impl HostDetailState {
             self.containers = data.containers;
             self.host_info = data.host_info;
         }
-        clamp_selection(&mut self.table, self.containers.len());
+        // Clamp against the *visible* count, not the unfiltered total.
+        // With an active filter, `table.selected()` indexes into the
+        // `visible_indices()` slice (see `render`), so clamping to the
+        // larger unfiltered count would let `selected` point past the
+        // filtered list for a frame.
+        let n = self.visible_indices().len();
+        clamp_selection(&mut self.table, n);
     }
 
     pub fn select_next(&mut self) {

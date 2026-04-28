@@ -291,9 +291,37 @@ impl ResourcesState {
         self.networks = networks;
 
         self.errors = errors;
-        clamp_selection(&mut self.images_table, self.images.len());
-        clamp_selection(&mut self.volumes_table, self.volumes.len());
-        clamp_selection(&mut self.networks_table, self.networks.len());
+        // Clamp against per-tab *filtered* counts. `selected()` indexes
+        // into each tab's `visible_indices()` slice, so clamping to the
+        // unfiltered totals here would let `selected` point past the
+        // filtered list for a frame.
+        let images_visible = self
+            .images
+            .iter()
+            .filter(|img| {
+                let target = format!("{} {} {}", img.host, img.id, img.repo_tags.join(" "));
+                self.filter.matches(&target)
+            })
+            .count();
+        let volumes_visible = self
+            .volumes
+            .iter()
+            .filter(|v| {
+                let target = format!("{} {} {}", v.host, v.name, v.driver);
+                self.filter.matches(&target)
+            })
+            .count();
+        let networks_visible = self
+            .networks
+            .iter()
+            .filter(|n| {
+                let target = format!("{} {} {} {}", n.host, n.name, n.driver, n.scope);
+                self.filter.matches(&target)
+            })
+            .count();
+        clamp_selection(&mut self.images_table, images_visible);
+        clamp_selection(&mut self.volumes_table, volumes_visible);
+        clamp_selection(&mut self.networks_table, networks_visible);
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect, _config: &Config) {

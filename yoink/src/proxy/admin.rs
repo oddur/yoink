@@ -121,10 +121,51 @@ pub async fn push_config(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // Caddy's /load response body usually carries only its own
+        // error message, but parser errors can echo a slice of the
+        // submitted JSON — which contains inline `tls.certificates.
+        // load_pem` entries with full PEM-encoded cert + key. Strip
+        // PEM blocks before propagating, since this error string
+        // ends up in CLI stderr / tracing logs / TUI toasts.
+        let body = redact_pem_blocks(&body);
         return Err(AdminError::LoadRejected { status, body });
     }
     drop(tunnel);
     Ok(())
+}
+
+/// Replace every `-----BEGIN <kind>-----` … `-----END <kind>-----`
+/// block (and its escape-encoded `\n` JSON variant) with a placeholder.
+/// Keeps the surrounding error context legible while ensuring no
+/// secret material survives in a logged error string.
+fn redact_pem_blocks(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    loop {
+        let Some(begin_pos) = rest.find("-----BEGIN ") else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..begin_pos]);
+        let after_begin = &rest[begin_pos..];
+        // Find the matching END marker (Caddy may emit literal newlines
+        // OR JSON-escaped \n; END marker shape is the same in both).
+        if let Some(end_marker_pos) = after_begin.find("-----END ") {
+            // Skip past the trailing five dashes after the END label.
+            let tail = &after_begin[end_marker_pos..];
+            let after_end_label = match tail.find("-----") {
+                Some(idx) => idx + "-----".len(),
+                None => after_begin.len(),
+            };
+            out.push_str("<redacted PEM>");
+            rest = &after_begin[end_marker_pos + after_end_label..];
+        } else {
+            // Unterminated PEM — replace everything from BEGIN to end
+            // of body. Better to over-redact than to leak.
+            out.push_str("<redacted PEM>");
+            return out;
+        }
+    }
 }
 
 async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), AdminError> {
@@ -142,6 +183,34 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
             return Err(AdminError::NotReady { timeout });
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_strips_full_pem_blocks() {
+        let body = "json error at offset 42: -----BEGIN CERTIFICATE-----\nABCDEF\n-----END CERTIFICATE-----\n more context";
+        let out = redact_pem_blocks(body);
+        assert!(out.contains("<redacted PEM>"));
+        assert!(!out.contains("ABCDEF"));
+        assert!(out.contains("more context"));
+    }
+
+    #[test]
+    fn redact_handles_unterminated_pem() {
+        let body = "load failed: -----BEGIN PRIVATE KEY-----\nMIIabc... (truncated)";
+        let out = redact_pem_blocks(body);
+        assert!(out.contains("<redacted PEM>"));
+        assert!(!out.contains("MIIabc"));
+    }
+
+    #[test]
+    fn redact_passthrough_when_no_pem() {
+        let body = r#"{"error":"unknown directive 'foo'"}"#;
+        assert_eq!(redact_pem_blocks(body), body);
     }
 }
 

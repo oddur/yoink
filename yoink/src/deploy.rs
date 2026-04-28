@@ -553,6 +553,14 @@ pub async fn deploy_service(
     // close to zero as possible. `--service` filtering skips the
     // service and its hooks together (`yoink up --service api` will
     // not run web's migrations).
+    //
+    // On hook failure we force-remove every pre-created (pending)
+    // replica before propagating the error. Without this, a failed
+    // migration leaves N×hosts `created`-state containers cluttering
+    // `docker ps -a` until the next reconcile / `yoink prune` reaps
+    // them; the next reconcile RE-creates them anyway via
+    // `force_remove_name`, but the operator-visible noise is
+    // confusing.
     for hook in &service.pre_deploy {
         let hook_tag = resolve_hook_tag(hook, &BTreeMap::new(), &config.services);
         let resolved_tag = if matches!(hook.tag, HookTag::Ref { .. }) {
@@ -565,7 +573,10 @@ pub async fn deploy_service(
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
         });
-        run_hook(ops, config, hook, &resolved_tag, secrets).await?;
+        if let Err(e) = run_hook(ops, config, hook, &resolved_tag, secrets).await {
+            cleanup_prepared_replicas(ops, &prepared).await;
+            return Err(e);
+        }
         on_event(DeployEvent::HookFinished {
             name: hook.name.clone(),
         });
@@ -1253,6 +1264,25 @@ async fn list_existing_containers(
 async fn force_remove_name(ops: &dyn DockerOps, host: &Host, name: &str) {
     if let Err(e) = ops.force_remove_container(host, name).await {
         warn!(host = %host.address, container = %name, error = %e, "force_remove_container failed; continuing");
+    }
+}
+
+/// Best-effort cleanup of pre-created (pending) containers. Called when
+/// a service's pre-deploy hook fails, so the half-prepared deploy
+/// doesn't leave N×hosts `created`-state containers cluttering
+/// `docker ps -a` until the next reconcile or `yoink prune`. Each
+/// removal is idempotent (404 = already gone); failures are logged
+/// but don't mask the original hook error.
+async fn cleanup_prepared_replicas(ops: &dyn DockerOps, prepared: &[HostPrep]) {
+    for prep in prepared {
+        for replica in &prep.replicas {
+            if replica.already_running {
+                // Pre-existing container already at spec; not ours to
+                // remove on hook failure.
+                continue;
+            }
+            force_remove_name(ops, &prep.host, &replica.name).await;
+        }
     }
 }
 
