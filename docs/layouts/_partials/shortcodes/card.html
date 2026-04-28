@@ -19,14 +19,19 @@
 
 {{- $external := strings.HasPrefix $link "http" -}}
 {{/*
-  Override of Hextra's upstream `card.html`: use `absURL` instead of
-  `relURL` for absolute-path inputs. Hugo's `relURL "/docs/foo"`
-  strips the leading slash but does NOT prepend the baseURL's path
-  component — on a project page at `https://oddur.github.io/yoink/`
-  that yields `/docs/foo` (404) instead of `/yoink/docs/foo`.
-  `absURL` prepends the full baseURL (path component included).
+  Override of Hextra's upstream `card.html`. The upstream calls
+  `relURL "/docs/foo"`, but Hugo treats a leading slash as "from
+  origin" and skips the baseURL's path component — on a project page
+  at `https://oddur.github.io/yoink/` it yields `/docs/foo` (404)
+  instead of `/yoink/docs/foo`. The fix Hextra itself uses for
+  images is to trim the leading slash before `relURL`, which then
+  prepends the full baseURL path. Mirror that here.
 */}}
-{{- $href := cond (strings.HasPrefix $link "/") ($link | absURL) $link -}}
+{{- $href := cond
+    (strings.HasPrefix $link "/")
+    (relURL (strings.TrimPrefix "/" $link))
+    $link
+-}}
 
 
 <a
