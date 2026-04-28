@@ -220,9 +220,7 @@ The app is reachable on the host's docker network at `my-app:3000` but isn't bou
 yoink pf my-app -o
 ```
 
-`yoink pf` notices `my-app` has no `publish:` entry, spawns an ephemeral `alpine/socat` sidecar inside the docker network, bridges over the existing SSH connection, and prints a `http://localhost:<port>` URL (`-o` opens it in your browser). `Ctrl-C` tears down the tunnel and force-removes the sidecar.
-
-No yaml changes, no host ports bound — see the [port-forward recipe](/docs/recipes/port-forward) for the full sidecar-vs-published design.
+`yoink pf` opens a tunnel to the container even though no host port is published, and `-o` opens the printed URL in your browser. See the [port-forward recipe](/docs/recipes/port-forward) for how it works.
 
 The page should render JSON with `ok: true` and a postgres version string.
 
