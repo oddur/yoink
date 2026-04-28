@@ -77,6 +77,17 @@ impl Host {
     pub fn is_local(&self) -> bool {
         self.address == Self::LOCAL_ADDRESS
     }
+
+    /// Construct the synthetic local host. The empty `user` is fine —
+    /// the local-socket transport ignores it. Symmetric with
+    /// [`Self::is_local`].
+    #[must_use]
+    pub fn local() -> Self {
+        Self {
+            user: String::new(),
+            address: Self::LOCAL_ADDRESS.to_string(),
+        }
+    }
 }
 
 impl From<&YoinkHost> for Host {
