@@ -205,15 +205,12 @@ include:
 ## Step 6: deploy
 
 ```sh
-yoink up --service postgres                     # pass 1: accessory
-yoink up --build --no-registry --service my-app # pass 2: app, local build → unregistry push
+yoink up --build --no-registry
 ```
 
-Pass 1 pulls postgres from Docker Hub, starts it on the `yoink` network. Pass 2 builds the app image locally and ships it via [unregistry](https://github.com/psviderski/unregistry) over SSH (no registry account required), starts the container, and runs the healthcheck.
+One command. Yoink pulls postgres from Docker Hub, builds the app image locally, ships the app to the host via [unregistry](https://github.com/psviderski/unregistry) over SSH (no registry account required), starts both containers on the `yoink` network, and runs the app's healthcheck. The image-prefetch phase auto-skips services with a `build:` block when `--no-registry` is set, so locally-built services don't 404 on Docker Hub.
 
-> **Why two passes?** With a single `yoink up --build --no-registry`, yoink's image-prefetch step still tries to pull every image — including the locally-built app, which 404s on Hub. Scoping with `--service` avoids the prefetch for accessories that don't need updating.
-
-First deploy of the app is the slow one — pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry ships only changed layers.
+First deploy is the slow one — pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry ships only changed layers.
 
 ## Verify
 
