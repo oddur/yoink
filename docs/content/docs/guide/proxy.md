@@ -81,6 +81,7 @@ Containers are named in upstream entries (not IPs), so a container restart with 
 | `bind` | string | — (all interfaces) | Host IP to bind `:80` and `:443` to. Common use: bind to a Tailscale IP so the proxy is reachable only over the tailnet. Admin port stays on `127.0.0.1` regardless. |
 | `tls` | block (see below) | — | Proxy-level TLS — every routed service inherits this cert (and optional mTLS) by default. |
 | `config_extra` | string (JSON) | — | Top-level Caddy JSON snippet, deep-merged into the rendered config before `/load`. Escape hatch for global settings yoink doesn't model as typed fields — `trusted_proxies`, `storage`, plugin app blocks. See the [`config_extra:` block](#proxyconfig_extra-block--global-caddy-config-escape-hatch). |
+| `global_handlers` | list of strings (JSON) | `[]` | Caddy handlers (and/or routes) that run for every request before any service-specific route matches. The natural place for proxy-wide concerns: CrowdSec bouncer, Coraza WAF / OWASP CRS, fleet-wide rate limiting. See the [`global_handlers:` block](#proxyglobal_handlers-block--proxy-wide-middleware-chain). |
 
 ### `proxy.config_extra:` block — global Caddy config escape hatch
 
@@ -117,6 +118,42 @@ Merge semantics:
 - User wins on every leaf conflict: setting `admin.listen` to your own value overrides yoink's default `0.0.0.0:2019`. Yoink trusts you.
 
 Use it for plugin-specific top-level config too — for example, `caddy-storage-redis` for shared ACME state across a fleet ([recipe](../recipes/multi-host-redis-storage)), `caddyserver/cache-handler` advanced backends, `coraza` global directives, `crowdsec` agent connection settings.
+
+### `proxy.global_handlers:` block — proxy-wide middleware chain
+
+`config_extra:` injects raw config; `global_handlers:` is the typed slot for Caddy *handlers* you want running on every request before any service route matches. Yoink wraps the per-service routes in a `subroute` handler and prepends your handlers in front of it — the whole thing becomes one wildcard-match route, so the chain executes unconditionally.
+
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/hslatman/caddy-crowdsec-bouncer
+      - github.com/corazawaf/coraza-caddy/v3
+  global_handlers:
+    - |
+      {"handler": "crowdsec", "appsec_url": "http://crowdsec:8080"}
+    - |
+      {
+        "handler": "waf",
+        "directives": [
+          "Include @coraza.conf-recommended",
+          "Include @crs-setup.conf.example",
+          "Include @owasp_crs/*.conf",
+          "SecRuleEngine On"
+        ]
+      }
+```
+
+When to reach for it:
+
+- **CrowdSec bouncer** — IP-based denial that should apply everywhere, not just to the services that opt in. Add a service tomorrow and it's protected without touching its config.
+- **Coraza / OWASP CRS** — signature-based payload inspection on every request. Same "fleet-wide by default" framing.
+- **Global rate limiting** — `caddy-ratelimit` zones that apply across hostnames (e.g. a single `per_ip` budget for the whole proxy).
+
+Each entry is a JSON snippet: a single handler object (`{"handler": "x", ...}`), a route object (`{"match": ..., "handle": ...}`), or an array mixing the two. Same shape as `caddy_extra_json:` per-service. Order matters — entries run as a pipeline in the order written. Put cheap filters (CrowdSec hashmap lookup) before expensive ones (Coraza regex evaluation) so you don't burn CPU on traffic you were going to drop anyway.
+
+`global_handlers:` and per-service `caddy_extra_json:` compose: the global chain runs first, then per-service handlers run on the matched route. Put fleet-wide concerns at the proxy level and per-app concerns on the service.
 
 ### `proxy.xcaddy:` block — caddy plugins without a registry
 

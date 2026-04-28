@@ -91,6 +91,25 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         }
     }
 
+    if let Some(p) = cfg.proxy.as_ref() {
+        for (i, raw) in p.global_handlers.iter().enumerate() {
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_)) => {}
+                Ok(_) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "proxy.global_handlers[{i}] must be a JSON object (handler) or \
+                         array of handlers/routes"
+                    )));
+                }
+                Err(e) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "proxy.global_handlers[{i}] is not valid JSON: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
     if let Some(p) = cfg.proxy.as_ref()
         && let Some(x) = &p.xcaddy
     {
@@ -544,6 +563,24 @@ services:
         assert!(
             format!("{err}").contains("must be a JSON object"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn global_handlers_must_be_json() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            global_handlers: vec!["{not json".into()],
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(
+            format!("{err}").contains("proxy.global_handlers[0] is not valid JSON"),
+            "got: {err}",
         );
     }
 

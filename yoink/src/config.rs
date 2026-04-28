@@ -218,6 +218,27 @@ pub struct ProxyConfig {
     /// at non-overlapping keys). Validation rejects non-object JSON.
     #[serde(default)]
     pub config_extra: Option<String>,
+    /// Caddy handlers to run for **every** request before any
+    /// service-specific route matches. Yoink wraps the per-service
+    /// routes in a `subroute` handler so the global handlers form a
+    /// single shared middleware chain — the natural place for
+    /// proxy-wide concerns:
+    ///
+    /// - CrowdSec bouncer (deny based on IP decisions before the
+    ///   request hits app-level handlers).
+    /// - Coraza WAF / OWASP CRS (signature-based payload inspection
+    ///   on every request, not just the ones a particular service
+    ///   opts into).
+    /// - Global rate limiting that should apply to all hostnames.
+    ///
+    /// Each entry is a JSON snippet: a single handler object
+    /// (`{"handler": "crowdsec", ...}`), a route object (`{"match":
+    /// ..., "handle": ...}` — same as `caddy_extra_json`'s convenience
+    /// shape), or an array mixing the two. Validated as JSON at
+    /// config-load time; Caddy itself catches semantic errors at
+    /// `/load`.
+    #[serde(default)]
+    pub global_handlers: Vec<String>,
 }
 
 /// Build inputs for an on-host xcaddy compile. The resulting image is

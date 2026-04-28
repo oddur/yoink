@@ -82,6 +82,32 @@ where
         routes.insert(0, redirect_route_http_to_https());
     }
 
+    // `proxy.global_handlers:` runs the listed handlers for every
+    // request before any service route matches. Implementation: wrap
+    // the per-service routes in a single Caddy `subroute` handler,
+    // and prepend the user's handlers in front of it. The whole thing
+    // becomes one wildcard-match route so the chain runs unconditionally.
+    let global_handlers_raw = cfg
+        .proxy
+        .as_ref()
+        .map(|p| p.global_handlers.as_slice())
+        .unwrap_or(&[]);
+    if !global_handlers_raw.is_empty() {
+        let mut prepend: Vec<Value> = Vec::new();
+        for (i, raw) in global_handlers_raw.iter().enumerate() {
+            let parsed: Value = serde_json::from_str(raw)
+                .with_context(|| format!("proxy.global_handlers[{i}] is not valid JSON"))?;
+            let context = format!("proxy.global_handlers[{i}]");
+            prepend.extend(normalize_extra_json(parsed, &context)?);
+        }
+        let inner_routes = std::mem::take(&mut routes);
+        prepend.push(json!({
+            "handler": "subroute",
+            "routes": inner_routes,
+        }));
+        routes.push(json!({ "handle": prepend }));
+    }
+
     let mut http_server = json!({
         "listen": [":80", ":443"],
         "routes": routes,
@@ -508,7 +534,8 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
         let parsed: Value = serde_json::from_str(extra).with_context(|| {
             format!("service {:?}: caddy_extra_json is not valid JSON", svc.name,)
         })?;
-        for item in normalize_extra_json(parsed, &svc.name)? {
+        let context = format!("service {:?}: caddy_extra_json", svc.name);
+        for item in normalize_extra_json(parsed, &context)? {
             handle.push(item);
         }
     }
@@ -586,8 +613,8 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
     Ok(route)
 }
 
-/// Coerce `caddy_extra_json` parsed value into a list of handler
-/// objects ready to splice into the route's `handle` array.
+/// Coerce a `caddy_extra_json` / `proxy.global_handlers` parsed value
+/// into a list of handler objects ready to splice into a `handle` array.
 ///
 /// - Handler shape (`{"handler": "x", ...}`) → pass-through.
 /// - Route shape (`{"match": ..., "handle": ...}`) → wrapped in a
@@ -595,14 +622,17 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
 ///   shape ("when X, do Y") without knowing `subroute` exists.
 /// - Mixed lists → each entry classified independently; route-shaped
 ///   entries are wrapped together in one `subroute`.
-fn normalize_extra_json(parsed: Value, svc_name: &str) -> Result<Vec<Value>> {
+///
+/// `context` is a human-readable prefix included verbatim in error
+/// messages — e.g. `service "api": caddy_extra_json` or
+/// `proxy.global_handlers[0]`.
+fn normalize_extra_json(parsed: Value, context: &str) -> Result<Vec<Value>> {
     let items: Vec<Value> = match parsed {
         Value::Array(xs) => xs,
         Value::Object(_) => vec![parsed],
         other => {
             return Err(anyhow!(
-                "service {svc_name:?}: caddy_extra_json must be a JSON object or array \
-                 of objects, got {}",
+                "{context}: must be a JSON object or array of objects, got {}",
                 discriminant_str(&other),
             ));
         }
@@ -615,8 +645,7 @@ fn normalize_extra_json(parsed: Value, svc_name: &str) -> Result<Vec<Value>> {
             Some(_) => item,
             None => {
                 return Err(anyhow!(
-                    "service {svc_name:?}: caddy_extra_json entries must be JSON \
-                     objects (a handler or a route), got {}",
+                    "{context}: entries must be JSON objects (a handler or a route), got {}",
                     discriminant_str(&item),
                 ));
             }
@@ -635,8 +664,8 @@ fn normalize_extra_json(parsed: Value, svc_name: &str) -> Result<Vec<Value>> {
             routes_buf.push(obj);
         } else {
             return Err(anyhow!(
-                "service {svc_name:?}: caddy_extra_json entry has neither `handler` \
-                 (handler form) nor `match`/`handle` (route form): {obj}",
+                "{context}: entry has neither `handler` (handler form) nor \
+                 `match`/`handle` (route form): {obj}",
             ));
         }
     }
@@ -1048,6 +1077,49 @@ services:
             .as_array()
             .expect("routes array");
         assert!(!routes.is_empty(), "yoink routes preserved across merge");
+    }
+
+    #[test]
+    fn global_handlers_wrap_service_routes_in_subroute() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  global_handlers:
+    - '{"handler": "crowdsec", "appsec_url": "http://crowdsec:8080"}'
+    - '{"handler": "waf", "directives": ["SecRuleEngine On"]}'
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let routes = json["apps"]["http"]["servers"]["main"]["routes"]
+            .as_array()
+            .expect("routes array");
+        // With global_handlers set, every yoink-managed route lives
+        // inside a single wildcard wrapper.
+        assert_eq!(routes.len(), 1, "wrapped into one route");
+        let wrapper_handle = routes[0]["handle"].as_array().expect("wrapper handle");
+        // Order: crowdsec, waf, then a subroute carrying the original
+        // service routes.
+        assert_eq!(wrapper_handle[0]["handler"].as_str(), Some("crowdsec"));
+        assert_eq!(wrapper_handle[1]["handler"].as_str(), Some("waf"));
+        assert_eq!(wrapper_handle[2]["handler"].as_str(), Some("subroute"));
+        let inner_routes = wrapper_handle[2]["routes"]
+            .as_array()
+            .expect("inner subroute carries the service routes");
+        assert!(
+            inner_routes
+                .iter()
+                .any(|r| r["match"][0]["host"][0].as_str() == Some("api.example.com")),
+            "service route preserved inside the subroute",
+        );
     }
 
     #[test]

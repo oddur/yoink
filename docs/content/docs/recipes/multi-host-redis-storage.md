@@ -9,10 +9,17 @@ If you're using Cloudflare's edge, the simpler answer is [Origin Certificates](/
 
 ## Architecture
 
-```
-host-1 ──┐
-host-2 ──┤── all reach ──→ redis:6379 (on tailnet) ──→ shared ACME state
-host-3 ──┘
+```mermaid
+flowchart LR
+    H1["host-1"]
+    H2["host-2"]
+    H3["host-3"]
+    Redis[("redis:6379<br/>on tailnet")]
+    Acme[/"shared ACME state"/]
+    H1 --> Redis
+    H2 --> Redis
+    H3 --> Redis
+    Redis --> Acme
 ```
 
 - A **single Redis** instance, deployed by yoink onto one canonical host.
