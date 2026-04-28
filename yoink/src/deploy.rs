@@ -260,12 +260,50 @@ pub fn build_env(
 /// point for `yoink up`. `tag_overrides` lets the CLI override the tag
 /// for specific services (`yoink up --service api --tag a1b2c3d`).
 #[allow(clippy::too_many_lines)]
+/// Knobs the operator can flip on a single reconcile invocation. New
+/// fields here should default to "preserve existing behaviour" so that
+/// `reconcile()` (the no-options shim) stays a drop-in.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReconcileOptions {
+    /// Bypass every "already at spec, skip" short-circuit, so each
+    /// selected service runs the full prepare → finalize loop and
+    /// (for routed services) the Caddy admin-API push. Recovery
+    /// gesture for cases where proxy-side state has drifted from
+    /// container reality (e.g. a stale upstream pool that never got
+    /// cleaned up). Surfaces as `--force` on `yoink up`.
+    pub force: bool,
+}
+
+/// Backwards-compatible shim — call sites that don't need the new
+/// options stay unchanged.
 pub async fn reconcile(
     ops: &dyn DockerOps,
     config: &Config,
     tag_overrides: &BTreeMap<String, String>,
     services_filter: Option<&[String]>,
     secrets: Option<&SecretsBundle>,
+    on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
+) -> Result<Vec<ServiceDeployReport>, DeployError> {
+    reconcile_with_options(
+        ops,
+        config,
+        tag_overrides,
+        services_filter,
+        secrets,
+        ReconcileOptions::default(),
+        on_event,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn reconcile_with_options(
+    ops: &dyn DockerOps,
+    config: &Config,
+    tag_overrides: &BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
+    secrets: Option<&SecretsBundle>,
+    options: ReconcileOptions,
     on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
 ) -> Result<Vec<ServiceDeployReport>, DeployError> {
     // Ensure every declared network exists on every host, once. Top-
@@ -381,9 +419,12 @@ pub async fn reconcile(
                     // Pre-flight skip: every applicable host has the
                     // expected replicas at desired_hash → emit
                     // AlreadyAtSpec events + synthesize a report.
+                    // Skipped under `--force` so the operator can
+                    // explicitly re-run the deploy to reset proxy /
+                    // admin state even when nothing has drifted.
                     let desired = build_desired_spec(config_ref, service, &tag, secrets_ref)?;
                     let desired_hash = docker::compute_spec_hash(&desired);
-                    if let Some(host_results) =
+                    if !options.force && let Some(host_results) =
                         service_already_at_spec(snapshot_ref, config_ref, service, &desired_hash)
                     {
                         let mut g = sink_ref.lock().expect("sink poisoned");
@@ -423,6 +464,7 @@ pub async fn reconcile(
                         service,
                         &tag,
                         secrets_ref,
+                        options.force,
                         &mut local_sink,
                     )
                     .await
@@ -485,6 +527,7 @@ pub async fn deploy_service(
     service: &ServiceConfig,
     tag: &str,
     secrets: Option<&SecretsBundle>,
+    force: bool,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<ServiceDeployReport, DeployError> {
     let hosts = service.applicable_hosts(&config.hosts);
@@ -496,7 +539,9 @@ pub async fn deploy_service(
     // `docker start` away from running.
     let mut prepared: Vec<HostPrep> = Vec::with_capacity(hosts.len());
     for host_cfg in &hosts {
-        let prep = prepare_one_host(ops, config, service, tag, secrets, host_cfg, on_event).await?;
+        let prep =
+            prepare_one_host(ops, config, service, tag, secrets, host_cfg, force, on_event)
+                .await?;
         prepared.push(prep);
     }
 
@@ -570,6 +615,7 @@ async fn prepare_one_host(
     tag: &str,
     secrets: Option<&SecretsBundle>,
     host_cfg: &crate::config::HostConfig,
+    force: bool,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<HostPrep, DeployError> {
     let host = Host::from(host_cfg);
@@ -616,11 +662,17 @@ async fn prepare_one_host(
     let mut replicas: Vec<ReplicaPrep> = Vec::with_capacity(replicas_count as usize);
     for index in 0..replicas_count {
         let name = container_name(&service.name, &spec_hash, index, replicas_count);
-        let already = existing.iter().any(|c| {
-            c.name == name
-                && c.is_running()
-                && c.yoink_spec_hash.as_deref() == Some(spec_hash.as_str())
-        });
+        // `--force` makes every replica look not-already-running, so
+        // the prep path below force-removes the existing container
+        // and re-creates it. Same name, same spec_hash — the operator
+        // is asking for a forced redeploy, typically to push a fresh
+        // Caddy admin config or to recover from drifted proxy state.
+        let already = !force
+            && existing.iter().any(|c| {
+                c.name == name
+                    && c.is_running()
+                    && c.yoink_spec_hash.as_deref() == Some(spec_hash.as_str())
+            });
         if already {
             on_event(DeployEvent::AlreadyAtSpec {
                 host: host.address.clone(),
@@ -1594,7 +1646,7 @@ services:
         let cfg = config_one_service();
         let mut events: Vec<DeployEvent> = Vec::new();
         let mut sink = |e: DeployEvent| events.push(e);
-        let report = deploy_service(&ops, &cfg, &cfg.services[0], "a1b2c3d", None, &mut sink)
+        let report = deploy_service(&ops, &cfg, &cfg.services[0], "a1b2c3d", None, false, &mut sink)
             .await
             .unwrap();
         assert_eq!(report.service, "app-a");
@@ -1712,7 +1764,7 @@ services:
 
         let mut events: Vec<DeployEvent> = Vec::new();
         let mut sink = |e: DeployEvent| events.push(e);
-        let report = deploy_service(&ops, &cfg, &cfg.services[0], "a1b2c3d", None, &mut sink)
+        let report = deploy_service(&ops, &cfg, &cfg.services[0], "a1b2c3d", None, false, &mut sink)
             .await
             .unwrap();
         assert_eq!(report.hosts[0].container, expected_name);
