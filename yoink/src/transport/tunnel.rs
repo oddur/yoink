@@ -69,7 +69,37 @@ impl SshTunnel {
         ready_timeout: Duration,
         keyfile: Option<&std::path::Path>,
     ) -> Result<Self, TunnelError> {
-        let local_port = pick_free_port().map_err(TunnelError::Bind)?;
+        Self::open_with_local_port(
+            user,
+            host,
+            remote_dial_host,
+            remote_port,
+            None,
+            ready_timeout,
+            keyfile,
+        )
+        .await
+    }
+
+    /// Caller-controlled local port. `None` picks a free one via
+    /// `bind(0)`. Used by `yoink pf` so the operator can ask for a
+    /// specific laptop-side port (e.g. `pf pgadmin 5050:80` binds
+    /// 5050 explicitly so muscle-memory bookmarks stay valid across
+    /// sessions); `None` is the implicit-port shortcut and the
+    /// shape every other yoink caller uses.
+    pub async fn open_with_local_port(
+        user: &str,
+        host: &str,
+        remote_dial_host: &str,
+        remote_port: u16,
+        local_port: Option<u16>,
+        ready_timeout: Duration,
+        keyfile: Option<&std::path::Path>,
+    ) -> Result<Self, TunnelError> {
+        let local_port = match local_port {
+            Some(p) => p,
+            None => pick_free_port().map_err(TunnelError::Bind)?,
+        };
 
         let mut cmd = Command::new("ssh");
         if let Some(key) = keyfile {

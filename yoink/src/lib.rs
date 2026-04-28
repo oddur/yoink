@@ -13,6 +13,7 @@ pub mod init;
 pub mod lock;
 pub mod network;
 pub mod output;
+pub mod pf;
 pub mod prune;
 pub mod proxy;
 pub mod sealed;

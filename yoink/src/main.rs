@@ -351,6 +351,51 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Forward a published container port to the laptop over SSH.
+    ///
+    /// Only services with a `publish:` entry are supported — yoink
+    /// reuses the host's existing `docker-proxy` binding and just
+    /// bridges with `ssh -L`. For containers that don't publish
+    /// (api / web behind Caddy) use `yoink shell <service>` instead.
+    ///
+    /// Usage shapes:
+    ///   yoink pf pgadmin               # service has 1 publish; LOCAL = OS-assigned
+    ///   yoink pf pgadmin 5050          # localhost:5050 → pgadmin:5050 (or its mapped port)
+    ///   yoink pf pgadmin 5050:80       # localhost:5050 → pgadmin:80 (explicit container port)
+    ///   yoink pf api 8080 -o           # also opens a browser when the tunnel is ready
+    Pf {
+        /// Service name as declared in the config.
+        service: String,
+        /// Either `LOCAL:CONTAINER` or just `CONTAINER` (LOCAL defaults
+        /// to the same number as CONTAINER, or use `0:CONTAINER` /
+        /// `--local 0` to ask the OS for a free port). Optional when the
+        /// service has exactly one `publish:` entry — that entry's
+        /// container port is used.
+        #[arg(value_name = "[LOCAL:]CONTAINER_PORT")]
+        port: Option<String>,
+        /// Pin to a specific host when the service runs on multiple.
+        #[arg(long)]
+        host: Option<String>,
+        /// Replica index (0-based) for services with `replicas: > 1`.
+        /// Defaults to 0.
+        #[arg(short = 'r', long, default_value_t = 0)]
+        replica: usize,
+        /// Open a browser at the forwarded URL once the tunnel is up.
+        /// Same heuristic as the printed link: HTTP for 80/3000/5050/…,
+        /// HTTPS for 443. For non-web ports (databases, gRPC) `--scheme`
+        /// can override.
+        #[arg(short = 'o', long)]
+        open: bool,
+        /// Override the URL scheme used by the printed link / `--open`.
+        /// `tcp` / `none` disable auto-open.
+        #[arg(long)]
+        scheme: Option<String>,
+        /// Print the assigned local port + remote endpoint as a single
+        /// JSON line on stdout, then keep tunneling until SIGINT.
+        /// Useful for scripts that want to read the chosen port.
+        #[arg(long)]
+        json: bool,
+    },
     /// Like `shell` but spawns an `alpine` debug sidecar in the
     /// target's pid+net namespaces — for distroless / shell-less
     /// images. The sidecar is `--rm` and is force-removed on exit.
@@ -860,6 +905,27 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Version { service } => cmd_version(&config, &service).await,
         Command::Shell { service, host } => {
             cmd_pty(&config, &service, host.as_deref(), PtyMode::Exec).await
+        }
+        Command::Pf {
+            service,
+            port,
+            host,
+            replica,
+            open,
+            scheme,
+            json,
+        } => {
+            cmd_pf(
+                &config,
+                &service,
+                port.as_deref(),
+                host.as_deref(),
+                replica,
+                open,
+                scheme.as_deref(),
+                json,
+            )
+            .await
         }
         Command::Debug {
             service,
@@ -1725,6 +1791,165 @@ async fn cmd_version(config: &Config, service: &str) -> Result<()> {
 enum PtyMode {
     Exec,
     Debug { image: String },
+}
+
+/// `yoink pf` — bind a laptop port to a container's published host
+/// port via `ssh -L`. Foreground; holds the tunnel until SIGINT.
+#[allow(clippy::fn_params_excessive_bools)] // operator-facing flags, explicit at the CLI; bundling into a struct hides them.
+#[allow(clippy::too_many_arguments)] // mirrors the CLI surface 1:1; struct would force a noop builder.
+async fn cmd_pf(
+    config: &Config,
+    service_name: &str,
+    port_arg: Option<&str>,
+    host_filter: Option<&str>,
+    replica: usize,
+    open_browser: bool,
+    scheme_override: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use yoink::pf;
+    use yoink::transport::tunnel::SshTunnel;
+
+    let service = pf::resolve_service(config, service_name)?;
+
+    // Parse `[LOCAL:]CONTAINER` (or fall back to sole_publish when no
+    // port arg was supplied).
+    let (local_port_request, container_port) = match port_arg {
+        Some(arg) => parse_pf_port_arg(arg)?,
+        None => {
+            let ep = pf::sole_publish(service).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "service {service_name:?} has 0 or multiple `publish:` entries — \
+                     specify which container port to forward, e.g. \
+                     `yoink pf {service_name} 8080`"
+                )
+            })?;
+            // Default LOCAL to the same port as CONTAINER for the
+            // single-publish shortcut — most operators already have
+            // that bookmarked locally.
+            (Some(ep.host_port), ep.container_port)
+        }
+    };
+
+    let endpoint = pf::resolve_endpoint(service, container_port)?;
+
+    // Pick the host: respect --host if given; otherwise the first
+    // host the service applies to. Reject if zero applicable hosts.
+    let applicable: Vec<_> = service
+        .applicable_hosts(&config.hosts)
+        .into_iter()
+        .filter(|h| host_filter.is_none_or(|f| f == h.address))
+        .collect();
+    let host_cfg = match applicable.as_slice() {
+        [] => anyhow::bail!(
+            "service {service_name:?} has no applicable host{}",
+            host_filter.map_or(String::new(), |f| format!(" matching --host={f}")),
+        ),
+        [single] => *single,
+        many if host_filter.is_some() => many[0],
+        many => anyhow::bail!(
+            "service {service_name:?} runs on {} hosts; pin one with --host:\n{}",
+            many.len(),
+            many.iter()
+                .map(|h| format!("  {}", h.address))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    };
+
+    // Replica index is essentially a no-op when publishes exist (yoink
+    // rejects `replicas > 1` together with `publish:` at config-load),
+    // but keep the flag for completeness + future flexibility. Surface
+    // a clear error if the operator asks for a non-zero index.
+    if u32::try_from(replica).map_or(true, |r| r >= service.run.replicas) {
+        anyhow::bail!(
+            "service {service_name:?} has {} replica(s); --replica {replica} is out of range",
+            service.run.replicas,
+        );
+    }
+
+    // Run the SSH probe so a misconfigured connection surfaces a
+    // structured error before SshTunnel times out generically.
+    let host = yoink::docker_ops::Host::from(host_cfg);
+    let ops = build_real_ops(config, None).await?;
+    let keyfile = ops.ssh_keyfile(&host);
+    yoink::ssh_probe::probe(&host, keyfile.as_deref().and_then(|p| p.to_str()))
+        .await
+        .map_err(|e| anyhow::anyhow!("ssh probe to {}: {e}", host.address))?;
+
+    let tunnel = SshTunnel::open_with_local_port(
+        &host.user,
+        &host.address,
+        &endpoint.host_ip,
+        endpoint.host_port,
+        local_port_request,
+        pf::TUNNEL_READY_TIMEOUT,
+        keyfile.as_deref(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "open ssh tunnel to {}:{}:{}",
+            host.address, endpoint.host_ip, endpoint.host_port
+        )
+    })?;
+
+    let local_port = tunnel.local_port();
+    let url = pf::forward_url(local_port, container_port, scheme_override);
+
+    if json {
+        let line = serde_json::json!({
+            "service": service_name,
+            "host": host.address,
+            "remote_ip": endpoint.host_ip,
+            "remote_port": endpoint.host_port,
+            "container_port": container_port,
+            "local_port": local_port,
+            "url": url,
+        });
+        println!("{line}");
+    } else {
+        eprintln!(
+            "→ {} ({}:{}) ⇆ {url}\n  Ctrl-C to close",
+            service_name, endpoint.host_ip, endpoint.host_port
+        );
+    }
+
+    if open_browser
+        && let Err(e) = pf::open_in_browser(&url)
+    {
+        eprintln!("✗ failed to open browser: {e}\n  paste into one yourself: {url}");
+    }
+
+    // Hold open until SIGINT. Drop on the tunnel kills the ssh child.
+    tokio::signal::ctrl_c()
+        .await
+        .context("install SIGINT handler")?;
+    drop(tunnel);
+    if !json {
+        eprintln!("\n✓ tunnel closed");
+    }
+    Ok(())
+}
+
+/// Parse `LOCAL:CONTAINER` or just `CONTAINER`. Empty / non-numeric
+/// segments reject with a stable message for shell-completion friendliness.
+fn parse_pf_port_arg(arg: &str) -> Result<(Option<u16>, u16)> {
+    let (local, container) = match arg.split_once(':') {
+        Some((l, c)) => (Some(l), c),
+        None => (None, arg),
+    };
+    let container: u16 = container
+        .parse()
+        .with_context(|| format!("container port {container:?} not in 0..=65535"))?;
+    let local = match local {
+        Some(s) => Some(
+            s.parse::<u16>()
+                .with_context(|| format!("local port {s:?} not in 0..=65535"))?,
+        ),
+        None => Some(container),
+    };
+    Ok((local, container))
 }
 
 async fn cmd_pty(

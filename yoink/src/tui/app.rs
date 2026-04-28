@@ -164,6 +164,9 @@ impl View {
             "  D             doctor — diagnose deploy-blockers",
             "  E             edit config in $EDITOR (jumps to focused service/host)",
             "  ~             show drift detail for the focused service",
+            "  f             port-forward the focused service (single-publish only)",
+            "  o             open the active port-forward URL in the browser",
+            "  F             close every active port-forward",
             "  Tab / S-Tab   cycle modes forward / backward",
             "  ?             toggle this help overlay",
             "",
@@ -423,6 +426,18 @@ enum Update {
     /// regardless of which view the operator was on while it was being
     /// collected.
     StatsBatch(Vec<(String, String, crate::docker_ops::ContainerStats)>),
+    /// Background `f`-key port-forward succeeded — registers the
+    /// `SshTunnel` into the App's `forwards` map. The tunnel must
+    /// land in main-loop state because dropping it (e.g. on the
+    /// background task's exit) would kill the ssh child immediately.
+    PortForwardOpened {
+        host: Host,
+        service: String,
+        endpoint: crate::pf::PublishedEndpoint,
+        local_port: u16,
+        url: String,
+        tunnel: crate::transport::tunnel::SshTunnel,
+    },
 }
 
 /// Auto-pop error overlay carrying the full text (including URLs
@@ -788,6 +803,11 @@ pub struct App {
     /// runs `crate::doctor::run_doctor` async, lands findings via
     /// `Update::Doctor`. `r` rerun; Esc closes.
     doctor: super::doctor::DoctorState,
+    /// Active port-forward tunnels keyed by `(host, service,
+    /// container_port)`. Created by `f`, closed by `Shift-F` (all)
+    /// or by dropping the App. Each entry owns its `SshTunnel`
+    /// child; Drop kills the ssh subprocess on session exit.
+    forwards: super::pf::PortForwardState,
     /// `Some((service, tag))` while a reconcile-confirmation modal
     /// is open. `y` / Enter confirms; anything else cancels.
     reconcile_target: Option<(String, String)>,
@@ -925,6 +945,7 @@ impl App {
             kill_target: None,
             drift: super::drift::DriftState::default(),
             doctor: super::doctor::DoctorState::default(),
+            forwards: super::pf::PortForwardState::default(),
             reconcile_target: None,
             prune_target: false,
             reconcile_all_target: false,
@@ -1795,6 +1816,41 @@ impl App {
             KeyCode::Char('~') => {
                 if let Some((host, service)) = self.drift_focus() {
                     self.open_drift(host, service);
+                }
+                return false;
+            }
+            // `f` opens an SSH-tunnel port-forward to the focused
+            // service. Same machinery as `yoink pf` on the CLI; resolves
+            // the service's `publish:` block, picks the first matching
+            // entry (or errors with a hint when there are 0/many), and
+            // prints the URL into a toast. The tunnel lives until
+            // `Shift-F` closes all of them or the TUI exits. `o` while
+            // a tunnel exists for the focused service opens its URL in
+            // the system browser.
+            KeyCode::Char('f') => {
+                if let Some((host, service)) = self.drift_focus() {
+                    self.open_port_forward(host, service);
+                }
+                return false;
+            }
+            KeyCode::Char('F') => {
+                let n = self.forwards.len();
+                self.forwards.clear();
+                if n > 0 {
+                    self.push_toast(format!("✓ closed {n} port-forward(s)"));
+                }
+                return false;
+            }
+            KeyCode::Char('o') => {
+                if let Some((_host, service)) = self.drift_focus()
+                    && let Some(fwd) = self.forwards.first_for_service(&service)
+                {
+                    let url = fwd.url.clone();
+                    if let Err(e) = crate::pf::open_in_browser(&url) {
+                        self.push_toast(format!("✗ open browser failed: {e} — {url}"));
+                    } else {
+                        self.push_toast(format!("→ opened {url}"));
+                    }
                 }
                 return false;
             }
@@ -2843,6 +2899,18 @@ impl App {
                 self.drift.apply(&host, &service, result);
             }
             Update::Doctor(findings) => self.doctor.store(findings),
+            Update::PortForwardOpened {
+                host,
+                service,
+                endpoint,
+                local_port,
+                url,
+                tunnel,
+            } => {
+                self.forwards.insert(super::pf::ActiveForward::new(
+                    &host, &service, endpoint, local_port, url, tunnel,
+                ));
+            }
         }
     }
 
@@ -2934,6 +3002,110 @@ impl App {
                 service,
                 result,
             });
+        });
+    }
+
+    /// Spawn an `ssh -L` tunnel to the focused (host, service) and
+    /// register it in `self.forwards`. Errors land as toasts; success
+    /// announces the URL in a toast and the footer band picks up the
+    /// new entry on the next render. No-op when an active forward
+    /// already exists for the same key (clicking `f` twice in a row
+    /// shouldn't stack tunnels).
+    fn open_port_forward(&mut self, host: Host, service_name: String) {
+        let Some(service) = self
+            .config
+            .services
+            .iter()
+            .find(|s| s.name == service_name)
+        else {
+            self.push_toast(format!("✗ no service named {service_name}"));
+            return;
+        };
+
+        // Pick the publish entry. Single-publish services get the
+        // shortcut; multi-publish requires the operator to use the
+        // CLI for now (TUI affordance for picking is a follow-up).
+        let endpoint = match crate::pf::sole_publish(service) {
+            Some(ep) => ep,
+            None => {
+                let n = service.run.publish.len();
+                if n == 0 {
+                    self.push_toast(format!(
+                        "✗ {service_name} has no `publish:` — use yoink shell instead"
+                    ));
+                } else {
+                    self.push_toast(format!(
+                        "✗ {service_name} publishes {n} ports; pick one via `yoink pf {service_name} <PORT>` on the CLI"
+                    ));
+                }
+                return;
+            }
+        };
+
+        if let Some(existing) = self
+            .forwards
+            .get(&host.address, &service_name, endpoint.container_port)
+        {
+            self.push_toast(format!("→ already up: {}", existing.url));
+            return;
+        }
+
+        let host_for_task = host.clone();
+        let service_for_task = service_name.clone();
+        let endpoint_for_task = endpoint.clone();
+        let ops = self.ops.clone();
+        let tx = self.update_tx.clone();
+        let toast_url_prefix = format!("→ {service_name} :{}", endpoint.container_port);
+        tokio::spawn(async move {
+            let keyfile = ops.ssh_keyfile(&host_for_task);
+            // Probe first so misconfigured ssh surfaces as a clean
+            // toast instead of a generic timeout.
+            if let Err(e) = crate::ssh_probe::probe(
+                &host_for_task,
+                keyfile.as_deref().and_then(|p| p.to_str()),
+            )
+            .await
+            {
+                let _ = tx.send(Update::Toast(format!(
+                    "✗ ssh probe to {} failed: {e}",
+                    host_for_task.address
+                )));
+                return;
+            }
+            match crate::transport::tunnel::SshTunnel::open_with_local_port(
+                &host_for_task.user,
+                &host_for_task.address,
+                &endpoint_for_task.host_ip,
+                endpoint_for_task.host_port,
+                None, // OS-assigned local port
+                crate::pf::TUNNEL_READY_TIMEOUT,
+                keyfile.as_deref(),
+            )
+            .await
+            {
+                Ok(tunnel) => {
+                    let local_port = tunnel.local_port();
+                    let url = crate::pf::forward_url(
+                        local_port,
+                        endpoint_for_task.container_port,
+                        None,
+                    );
+                    let _ = tx.send(Update::PortForwardOpened {
+                        host: host_for_task,
+                        service: service_for_task,
+                        endpoint: endpoint_for_task,
+                        local_port,
+                        url: url.clone(),
+                        tunnel,
+                    });
+                    let _ = tx.send(Update::Toast(format!(
+                        "{toast_url_prefix} → {url}  [o] open  [F] close"
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(Update::Toast(format!("✗ port-forward failed: {e}")));
+                }
+            }
         });
     }
 
@@ -3060,7 +3232,23 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
-        let (header_area, pane_area) = super::ui::split_with_header(frame.area());
+        let (header_area, mut pane_area) = super::ui::split_with_header(frame.area());
+        // Slice a single row off the bottom for the port-forward footer
+        // when any tunnels are active. Goal: operators can't forget they
+        // have an open tunnel — the band stays visible across every pane.
+        let pf_footer_area = if !self.forwards.is_empty() && pane_area.height >= 2 {
+            let split = ratatui::layout::Layout::default()
+                .direction(ratatui::layout::Direction::Vertical)
+                .constraints([
+                    ratatui::layout::Constraint::Min(0),
+                    ratatui::layout::Constraint::Length(1),
+                ])
+                .split(pane_area);
+            pane_area = split[0];
+            Some(split[1])
+        } else {
+            None
+        };
         let crumbs = self.view.breadcrumb();
         // Drop expired toasts and pick the freshest live one for the
         // right-side info slot. When nothing's live, fall back to the
@@ -3385,6 +3573,10 @@ impl App {
                     running_throbber,
                 );
             }
+        }
+
+        if let Some(area) = pf_footer_area {
+            self.forwards.render_footer(frame, area);
         }
 
         if self.drift.is_visible() {

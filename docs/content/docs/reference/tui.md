@@ -57,6 +57,9 @@ Heavily inspired by [k9s](https://k9scli.io/) and [lazydocker](https://github.co
 | `D` | debug sidecar (alpine in target's pid+net ns — for distroless / shell-less images) |
 | `H` | service deploy history; on a stopped row press `r` to roll back |
 | `~` | show drift detail for the focused service (image / tag / spec_hash / env keys / label keys) |
+| `f` | port-forward the focused service via `ssh -L` (single-publish only; CLI `yoink pf` handles multi). Footer band shows the URL until closed. |
+| `o` | open the active port-forward URL in the system browser |
+| `F` | close every active port-forward |
 | `x` | toggle eXited containers visible in the table |
 | `r` | refresh |
 | `/` | filter substring (Esc clears) |
