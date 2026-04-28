@@ -489,33 +489,100 @@ fn parse_json_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
     Ok(SecretsBundle::new(out))
 }
 
-/// Minimal dotenv parser — same shape `crate::sealed::parse_dotenv`
-/// uses on the age plaintext. Comments (`#…`) and blank lines are
-/// dropped; values may be wrapped in single or double quotes; surrounding
-/// whitespace is trimmed; an unrecognised line is a parse error
-/// (better to fail loudly than silently drop a malformed export).
+/// Minimal dotenv parser. Comments (`#…`) and blank lines are
+/// dropped; values may be wrapped in single or double quotes;
+/// quoted values may span multiple lines (tools like `infisical
+/// export --format=dotenv`, `doppler secrets download`, and shell
+/// `set` emit PEM certs / private keys this way — the value runs
+/// from the opening quote to the matching closing quote across
+/// however many `\n`s sit between).
+///
+/// Stricter than the sealed-file parser (`crate::sealed::parse_dotenv`)
+/// in that we support multi-line — sealed files are operator-authored
+/// and stay single-line on purpose; bundle output comes from arbitrary
+/// upstream tools where we don't control the format.
 fn parse_dotenv_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    for (i, raw_line) in text.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw_line = lines[i];
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            i += 1;
             continue;
         }
-        // Strip an optional leading `export ` (dotenv tools sometimes
-        // emit it for shell-source ergonomics).
-        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-        let (key, value) = line.split_once('=').ok_or_else(|| {
+        let after_export = trimmed
+            .strip_prefix("export ")
+            .unwrap_or(trimmed)
+            .trim_start();
+        let (key, first_value) = after_export.split_once('=').ok_or_else(|| {
             format!("line {}: expected `KEY=VALUE`, got {raw_line:?}", i + 1)
         })?;
         let key = key.trim();
         if key.is_empty() {
             return Err(format!("line {}: empty key", i + 1));
         }
-        let value = strip_quotes(value.trim());
+
+        let value_start = first_value.trim_start();
+        let value = if let Some(quote) = opening_unmatched_quote(value_start) {
+            // Multi-line quoted value: keep consuming lines until
+            // we find the closing quote on its own. The opening
+            // line contributes everything *after* the quote char.
+            let mut acc = String::from(&value_start[1..]);
+            let start_line = i;
+            i += 1;
+            let mut closed = false;
+            while i < lines.len() {
+                acc.push('\n');
+                let l = lines[i];
+                if let Some(idx) = l.find(quote) {
+                    acc.push_str(&l[..idx]);
+                    if !l[idx + 1..].trim().is_empty() {
+                        return Err(format!(
+                            "line {}: trailing content after closing {quote} in multi-line value for {key:?}",
+                            i + 1
+                        ));
+                    }
+                    closed = true;
+                    i += 1;
+                    break;
+                }
+                acc.push_str(l);
+                i += 1;
+            }
+            if !closed {
+                return Err(format!(
+                    "line {}: unterminated {quote}-quoted value for {key:?}",
+                    start_line + 1
+                ));
+            }
+            acc
+        } else {
+            i += 1;
+            strip_quotes(value_start.trim_end())
+        };
+
         out.insert(key.to_string(), value);
     }
     Ok(SecretsBundle::new(out))
+}
+
+/// If `s` starts with `'` or `"` but the matching closing quote
+/// isn't on the same line (e.g. a PEM cert that wraps), return the
+/// quote char so the caller knows what to look for on subsequent
+/// lines. `None` for unquoted values or single-line quoted values.
+fn opening_unmatched_quote(s: &str) -> Option<char> {
+    let bytes = s.as_bytes();
+    let first = *bytes.first()? as char;
+    if first != '\'' && first != '"' {
+        return None;
+    }
+    if s[1..].contains(first) {
+        return None;
+    }
+    Some(first)
 }
 
 fn strip_quotes(raw: &str) -> String {
@@ -581,6 +648,28 @@ mod tests {
         assert_eq!(bundle.get("FOO"), Some("1"));
         assert_eq!(bundle.get("BAR"), Some("hello"));
         assert_eq!(bundle.get("BAZ"), Some("spaced value"));
+    }
+
+    #[test]
+    fn parse_dotenv_bundle_handles_multiline_quoted_value() {
+        // Mirrors `infisical export --format=dotenv` output for a PEM
+        // cert: opening single quote, value spans many lines, closing
+        // quote on its own line.
+        let bytes = b"FOO=1\nCERT='-----BEGIN CERTIFICATE-----\nABCDEF\nGHIJKL\n-----END CERTIFICATE-----'\nBAR=2\n";
+        let bundle = parse_dotenv_bundle(bytes).unwrap();
+        assert_eq!(bundle.get("FOO"), Some("1"));
+        assert_eq!(bundle.get("BAR"), Some("2"));
+        let cert = bundle.get("CERT").unwrap();
+        assert!(cert.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(cert.contains("ABCDEF"));
+        assert!(cert.ends_with("-----END CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn parse_dotenv_bundle_unterminated_multiline_errors() {
+        let bytes = b"CERT='-----BEGIN CERT-----\nMIIE\nMIIE\n";
+        let err = parse_dotenv_bundle(bytes).unwrap_err();
+        assert!(err.contains("unterminated"), "got: {err}");
     }
 
     #[test]
