@@ -267,39 +267,48 @@ impl SecretsState {
     }
 
     /// Apply a confirmed `EditCommit` to the in-memory map and
-    /// re-seal to disk. Updates the flash with the result.
-    pub fn apply_commit(&mut self, commit: EditCommit) {
+    /// re-seal to disk. Updates the flash with the result. Returns
+    /// `true` when the new sealed file made it to disk — the caller
+    /// uses the signal to refresh the app's drift-detection bundle
+    /// cache so the dashboard drift cell picks up the edit on the
+    /// very next tick instead of waiting for a TUI restart.
+    pub fn apply_commit(&mut self, commit: EditCommit) -> bool {
         let LoadStatus::Loaded(bundle) = &mut self.bundle else {
             self.flash("internal: bundle not loaded");
-            return;
+            return false;
         };
-        match commit {
+        let saved = match commit {
             EditCommit::Set { key, value } => {
                 bundle.values.insert(key.clone(), value);
                 bundle.keys = bundle.values.keys().cloned().collect();
                 if let Err(e) = persist(bundle) {
                     self.flash(format!("save failed: {e}"));
-                    return;
+                    return false;
                 }
                 self.flash(format!("set {key}"));
+                true
             }
             EditCommit::Remove { key } => {
                 bundle.values.remove(&key);
                 bundle.keys = bundle.values.keys().cloned().collect();
                 if let Err(e) = persist(bundle) {
                     self.flash(format!("save failed: {e}"));
-                    return;
+                    return false;
                 }
                 self.flash(format!("removed {key}"));
+                true
             }
-        }
+        };
         let n = self.bundle_len();
         clamp_selection(&mut self.table, n);
+        saved
     }
 
     /// Convenience for the on_key handler: confirmed remove path.
-    pub fn apply_remove(&mut self, key: String) {
-        self.apply_commit(EditCommit::Remove { key });
+    /// Returns the same `did-we-persist` bool as `apply_commit` so the
+    /// caller can refresh the drift cache on success.
+    pub fn apply_remove(&mut self, key: String) -> bool {
+        self.apply_commit(EditCommit::Remove { key })
     }
 
     pub fn select_next(&mut self) {
@@ -841,6 +850,53 @@ mod tests {
         assert_eq!(parsed.get("FOO").unwrap(), "bar baz");
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn apply_commit_signals_persist_success() {
+        // The bool return drives the app's spawn_secrets_loader call —
+        // we want a refresh on persist success, not on read-only or
+        // failure paths.
+        let dir = tempdir();
+        let path = dir.join("secrets.age");
+        let id = age::x25519::Identity::generate();
+        let recipient = id.to_public().to_string();
+        let mut s = SecretsState::new();
+        s.bundle = LoadStatus::Loaded(LoadedBundle {
+            values: BTreeMap::new(),
+            keys: Vec::new(),
+            title: "test".into(),
+            write_target: Some(WriteTarget {
+                path,
+                recipients: vec![recipient],
+            }),
+        });
+        let saved = s.apply_commit(EditCommit::Set {
+            key: "K".into(),
+            value: "v".into(),
+        });
+        assert!(saved, "successful set must signal persist");
+        let removed = s.apply_remove("K".into());
+        assert!(removed, "successful remove must signal persist");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn apply_commit_returns_false_on_read_only_bundle() {
+        // provider:command bundles arrive with write_target=None;
+        // commits should fail loud and not signal a refresh.
+        let mut s = SecretsState::new();
+        s.bundle = LoadStatus::Loaded(LoadedBundle {
+            values: BTreeMap::new(),
+            keys: Vec::new(),
+            title: "test".into(),
+            write_target: None,
+        });
+        let saved = s.apply_commit(EditCommit::Set {
+            key: "K".into(),
+            value: "v".into(),
+        });
+        assert!(!saved);
     }
 
     fn tempdir() -> PathBuf {
