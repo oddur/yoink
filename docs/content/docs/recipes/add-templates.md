@@ -81,53 +81,7 @@ resolved short SHA so you know exactly what version you're applying.
 
 ### Authoring a template
 
-A template is a directory with a `template.yaml` manifest and one or
-more `.tmpl` files. Minimal example:
-
-```yaml
-# template.yaml
-name: clickhouse
-kind: accessory
-description: ClickHouse with sealed credentials.
-
-variables:
-  - name: service_name
-    prompt: Service name
-    default: clickhouse
-    pattern: "^[a-z][a-z0-9-]*$"
-
-files:
-  - dest: "services/{{ service_name }}.yaml"
-    template: service.yaml.tmpl
-
-secrets:
-  - name: "{{ service_name | upper }}_PASSWORD"
-    generate: "random:32"
-
-include_glob: "services/*.yaml"
-
-notes: |
-  depends_on: [{{ service_name }}]
-  env_from_secrets:
-    CLICKHOUSE_PASSWORD: {{ service_name | upper }}_PASSWORD
-```
-
-```yaml
-# service.yaml.tmpl
-services:
-  - name: {{ service_name }}
-    image: clickhouse/clickhouse-server
-    tag: "24-alpine"
-    env_from_secrets:
-      CLICKHOUSE_PASSWORD: {{ service_name | upper }}_PASSWORD
-    run:
-      volumes:
-        - {{ service_name }}-data:/var/lib/clickhouse
-      options:
-        memory: 1g
-```
-
-Push to a repo and your users get one-line `yoink add gh:you/repo/clickhouse`.
+A template is a directory with a small manifest + one or more rendered files. Push to any GitHub repo and consumers get one-line `yoink add gh:you/repo/yourname`. See [Authoring templates for `yoink add`](/docs/recipes/authoring-templates) for the full guide — manifest schema, variable types, secret generation, the container-hardening overrides that bite in practice, and the local-dev iteration loop.
 
 ## CI / non-interactive
 
