@@ -218,9 +218,9 @@ pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, Secre
     };
     let any_secrets_referenced = config_references_secrets(config);
     let bundle = match cfg {
-        SecretsConfig::Age { file, .. } => {
+        SecretsConfig::Age { file, recipients } => {
             let path = sealed::resolve_sealed_path(config, file.as_deref())?;
-            load_age_bundle(&path, any_secrets_referenced)?
+            load_age_bundle(&path, recipients, any_secrets_referenced)?
         }
         SecretsConfig::Command { command, format } => {
             load_command_bundle(command, *format, any_secrets_referenced).await?
@@ -250,13 +250,14 @@ fn config_references_secrets(config: &Config) -> bool {
 
 fn load_age_bundle(
     path: &Path,
+    recipients: &[String],
     any_secrets_referenced: bool,
 ) -> Result<SecretsBundle, SecretsError> {
     let bytes = std::fs::read(path).map_err(|source| SecretsError::SealedRead {
         path: path.to_path_buf(),
         source,
     })?;
-    let identity = sealed::load_identity().map_err(SecretsError::NoAgeIdentity)?;
+    let identity = sealed::load_identity(recipients).map_err(SecretsError::NoAgeIdentity)?;
     let plaintext =
         sealed::unseal(&bytes, &identity).map_err(|source| SecretsError::SealedDecrypt {
             path: path.to_path_buf(),

@@ -9,7 +9,10 @@
 //! Identity resolution order (same code path locally and in CI):
 //!   1. `YOINK_AGE_KEY` env var — raw `AGE-SECRET-KEY-1...`
 //!   2. `YOINK_AGE_KEY_FILE` env var — path to a key file
-//!   3. `~/.config/yoink/age.key`
+//!   3. Scan `~/.config/yoink/keys/*.key` for an identity whose public
+//!      half matches one of the config's `secrets.recipients:`
+//!   4. Legacy `~/.config/yoink/age.key` (the pre-multi-identity default;
+//!      still loaded so existing setups don't break on upgrade)
 //!
 //! Recipients (used by the `seal`/`edit` CLI flow) are read from the
 //! `secrets.recipients:` list in `yoink.yaml`. Decryption only needs
@@ -39,7 +42,7 @@ pub enum SealedError {
     #[error("`HOME` env var not set — cannot locate ~/.config/yoink/age.key")]
     NoHome,
     #[error(
-        "no age identity found — set {AGE_KEY_ENV} (raw key), {AGE_KEY_FILE_ENV} (path), or write the key to {0}"
+        "no matching age identity found for this config's recipients — set {AGE_KEY_ENV} (raw key), {AGE_KEY_FILE_ENV} (path), or place the key at {0}"
     )]
     NoIdentity(PathBuf),
     #[error("read age identity file {path}: {source}")]
@@ -116,14 +119,47 @@ pub fn resolve_sealed_path(
     Ok(base.join(candidate))
 }
 
-/// Default location of the operator's age identity.
-pub fn default_identity_path() -> Result<PathBuf, SealedError> {
+/// Multi-identity keys directory: `~/.config/yoink/keys/`.
+///
+/// Each file in the dir is one age identity. By convention the
+/// filename is `<public-recipient>.key` (so `~/.config/yoink/keys/age1abc….key`)
+/// — that lets us pick the right one for a given config without
+/// having to read every file. We still fall back to opening + checking
+/// pubkey for files whose filename doesn't match the convention.
+pub fn keys_dir() -> Result<PathBuf, SealedError> {
+    let home = env::var("HOME").map_err(|_| SealedError::NoHome)?;
+    Ok(PathBuf::from(home).join(".config/yoink/keys"))
+}
+
+/// Path inside [`keys_dir`] for a given public recipient. Use this when
+/// writing a freshly-generated identity so future `load_identity` calls
+/// can find it by filename without opening every file in the dir.
+pub fn keys_dir_path_for(public: &str) -> Result<PathBuf, SealedError> {
+    Ok(keys_dir()?.join(format!("{public}.key")))
+}
+
+/// Pre-multi-identity location: `~/.config/yoink/age.key`. Still loaded
+/// when no match is found in [`keys_dir`], so existing setups don't
+/// break on upgrade.
+pub fn legacy_identity_path() -> Result<PathBuf, SealedError> {
     let home = env::var("HOME").map_err(|_| SealedError::NoHome)?;
     Ok(PathBuf::from(home).join(".config/yoink/age.key"))
 }
 
-/// Resolve the operator's age identity using the documented priority.
-pub fn load_identity() -> Result<x25519::Identity, SealedError> {
+/// Back-compat alias for [`legacy_identity_path`]. Older code in this
+/// crate referenced `default_identity_path`; the new keys-dir layout
+/// makes "default" ambiguous, so the rename clarifies.
+#[deprecated(note = "use legacy_identity_path or keys_dir")]
+pub fn default_identity_path() -> Result<PathBuf, SealedError> {
+    legacy_identity_path()
+}
+
+/// Resolve the operator's age identity for a config that seals against
+/// `recipients`. See module docs for the full priority list.
+///
+/// Pass `&[]` to skip the keys-dir scan (e.g. from contexts that don't
+/// have a config handy). Falls through env vars + legacy path only.
+pub fn load_identity(recipients: &[String]) -> Result<x25519::Identity, SealedError> {
     if let Ok(raw) = env::var(AGE_KEY_ENV) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
@@ -138,11 +174,77 @@ pub fn load_identity() -> Result<x25519::Identity, SealedError> {
         }
     }
 
-    let default = default_identity_path()?;
-    if default.exists() {
-        return load_identity_from_file(&default);
+    if !recipients.is_empty() {
+        let dir = keys_dir()?;
+        if let Some(identity) = scan_dir_for_match(&dir, recipients)? {
+            return Ok(identity);
+        }
     }
-    Err(SealedError::NoIdentity(default))
+
+    let legacy = legacy_identity_path()?;
+    if legacy.exists() {
+        return load_identity_from_file(&legacy);
+    }
+    Err(SealedError::NoIdentity(legacy))
+}
+
+/// Walk a keys dir looking for an identity whose public half is in
+/// `recipients`. Cheap path: filename match (`<pubkey>.key`). Slow
+/// path: open and check the public for files that don't follow the
+/// naming convention (e.g. `team.key`, `prod.key`).
+///
+/// Decoupled from `HOME` resolution so tests can drive it against a
+/// hermetic temp dir.
+fn scan_dir_for_match(
+    dir: &Path,
+    recipients: &[String],
+) -> Result<Option<x25519::Identity>, SealedError> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // Dir doesn't exist yet — fresh user, no keys saved. Not an error.
+        return Ok(None);
+    };
+
+    let recipient_set: std::collections::HashSet<&str> =
+        recipients.iter().map(String::as_str).collect();
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("key") {
+            continue;
+        }
+        // Cheap path: filename without extension equals one of the
+        // recipients. Avoid opening (and thus mode-checking) files we
+        // know we don't care about.
+        if let Some(stem) = path.file_stem().and_then(std::ffi::OsStr::to_str)
+            && recipient_set.contains(stem)
+        {
+            return Ok(Some(load_identity_from_file(&path)?));
+        }
+        candidates.push(path);
+    }
+
+    // Slow path: a key file with a non-conventional name. Open each,
+    // derive its public, and check membership.
+    for path in candidates {
+        match load_identity_from_file(&path) {
+            Ok(identity) => {
+                let public = identity.to_public().to_string();
+                if recipient_set.contains(public.as_str()) {
+                    return Ok(Some(identity));
+                }
+            }
+            Err(e) => {
+                // A broken key file in the dir shouldn't block
+                // loading a sibling that works. Skip and move on.
+                tracing::debug!(
+                    "skipping {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn load_identity_from_file(path: &Path) -> Result<x25519::Identity, SealedError> {
@@ -536,5 +638,94 @@ BAZ=plain
         assert!(pub_.starts_with("age1"));
         // The secret round-trips back into an Identity.
         parse_identity(&sec).unwrap();
+    }
+
+    #[test]
+    fn scan_finds_identity_by_filename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (secret, public) = keygen();
+        write_key_file(tmp.path(), &format!("{public}.key"), &secret);
+
+        let recipients = vec![public.clone()];
+        let found = scan_dir_for_match(tmp.path(), &recipients)
+            .unwrap()
+            .expect("identity by filename");
+        assert_eq!(found.to_public().to_string(), public);
+    }
+
+    #[test]
+    fn scan_finds_identity_by_content_when_filename_differs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (secret, public) = keygen();
+        write_key_file(tmp.path(), "team.key", &secret);
+
+        let recipients = vec![public.clone()];
+        let found = scan_dir_for_match(tmp.path(), &recipients)
+            .unwrap()
+            .expect("identity by content");
+        assert_eq!(found.to_public().to_string(), public);
+    }
+
+    #[test]
+    fn scan_returns_none_when_no_recipient_matches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (secret_a, _public_a) = keygen();
+        write_key_file(tmp.path(), "a.key", &secret_a);
+
+        // Recipients only mention a *different* identity.
+        let (_other_secret, other_public) = keygen();
+        let recipients = vec![other_public];
+        let found = scan_dir_for_match(tmp.path(), &recipients).unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn scan_skips_broken_key_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // First file is gibberish — must not abort the scan.
+        write_key_file(tmp.path(), "broken.key", "not-a-key-at-all");
+        let (secret, public) = keygen();
+        write_key_file(tmp.path(), &format!("{public}.key"), &secret);
+
+        let recipients = vec![public.clone()];
+        let found = scan_dir_for_match(tmp.path(), &recipients)
+            .unwrap()
+            .expect("identity past the broken file");
+        assert_eq!(found.to_public().to_string(), public);
+    }
+
+    #[test]
+    fn scan_ignores_non_key_extensions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (secret, public) = keygen();
+        // Wrong extension — should be ignored even though contents are valid.
+        write_key_file(tmp.path(), &format!("{public}.txt"), &secret);
+
+        let recipients = vec![public];
+        let found = scan_dir_for_match(tmp.path(), &recipients).unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn scan_returns_none_for_missing_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let recipients = vec!["age1abc".into()];
+        assert!(scan_dir_for_match(&missing, &recipients).unwrap().is_none());
+    }
+
+    /// Write a key file with mode 0600 so `check_identity_file_mode`
+    /// doesn't reject it.
+    #[cfg(unix)]
+    fn write_key_file(dir: &Path, name: &str, contents: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn write_key_file(dir: &Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
     }
 }
