@@ -71,31 +71,31 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         return Ok(());
     }
 
-    if let Some(p) = cfg.proxy.as_ref() {
-        if let Some(x) = &p.xcaddy {
-            if p.image.is_some() {
-                return Err(ConfigError::Invalid(
-                    "proxy.image and proxy.xcaddy are mutually exclusive — `image:` is the \
-                     bring-your-own-image escape hatch; `xcaddy:` is the managed-build path. \
-                     Pick one."
-                        .to_string(),
-                ));
-            }
-            if x.plugins.is_empty() {
-                return Err(ConfigError::Invalid(
-                    "proxy.xcaddy.plugins is empty — set at least one plugin or remove the \
-                     `xcaddy:` block to use vanilla `caddy:2`"
-                        .to_string(),
-                ));
-            }
-            for plugin in &x.plugins {
-                if !is_plausible_go_module(plugin) {
-                    return Err(ConfigError::Invalid(format!(
-                        "proxy.xcaddy.plugins entry {plugin:?} doesn't look like a Go module \
-                         path (expected `<host>/<owner>/<repo>` or \
-                         `<host>/<owner>/<repo>@<version>`)"
-                    )));
-                }
+    if let Some(p) = cfg.proxy.as_ref()
+        && let Some(x) = &p.xcaddy
+    {
+        if p.image.is_some() {
+            return Err(ConfigError::Invalid(
+                "proxy.image and proxy.xcaddy are mutually exclusive — `image:` is the \
+                 bring-your-own-image escape hatch; `xcaddy:` is the managed-build path. \
+                 Pick one."
+                    .to_string(),
+            ));
+        }
+        if x.plugins.is_empty() {
+            return Err(ConfigError::Invalid(
+                "proxy.xcaddy.plugins is empty — set at least one plugin or remove the \
+                 `xcaddy:` block to use vanilla `caddy:2`"
+                    .to_string(),
+            ));
+        }
+        for plugin in &x.plugins {
+            if !is_plausible_go_module(plugin) {
+                return Err(ConfigError::Invalid(format!(
+                    "proxy.xcaddy.plugins entry {plugin:?} doesn't look like a Go module \
+                     path (expected `<host>/<owner>/<repo>` or \
+                     `<host>/<owner>/<repo>@<version>`)"
+                )));
             }
         }
     }

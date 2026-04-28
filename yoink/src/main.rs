@@ -3209,7 +3209,7 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
     }
 
     let image = config.proxy.as_ref().map_or_else(
-        || "caddy:2".to_string(),
+        || yoink::config::CADDY_DEFAULT_IMAGE.to_string(),
         yoink::config::ProxyConfig::resolved_image,
     );
     let mut child = tokio::process::Command::new("docker")

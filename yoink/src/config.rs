@@ -296,6 +296,14 @@ fn default_client_auth_mode() -> ClientAuthMode {
     ClientAuthMode::RequireAndVerify
 }
 
+/// Default proxy image when neither `proxy.image:` nor `proxy.xcaddy:`
+/// is set, and the default runtime stage of an xcaddy build. Floating
+/// upstream tag — bumps automatically when caddy ships a new release.
+pub const CADDY_DEFAULT_IMAGE: &str = "caddy:2";
+
+/// Default xcaddy builder image (carries the xcaddy CLI + Go toolchain).
+pub const CADDY_DEFAULT_BUILDER_IMAGE: &str = "caddy:2-builder";
+
 impl ProxyConfig {
     /// Resolve the Caddy image, applying the default. When `xcaddy:` is
     /// set, returns the content-addressed local tag the builder will
@@ -306,7 +314,9 @@ impl ProxyConfig {
         if let Some(x) = &self.xcaddy {
             return x.resolved_local_tag();
         }
-        self.image.clone().unwrap_or_else(|| "caddy:2".to_string())
+        self.image
+            .clone()
+            .unwrap_or_else(|| CADDY_DEFAULT_IMAGE.to_string())
     }
 
     /// Resolve the cert volume name, applying the default.
@@ -319,21 +329,16 @@ impl ProxyConfig {
 }
 
 impl XcaddyConfig {
-    pub const DEFAULT_BASE_IMAGE: &'static str = "caddy:2";
-    pub const DEFAULT_BUILDER_IMAGE: &'static str = "caddy:2-builder";
-
     #[must_use]
     pub fn resolved_base_image(&self) -> &str {
-        self.base_image
-            .as_deref()
-            .unwrap_or(Self::DEFAULT_BASE_IMAGE)
+        self.base_image.as_deref().unwrap_or(CADDY_DEFAULT_IMAGE)
     }
 
     #[must_use]
     pub fn resolved_builder_image(&self) -> &str {
         self.builder_image
             .as_deref()
-            .unwrap_or(Self::DEFAULT_BUILDER_IMAGE)
+            .unwrap_or(CADDY_DEFAULT_BUILDER_IMAGE)
     }
 
     /// Plugins, alphabetized. Both the rendered Dockerfile and the

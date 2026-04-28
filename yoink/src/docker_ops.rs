@@ -614,7 +614,6 @@ pub trait DockerOps: Send + Sync {
         _host: &Host,
         _tag: &str,
         _context_tar: bytes::Bytes,
-        _build_args: BTreeMap<String, String>,
     ) -> Result<(), DockerError> {
         Err(DockerError::Invalid("build_image not supported".into()))
     }
@@ -1330,26 +1329,24 @@ impl DockerOps for RealDockerOps {
         host: &Host,
         tag: &str,
         context_tar: bytes::Bytes,
-        build_args: BTreeMap<String, String>,
     ) -> Result<(), DockerError> {
         use bollard::query_parameters::BuildImageOptionsBuilder;
         let docker = self.client_for(host).await?;
-        let buildargs: HashMap<String, String> = build_args.into_iter().collect();
         let opts = BuildImageOptionsBuilder::default()
             .dockerfile("Dockerfile")
             .t(tag)
             .rm(true)
-            .buildargs(&buildargs)
             .build();
         let mut stream = docker.build_image(opts, None, Some(bollard::body_full(context_tar)));
-        // Drain progress; bollard surfaces stream-level errors (including
-        // `errorDetail` chunks from the daemon) as `Err(_)` so we just
-        // propagate the first one. Stdout chunks are forwarded to tracing
-        // so an operator running with RUST_LOG=info sees the build log.
+        // xcaddy compiles emit hundreds of progress lines — log at DEBUG
+        // so `--verbose` (INFO) stays focused on deploy milestones.
+        // bollard maps daemon `errorDetail` chunks to stream errors, so
+        // most failures arrive as `Err(_)` from `next()`; the explicit
+        // `error_detail` branch catches the rare detail-only case.
         while let Some(item) = stream.next().await {
             let info = item.map_err(|s| Self::err(host, s))?;
             if let Some(line) = info.stream.as_ref().filter(|s| !s.trim().is_empty()) {
-                tracing::info!(host = %host.address, %tag, build = %line.trim_end(), "build");
+                tracing::debug!(host = %host.address, %tag, build = %line.trim_end(), "build");
             }
             if let Some(detail) = info.error_detail.as_ref() {
                 let msg = detail
@@ -2393,7 +2390,7 @@ pub enum RecordedCall {
     EnsureNetwork(Host, String),
     PullImage(Host, String, String),
     LoadImage(Host),
-    BuildImage(Host, String, bytes::Bytes),
+    BuildImage(Host, String, usize),
     ListContainersByLabel(Host, String),
     ListRunningContainers(Host),
     CreateContainer(Host, String),
@@ -2578,13 +2575,12 @@ impl DockerOps for FakeDockerOps {
         host: &Host,
         tag: &str,
         context_tar: bytes::Bytes,
-        _build_args: BTreeMap<String, String>,
     ) -> Result<(), DockerError> {
         let mut s = self.lock();
         s.calls.push(RecordedCall::BuildImage(
             host.clone(),
             tag.into(),
-            context_tar,
+            context_tar.len(),
         ));
         let result = pop(&mut s.build_image, "build_image");
         if result.is_ok() {

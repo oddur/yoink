@@ -1259,39 +1259,37 @@ pub async fn prefetch_images(
 ) -> Result<(), DeployError> {
     let credentials = registry_credentials(config, secrets);
 
-    // When `proxy.xcaddy:` is set the proxy image is built on each host
-    // (no registry pull is possible), so fan out the build across proxy
-    // hosts before the regular pull loop. Idempotent — `image_present`
-    // short-circuits subsequent runs once the tag is in the host cache.
+    // Mix xcaddy builds and registry pulls into the same fan-out — they
+    // touch independent resources on each host's daemon, so a fresh
+    // proxy host can compile caddy in parallel with other services
+    // pulling their images instead of serializing the two phases.
+    let mut futs: Vec<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DeployError>> + Send>>,
+    > = Vec::new();
+
     if let Some(proxy_cfg) = config.proxy.as_ref()
         && let Some(xcaddy_cfg) = proxy_cfg.xcaddy.as_ref()
-    {
-        let proxy_service = config
+        && let Some(svc) = config
             .services
             .iter()
-            .find(|s| s.name == crate::proxy::PROXY_SERVICE_NAME);
-        if let Some(svc) = proxy_service {
-            let mut build_futs = Vec::new();
-            for host_cfg in svc.applicable_hosts(&config.hosts) {
-                let host = Host::from(host_cfg);
-                let ops = ops.clone();
-                let xcaddy_cfg = xcaddy_cfg.clone();
-                build_futs.push(async move {
-                    crate::proxy::xcaddy::ensure_xcaddy_image(&*ops, &host, &xcaddy_cfg)
-                        .await
-                        .map_err(|source| DeployError::Docker {
-                            host: host.address.clone(),
-                            source,
-                        })
-                });
-            }
-            for r in futures_util::future::join_all(build_futs).await {
-                r?;
-            }
+            .find(|s| s.name == crate::proxy::PROXY_SERVICE_NAME)
+    {
+        for host_cfg in svc.applicable_hosts(&config.hosts) {
+            let host = Host::from(host_cfg);
+            let ops = ops.clone();
+            let xcaddy_cfg = xcaddy_cfg.clone();
+            futs.push(Box::pin(async move {
+                crate::proxy::xcaddy::ensure_xcaddy_image(&*ops, &host, &xcaddy_cfg)
+                    .await
+                    .map(|_tag| ())
+                    .map_err(|source| DeployError::Docker {
+                        host: host.address.clone(),
+                        source,
+                    })
+            }));
         }
     }
 
-    let mut futs = Vec::new();
     for service in &config.services {
         if let Some(filter) = services_filter
             && !filter.iter().any(|n| n == &service.name)
@@ -1330,7 +1328,7 @@ pub async fn prefetch_images(
             let creds = credentials.clone();
             let image = service.image.clone();
             let tag = tag.clone();
-            futs.push(async move {
+            futs.push(Box::pin(async move {
                 on_event(DeployEvent::PullStarted {
                     host: host.address.clone(),
                     image: image.clone(),
@@ -1349,7 +1347,7 @@ pub async fn prefetch_images(
                     });
                 }
                 res
-            });
+            }));
         }
     }
 

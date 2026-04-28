@@ -10,7 +10,6 @@
 //! across runs short-circuits via `image_present`. Edit the plugin
 //! list and the hash flips, triggering a rebuild on next `up`.
 
-use std::collections::BTreeMap;
 use std::io::Write as _;
 
 use bytes::Bytes;
@@ -35,8 +34,7 @@ pub async fn ensure_xcaddy_image(
     }
     let dockerfile = render_dockerfile(cfg);
     let context = build_tar_context(&dockerfile);
-    ops.build_image(host, &tag, context, BTreeMap::new())
-        .await?;
+    ops.build_image(host, &tag, context).await?;
     Ok(tag)
 }
 

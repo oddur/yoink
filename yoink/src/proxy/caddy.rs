@@ -296,7 +296,7 @@ async fn adapt_snippet_to_handlers(snippet: &str, svc_name: &str) -> anyhow::Res
             "-i",
             "--entrypoint",
             "sh",
-            "caddy:2",
+            crate::config::CADDY_DEFAULT_IMAGE,
             "-c",
             "cat > /tmp/snippet.caddyfile && \
              caddy adapt --config /tmp/snippet.caddyfile --adapter caddyfile",
