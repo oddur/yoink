@@ -43,6 +43,9 @@ yoink rollback api                      # Roll service back to its previous vers
 yoink logs api -f                       # Stream logs (terminate when done)
 yoink prune --dry-run                   # See what stale containers would be removed
 yoink proxy-render                      # Print the rendered Caddy config (debugging)
+yoink pf api --json &                   # Tunnel to a (possibly non-published) service;
+                                        # stdout is a JSON line {local_port, mode, url, …}
+                                        # the agent can read to drive a follow-up curl
 ```
 
 The full surface is in the [CLI reference](/docs/reference/cli) — all flags, all subcommands, no hidden state.

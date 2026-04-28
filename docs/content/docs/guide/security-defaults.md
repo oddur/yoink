@@ -71,6 +71,20 @@ run:
     /var/cache/app: "size=128m,mode=0755"
 ```
 
+## No host port binds by default — and `yoink pf` keeps that practical
+
+Yoink doesn't add `publish:` entries for you. A service without a `publish:` block is reachable from the docker network it's on (other yoink-managed services dial it by alias) and through the bundled Caddy proxy when it has a `domain:` — but **never directly bound to a host port**. That's the right default for everything except operator UIs that genuinely need to be reachable on the host's loopback (pgadmin, monitoring dashboards behind tailnet) and the proxy itself.
+
+The standard pressure to weaken that default is debugging. "How do I curl this from my laptop?" usually pulls operators toward one of these workarounds:
+
+1. Add a `publish:` "temporarily" — which then sticks around forever because removing it after the incident is a chore.
+2. `docker exec` into the target — works for one-shot curls, but distroless / `FROM scratch` images don't ship `curl`, and you can't point a real browser at it.
+3. Spin up a one-off `docker run --network=container:<target>` shell with socat / nc — fiddly per-host, manual cleanup.
+
+[`yoink pf <service>`](/docs/recipes/port-forward) is the ergonomic version of #3 — and it works equally well for services that publish (fast `ssh -L` to docker-proxy) and services that don't (auto-spawned `alpine/socat` sidecar that joins the target's docker network and forwards). Either way the operator gets a `localhost:N` URL within ~2 seconds; the TUI's `f` key opens, `O` opens the browser, `Shift-F` closes everything cleanly. Sidecars are force-removed on exit.
+
+The point: **debugging never requires changing what's exposed in production**. The locked-down default stays the only default.
+
 ## What yoink doesn't do automatically (for now)
 
 Seccomp/AppArmor profiles beyond docker's defaults, user-namespace remapping (`--userns-remap`), gVisor / Kata runtime selection. Those are host-wide concerns, not per-service config — set them on the docker daemon and yoink containers inherit.

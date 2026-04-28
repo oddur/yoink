@@ -40,12 +40,13 @@ A high-level cross-section before the per-tool deep dives. ✓ = built-in, ◐ =
 | Sealed in-repo secrets (no external service) | ✓ (`age`) | ✗ (external vault required) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Standalone deploy (no registry, no CI) | ✓ | ✗ | ✗ | ✓ (git push) | ✗ | ✗ | ✓ (local) | ✗ |
 | Secure-by-default container options | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ◐ (Pod Security Standards) |
+| Port-forward to non-published services | ✓ (`yoink pf`, auto-spawns socat sidecar) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ (`kubectl port-forward`) |
 | TUI dashboard | ✓ (k9s-style) | ✗ | n/a (web UI) | ✗ | n/a (web UI) | ✗ | ✗ | ◐ (k9s, third-party) |
 | One-press rollback | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
 | Auto-scaling | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
 | Multi-tenancy / RBAC | ✗ | ✗ | ✓ | ◐ | ✓ | ✗ | ✗ | ✓ |
 
-The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, and standalone (no-registry) mode**. The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
+The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, standalone (no-registry) mode, and port-forwarding to services that don't publish host ports** (a kubectl-style affordance only Kubernetes itself otherwise offers in this peer group). The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
 
 ## vs. [Kamal](https://kamal-deploy.org)
 
@@ -67,6 +68,7 @@ Kamal is the closest neighbor — both are "ship a Rust/Ruby binary, ssh into ho
 | Resource limits | k8s-style (`"500m"`, `"2Gi"`) | docker-style (`cpus: 2`, `memory: 1g`) |
 | Per-service `pids_limit` | ✓ | ✗ |
 | Secure-by-default RunOptions | ✓ (cap_drop=ALL, no-new-privileges, read_only=true, pids_limit=1024, init=tini, tmpfs noexec, binds default :ro) | ✗ (docker defaults) |
+| Port-forward to non-published services | ✓ (`yoink pf <svc>`, auto-spawns socat sidecar so the locked-down "no `publish:`" default doesn't make debugging awkward) | ✗ (operator BYO `ssh -L`) |
 | No-registry deploy | ✓ (`yoink up --build --no-registry` runs an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar on the host and pushes only the missing layers via SSH; tarball fallback) | ✗ (registry required) |
 | Driven by AI agents / CI scripts | ✓ (CLI + YAML, identical local & remote) | ✓ (CLI + YAML) |
 | Maturity | New (born 2026) | Mature (born 2023, used at 37signals scale) |
@@ -180,6 +182,7 @@ Compose is a YAML schema for declaring a stack on a single host. yoink is a depl
 | Per-service drift detection | ✓ | ✗ |
 | Bundled reverse proxy with HTTPS | ✓ (Caddy + ACME / sealed certs) | ✗ (BYO) |
 | Secure-by-default container options | ✓ | ✗ (compose's defaults are dev-friendly: full caps, writable rootfs, no pids cap) |
+| Port-forward to non-published services | ✓ (`yoink pf <svc>`, auto-spawns socat sidecar) | ✗ (BYO `docker exec` / temporary `ports:` edit) |
 | Pre-deploy hooks (migrations etc.) | ✓ (`hooks.pre_deploy`) | partial (`depends_on` + healthcheck dance) |
 | Secrets store | ✓ (age-sealed `secrets.age` in the repo by default, `provider: command` for any external CLI) | ✗ (env file or external) |
 | TUI / drift dashboard | ✓ | ✗ |
@@ -205,6 +208,7 @@ Different leagues. Yoink is for people who don't want a control plane.
 | Per-tier network isolation | ✓ (named docker networks) | ✓ (NetworkPolicy + CNI) |
 | Resource limits (cpu/memory) | ✓ | ✓ |
 | Secrets management | ✓ (age-sealed in-repo by default, `provider: command` to any external CLI) | ✓ (Secrets / external store) |
+| Port-forward to non-published services | ✓ (`yoink pf <svc>`, auto-spawns socat sidecar) | ✓ (`kubectl port-forward`) |
 | Driven by AI agents / CI scripts | ✓ (CLI + one YAML file) | ✓ (kubectl + many YAML files) |
 | Imperative deploy command | `yoink up` | `kubectl apply -f` |
 
