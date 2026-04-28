@@ -170,9 +170,13 @@ pub async fn fetch(template: &TemplateRef, refresh: bool) -> Result<FetchedTempl
     let extract_root = cache_dir(&template.owner, &template.repo, &sha)?;
     if !extract_root.exists() {
         let bytes = download_tarball(&client, template, &sha).await?;
-        let toplevel = format!("{}-{}", template.repo, sha);
-        let filter = PathBuf::from(&toplevel).join(&template.subpath);
-        extract_tarball(&bytes, &extract_root, Some(&filter)).with_context(|| {
+        // Extract every entry — a per-call subpath filter would
+        // produce a cache dir that's only good for *that* subpath, so
+        // a second `yoink add` against the same SHA but a different
+        // template would silently miss its files. Tarballs are capped
+        // at 50 MB; the disk saved isn't worth the cache-correctness
+        // hazard.
+        extract_tarball(&bytes, &extract_root, None).with_context(|| {
             format!("extract tarball for {}@{}", template.original, &sha[..7])
         })?;
     }

@@ -287,7 +287,7 @@ fn seal_new_secrets(
     let mut values: BTreeMap<String, String> = if path.exists() {
         let bytes = std::fs::read(&path)
             .with_context(|| format!("read sealed file {}", path.display()))?;
-        let identity = sealed::load_identity()?;
+        let identity = sealed::load_identity(recipients)?;
         let plaintext = sealed::unseal(&bytes, &identity)?;
         sealed::parse_dotenv(&plaintext)?
     } else {

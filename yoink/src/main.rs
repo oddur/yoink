@@ -966,6 +966,10 @@ async fn run(cli: Cli) -> Result<()> {
                         transport: TransportMode::Auto.into(),
                         build: false,
                         force: false,
+                        here: false,
+                        plan: false,
+                        watch: false,
+                        config_path: &cli.config,
                     },
                 )
                 .await

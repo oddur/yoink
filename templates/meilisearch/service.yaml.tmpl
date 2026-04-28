@@ -14,3 +14,14 @@ services:
         - meili-{{ service_name }}-data:/meili_data
       options:
         memory: {{ memory }}
+        # The meilisearch image's default USER is `meili`, but the
+        # /meili_data volume mount is owned by root — and with yoink's
+        # default cap_drop=ALL, the container can't chown it. Run as
+        # root so the index directory is writable; meili itself
+        # doesn't drop privileges, so this is the simplest path.
+        user: "0:0"
+        # Meili writes payload-receive buffers to its working directory
+        # during ingest, which lands on the rootfs (the volume only
+        # covers /meili_data). yoink defaults to read_only=true; flip
+        # it for meili.
+        read_only: false
