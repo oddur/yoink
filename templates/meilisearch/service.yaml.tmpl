@@ -14,6 +14,10 @@ services:
         - meili-{{ service_name }}-data:/meili_data
       options:
         memory: {{ memory }}
+        # Stable DNS name for in-network clients. Without this, yoink
+        # only registers `{{ service_name }}-<spec_hash>` as the alias,
+        # so `http://{{ service_name }}:7700` wouldn't resolve.
+        network_aliases: [{{ service_name }}]
         # The meilisearch image's default USER is `meili`, but the
         # /meili_data volume mount is owned by root — and with yoink's
         # default cap_drop=ALL, the container can't chown it. Run as

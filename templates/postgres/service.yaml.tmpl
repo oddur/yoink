@@ -12,6 +12,11 @@ services:
         - pgdata-{{ service_name }}:/var/lib/postgresql/data
       options:
         memory: {{ memory }}
+        # Stable DNS name for in-network clients. Without this, yoink
+        # only registers `{{ service_name }}-<spec_hash>` as the alias,
+        # so `host: {{ service_name }}` in the connecting service's
+        # config wouldn't resolve.
+        network_aliases: [{{ service_name }}]
         # The postgres entrypoint runs initdb as root, chowns the data
         # volume, then drops privileges to the postgres user via gosu.
         # Override yoink's `user: nobody` default so initdb can do its
