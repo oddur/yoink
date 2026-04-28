@@ -1,0 +1,19 @@
+services:
+  - name: {{ service_name }}
+    image: redis
+    tag: 7-alpine
+    run:
+      cmd:
+        - redis-server
+        - --maxmemory
+        - "{{ maxmemory }}"
+        - --maxmemory-policy
+        - allkeys-lru
+        - --save
+        - ""
+        - --appendonly
+        - "no"
+      options:
+        memory: {{ memory }}
+        tmpfs:
+          /data: size=32m,mode=1777

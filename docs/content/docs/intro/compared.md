@@ -46,7 +46,7 @@ A high-level cross-section before the per-tool deep dives. ✓ = built-in, ◐ =
 | Auto-scaling | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
 | Multi-tenancy / RBAC | ✗ | ✗ | ✓ | ◐ | ✓ | ✗ | ✗ | ✓ |
 
-The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, standalone (no-registry) mode, and port-forwarding to services that don't publish host ports** (a kubectl-style affordance only Kubernetes itself otherwise offers in this peer group). The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
+The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, standalone (no-registry) mode, port-forwarding to services that don't publish host ports** (a kubectl-style affordance only Kubernetes itself otherwise offers in this peer group), **and one-line templates** (`yoink add postgres`, `yoink add openclaw`, `yoink add gh:acme/templates/foo` — see the [recipe](/docs/recipes/add-templates)). The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
 
 ## vs. [Kamal](https://kamal-deploy.org)
 
@@ -64,7 +64,7 @@ Kamal is the closest neighbor — both are "ship a Rust/Ruby binary, ssh into ho
 | TUI dashboard | ✓ (k9s-style) | ✗ (CLI only) |
 | Service deploy history + one-press rollback | ✓ (TUI `H` then `r`) | ✓ (CLI `kamal rollback <version>`) |
 | Secrets store | age-sealed `secrets.age` in the repo (default, no external service); `provider: command` shells out to any CLI (1Password `op`, Doppler, Vault, AWS Secrets Manager, Infisical CLI, Bitwarden) | 1Password / Bitwarden / LastPass / generic shell command |
-| Accessory containers (postgres, redis, …) | Same shape as services | First-class `accessories:` block |
+| Accessory / app templates | `yoink add postgres`, `yoink add openclaw`, `yoink add gh:owner/repo/path` — fetched from GitHub, sealed secrets generated, fragment dropped in (poor-man's-helm) | First-class `accessories:` block |
 | Resource limits | k8s-style (`"500m"`, `"2Gi"`) | docker-style (`cpus: 2`, `memory: 1g`) |
 | Per-service `pids_limit` | ✓ | ✗ |
 | Secure-by-default RunOptions | ✓ (cap_drop=ALL, no-new-privileges, read_only=true, pids_limit=1024, init=tini, tmpfs noexec, binds default :ro) | ✗ (docker defaults) |

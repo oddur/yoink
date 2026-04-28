@@ -4,6 +4,7 @@ A small, opinionated container deploy CLI + TUI for people who run a handful of 
 
 ```
 yoink up                  # reconcile every service in dep order
+yoink add postgres        # drop in vetted templates (postgres, redis, your own)
 yoink tui                 # k9s-style dashboard, drift, logs, shell-into
 yoink prune               # clean up stale containers
 yoink history api         # who deployed what, when

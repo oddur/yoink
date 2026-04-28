@@ -1,0 +1,16 @@
+services:
+  - name: {{ service_name }}
+    image: getmeili/meilisearch
+    tag: "{{ version }}"
+    env:
+      MEILI_ENV: {{ env_label }}
+      MEILI_NO_ANALYTICS: "true"
+    env_from_secrets:
+      MEILI_MASTER_KEY: {{ service_name | upper }}_MASTER_KEY
+    run:
+      port: 7700
+      healthcheck_path: /health
+      volumes:
+        - meili-{{ service_name }}-data:/meili_data
+      options:
+        memory: {{ memory }}

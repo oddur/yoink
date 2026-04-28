@@ -1,0 +1,17 @@
+services:
+  - name: {{ service_name }}
+    image: postgres
+    tag: "{{ version }}-alpine"
+    env:
+      POSTGRES_DB: {{ database }}
+      POSTGRES_USER: {{ user }}
+    env_from_secrets:
+      POSTGRES_PASSWORD: {{ service_name | upper }}_PASSWORD
+    run:
+      volumes:
+        - pgdata-{{ service_name }}:/var/lib/postgresql/data
+      options:
+        memory: {{ memory }}
+        # Postgres writes to /var/run/postgresql for the unix socket and
+        # /tmp during initdb; the data directory is on a volume.
+        read_only: false

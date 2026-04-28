@@ -1,0 +1,360 @@
+//! `yoink add <ref>` — fetch a template from GitHub, run a small
+//! variable-collection wizard, and drop a sealed-secret-and-fragment
+//! pair into the operator's repo. The "poor man's helm" surface.
+//!
+//! Everything user-facing flows through [`cmd_add`]. The submodules
+//! handle one concern each:
+//!   - [`source`]: ref parsing, GitHub API, tarball fetch, cache.
+//!   - [`manifest`]: parse `template.yaml`.
+//!   - [`wizard`]: collect variable values from CLI overrides, prompts,
+//!     or defaults.
+//!   - [`render`]: minijinja substitution into files, secret names,
+//!     dest paths, and notes.
+//!   - [`include`]: extend the main `yoink.yaml`'s `include:` list when
+//!     the rendered fragments aren't already glob-matched.
+
+use std::collections::BTreeMap;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+
+use crate::config::{Config, SecretsConfig};
+use crate::sealed;
+
+pub mod include;
+pub mod manifest;
+pub mod render;
+pub mod source;
+pub mod wizard;
+
+#[derive(Debug, Clone)]
+pub struct AddOpts {
+    pub r#ref: String,
+    pub yes: bool,
+    pub up: bool,
+    pub refresh: bool,
+    /// Repeated `--var key=value`.
+    pub vars: Vec<String>,
+}
+
+/// Outcome of [`cmd_add`]. The caller decides whether to immediately
+/// invoke `yoink up` — keeps `cmd_add` testable and avoids a circular
+/// dependency on the deploy module's CLI plumbing.
+#[derive(Debug, Clone, Default)]
+pub struct AddOutcome {
+    pub deploy_requested: bool,
+}
+
+#[allow(clippy::too_many_lines)] // single linear orchestration; splitting fragments the flow.
+pub async fn cmd_add(
+    config: &Config,
+    config_path: &Path,
+    opts: AddOpts,
+) -> Result<AddOutcome> {
+    let template_ref = source::parse_ref(&opts.r#ref)?;
+    let overrides = wizard::parse_var_overrides(&opts.vars)?;
+
+    eprintln!(
+        "fetching template `{}` from {}/{}@{}…",
+        template_ref.subpath.rsplit('/').next().unwrap_or("?"),
+        template_ref.owner,
+        template_ref.repo,
+        template_ref.git_ref
+    );
+    let fetched = source::fetch(&template_ref, opts.refresh).await?;
+
+    let manifest_path = fetched.root.join("template.yaml");
+    let manifest = manifest::TemplateManifest::parse_file(&manifest_path)?;
+
+    if let Some(min) = &manifest.yoink_min_version
+        && version_lt(env!("CARGO_PKG_VERSION"), min)
+    {
+        eprintln!(
+            "warning: template requires yoink >= {min}, you have {} — render may fail",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    let interactive = !opts.yes && io::stdin().is_terminal();
+    let variables = wizard::collect_variables(&manifest.variables, &overrides, interactive)?;
+
+    let rendered = render::render(&manifest, &fetched.root, &variables)?;
+
+    // Validate the rendered fragment files parse as valid yoink config
+    // fragments. Catches manifest bugs (typos in the .tmpl) before we
+    // touch the operator's filesystem.
+    for file in &rendered.files {
+        validate_fragment(&file.contents).with_context(|| {
+            format!("rendered file `{}` failed yoink validation", file.dest.display())
+        })?;
+    }
+
+    let dests: Vec<PathBuf> = rendered.files.iter().map(|f| f.dest.clone()).collect();
+    let include_plan =
+        include::plan(config, rendered.include_glob.as_deref(), &dests);
+
+    let target_dir = config
+        .config_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let absolute_dests: Vec<PathBuf> = rendered
+        .files
+        .iter()
+        .map(|f| target_dir.join(&f.dest))
+        .collect();
+
+    print_confirmation(
+        &template_ref,
+        &fetched.sha,
+        manifest.kind,
+        &rendered,
+        &absolute_dests,
+        &include_plan,
+        config,
+    );
+
+    if !opts.yes && interactive && !confirm("Proceed?", true)? {
+        eprintln!("aborted.");
+        return Ok(AddOutcome::default());
+    }
+
+    for (file, abs) in rendered.files.iter().zip(&absolute_dests) {
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        sealed::write_atomically(abs, file.contents.as_bytes())
+            .with_context(|| format!("write {}", abs.display()))?;
+        eprintln!("  ✓ wrote {}", abs.display());
+    }
+
+    if !rendered.secrets.is_empty() {
+        match seal_new_secrets(config, &rendered.secrets) {
+            Ok(SealReport::Sealed { count, path }) => {
+                eprintln!("  ✓ sealed {count} secret(s) into {}", path.display());
+            }
+            Ok(SealReport::Skipped { reason }) => {
+                eprintln!("  ! skipped sealing secrets: {reason}");
+                eprintln!("    keys to add manually:");
+                for s in &rendered.secrets {
+                    eprintln!("      - {}", s.name);
+                }
+            }
+            Err(e) => {
+                eprintln!("  ✗ failed to seal secrets: {e}");
+                eprintln!("    fragment files were written; re-run after fixing the secrets config");
+                return Err(e);
+            }
+        }
+    }
+
+    if let include::IncludePlan::AddGlob { glob } = &include_plan {
+        let do_apply = if opts.yes {
+            true
+        } else if interactive {
+            confirm(&format!("Add `include: [\"{glob}\"]` to {}?", config_path.display()), true)?
+        } else {
+            false
+        };
+        if do_apply {
+            include::apply(config_path, glob)?;
+            eprintln!("  ✓ updated {} include:", config_path.display());
+        } else {
+            eprintln!("  ! skipped include edit — add this to {} yourself:", config_path.display());
+            eprintln!("      include:\n        - \"{glob}\"");
+        }
+    }
+
+    if let Some(notes) = &rendered.notes
+        && !notes.trim().is_empty()
+    {
+        eprintln!();
+        eprintln!("notes:");
+        for line in notes.lines() {
+            eprintln!("  {line}");
+        }
+    }
+
+    let deploy = if opts.up {
+        true
+    } else if interactive {
+        let app_default = matches!(manifest.kind, manifest::TemplateKind::App);
+        confirm("Deploy now?", app_default)?
+    } else {
+        false
+    };
+
+    if !deploy {
+        eprintln!();
+        eprintln!("next:");
+        eprintln!("  yoink up");
+    }
+
+    Ok(AddOutcome {
+        deploy_requested: deploy,
+    })
+}
+
+fn validate_fragment(text: &str) -> Result<()> {
+    use crate::config::ConfigFragment;
+    let _: ConfigFragment = yaml_serde::from_str(text)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+enum SealReport {
+    Sealed { count: usize, path: PathBuf },
+    Skipped { reason: String },
+}
+
+fn seal_new_secrets(
+    config: &Config,
+    new_secrets: &[render::RenderedSecret],
+) -> Result<SealReport> {
+    let Some(SecretsConfig::Age { file, recipients }) = &config.secrets else {
+        return Ok(SealReport::Skipped {
+            reason: "no `secrets:` block configured (run `yoink secrets key generate` first)".into(),
+        });
+    };
+    if recipients.is_empty() {
+        return Ok(SealReport::Skipped {
+            reason: "`secrets.recipients:` is empty".into(),
+        });
+    }
+    let path = sealed::resolve_sealed_path(config, file.as_deref())?;
+
+    // Merge with existing sealed contents if the file already exists.
+    let mut values: BTreeMap<String, String> = if path.exists() {
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read sealed file {}", path.display()))?;
+        let identity = sealed::load_identity()?;
+        let plaintext = sealed::unseal(&bytes, &identity)?;
+        sealed::parse_dotenv(&plaintext)?
+    } else {
+        BTreeMap::new()
+    };
+
+    let mut added = 0;
+    for s in new_secrets {
+        if values.contains_key(&s.name) {
+            eprintln!(
+                "  ! secret `{}` already sealed — keeping existing value",
+                s.name
+            );
+            continue;
+        }
+        values.insert(s.name.clone(), s.value.clone());
+        added += 1;
+    }
+
+    if added == 0 {
+        return Ok(SealReport::Sealed { count: 0, path });
+    }
+
+    let canonical = sealed::render_dotenv(&values);
+    let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
+    sealed::write_atomically_secret(&path, &sealed_bytes)?;
+    Ok(SealReport::Sealed { count: added, path })
+}
+
+fn print_confirmation(
+    template_ref: &source::TemplateRef,
+    sha: &str,
+    kind: manifest::TemplateKind,
+    rendered: &render::Rendered,
+    absolute_dests: &[PathBuf],
+    include_plan: &include::IncludePlan,
+    config: &Config,
+) {
+    let kind_label = match kind {
+        manifest::TemplateKind::Accessory => "accessory",
+        manifest::TemplateKind::App => "app",
+    };
+    eprintln!();
+    eprintln!(
+        "Template: {} ({kind_label})",
+        template_ref.display_short(sha)
+    );
+    eprintln!("Files to write:");
+    for abs in absolute_dests {
+        let exists = if abs.exists() { " (overwrites existing)" } else { "" };
+        eprintln!("  + {}{exists}", abs.display());
+    }
+    if !rendered.secrets.is_empty() {
+        match &config.secrets {
+            Some(SecretsConfig::Age { file, .. }) => {
+                let path = sealed::resolve_sealed_path(config, file.as_deref())
+                    .unwrap_or_else(|_| PathBuf::from("secrets.age"));
+                eprintln!("Secrets to seal into {}:", path.display());
+            }
+            _ => {
+                eprintln!("Secrets to generate (no sealing — set up `secrets:` first):");
+            }
+        }
+        for s in &rendered.secrets {
+            eprintln!("  + {} (random)", s.name);
+        }
+    }
+    if let include::IncludePlan::AddGlob { glob } = include_plan {
+        eprintln!("Update yoink.yaml:");
+        eprintln!("  + include: [\"{glob}\"]");
+    }
+    eprintln!();
+}
+
+fn confirm(prompt: &str, default_yes: bool) -> Result<bool> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    eprint!("{prompt} {suffix} ");
+    io::stderr().flush().ok();
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    let answer = buf.trim().to_ascii_lowercase();
+    if answer.is_empty() {
+        return Ok(default_yes);
+    }
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
+/// Loose semver `<` for the "you need a newer yoink" warning. Treats
+/// version strings as dot-separated decimal segments; non-numeric
+/// suffixes (`-rc1`) are ignored. Returns false on parse failure to
+/// avoid spurious warnings.
+fn version_lt(have: &str, need: &str) -> bool {
+    fn parts(s: &str) -> Vec<u64> {
+        s.split('.')
+            .map(|p| {
+                let digits: String = p.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().unwrap_or(0)
+            })
+            .collect()
+    }
+    let h = parts(have);
+    let n = parts(need);
+    let len = h.len().max(n.len());
+    for i in 0..len {
+        let a = h.get(i).copied().unwrap_or(0);
+        let b = n.get(i).copied().unwrap_or(0);
+        if a < b {
+            return true;
+        }
+        if a > b {
+            return false;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_compare() {
+        assert!(version_lt("0.10.0", "0.12.0"));
+        assert!(!version_lt("0.12.0", "0.12.0"));
+        assert!(!version_lt("0.13.0", "0.12.0"));
+        assert!(version_lt("0.11.0", "0.12.0-rc1"));
+        assert!(!version_lt("1.0.0", "0.99.0"));
+    }
+}

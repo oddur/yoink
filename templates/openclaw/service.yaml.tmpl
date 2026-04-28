@@ -1,0 +1,12 @@
+services:
+  - name: {{ service_name }}
+    image: {{ image }}
+    tag: "{{ tag }}"
+    {% if domain %}domain: {{ domain }}
+    {% endif %}env_from_secrets:
+      SECRET_KEY: {{ service_name | upper }}_SECRET_KEY
+    run:
+      port: {{ port }}
+      healthcheck_path: /health
+      options:
+        memory: {{ memory }}
