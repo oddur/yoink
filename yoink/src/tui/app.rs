@@ -533,12 +533,9 @@ pub async fn run(
         tracing::info!("hl not on PATH; using raw log forwarder");
     }
     let mut terminal = setup_terminal(mouse).context("setup terminal")?;
-    // Panic hook: a panic anywhere in render or event handling unwinds
-    // straight past `restore_terminal`, leaving the operator stuck in
-    // raw mode + alternate screen until they `reset` (or kill the
-    // terminal). Hook restores the terminal first, then chains to the
-    // previous hook so the panic message still prints normally and any
-    // process-level handler (color-eyre, sentry-panic) still runs.
+    // Restore the terminal on panic before chaining to the previous
+    // hook — without this a panic in render unwinds past
+    // `restore_terminal` and leaves the operator stuck in raw+alt mode.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = restore_terminal_raw(mouse);
@@ -554,16 +551,13 @@ pub async fn run(
     )
     .await;
     let restore = restore_terminal(&mut terminal, mouse);
-    let _ = std::panic::take_hook(); // drop our hook so future code runs without it
+    let _ = std::panic::take_hook();
     result.and(restore)
 }
 
-/// Best-effort terminal restore from a panic context — operates on raw
-/// stdout instead of the `Terminal<Backend>` (which we don't own from
-/// inside the hook). Mirror of `restore_terminal` minus cursor show
-/// (the panic flow doesn't need pixel-perfect cleanup; getting raw
-/// mode off + leaving the alt screen is enough to make the operator's
-/// terminal usable again).
+/// Restore from a panic context — operates on raw stdout because we
+/// don't own the `Terminal<Backend>` here. Skips the cursor-show step
+/// of the normal-exit `restore_terminal` (not needed for usability).
 fn restore_terminal_raw(mouse: bool) -> std::io::Result<()> {
     let mut stdout = io::stdout();
     if mouse {
@@ -906,12 +900,9 @@ impl App {
         let mut new_config = match Config::load_from_path(&self.config_path) {
             Ok(c) => c,
             Err(e) => {
-                // Surface the parse error once per unique message —
-                // operator edits yoink.yaml from another shell, makes
-                // a typo, and otherwise has no signal that the live
-                // TUI is still running the previous config. Toast
-                // dedup avoids spamming on every CONFIG_RELOAD_TICK
-                // while the file stays broken.
+                // Toast once per unique message so the operator sees
+                // their typo; dedup keeps the ring quiet while the
+                // file stays broken across many reload ticks.
                 let msg = format!("✗ config reload failed: {e}");
                 if !self
                     .toasts
@@ -939,11 +930,8 @@ impl App {
             self.start_event_subscriptions();
             self.stop_stats_history_pollers();
             self.start_stats_history_pollers();
-            // Drop ring-buffer entries for hosts that are no longer in
-            // the config. Without this, removing a host leaks its 200-
-            // event ring forever, and re-adding the same address later
-            // would resurrect events from a prior era and confuse the
-            // operator.
+            // Drop event rings for hosts no longer in the config so a
+            // re-added address doesn't inherit stale events.
             let active: std::collections::HashSet<&str> =
                 self.config.hosts.iter().map(|h| h.address.as_str()).collect();
             self.host_events.retain(|addr, _| active.contains(addr.as_str()));
@@ -2118,11 +2106,8 @@ impl App {
         self.reconcile_all_target = false;
         self.resource_remove_target = None;
         self.resource_prune_target = None;
-        // The `docker top` modal lives on `ContainerDetailState`; if we
-        // leave ContainerDetail with it visible, returning later
-        // re-renders the stale process list. Dismiss explicitly so a
-        // re-entry starts clean (the operator presses `p` again to
-        // re-fetch).
+        // Drop the `docker top` modal so a re-entry to ContainerDetail
+        // doesn't resurrect a stale process list.
         self.container_detail.dismiss_top();
         // Don't clear job_progress on transition — operator
         // may want to navigate around with the deploy still in flight.
@@ -3063,17 +3048,10 @@ impl Drop for App {
         self.stop_log_streams();
         self.stop_event_subscriptions();
         self.stop_stats_history_pollers();
-        // Belt-and-braces sidecar cleanup. Normal exit goes through
-        // `transition`, which already calls `shell.cleanup()`; the
-        // panic path doesn't, so a crash while in `View::ContainerShell`
-        // would otherwise leave the alpine debug container running on
-        // the host. `cleanup()` is a `tokio::spawn` of
-        // `force_remove_container` — the spawn requires the tokio
-        // runtime to still be alive. When that's true (Drop fires
-        // inside `cmd_tui`'s async tail), the cleanup completes; in
-        // the rarer case of post-runtime drop, the sidecar's
-        // `auto_remove: true` plus the SSH connection breaking still
-        // covers us within seconds.
+        // Sidecar cleanup on the panic-drop path (the transition path
+        // already does this on normal exit). `cleanup` spawns a force-
+        // remove; if the runtime is gone, `auto_remove: true` + the
+        // dropped SSH connection still reaps the alpine container.
         if let Some(mut shell) = self.shell.take() {
             shell.cleanup(self.ops.clone());
         }

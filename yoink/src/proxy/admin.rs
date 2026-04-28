@@ -120,24 +120,22 @@ pub async fn push_config(
         .map_err(|source| AdminError::Http { source })?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        // Caddy's /load response body usually carries only its own
-        // error message, but parser errors can echo a slice of the
-        // submitted JSON — which contains inline `tls.certificates.
-        // load_pem` entries with full PEM-encoded cert + key. Strip
-        // PEM blocks before propagating, since this error string
-        // ends up in CLI stderr / tracing logs / TUI toasts.
-        let body = redact_pem_blocks(&body);
+        // Caddy parser errors can echo a slice of the submitted JSON,
+        // which carries inline cert+key PEMs from
+        // `tls.certificates.load_pem`. Strip them before the error
+        // lands in stderr / tracing / TUI toasts.
+        let body = redact_pem_blocks(&resp.text().await.unwrap_or_default());
         return Err(AdminError::LoadRejected { status, body });
     }
     drop(tunnel);
     Ok(())
 }
 
-/// Replace every `-----BEGIN <kind>-----` … `-----END <kind>-----`
-/// block (and its escape-encoded `\n` JSON variant) with a placeholder.
-/// Keeps the surrounding error context legible while ensuring no
-/// secret material survives in a logged error string.
+const REDACTED_PEM: &str = "<redacted PEM>";
+
+/// Replace `-----BEGIN <kind>----- … -----END <kind>-----` regions
+/// with a placeholder; an unterminated BEGIN is over-redacted to the
+/// end of the body (better than leaking).
 fn redact_pem_blocks(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
@@ -148,23 +146,16 @@ fn redact_pem_blocks(body: &str) -> String {
         };
         out.push_str(&rest[..begin_pos]);
         let after_begin = &rest[begin_pos..];
-        // Find the matching END marker (Caddy may emit literal newlines
-        // OR JSON-escaped \n; END marker shape is the same in both).
-        if let Some(end_marker_pos) = after_begin.find("-----END ") {
-            // Skip past the trailing five dashes after the END label.
-            let tail = &after_begin[end_marker_pos..];
-            let after_end_label = match tail.find("-----") {
-                Some(idx) => idx + "-----".len(),
-                None => after_begin.len(),
-            };
-            out.push_str("<redacted PEM>");
-            rest = &after_begin[end_marker_pos + after_end_label..];
-        } else {
-            // Unterminated PEM — replace everything from BEGIN to end
-            // of body. Better to over-redact than to leak.
-            out.push_str("<redacted PEM>");
+        let Some(end_marker_pos) = after_begin.find("-----END ") else {
+            out.push_str(REDACTED_PEM);
             return out;
-        }
+        };
+        let tail = &after_begin[end_marker_pos..];
+        let after_end_label = tail
+            .find("-----")
+            .map_or(after_begin.len(), |idx| idx + "-----".len());
+        out.push_str(REDACTED_PEM);
+        rest = &after_begin[end_marker_pos + after_end_label..];
     }
 }
 
