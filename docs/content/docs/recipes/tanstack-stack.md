@@ -242,14 +242,11 @@ yoink up --build --here --service my-app
 
 ## What just happened
 
-Five files (`Dockerfile`, `.dockerignore`, `src/lib/db.server.ts`, `src/routes/index.tsx`, `yoink.yaml`) plus three yoink commands (`init`, `add`, `up`):
+Five files (`Dockerfile`, `.dockerignore`, `src/lib/db.server.ts`, `src/routes/index.tsx`, `yoink.yaml`) plus three yoink commands (`init`, `add`, `up`) brought up two containers on a private docker network with a sealed-on-commit Postgres password and drift detection on every container.
 
-- Two containers on one host: postgres and your app.
-- Random `POSTGRES_PASSWORD` generated, sealed into `secrets.age`, and committed to the repo. Decryption needs the age key in `~/.config/yoink/keys/`.
-- All inter-service traffic on a private docker network — nothing exposed publicly yet.
-- Spec-hash drift detection on every container, so a manual `docker exec` in production shows up in `yoink status` next time you check.
-
-For the full `yoink up` flag list, see [first deploy](/docs/start/first-deploy) and the [CLI reference](/docs/reference/cli).
+- [Sealed secrets](/docs/recipes/sealed-secrets) — how the `POSTGRES_PASSWORD` is generated and decrypted at deploy.
+- [Architecture](/docs/guide/architecture) — drift detection, healthcheck-gated swap.
+- [CLI reference](/docs/reference/cli) — every `yoink up` flag.
 
 ## Going public — HTTPS with Let's Encrypt
 

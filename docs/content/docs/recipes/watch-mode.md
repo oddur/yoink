@@ -11,14 +11,9 @@ weight: 8
 yoink up --watch --build --service my-tool
 ```
 
-Then edit `yoink.yaml` (or the Dockerfile for `my-tool`). On save:
+Edit `yoink.yaml` (or the Dockerfile for `my-tool`). On save, yoink rebuilds, ships, and rolls the container behind its healthcheck. Ctrl-C exits.
 
-1. Yoink polls every 2s and notices the config differs from the last reconcile.
-2. `--build` rebuilds `my-tool`'s image against your local docker daemon.
-3. Because `my-tool` has a `build:` block, yoink ships the new image directly to the host (unregistry transport by default — only the changed layers cross the wire). No registry pull is attempted for it.
-4. The reconcile loop swaps the running container with the standard healthcheck-gated rolling deploy.
-
-Ctrl-C exits the loop.
+Polling cadence and reload-failure semantics live in the [Why polling?](#why-polling) section below; the underlying ship + swap mechanics are in [deploy modes](/docs/guide/deploy-modes) and [architecture](/docs/guide/architecture).
 
 ## Why polling?
 

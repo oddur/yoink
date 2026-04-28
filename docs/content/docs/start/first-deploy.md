@@ -83,7 +83,7 @@ services:
 yoink up --build
 ```
 
-Builds the image locally, ships it directly to the host over SSH (the `build:` block tells yoink the image is local-only — no registry pull is attempted), and runs it through a healthcheck-gated rolling deploy.
+Builds the image locally, ships it directly to the host over SSH, runs it through a healthcheck-gated rolling deploy. See [deploy modes](/docs/guide/deploy-modes) for how yoink picks per-service between local-ship and registry-pull.
 
 ### Iterate
 
@@ -93,7 +93,7 @@ Edit code or Dockerfile. Re-run the same command:
 yoink up --build
 ```
 
-Only changed layers cross the wire (yoink uses [unregistry-style](/docs/guide/deploy-modes#standalone-no-registry) layer-dedup transport). Healthcheck-gated swap; the old container only stops after the new one is healthy.
+Only changed layers cross the wire. Healthcheck-gated swap — the old container only stops after the new one is healthy.
 
 ### Inspect what's running
 

@@ -28,14 +28,7 @@ That's it. ~15 seconds for a small image. The `build:` block tells yoink the ima
 
 ## What yoink does for you (without you asking)
 
-Even at this minimum size, the container yoink creates is hardened:
-
-- **read-only rootfs** (default `read_only: true`) — exploits can't drop binaries on disk
-- **no Linux caps** (default `cap_drop: [ALL]`) — `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, … all dropped
-- **no setuid escalation** (default `security_opt: [no-new-privileges:true]`)
-- **`pids_limit: 1024`** — fork-bomb bound
-- **tini as PID 1** (default `init: true`) — zombie reaping + proper SIGTERM forwarding
-- **healthcheck-gated swap** — yoink runs a TCP-connect probe on port 8080 before declaring the new container live
+Even at this minimum size your container inherits yoink's hardened defaults — read-only rootfs, no Linux caps, no setuid escalation, fork-bomb bound, tini as PID 1, healthcheck-gated swap. See [secure by default](/docs/guide/security-defaults) for the full list and per-field rationale.
 
 If your `my-tool` actually needs to write somewhere, give it a tmpfs:
 
