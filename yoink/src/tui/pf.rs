@@ -55,10 +55,15 @@ pub struct ActiveForward {
     #[allow(dead_code)]
     pub local_port: u16,
     pub url: String,
-    /// Owning the child here means the ssh process dies with the App.
+    /// Owning the ssh child here means the process dies with the App.
     /// `Option` so unit tests can build the surface without spawning
     /// a real ssh; production code always passes `Some(tunnel)`.
     _tunnel: Option<SshTunnel>,
+    /// Sidecar container (only Some on the non-published path).
+    /// Drop force-removes the alpine/socat container; auto-remove on
+    /// docker handles the case where Drop runs after the runtime has
+    /// already torn down.
+    _sidecar: Option<crate::pf::SidecarHandle>,
 }
 
 impl ActiveForward {
@@ -69,6 +74,7 @@ impl ActiveForward {
         local_port: u16,
         url: String,
         tunnel: SshTunnel,
+        sidecar: Option<crate::pf::SidecarHandle>,
     ) -> Self {
         Self {
             key: ForwardKey {
@@ -80,6 +86,7 @@ impl ActiveForward {
             local_port,
             url,
             _tunnel: Some(tunnel),
+            _sidecar: sidecar,
         }
     }
 
@@ -99,6 +106,7 @@ impl ActiveForward {
             local_port: local,
             url: format!("http://localhost:{local}"),
             _tunnel: None,
+            _sidecar: None,
         }
     }
 }
@@ -142,11 +150,30 @@ impl PortForwardState {
         self.refresh_footer();
     }
 
-    /// Close every active forward. Invoked by `Shift-F` from the
-    /// dashboard or on App drop.
-    pub fn clear(&mut self) {
+    /// Close every active forward. Sync — kept around for tests +
+    /// non-async callers; production paths use `close_all_async`
+    /// so sidecar removes actually complete.
+    #[cfg(test)]
+    fn clear(&mut self) {
         self.forwards.clear();
         self.refresh_footer();
+    }
+
+    /// Like `clear`, but awaits each sidecar's force-remove before
+    /// returning so the operator never sees stranded `yoink-pf-*`
+    /// containers in `docker ps`. Drains the map first to release
+    /// the SshTunnel children, then awaits sidecar close() calls
+    /// in parallel.
+    pub async fn close_all_async(&mut self) {
+        let drained: Vec<_> = std::mem::take(&mut self.forwards).into_values().collect();
+        self.refresh_footer();
+        let closes: Vec<_> = drained
+            .into_iter()
+            .filter_map(|fwd| fwd._sidecar.map(crate::pf::SidecarHandle::close))
+            .collect();
+        if !closes.is_empty() {
+            futures_util::future::join_all(closes).await;
+        }
     }
 
     #[must_use]

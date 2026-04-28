@@ -397,6 +397,15 @@ enum Command {
         /// Useful for scripts that want to read the chosen port.
         #[arg(long)]
         json: bool,
+        /// How to reach the container. `auto` (default) tries the
+        /// `publish:` block first and falls back to spawning a
+        /// socat sidecar if the service doesn't publish the
+        /// requested port — that's the "secure-by-default" path
+        /// for services like api/web that only expose to Caddy.
+        /// `published` errors instead of spawning. `sidecar`
+        /// always spawns even when a publish exists.
+        #[arg(long, value_enum, default_value_t = PfMode::Auto)]
+        mode: PfMode,
     },
     /// Like `shell` but spawns an `alpine` debug sidecar in the
     /// target's pid+net namespaces — for distroless / shell-less
@@ -585,6 +594,30 @@ impl From<PfScheme> for yoink::pf::SchemeOverride {
             PfScheme::Https => Self::Https,
             PfScheme::Tcp => Self::Tcp,
             PfScheme::None => Self::None,
+        }
+    }
+}
+
+/// CLI value enum for `yoink pf --mode`. `auto` is the default and
+/// covers both the published-port fast path and the sidecar
+/// fallback. `published` errors when the service doesn't publish;
+/// `sidecar` always spawns a socat sidecar even for services that
+/// could use the fast path (rare; useful for "I want to bypass
+/// docker-proxy and hit the container's :8080 directly").
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum PfMode {
+    #[default]
+    Auto,
+    Published,
+    Sidecar,
+}
+
+impl From<PfMode> for yoink::pf::Mode {
+    fn from(m: PfMode) -> Self {
+        match m {
+            PfMode::Auto => Self::Auto,
+            PfMode::Published => Self::Published,
+            PfMode::Sidecar => Self::Sidecar,
         }
     }
 }
@@ -942,6 +975,7 @@ async fn run(cli: Cli) -> Result<()> {
             open,
             scheme,
             json,
+            mode,
         } => {
             cmd_pf(
                 &config,
@@ -952,6 +986,7 @@ async fn run(cli: Cli) -> Result<()> {
                 open,
                 scheme.into(),
                 json,
+                mode.into(),
             )
             .await
         }
@@ -1821,8 +1856,11 @@ enum PtyMode {
     Debug { image: String },
 }
 
-/// `yoink pf` — bind a laptop port to a container's published host
-/// port via `ssh -L`. Foreground; holds the tunnel until SIGINT.
+/// `yoink pf` — bind a laptop port to a container port. Foreground;
+/// holds the tunnel until SIGINT. Picks the published-port fast path
+/// when available (`auto` mode), or spawns a socat sidecar for
+/// services that don't expose host ports — the secure-by-default
+/// shape (api/web behind Caddy in production).
 #[allow(clippy::fn_params_excessive_bools)] // operator-facing flags, explicit at the CLI; bundling into a struct hides them.
 #[allow(clippy::too_many_arguments)] // mirrors the CLI surface 1:1; struct would force a noop builder.
 async fn cmd_pf(
@@ -1834,32 +1872,32 @@ async fn cmd_pf(
     open_browser: bool,
     scheme_override: yoink::pf::SchemeOverride,
     json: bool,
+    mode: yoink::pf::Mode,
 ) -> Result<()> {
     use yoink::pf;
     use yoink::transport::tunnel::SshTunnel;
 
     let service = pf::resolve_service(config, service_name)?;
 
-    // Parse `[LOCAL:]CONTAINER` (or fall back to sole_publish when no
-    // port arg was supplied).
+    // Resolve `(LOCAL, CONTAINER)`. The container port comes from
+    // either an explicit arg, the unique publish (when there is
+    // exactly one), or service.run.port (the healthcheck port,
+    // which is the right default for non-published services).
     let (local_port_request, container_port) = match port_arg {
         Some(arg) => parse_pf_port_arg(arg)?,
         None => {
-            let ep = pf::sole_publish(service).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "service {service_name:?} has 0 or multiple `publish:` entries — \
-                     specify which container port to forward, e.g. \
-                     `yoink pf {service_name} 8080`"
-                )
-            })?;
-            // Default LOCAL to the same port as CONTAINER for the
-            // single-publish shortcut — most operators already have
-            // that bookmarked locally.
-            (Some(ep.host_port), ep.container_port)
+            if let Some(ep) = pf::sole_publish(service) {
+                (Some(ep.host_port), ep.container_port)
+            } else if let Some(p) = service.run.port {
+                (None, p)
+            } else {
+                anyhow::bail!(
+                    "service {service_name:?} has no `publish:` and no `run.port:` — \
+                     specify the container port explicitly, e.g. `yoink pf {service_name} 8080`"
+                );
+            }
         }
     };
-
-    let endpoint = pf::resolve_endpoint(service, container_port)?;
 
     // Pick the host: respect --host if given; otherwise the first
     // host the service applies to. Reject if zero applicable hosts.
@@ -1885,10 +1923,6 @@ async fn cmd_pf(
         ),
     };
 
-    // Replica index is essentially a no-op when publishes exist (yoink
-    // rejects `replicas > 1` together with `publish:` at config-load),
-    // but keep the flag for completeness + future flexibility. Surface
-    // a clear error if the operator asks for a non-zero index.
     if u32::try_from(replica).map_or(true, |r| r >= service.run.replicas) {
         anyhow::bail!(
             "service {service_name:?} has {} replica(s); --replica {replica} is out of range",
@@ -1896,20 +1930,31 @@ async fn cmd_pf(
         );
     }
 
-    // Run the SSH probe so a misconfigured connection surfaces a
-    // structured error before SshTunnel times out generically.
     let host = yoink::docker_ops::Host::from(host_cfg);
-    let ops = build_real_ops(config, None).await?;
+    let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
+        std::sync::Arc::new(build_real_ops(config, None).await?);
     let keyfile = ops.ssh_keyfile(&host);
     yoink::ssh_probe::probe(&host, keyfile.as_deref().and_then(|p| p.to_str()))
         .await
         .map_err(|e| anyhow::anyhow!("ssh probe to {}: {e}", host.address))?;
 
+    // Resolve the path: published host endpoint OR sidecar handle +
+    // host port. `_sidecar` is bound here so its Drop fires after
+    // SIGINT even though the variable is otherwise unused.
+    let resolved =
+        pf::resolve_target(ops.clone(), &host, service, container_port, mode).await?;
+    let (remote_dial_host, remote_port, mode_label, _sidecar) = match resolved {
+        pf::ResolvedTarget::Published(ep) => (ep.host_ip, ep.host_port, "published", None),
+        pf::ResolvedTarget::Sidecar { handle, host_port } => {
+            ("127.0.0.1".to_string(), host_port, "sidecar", Some(handle))
+        }
+    };
+
     let tunnel = SshTunnel::open_with_local_port(
         &host.user,
         &host.address,
-        &endpoint.host_ip,
-        endpoint.host_port,
+        &remote_dial_host,
+        remote_port,
         local_port_request,
         pf::TUNNEL_READY_TIMEOUT,
         keyfile.as_deref(),
@@ -1917,8 +1962,8 @@ async fn cmd_pf(
     .await
     .with_context(|| {
         format!(
-            "open ssh tunnel to {}:{}:{}",
-            host.address, endpoint.host_ip, endpoint.host_port
+            "open ssh tunnel to {}:{remote_dial_host}:{remote_port}",
+            host.address
         )
     })?;
 
@@ -1929,8 +1974,9 @@ async fn cmd_pf(
         let line = serde_json::json!({
             "service": service_name,
             "host": host.address,
-            "remote_ip": endpoint.host_ip,
-            "remote_port": endpoint.host_port,
+            "mode": mode_label,
+            "remote_ip": remote_dial_host,
+            "remote_port": remote_port,
             "container_port": container_port,
             "local_port": local_port,
             "url": url,
@@ -1938,8 +1984,8 @@ async fn cmd_pf(
         println!("{line}");
     } else {
         eprintln!(
-            "→ {} ({}:{}) ⇆ {url}\n  Ctrl-C to close",
-            service_name, endpoint.host_ip, endpoint.host_port
+            "→ {} ({} via {mode_label}) ⇆ {url}\n  Ctrl-C to close",
+            service_name, host.address
         );
     }
 
@@ -1949,10 +1995,19 @@ async fn cmd_pf(
         eprintln!("✗ failed to open browser: {e}\n  paste into one yourself: {url}");
     }
 
-    // Hold open until SIGINT. Drop on the tunnel kills the ssh child.
+    // Hold open until SIGINT. Order matters: close the sidecar
+    // FIRST (the bollard SSH connection is still live and warm),
+    // THEN drop the SshTunnel (synchronously kills the ssh -L
+    // child). Reverse order saw bollard return SendRequest errors
+    // on the docker remove call, presumably because something in
+    // the tunnel teardown was poking the same SSH stack bollard
+    // uses.
     tokio::signal::ctrl_c()
         .await
         .context("install SIGINT handler")?;
+    if let Some(sc) = _sidecar {
+        sc.close().await;
+    }
     drop(tunnel);
     if !json {
         eprintln!("\n✓ tunnel closed");

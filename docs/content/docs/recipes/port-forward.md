@@ -1,51 +1,52 @@
 ---
-title: Port-forward to a published service
+title: Port-forward to any service
 weight: 13
 ---
 
-`yoink pf <service>` opens an `ssh -L` tunnel from your laptop to one of the service's published container ports — the same shape `kubectl port-forward` gives you, but reusing the SSH connection yoink already has to the host. No proxy, no sidecar, no extra TLS termination; the host's `docker-proxy` is already listening on `127.0.0.1:<host_port>`, and yoink just bridges the laptop into it.
+`yoink pf <service>` opens a tunnel from your laptop to a container port — the same shape `kubectl port-forward` gives you, reusing the SSH connection yoink already has to the host. Two paths under the hood, picked automatically:
+
+- **Published path.** When the service declares a `publish:` entry that matches the requested container port, yoink does a single `ssh -L` to the host's existing `docker-proxy` listener. No extra container, ~50 ms to bind.
+- **Sidecar path.** When the service has no `publish:` (the secure-by-default api/web shape — only reachable via Caddy on :443), yoink spawns an ephemeral `alpine/socat` sidecar that joins the same docker network, listens on its own internal port, and forwards to `<service-alias>:<container-port>`. Yoink then `ssh -L`s to the sidecar's published-on-loopback port. The sidecar lives only as long as the `pf` invocation; Drop force-removes it.
+
+Either way the operator-visible UX is identical: an open URL, `Ctrl-C` / `Shift-F` closes everything cleanly. **You don't need to publish a port to debug a service.** The sidecar path is the secure-by-default story: production stays "no `publish:` for api/web" and `yoink pf` Just Works.
 
 ## What it works on
 
-`yoink pf` is **only** for services that declare a `publish:` block in `yoink.yaml`. Common cases:
+Anything yoink runs:
 
-- `pgadmin` published on `127.0.0.1:5050:80` (operator UI behind tailnet).
-- An internal admin port published on `127.0.0.1:9090:9090` for ad-hoc curling.
-- A databases / consoles you've intentionally bound to loopback for SSH-only access.
-
-For the typical web service that's only reachable through the bundled Caddy proxy on `:443` (api / web in the standard Backtrack-shape config), there's no published port to forward — use [`yoink shell <service>`](/docs/reference/cli) to drop into a docker-exec inside the container instead.
+- **Published** (pgadmin on `127.0.0.1:5050:80`, the operator UI): published path. Fastest.
+- **Caddy-fronted, sealed-network** (api on the `api` network, no `publish:`): sidecar path. ~500 ms cold-start; ~5 MB image pulled once per host.
+- **Multi-network** (web on `web` + `otel`): sidecar joins the first declared network and the operator dials the service's docker DNS alias.
 
 ## CLI
 
 ```sh
-# Service has exactly one publish: that's the one we use, OS-assigned local port.
-yoink pf pgadmin
+# Auto-mode: published if available, sidecar otherwise.
+yoink pf pgadmin              # published path (pgadmin has `publish:`)
+yoink pf api                  # sidecar path (api has no publish; uses run.port)
+yoink pf api 8080             # explicit container port
+yoink pf api 5050:8080        # LOCAL:CONTAINER (stable laptop port across sessions)
+yoink pf api 8080 -o          # also open browser when ready
+yoink pf web 3000 --scheme=https -o     # force https://
 
-# Equivalent: pin local port = container port (the implicit shape).
-yoink pf pgadmin 80
+# Mode override:
+yoink pf pgadmin --mode=sidecar   # bypass docker-proxy, hit the container directly
+yoink pf api --mode=published     # error instead of falling back to sidecar
 
-# `LOCAL:CONTAINER` to keep a known local port stable across sessions.
-yoink pf pgadmin 5050:80
-
-# Open the URL in the browser as soon as the tunnel is up.
-yoink pf pgadmin -o
-
-# Force the URL scheme (HTTP/HTTPS heuristic only knows the obvious ports).
-yoink pf my-service 9000 --scheme=https -o
-
-# Print the chosen local port as JSON, then keep tunneling — useful from scripts.
-yoink pf pgadmin --json &
+# JSON output (script-friendly): first stdout line is `{local_port, mode, url, …}`,
+# then keep tunneling.
+yoink pf api --json &
 LOCAL=$(read -r line; echo "$line" | jq -r .local_port)
-curl -s http://localhost:$LOCAL/healthz
+curl -s http://localhost:$LOCAL/health
 ```
 
-The process holds the tunnel until you Ctrl-C; on exit the SSH child dies and the local port is freed.
+The process holds the tunnel until you Ctrl-C; on exit the SSH child dies, the sidecar (if any) is force-removed, and the local port is freed.
 
 ### Errors you'll see
 
-- **`service "x" has no \`publish:\` block`** — yoink doesn't have a host port to bridge to. Use `yoink shell x` to docker-exec inside the container.
-- **`service "x" has no published container port 9999 (available: 80, 443)`** — typo. The error lists the container ports the service actually publishes; pick one.
-- **`service "x" publishes 80 on more than one host port (got 5050, 5051); pin one`** — rare (services usually publish each container port to exactly one host port), but handle it by passing `LOCAL:CONTAINER` to disambiguate.
+- **`service "x" has no \`publish:\` block and \`--mode published\` was forced`** — drop the flag (auto mode falls back to a sidecar) or pass `--mode sidecar` explicitly.
+- **`service "x" declares no \`networks:\``** — sidecar mode needs a docker network to join. Add a `networks:` entry to the service or to `deploy.networks:`.
+- **`service "x" has no \`publish:\` and no \`run.port:\``** — when no port arg is given, yoink defaults to `run.port`. Set one or pass the container port explicitly.
 - **`ssh probe to <host> failed: …`** — the same probe `yoink up` uses. Tailnet, key, host-key acceptance — fix once and `yoink pf` works for everything.
 
 ## TUI
@@ -68,12 +69,24 @@ The band is hard to miss on purpose — open tunnels are the kind of thing opera
 
 ## How it works
 
-`yoink pf` is a thin wrapper around `ssh -N -L laptop_port:remote_dial_host:remote_port user@host` against the same SSH config bollard already uses for the docker daemon connection. The remote-dial-host comes from the publish block (`127.0.0.1` for two-token publishes, the explicit IP for three-token), and the remote port is the host port. Container-side: nothing changes; `docker-proxy` was already listening before `pf` ran.
+### Published path
 
-What that buys you:
+When the service publishes the requested port, yoink runs `ssh -N -L laptop_port:remote_dial_host:remote_port user@host` against the same SSH config bollard already uses for the docker daemon connection. The remote-dial-host comes from the publish block (`127.0.0.1` for two-token publishes, the explicit IP for three-token); the remote port is the host port. `docker-proxy` was already listening before `pf` ran. ~50 ms cold-start.
 
-- **No extra container.** Some other tools spin up a sidecar in the target's network namespace running socat or nc; yoink doesn't need to. The host already has the listener.
-- **No image dependencies.** `pf` works whether the target image has socat, curl, anything. Even a `FROM scratch` distroless image port-forwards fine, because we never enter the target container.
+### Sidecar path
+
+When the service doesn't publish the requested port, yoink:
+
+1. Pulls `alpine/socat:latest` on the host (no-op after the first run; ~5 MB).
+2. Spawns a one-shot container named `yoink-pf-<service>-<port>-<id>` that joins the same docker network as the target and publishes its own internal port `1080` to a random `127.0.0.1:<host_port>` on the host. Inside, it runs `socat tcp-listen:1080,fork,reuseaddr tcp:<service-alias>:<container-port>`.
+3. Inspects the container for the docker-assigned host port.
+4. SSH-tunnels the laptop to that loopback host port.
+5. On `pf` exit (Ctrl-C, `Shift-F`, TUI exit, panic), Drop fires a `force-remove` against the sidecar. Belt-and-braces `auto_remove: true` catches the case where Drop runs after the runtime has torn down.
+
+The sidecar is labelled `yoink.kind=pf-sidecar` so a future `yoink prune` pass can sweep stragglers if `pf` ever crashes mid-flight.
+
+What both paths share:
+
 - **Same auth path as everything else.** If `yoink up` works against the host, `yoink pf` works. No separate SSH config, no extra keys.
-
-The trade-off is that `pf` only forwards what's already published. That's the whole point — encoding "do you actually want this exposed on the host?" into the yaml is part of yoink's contract.
+- **No image dependencies on the target.** Whether the target is `FROM scratch` or full Debian, `pf` reaches it the same way (the published path doesn't enter the target; the sidecar speaks docker DNS to it).
+- **Loopback-only on the host.** Both the published path and the sidecar's published port bind `127.0.0.1` — the laptop reaches them through SSH; nothing fronts the public internet.

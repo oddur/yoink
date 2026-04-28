@@ -427,9 +427,11 @@ enum Update {
     /// collected.
     StatsBatch(Vec<(String, String, crate::docker_ops::ContainerStats)>),
     /// Background `f`-key port-forward succeeded — registers the
-    /// `SshTunnel` into the App's `forwards` map. The tunnel must
-    /// land in main-loop state because dropping it (e.g. on the
-    /// background task's exit) would kill the ssh child immediately.
+    /// `SshTunnel` (and optional `SidecarHandle` for the non-published
+    /// path) into the App's `forwards` map. Both must land in
+    /// main-loop state because dropping them on the background task
+    /// would kill the ssh child / force-remove the sidecar
+    /// immediately.
     PortForwardOpened {
         host: Host,
         service: String,
@@ -437,6 +439,10 @@ enum Update {
         local_port: u16,
         url: String,
         tunnel: crate::transport::tunnel::SshTunnel,
+        /// `Some` when the resolution went through the sidecar
+        /// path. The handle's Drop force-removes the alpine/socat
+        /// container.
+        sidecar: Option<crate::pf::SidecarHandle>,
     },
 }
 
@@ -680,6 +686,14 @@ async fn run_loop(
                 match input {
                     Some(Ok(Event::Key(key))) => {
                         if app.on_key(key).await {
+                            // Quit. Drain port-forwards explicitly
+                            // so each sidecar's docker remove
+                            // completes before the runtime tears
+                            // down (the spawn-from-Drop fallback
+                            // races with shutdown). Synchronous
+                            // SshTunnel children get killed by
+                            // their own Drop on App teardown.
+                            app.forwards.close_all_async().await;
                             return Ok(());
                         }
                         if let Some(target) = app.take_pending_editor() {
@@ -1835,7 +1849,7 @@ impl App {
             }
             KeyCode::Char('F') => {
                 let n = self.forwards.len();
-                self.forwards.clear();
+                self.forwards.close_all_async().await;
                 if n > 0 {
                     self.push_toast(format!("✓ closed {n} port-forward(s)"));
                 }
@@ -2906,9 +2920,10 @@ impl App {
                 local_port,
                 url,
                 tunnel,
+                sidecar,
             } => {
                 self.forwards.insert(super::pf::ActiveForward::new(
-                    &host, &service, endpoint, local_port, url, tunnel,
+                    &host, &service, endpoint, local_port, url, tunnel, sidecar,
                 ));
             }
         }
@@ -3005,61 +3020,53 @@ impl App {
         });
     }
 
-    /// Spawn an `ssh -L` tunnel to the focused (host, service) and
-    /// register it in `self.forwards`. Errors land as toasts; success
-    /// announces the URL in a toast and the footer band picks up the
-    /// new entry on the next render. No-op when an active forward
-    /// already exists for the same key (clicking `f` twice in a row
-    /// shouldn't stack tunnels).
+    /// Open a port-forward to the focused (host, service) and register
+    /// it in `self.forwards`. Same auto-mode dispatch the CLI uses:
+    /// published-port fast path when available, sidecar fallback for
+    /// secure-by-default services with no `publish:` block (api/web).
+    /// No-op when an active forward already exists for the same key.
     fn open_port_forward(&mut self, host: Host, service_name: String) {
         let Some(service) = self
             .config
             .services
             .iter()
             .find(|s| s.name == service_name)
+            .cloned()
         else {
             self.push_toast(format!("✗ no service named {service_name}"));
             return;
         };
 
-        // Pick the publish entry. Single-publish services get the
-        // shortcut; multi-publish requires the operator to use the
-        // CLI for now (TUI affordance for picking is a follow-up).
-        let endpoint = match crate::pf::sole_publish(service) {
-            Some(ep) => ep,
-            None => {
-                let n = service.run.publish.len();
-                if n == 0 {
-                    self.push_toast(format!(
-                        "✗ {service_name} has no `publish:` — use yoink shell instead"
-                    ));
-                } else {
-                    self.push_toast(format!(
-                        "✗ {service_name} publishes {n} ports; pick one via `yoink pf {service_name} <PORT>` on the CLI"
-                    ));
-                }
-                return;
-            }
+        // Container port: unique publish if there's exactly one,
+        // else `service.run.port` (the healthcheck port — right
+        // default for non-published services).
+        let container_port = if let Some(ep) = crate::pf::sole_publish(&service) {
+            ep.container_port
+        } else if let Some(p) = service.run.port {
+            p
+        } else {
+            self.push_toast(format!(
+                "✗ {service_name} has no `publish:` and no `run.port:` — pick a port via `yoink pf` on the CLI"
+            ));
+            return;
         };
 
         if let Some(existing) = self
             .forwards
-            .get(&host.address, &service_name, endpoint.container_port)
+            .get(&host.address, &service_name, container_port)
         {
             self.push_toast(format!("→ already up: {}", existing.url));
             return;
         }
 
         let host_for_task = host.clone();
-        let service_for_task = service_name.clone();
-        let endpoint_for_task = endpoint.clone();
+        let service_name_for_task = service_name.clone();
+        let service_for_task = service.clone();
         let ops = self.ops.clone();
         let tx = self.update_tx.clone();
-        let toast_url_prefix = format!("→ {service_name} :{}", endpoint.container_port);
+        let toast_prefix = format!("→ {service_name} :{container_port}");
         tokio::spawn(async move {
             let keyfile = ops.ssh_keyfile(&host_for_task);
-            // Probe first so misconfigured ssh surfaces as a clean
-            // toast instead of a generic timeout.
             if let Err(e) = crate::ssh_probe::probe(
                 &host_for_task,
                 keyfile.as_deref().and_then(|p| p.to_str()),
@@ -3072,11 +3079,41 @@ impl App {
                 )));
                 return;
             }
+            let resolved = match crate::pf::resolve_target(
+                ops.clone(),
+                &host_for_task,
+                &service_for_task,
+                container_port,
+                crate::pf::Mode::Auto,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Update::Toast(format!("✗ port-forward failed: {e}")));
+                    return;
+                }
+            };
+            let (dial_host, dial_port, endpoint, sidecar) = match resolved {
+                crate::pf::ResolvedTarget::Published(ep) => {
+                    (ep.host_ip.clone(), ep.host_port, ep, None)
+                }
+                crate::pf::ResolvedTarget::Sidecar { handle, host_port } => (
+                    "127.0.0.1".to_string(),
+                    host_port,
+                    crate::pf::PublishedEndpoint {
+                        host_ip: "127.0.0.1".into(),
+                        host_port,
+                        container_port,
+                    },
+                    Some(handle),
+                ),
+            };
             match crate::transport::tunnel::SshTunnel::open_with_local_port(
                 &host_for_task.user,
                 &host_for_task.address,
-                &endpoint_for_task.host_ip,
-                endpoint_for_task.host_port,
+                &dial_host,
+                dial_port,
                 None, // OS-assigned local port
                 crate::pf::TUNNEL_READY_TIMEOUT,
                 keyfile.as_deref(),
@@ -3087,19 +3124,20 @@ impl App {
                     let local_port = tunnel.local_port();
                     let url = crate::pf::forward_url(
                         local_port,
-                        endpoint_for_task.container_port,
+                        container_port,
                         crate::pf::SchemeOverride::Auto,
                     );
                     let _ = tx.send(Update::PortForwardOpened {
                         host: host_for_task,
-                        service: service_for_task,
-                        endpoint: endpoint_for_task,
+                        service: service_name_for_task,
+                        endpoint,
                         local_port,
                         url: url.clone(),
                         tunnel,
+                        sidecar,
                     });
                     let _ = tx.send(Update::Toast(format!(
-                        "{toast_url_prefix} → {url}  [o] open  [F] close"
+                        "{toast_prefix} → {url}  [o] open  [F] close"
                     )));
                 }
                 Err(e) => {
