@@ -2734,8 +2734,13 @@ impl App {
         let secrets = self.secrets.try_read().ok().and_then(|g| g.clone());
         match &self.view {
             View::Dashboard => {
-                self.dashboard
-                    .render(frame, pane_area, &self.config, secrets.as_deref());
+                self.dashboard.render(
+                    frame,
+                    pane_area,
+                    &self.config,
+                    secrets.as_deref(),
+                    &self.container_history,
+                );
             }
             View::Hosts => self.hosts.render(frame, pane_area, &self.config),
             View::HostDetail(host) => {
@@ -2750,6 +2755,7 @@ impl App {
                     &self.config,
                     secrets.as_deref(),
                     &events,
+                    &self.container_history,
                 );
             }
             View::ContainerDetail { host, container } => {

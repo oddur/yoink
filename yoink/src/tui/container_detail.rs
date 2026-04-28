@@ -71,6 +71,11 @@ pub struct StatsHistory {
     /// Last absolute mem bytes (for the uncapped case so the y-axis
     /// max can grow).
     mem_max_bytes: i64,
+    /// The newest raw `ContainerStats` sample we ingested. Cached
+    /// alongside the derived rings so list views (Dashboard,
+    /// `HostDetail`) can render their CPU/Mem cells directly from the
+    /// always-on poller's data instead of duplicating the stats fetch.
+    latest: Option<ContainerStats>,
 }
 
 impl StatsHistory {
@@ -80,9 +85,12 @@ impl StatsHistory {
     }
 
     /// Record a fresh sample. Drops points that fall outside the
-    /// history window so the chart keeps a fixed time horizon.
+    /// history window so the chart keeps a fixed time horizon. Also
+    /// caches the raw `ContainerStats` so list views can read it
+    /// without their own per-container fetch.
     pub fn push(&mut self, stats: &ContainerStats) {
         let t = self.now_elapsed();
+        self.latest = Some(stats.clone());
         self.cpu_pct.push_back((t, stats.cpu_pct.max(0.0)));
 
         match stats.mem_limit {
@@ -129,6 +137,14 @@ impl StatsHistory {
     #[allow(dead_code)] // Useful for tests + future "reset on disconnect" hooks.
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    /// Most recent raw stats sample, if any. Used by Dashboard /
+    /// `HostDetail` to render their CPU/Mem cells without duplicating
+    /// the stats fetch.
+    #[must_use]
+    pub fn latest(&self) -> Option<&ContainerStats> {
+        self.latest.as_ref()
     }
 
     /// True when the CPU samples ring is empty — used by the App-level

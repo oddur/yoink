@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures_util::future::join_all;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -17,6 +16,7 @@ use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host, HostInfo
 use crate::output::format_bytes;
 use crate::secrets::SecretsBundle;
 
+use super::container_detail::StatsHistory;
 use super::ui::{
     FilterState, bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge,
     render_drift_cell, short_image, state_style,
@@ -24,7 +24,6 @@ use super::ui::{
 
 pub struct HostDetailRefresh {
     pub containers: Vec<ContainerInfo>,
-    pub stats: HashMap<String, ContainerStats>,
     pub host_info: Option<HostInfo>,
     pub error: Option<String>,
 }
@@ -33,7 +32,6 @@ pub struct HostDetailRefresh {
 pub struct HostDetailState {
     host: Option<Host>,
     containers: Vec<ContainerInfo>,
-    stats: HashMap<String, ContainerStats>,
     host_info: Option<HostInfo>,
     last_error: Option<String>,
     table: TableState,
@@ -51,7 +49,6 @@ impl HostDetailState {
     pub fn set_host(&mut self, host: Host) {
         if self.host.as_ref() != Some(&host) {
             self.containers.clear();
-            self.stats.clear();
             self.table.select(None);
             self.loaded = false;
         }
@@ -78,7 +75,6 @@ impl HostDetailState {
         self.loaded = true;
         if self.last_error.is_none() {
             self.containers = data.containers;
-            self.stats = data.stats;
             self.host_info = data.host_info;
         }
         clamp_selection(&mut self.table, self.containers.len());
@@ -154,6 +150,7 @@ impl HostDetailState {
         config: &Config,
         secrets: Option<&SecretsBundle>,
         events: &[String],
+        history: &HashMap<(String, String), StatsHistory>,
     ) {
         // 5-section layout: header · summary · containers (Min) · events (Length 8 when present) · footer.
         // The event panel collapses to 0 when no events are recorded yet.
@@ -184,7 +181,7 @@ impl HostDetailState {
         let header = Paragraph::new(header_text).style(bold());
         frame.render_widget(header, header_area);
 
-        self.render_summary(frame, summary_area);
+        self.render_summary(frame, summary_area, history);
 
         let widths = [
             Constraint::Length(14), // service
@@ -215,7 +212,14 @@ impl HostDetailState {
                 .iter()
                 .map(|i| {
                     let c = &self.containers[*i];
-                    let stats = self.stats.get(&c.name);
+                    let host_addr = self
+                        .host
+                        .as_ref()
+                        .map(|h| h.address.clone())
+                        .unwrap_or_default();
+                    let stats = history
+                        .get(&(host_addr, c.name.clone()))
+                        .and_then(StatsHistory::latest);
                     let health = c.health_hint().unwrap_or("-");
                     Row::new(vec![
                         Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
@@ -305,7 +309,12 @@ impl HostDetailState {
         clippy::cast_sign_loss,
         clippy::cast_lossless
     )]
-    fn render_summary(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    fn render_summary(
+        &self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        history: &HashMap<(String, String), StatsHistory>,
+    ) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" host summary ");
@@ -321,8 +330,23 @@ impl HostDetailState {
             ])
             .split(inner);
 
-        let cpu_total: f32 = self.stats.values().map(|s| s.cpu_pct as f32).sum();
-        let mem_total: u64 = self.stats.values().map(|s| s.mem_used.max(0) as u64).sum();
+        // Sum across the latest stats sample of every container we
+        // know is on this host. The history store is keyed by
+        // (host_address, container_name) so we filter to the rows that
+        // belong to the current host.
+        let host_addr = self
+            .host
+            .as_ref()
+            .map(|h| h.address.as_str())
+            .unwrap_or_default();
+        let host_stats: Vec<&ContainerStats> = self
+            .containers
+            .iter()
+            .filter_map(|c| history.get(&(host_addr.to_string(), c.name.clone())))
+            .filter_map(StatsHistory::latest)
+            .collect();
+        let cpu_total: f32 = host_stats.iter().map(|s| s.cpu_pct as f32).sum();
+        let mem_total: u64 = host_stats.iter().map(|s| s.mem_used.max(0) as u64).sum();
         let n_cpu = self
             .host_info
             .as_ref()
@@ -443,42 +467,30 @@ pub async fn fetch_owned(ops: Arc<dyn DockerOps>, host: Host) -> HostDetailRefre
     fetch(ops.as_ref(), &host).await
 }
 
+/// List running containers + host info, in parallel. Live stats are
+/// owned by the App-level always-on poller and read from
+/// `App::container_history` at render time.
 async fn fetch(ops: &dyn DockerOps, host: &Host) -> HostDetailRefresh {
-    // Containers + host info concurrently.
     let (containers_res, host_info_res) =
-        tokio::join!(ops.list_running_containers(host), ops.host_info(host),);
-    let containers = match containers_res {
-        Ok(c) => c,
-        Err(e) => {
-            return HostDetailRefresh {
-                containers: Vec::new(),
-                stats: HashMap::new(),
-                host_info: None,
-                error: Some(format!("{e:#}")),
-            };
-        }
-    };
-    let stat_futs = containers.iter().map(|c| {
-        let name = c.name.clone();
-        async move { (name.clone(), ops.container_stats(host, &name).await) }
-    });
-    let stats: HashMap<String, ContainerStats> = join_all(stat_futs)
-        .await
-        .into_iter()
-        .filter_map(|(name, r)| r.ok().map(|s| (name, s)))
-        .collect();
-    HostDetailRefresh {
-        containers,
-        stats,
-        host_info: host_info_res.ok(),
-        error: None,
+        tokio::join!(ops.list_running_containers(host), ops.host_info(host));
+    match containers_res {
+        Ok(containers) => HostDetailRefresh {
+            containers,
+            host_info: host_info_res.ok(),
+            error: None,
+        },
+        Err(e) => HostDetailRefresh {
+            containers: Vec::new(),
+            host_info: None,
+            error: Some(format!("{e:#}")),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::docker_ops::{ContainerStats, FakeDockerOps};
+    use crate::docker_ops::FakeDockerOps;
     use std::collections::BTreeMap;
 
     fn host() -> Host {
@@ -507,25 +519,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_populates_containers_and_stats() {
+    async fn refresh_populates_containers() {
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![container("a"), container("b")]));
-        ops.push_container_stats(Ok(ContainerStats {
-            cpu_pct: 100.0,
-            mem_used: 64 * 1024 * 1024,
-            ..Default::default()
-        }));
-        ops.push_container_stats(Ok(ContainerStats {
-            cpu_pct: 50.0,
-            mem_used: 32 * 1024 * 1024,
-            ..Default::default()
-        }));
-
+        // Stats are owned by the always-on poller now; refresh just
+        // collects the listing.
         let mut state = HostDetailState::new();
         state.set_host(host());
         state.refresh(&ops).await;
         assert_eq!(state.containers.len(), 2);
-        assert_eq!(state.stats.len(), 2);
         assert_eq!(state.selected_container().as_deref(), Some("a"));
     }
 
@@ -533,8 +535,6 @@ mod tests {
     async fn select_next_and_prev_clamp_to_bounds() {
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![container("a"), container("b")]));
-        ops.push_container_stats(Ok(ContainerStats::default()));
-        ops.push_container_stats(Ok(ContainerStats::default()));
         let mut state = HostDetailState::new();
         state.set_host(host());
         state.refresh(&ops).await;
