@@ -152,6 +152,76 @@ View / add / edit / remove individual sealed secrets without leaving the TUI. Re
 
 When the provider is Infisical the pane is read-only — edits go via the Infisical web UI. When no age identity is available, the pane shows the failed-load reason + a remediation pointer. For bulk multi-line edits, drop to the CLI: `yoink secrets edit`.
 
+## Logs pane (`l`)
+
+The multiplexed Logs view aggregates a live tail from **every yoink-managed container** across every host into one scrollable buffer. Each line is prefixed with the container name; lines from different hosts and services interleave in real time. Useful for "something just happened on prod, what was it?" when you don't yet know which service.
+
+| key | action |
+|---|---|
+| `↑↓` / `PgUp` `PgDn` | scroll line / page (auto-follow disengages while scrolling away from bottom) |
+| `g` / `G` / `End` | jump to top / bottom (resumes auto-follow) |
+| `/` | begin filter input — Enter applies, Esc cancels (live-typed, case-insensitive substring) |
+| `k` | clear the buffer (next ticks repopulate) |
+| `r` | restart streams (re-opens log pipes if any died) |
+| `y` | yank the visible buffer to the system clipboard via OSC-52 |
+
+The buffer is bounded at 5,000 lines; older lines fall off as new ones arrive. Filter doesn't shrink the buffer, only the rendered view.
+
+### `ContainerLogs` (single container)
+
+Reached via `Enter` from any list view. Same shape as the multiplexed Logs pane, scoped to one container. Same keybindings; `Esc` returns to the parent. `!` and `D` are also bound here for quick "tail logs → drop into shell" pivots.
+
+## Shell / debug sidecar (`!`, `D`)
+
+Both gestures put you on a PTY inside the host's docker daemon, no SSH on top — bollard's exec API does the heavy lifting and the TUI streams bytes both ways through `vt100::Parser`.
+
+`!` runs `bash` (falls back to `sh`) inside the existing container — equivalent to `yoink shell <service>` but staying in the TUI. Useful when the image has a shell and you want quick access to the running process's filesystem, env, etc.
+
+`D` spins up an ephemeral **alpine debug sidecar** sharing the target container's PID and network namespaces. The fallback for distroless / scratch / shell-less images: you get `ps`, `ss`, `cat /proc/<pid>/...`, `tcpdump`, `apk add` whatever you need — without modifying the production image. The sidecar is `--rm` and force-removed when you `exit` / Ctrl-D, even if the TUI crashes.
+
+| key inside the shell view | action |
+|---|---|
+| anything | forwarded into the in-shell process (Ctrl-C, Ctrl-D, arrow keys, …) |
+| `Ctrl-Q` | exit shell, back to the parent pane (yoink-side gesture) |
+| `?` | toggle help overlay (one yoink-side gesture even inside the shell) |
+| `exit` / `Ctrl-D` | end the in-container shell normally |
+
+Window resizing flows through automatically — the panel size is sent to the daemon on every render so `top` / `vim` / etc. re-flow.
+
+## Progress modals
+
+Long-running operations (reconcile-one, reconcile-all, prune) render a centred modal that streams the deploy event log live. The border colour reflects state — cyan while running, green on success, red on failure. The modal eats every key while the operation is in flight (so a stray `j` can't drive the underlying view); `y` yanks the modal's text to the clipboard at any time. Once finished, `Esc` / `Enter` dismisses.
+
+`reconcile-all` (`A` from Dashboard) gets a richer status table at the top of the modal — one row per service, colour-coded by current state (waiting → pulling → healthcheck → swapping → done / failed) — so when the wave-parallel deploy is mid-flight you can see all six services' progress at a glance instead of hunting through interleaved log lines.
+
+## Filter conventions
+
+Every list/table pane has a consistent filter:
+
+- `/` enters input mode — type freeform; `Backspace` deletes; `Enter` applies; `Esc` cancels (drops back to whatever filter was already active)
+- Active filter is shown in cyan in the footer (`filter: foo`); editable filter buffer is yellow
+- `Esc` with no input mode and an active filter clears it
+
+Filter is case-insensitive substring across multiple fields per pane (host + service + container name + state + version + networks for the dashboard; analogous sets elsewhere). Empty filter shows everything.
+
+## Help overlay (`?`)
+
+Toggles a centred per-view modal listing every key binding active in the current view. Press `?` again or `Esc` to close. The contents are scoped — Dashboard's overlay shows only Dashboard keys, Resources' shows only Resources keys, etc. — so you don't have to scan irrelevant bindings.
+
+The overlay is available in every view including inside the embedded shell (which otherwise forwards every key to the PTY).
+
+## CLI launch flags
+
+```sh
+yoink tui                       # Dashboard view by default
+yoink tui --mode hosts          # start on a specific top-level pane
+yoink tui --mouse               # enable mouse capture (scroll wheel + selection)
+```
+
+`--mode` accepts `dashboard` / `hosts` / `services` / `logs` / `resources` / `secrets`. `--mouse` is opt-in because mouse capture disables your terminal's native text-selection — if you don't actively use mouse scroll inside the TUI, leave it off.
+
+`YOINK_NO_HL=1` in the environment skips the `hl` auto-detection (the logs pane will use raw output even if `hl` is on PATH). Useful when troubleshooting `hl` itself.
+
 ## Pretty logs
 
 Structured log lines (JSON, logfmt, etc.) are hard to scan as raw text. The TUI's logs pane auto-detects [`hl`](https://github.com/pamburus/hl) (`brew install pamburus/tap/hl`) on the operator's `PATH` and transparently pipes every container's log stream through it before rendering — so JSON keys are colored, timestamps are dim, levels are highlighted, and stack traces stay readable. Falls back to raw output when `hl` isn't installed; no config knob to toggle.

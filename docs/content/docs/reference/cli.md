@@ -41,6 +41,8 @@ yoink up                                 reconcile every service to its desired 
   --no-registry                          stream local image to host (no docker pull);
                                          pair with --build for the indie one-shot
   --build                                docker build any service with a `build:` block first
+  --force                                redeploy even when at-spec; recovery gesture for
+                                         drifted proxy state. Pair with --service to scope.
   --allow-dirty                          allow operating with a dirty git working tree
 
 yoink build [<SERVICE>]                  docker build the named service (or every service
@@ -130,3 +132,14 @@ Services without an explicit tag (typical for `image: ghcr.io/you/api` where the
 yoink up --tag api=$(git rev-parse HEAD) --tag web=$(git rev-parse HEAD)
 yoink up --service api --tag $(git rev-parse HEAD)         # bare form, single service
 ```
+
+## Force redeploy (`--force`)
+
+Bypasses the at-spec early-return so every selected service runs the full prepare → finalize loop, including the Caddy admin push for routed services. The recovery gesture for cases where proxy-side state has drifted from container reality — e.g. Caddy's upstream pool still references containers that were swapped out in a prior reconcile. Pair with `--service <name>` to limit blast radius:
+
+```sh
+yoink up --service yoink-proxy --force          # re-push Caddy admin config
+yoink up --service api --force                  # re-create + healthcheck all api replicas
+```
+
+Tradeoff: for multi-replica services the prep phase removes the old replicas before finalize starts the new ones, so there's a brief service-level downtime window (≈ healthcheck timeout). Use sparingly. Routine deploys never need this — drift detection + the rolling-swap loop handle the normal case automatically.
