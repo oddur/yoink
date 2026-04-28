@@ -114,7 +114,7 @@ variables:
 - **`choices`** restricts the answer set. Wizard renders a numbered picker; CLI overrides via `--var name=X` validate against the list.
 - **`pattern`** is a small anchored regex (yoink ships a tiny matcher; supports literals, `.`, character classes like `[a-z0-9-]`, `*`, `+`). Mismatches re-prompt in the wizard, error out in `--yes` mode.
 
-Variable values are passed through to minijinja. Common filters that just work: `{{ name | upper }}`, `{{ name | lower }}`, `{{ name | default("fallback") }}`. Conditionals: `{% if domain %}domain: {{ domain }}{% endif %}`.
+Variable values are passed through to minijinja. Common filters: `{{ name | upper }}`, `{{ name | lower }}`, `{{ name | default("fallback") }}`. Conditionals: `{% if domain %}domain: {{ domain }}{% endif %}`.
 
 ## Files
 
@@ -198,8 +198,6 @@ yoink up --service clickhouse
 `--refresh` forces yoink to re-resolve the ref to the latest commit SHA, bypassing the `branch → sha` cache. Without it, yoink trusts the cached mapping and you'd serve a stale version of your template.
 
 The cache lives at `~/.cache/yoink/templates/<owner>__<repo>__<sha>/`. Wipe it (`rm -rf ~/.cache/yoink/templates`) if anything looks weirdly stuck — content-addressed by SHA, so re-fetching is harmless.
-
-> **Future**: a `yoink add --from-path ./local/dir` flag would skip the push-pull cycle entirely. Not implemented yet; for now the GitHub round-trip is the loop.
 
 ## Versioning and pinning
 

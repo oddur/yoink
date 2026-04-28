@@ -170,13 +170,12 @@ pub async fn fetch(template: &TemplateRef, refresh: bool) -> Result<FetchedTempl
     let extract_root = cache_dir(&template.owner, &template.repo, &sha)?;
     if !extract_root.exists() {
         let bytes = download_tarball(&client, template, &sha).await?;
-        // Extract every entry — a per-call subpath filter would
-        // produce a cache dir that's only good for *that* subpath, so
-        // a second `yoink add` against the same SHA but a different
-        // template would silently miss its files. Tarballs are capped
-        // at 50 MB; the disk saved isn't worth the cache-correctness
-        // hazard.
-        extract_tarball(&bytes, &extract_root, None).with_context(|| {
+        // We deliberately extract the whole tarball, not just the
+        // requested subpath. A subpath filter would mean the cache
+        // dir is only good for *that* template; a second `yoink add`
+        // against the same SHA but a different template would silently
+        // miss its files. Tarballs are capped at 50 MB on download.
+        extract_tarball(&bytes, &extract_root).with_context(|| {
             format!("extract tarball for {}@{}", template.original, &sha[..7])
         })?;
     }
@@ -272,15 +271,10 @@ async fn download_tarball(
     Ok(buf)
 }
 
-/// Extract entries to `dest`. Skips anything outside `subpath_filter`
-/// (when set) — for a tarball of a 100-service monorepo, we only need
-/// the one template directory's worth of files. Caps cumulative
-/// unpacked bytes against gzip bombs.
-fn extract_tarball(
-    gz_bytes: &[u8],
-    dest: &Path,
-    subpath_filter: Option<&Path>,
-) -> Result<()> {
+/// Extract every entry in the tarball to `dest`. Caps cumulative
+/// unpacked bytes against gzip bombs and rejects symlinks, absolute
+/// paths, and `..` components.
+fn extract_tarball(gz_bytes: &[u8], dest: &Path) -> Result<()> {
     use flate2::read::GzDecoder;
     use std::io::Cursor;
     use tar::Archive;
@@ -307,11 +301,6 @@ fn extract_tarball(
         if kind.is_symlink() || kind.is_hard_link() {
             continue;
         }
-        if let Some(filter) = subpath_filter
-            && !path_within(&path, filter)
-        {
-            continue;
-        }
         unpacked = unpacked.saturating_add(entry.size());
         if unpacked > TARBALL_UNPACK_CAP {
             anyhow::bail!(
@@ -321,20 +310,6 @@ fn extract_tarball(
         entry.unpack_in(dest)?;
     }
     Ok(())
-}
-
-/// True when `candidate`'s components start with all of `prefix`'s
-/// components. Used to skip tarball entries outside the template's
-/// subpath. Both are relative paths inside the archive.
-fn path_within(candidate: &Path, prefix: &Path) -> bool {
-    let mut c = candidate.components();
-    for p in prefix.components() {
-        match c.next() {
-            Some(cc) if cc.as_os_str() == p.as_os_str() => continue,
-            _ => return false,
-        }
-    }
-    true
 }
 
 fn cache_root() -> Result<PathBuf> {
@@ -487,22 +462,6 @@ mod tests {
     fn parse_rejects_empty_ref_after_at() {
         assert!(parse_ref("postgres@").is_err());
         assert!(parse_ref("gh:acme/templates@/path").is_err());
-    }
-
-    #[test]
-    fn path_within_matches_prefix() {
-        assert!(path_within(
-            Path::new("yoink-abc/templates/postgres/template.yaml"),
-            Path::new("yoink-abc/templates/postgres"),
-        ));
-        assert!(!path_within(
-            Path::new("yoink-abc/other/file"),
-            Path::new("yoink-abc/templates/postgres"),
-        ));
-        assert!(path_within(
-            Path::new("yoink-abc/templates/postgres"),
-            Path::new("yoink-abc/templates/postgres"),
-        ));
     }
 
     #[test]
