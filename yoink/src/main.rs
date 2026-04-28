@@ -202,6 +202,16 @@ enum Command {
         /// alongside `--no-registry`.
         #[arg(long)]
         build: bool,
+        /// Force a redeploy even when the running container already
+        /// matches the desired spec. Skips the at-spec early-return,
+        /// so every selected service goes through the full
+        /// rolling-swap-with-healthcheck loop and (for routed
+        /// services) the Caddy admin push. Useful as a recovery
+        /// gesture when proxy-side state has drifted from container
+        /// reality (e.g. a stale upstream pool that never got cleaned
+        /// up). Combine with `--service <name>` to limit blast radius.
+        #[arg(long)]
+        force: bool,
     },
     /// Build one or more services' images via `docker build` against
     /// the operator's local docker daemon. Tags the result as
@@ -695,6 +705,7 @@ async fn run(cli: Cli) -> Result<()> {
             no_registry,
             transport,
             build,
+            force,
         } => {
             cmd_up(
                 &config,
@@ -707,6 +718,7 @@ async fn run(cli: Cli) -> Result<()> {
                     no_registry,
                     transport: transport.into(),
                     build,
+                    force,
                 },
             )
             .await
@@ -820,6 +832,7 @@ struct UpOptions<'a> {
     no_registry: bool,
     transport: yoink::transport::Transport,
     build: bool,
+    force: bool,
 }
 
 #[allow(clippy::too_many_lines)] // borderline (6 lines over); split if it grows further
@@ -835,6 +848,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
         no_registry,
         transport,
         build,
+        force,
     } = up;
 
     // Load bundle first so build_real_ops can reuse it for any
@@ -946,12 +960,13 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
         }
     }
 
-    let reconcile_result = deploy::reconcile(
+    let reconcile_result = deploy::reconcile_with_options(
         &*ops,
         config,
         &tag_overrides,
         services_filter,
         bundle.as_ref(),
+        deploy::ReconcileOptions { force },
         &mut sink,
     )
     .await;
@@ -1166,6 +1181,7 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
             no_registry: false,
             transport: yoink::transport::Transport::Auto,
             build: false,
+            force: false,
         },
     )
     .await
