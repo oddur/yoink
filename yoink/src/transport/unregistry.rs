@@ -44,6 +44,13 @@ pub const SIDECAR_LABEL_VALUE: &str = "unregistry-ephemeral";
 /// over the SSH tunnel. Pulling the unregistry image dominates first-run
 /// time; the actual server startup is sub-second.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Per-attempt HTTP timeout when probing the sidecar's `/v2/` endpoint.
+/// Short on purpose — we expect a fast 200 once the sidecar is up.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Backoff between readiness probes while the sidecar comes up.
+/// Same cadence as the proxy admin probe so async cancellation latency
+/// is uniform across yoink's network paths.
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Error)]
 pub enum UnregistryError {
@@ -229,7 +236,7 @@ async fn wait_for_registry_ready(
 ) -> Result<(), UnregistryError> {
     let url = format!("http://127.0.0.1:{local_port}/v2/");
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(READY_PROBE_TIMEOUT)
         .build()
         .expect("reqwest client builder with default config");
     let deadline = Instant::now() + timeout;
@@ -239,7 +246,7 @@ async fn wait_for_registry_ready(
             // wired end-to-end and the registry is up.
             Ok(_) => return Ok(()),
             Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(150)).await;
+                tokio::time::sleep(READY_POLL_INTERVAL).await;
             }
             Err(_) => {
                 return Err(UnregistryError::RegistryNotReady {
@@ -306,8 +313,6 @@ fn sidecar_create_body() -> ContainerCreateBody {
         ..Default::default()
     }
 }
-
-
 
 /// RAII guard that force-removes the sidecar if Drop runs before
 /// [`SidecarCleanup::run_now`] consumes it. `run_now` is the happy-path

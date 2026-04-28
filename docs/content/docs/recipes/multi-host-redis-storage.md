@@ -1,6 +1,6 @@
 ---
 title: Multi-host Let's Encrypt with Redis storage
-weight: 11
+weight: 16
 ---
 
 When you run yoink across multiple hosts that serve the same domain, **each host's Caddy independently asks Let's Encrypt for a cert and you hit rate limits within a week**. The fix: share ACME state across all proxies via a small Redis instance reachable on a private network.

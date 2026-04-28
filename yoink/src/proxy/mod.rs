@@ -70,11 +70,7 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         return Ok(());
     }
 
-    let proxy_has_inline_cert = cfg
-        .proxy
-        .as_ref()
-        .and_then(|p| p.tls.as_ref())
-        .is_some();
+    let proxy_has_inline_cert = cfg.proxy.as_ref().and_then(|p| p.tls.as_ref()).is_some();
 
     // Validation: any service using `tls: cert` must name both
     // `tls_cert_secret` and `tls_key_secret` (or inherit from
@@ -152,9 +148,11 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
     // Refuse the user-defined `_proxy` collision case. Safer than
     // silently overriding because the user's definition probably
     // wouldn't have the right networks/admin-port wiring anyway.
-    if cfg.services.iter().any(|s| {
-        s.name == PROXY_SERVICE_NAME && !matches!(s.kind, Some(ServiceKind::Proxy))
-    }) {
+    if cfg
+        .services
+        .iter()
+        .any(|s| s.name == PROXY_SERVICE_NAME && !matches!(s.kind, Some(ServiceKind::Proxy)))
+    {
         return Err(ConfigError::Invalid(format!(
             "service name {PROXY_SERVICE_NAME:?} is reserved for the implicit reverse \
              proxy — rename your service or remove `domain:` from the routed services",
@@ -176,7 +174,10 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         if !is_proxied(svc) {
             continue;
         }
-        let mut nets = svc.networks.clone().unwrap_or_else(|| cfg.deploy.networks.clone());
+        let mut nets = svc
+            .networks
+            .clone()
+            .unwrap_or_else(|| cfg.deploy.networks.clone());
         if !nets.iter().any(|n| n == INGRESS_NETWORK) {
             nets.push(INGRESS_NETWORK.to_string());
         }
@@ -188,11 +189,7 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
 
     // Add the synthesized proxy service if not already present
     // (idempotent for tests that round-trip Config → render → re-parse).
-    if !cfg
-        .services
-        .iter()
-        .any(|s| s.name == PROXY_SERVICE_NAME)
-    {
+    if !cfg.services.iter().any(|s| s.name == PROXY_SERVICE_NAME) {
         let proxy_cfg = cfg.proxy.clone().unwrap_or_default();
         cfg.services.push(synthesized_proxy_service(&proxy_cfg));
     }
@@ -376,7 +373,13 @@ services:
             .expect("proxy synthesized");
         assert!(matches!(proxy.kind, Some(ServiceKind::Proxy)));
         let api = cfg.services.iter().find(|s| s.name == "api").unwrap();
-        assert!(api.networks.as_ref().unwrap().iter().any(|n| n == INGRESS_NETWORK));
+        assert!(
+            api.networks
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|n| n == INGRESS_NETWORK)
+        );
         assert!(api.depends_on.iter().any(|d| d == PROXY_SERVICE_NAME));
     }
 

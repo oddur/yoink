@@ -202,8 +202,10 @@ impl DashboardState {
             .map(|s| s.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let header =
-            Paragraph::new(format!("yoink dashboard · services: {services}")).style(bold());
+        let header = Paragraph::new(format!(
+            "yoink dashboard · services: {services} · ↑↓ select · enter detail · ? help"
+        ))
+        .style(bold());
         frame.render_widget(header, layout[0]);
 
         let rows = self.build_rows(config, secrets, history, forwards, throbber);
@@ -270,9 +272,13 @@ impl DashboardState {
             // and errored (loaded=true), don't pretend we're still
             // loading — the error footer carries the detail.
             if self.loaded {
-                return vec![Row::new(vec![Cell::from("(no data — see error in footer)")])];
+                return vec![Row::new(vec![Cell::from(
+                    "(no data — see error in footer)",
+                )])];
             }
-            return vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])];
+            return vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])];
         };
         let mut rows: Vec<Row<'_>> = Vec::new();
         for host in &report.hosts {

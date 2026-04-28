@@ -27,7 +27,7 @@ ssh deploy@<host> 'docker rm -f yoink-lock'
 
 ## `yoink up` / `yoink tui` hangs silently with no output
 
-Almost always an interactive ssh prompt yoink can't surface — bollard's SSH transport spawns its own `ssh` client and swallows stderr, so when ssh prompts for an extra check the connection just blocks.
+Almost always an interactive ssh prompt yoink can't surface — yoink's docker-over-SSH transport spawns its own `ssh` client and swallows stderr, so when ssh prompts for an extra check the connection just blocks.
 
 Run `yoink preflight` to get a classified error. The two common cases:
 

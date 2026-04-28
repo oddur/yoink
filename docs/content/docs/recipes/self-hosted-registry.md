@@ -1,6 +1,6 @@
 ---
 title: Self-hosted registry on a yoink host
-weight: 2
+weight: 11
 ---
 
 The middle ground between "real remote registry" (ghcr.io, etc.) and "no registry at all" (`--no-registry` save/load): run a `registry:2` container as a yoink-managed service on one of your hosts, expose it via tailscale, and point `image:` at the tailnet hostname.
@@ -60,3 +60,8 @@ yoink up --service api          # docker pull from the tailnet registry on each 
 - The registry host is a single point of failure for image pulls. If it dies during a deploy, every host that doesn't already have the image cached locally fails to pull. Mitigation: pin to a real cloud registry for prod-critical workloads, use the self-hosted registry for staging / hobby / non-critical.
 - No replication. If you need image distribution across regions, this isn't the right answer — use a real registry (Depot, ghcr.io, ECR).
 - No automatic garbage collection. Old image layers accumulate; periodically run the [registry's GC](https://distribution.github.io/distribution/about/garbage-collection/) inside the container.
+
+## See also
+
+- [Three deploy modes](/docs/guide/deploy-modes) — when registry vs. registry-less (`--no-registry` / unregistry) makes sense.
+- [Multi-host distribution](/docs/recipes/multi-host-distribution) — pinning services to specific hosts when you've split images across registries.

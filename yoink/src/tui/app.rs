@@ -197,7 +197,7 @@ impl View {
                 "  enter        live logs",
                 "  i            container detail (labels, env, live cpu/mem)",
                 "  !            shell into container (bash/sh)",
-                "  D            debug sidecar (alpine, target's pid+net ns)",
+                "  B            debug sidecar (alpine, target's pid+net ns)",
                 "  S            start · X stop · R restart container",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
@@ -211,7 +211,7 @@ impl View {
             View::ContainerDetail { .. } => vec![
                 "container detail",
                 "  enter / l    live logs",
-                "  !            shell · D debug sidecar",
+                "  !            shell · B debug sidecar",
                 "  S            start · X stop · R restart container",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
@@ -236,7 +236,7 @@ impl View {
                 "  ↑↓ / j k     select replica",
                 "  enter        live logs",
                 "  i            container detail",
-                "  !            shell · D debug sidecar",
+                "  !            shell · B debug sidecar",
                 "  H            deploy history (with rollback)",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
@@ -261,7 +261,7 @@ impl View {
                 "container logs",
                 "  /            filter substring",
                 "  ↑↓ / PgUp PgDn  scroll · g top · G bottom",
-                "  !            shell · D debug sidecar",
+                "  !            shell · B debug sidecar",
                 "  y            yank visible buffer to system clipboard",
                 "  k            clear · esc back",
             ],
@@ -566,14 +566,17 @@ pub async fn run(
 ) -> Result<()> {
     let hl_disabled = std::env::var_os("YOINK_NO_HL").is_some();
     let hl_available = !hl_disabled && probe_hl().await;
-    if hl_disabled {
-        tracing::info!("YOINK_NO_HL set; skipping hl pipeline");
-    } else if hl_available {
-        tracing::info!("hl detected on PATH; piping log streams through it");
-    } else {
-        tracing::info!("hl not on PATH; using raw log forwarder");
-    }
-    let mut terminal = setup_terminal(mouse).context("setup terminal")?;
+    tracing::info!(
+        hl_disabled,
+        hl_available,
+        "log forwarder pipeline initialized"
+    );
+    let mut terminal = setup_terminal(mouse).with_context(|| {
+        format!(
+            "initialize TUI (TERM={})",
+            std::env::var("TERM").unwrap_or_else(|_| "<unset>".into())
+        )
+    })?;
     // Restore the terminal on panic before chaining to the previous
     // hook — without this a panic in render unwinds past
     // `restore_terminal` and leaves the operator stuck in raw+alt mode.
@@ -1171,9 +1174,14 @@ impl App {
             self.start_stats_history_pollers();
             // Drop event rings for hosts no longer in the config so a
             // re-added address doesn't inherit stale events.
-            let active: std::collections::HashSet<&str> =
-                self.config.hosts.iter().map(|h| h.address.as_str()).collect();
-            self.host_events.retain(|addr, _| active.contains(addr.as_str()));
+            let active: std::collections::HashSet<&str> = self
+                .config
+                .hosts
+                .iter()
+                .map(|h| h.address.as_str())
+                .collect();
+            self.host_events
+                .retain(|addr, _| active.contains(addr.as_str()));
             self.schedule_hosts_refresh();
         }
         self.schedule_dashboard_refresh();
@@ -1827,7 +1835,11 @@ impl App {
             return false;
         }
         match key.code {
-            KeyCode::Char('d') => {
+            // Lowercase `d` is dashboard nav from anywhere EXCEPT the
+            // Secrets and Resources panes — both bind `d` to delete the
+            // selected item, and a delete key shouldn't surprise-route
+            // to a pane switch when the operator's intent is "remove."
+            KeyCode::Char('d') if !matches!(self.view, View::Secrets | View::Resources) => {
                 self.transition(View::Dashboard).await;
                 return false;
             }
@@ -1915,9 +1927,7 @@ impl App {
                     .or_else(|| self.forwards.first().map(|f| f.url.clone()));
                 let Some(url) = target_url else {
                     if !self.forwards.is_empty() {
-                        self.push_toast(
-                            "no port-forward URL resolved for this row".to_string(),
-                        );
+                        self.push_toast("no port-forward URL resolved for this row".to_string());
                     }
                     return false;
                 };
@@ -2004,7 +2014,7 @@ impl App {
                         .await;
                     }
                 }
-                KeyCode::Char('D') => {
+                KeyCode::Char('B') => {
                     if let (Some(host), Some(container)) = (
                         self.host_detail.host().cloned(),
                         self.host_detail.selected_container(),
@@ -2122,7 +2132,7 @@ impl App {
                     })
                     .await;
                 }
-                KeyCode::Char('D') => {
+                KeyCode::Char('B') => {
                     let host = host.clone();
                     let container = container.clone();
                     self.transition(View::ContainerShell {
@@ -2150,7 +2160,7 @@ impl App {
                     })
                     .await;
                 }
-                KeyCode::Char('D') => {
+                KeyCode::Char('B') => {
                     let host = host.clone();
                     let container = container.clone();
                     self.transition(View::ContainerShell {
@@ -2160,7 +2170,7 @@ impl App {
                     })
                     .await;
                 }
-                KeyCode::Char('k') => self.logs.clear(),
+                KeyCode::Char('c') => self.logs.clear(),
                 KeyCode::Char('y') => self.copy_logs_to_clipboard(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
                 KeyCode::Up => self.logs.scroll_up(1),
@@ -2242,7 +2252,7 @@ impl App {
                         .await;
                     }
                 }
-                KeyCode::Char('D') => {
+                KeyCode::Char('B') => {
                     if let Some(row) = self.service_detail.selected_row() {
                         self.transition(View::ContainerShell {
                             host: row.host,
@@ -2305,7 +2315,7 @@ impl App {
                     self.start_service_log_streams().await;
                 }
                 KeyCode::Char('y') => self.copy_logs_to_clipboard(),
-                KeyCode::Char('k') => self.logs.clear(),
+                KeyCode::Char('c') => self.logs.clear(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
                 KeyCode::Up => self.logs.scroll_up(1),
                 KeyCode::Down => self.logs.scroll_down(1),
@@ -3140,11 +3150,9 @@ impl App {
         let toast_prefix = format!("→ {service_name} :{container_port}");
         tokio::spawn(async move {
             let keyfile = ops.ssh_keyfile(&host_for_task);
-            if let Err(e) = crate::ssh_probe::probe(
-                &host_for_task,
-                keyfile.as_deref().and_then(|p| p.to_str()),
-            )
-            .await
+            if let Err(e) =
+                crate::ssh_probe::probe(&host_for_task, keyfile.as_deref().and_then(|p| p.to_str()))
+                    .await
             {
                 let _ = tx.send(Update::Toast(format!(
                     "✗ ssh probe to {} failed: {e}",
@@ -3468,8 +3476,7 @@ impl App {
                 );
             }
             View::ServiceHistory(_) => {
-                self.history
-                    .render(frame, pane_area, &self.throbber_state);
+                self.history.render(frame, pane_area, &self.throbber_state);
             }
             View::Logs | View::ContainerLogs { .. } => {
                 self.logs.render(frame, pane_area, &self.config);
@@ -3660,10 +3667,7 @@ impl App {
             );
             let success = matches!(progress.finished, Some(Ok(_)));
             let failure = matches!(progress.finished, Some(Err(_)));
-            let running_throbber = progress
-                .finished
-                .is_none()
-                .then_some(&self.throbber_state);
+            let running_throbber = progress.finished.is_none().then_some(&self.throbber_state);
             // ReconcileAll gets a status table on top of the scrolling
             // log so concurrent waves don't make the operator hunt for
             // "where is service X right now?".
@@ -3702,7 +3706,7 @@ impl App {
         }
 
         if self.doctor.is_open() {
-            super::doctor::render(frame, frame.area(), &mut self.doctor);
+            super::doctor::render(frame, frame.area(), &mut self.doctor, &self.throbber_state);
         }
 
         // Render last so it sits on top of everything else when a

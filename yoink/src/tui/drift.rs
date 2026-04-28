@@ -120,12 +120,21 @@ pub fn render_modal(
     } else if let Some(diff) = state.diff.as_ref() {
         body_lines(diff)
     } else {
-        vec![Line::from("(no data)")]
+        // Not loading, no error, no diff loaded yet — usually means
+        // the modal opened against a service we haven't fetched diff
+        // for, or the diff is genuinely empty. Distinguish from the
+        // "still fetching" case so the user knows what's happening.
+        vec![Line::from(Span::styled(
+            "(no diff available — open from the dashboard to populate)",
+            Style::default().fg(Color::DarkGray),
+        ))]
     };
 
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
         rect,
     );
 }
@@ -162,7 +171,14 @@ fn body_lines(diff: &ServiceDiff) -> Vec<Line<'static>> {
             current_image,
             desired_image,
             fields,
-        } => update_body(current_hash, current_image, desired_image, &diff.tag, &diff.desired_hash, fields),
+        } => update_body(
+            current_hash,
+            current_image,
+            desired_image,
+            &diff.tag,
+            &diff.desired_hash,
+            fields,
+        ),
     }
 }
 
@@ -176,17 +192,29 @@ fn update_body(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     out.push(kv_diff_line("image", current_image, desired_image));
-    out.push(kv_diff_line("spec", &short(current_hash), &short(desired_hash)));
+    out.push(kv_diff_line(
+        "spec",
+        &short(current_hash),
+        &short(desired_hash),
+    ));
     out.push(Line::from(vec![
         Span::styled("    tag  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             desired_tag.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     if !fields.is_empty() {
         out.push(Line::from(""));
-        push_kv_group(&mut out, "env", &fields.env_added, &fields.env_removed, &fields.env_changed);
+        push_kv_group(
+            &mut out,
+            "env",
+            &fields.env_added,
+            &fields.env_removed,
+            &fields.env_changed,
+        );
         push_kv_group(
             &mut out,
             "labels",
@@ -201,7 +229,10 @@ fn update_body(
 fn kv_diff_line(label: &str, current: &str, desired: &str) -> Line<'static> {
     if current == desired {
         Line::from(vec![
-            Span::styled(format!("{label:>8}  "), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{label:>8}  "),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::raw(current.to_string()),
             Span::styled(
                 "  (unchanged)".to_string(),
@@ -210,12 +241,17 @@ fn kv_diff_line(label: &str, current: &str, desired: &str) -> Line<'static> {
         ])
     } else {
         Line::from(vec![
-            Span::styled(format!("{label:>8}  "), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{label:>8}  "),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(current.to_string(), Style::default().fg(Color::Yellow)),
             Span::styled(" → ".to_string(), Style::default().fg(Color::DarkGray)),
             Span::styled(
                 desired.to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
         ])
     }
@@ -233,7 +269,9 @@ fn push_kv_group(
     }
     out.push(Line::from(Span::styled(
         format!("{label}:"),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )));
     for k in added {
         out.push(prefixed("  + ", k, Color::Green));

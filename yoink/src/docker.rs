@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use bollard::models::{
-    ContainerCreateBody, EndpointSettings, HealthConfig, HostConfig, NetworkingConfig,
-    PortBinding, RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, EndpointSettings, HealthConfig, HostConfig, NetworkingConfig, PortBinding,
+    RestartPolicy, RestartPolicyNameEnum,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -341,9 +341,7 @@ pub fn parse_cpus(s: &str) -> Result<i64, BuildError> {
             .map_err(|_| BuildError::Cpus(s.to_string()))?;
         (millis * 1_000_000.0) as i64
     } else {
-        let cores: f64 = s
-            .parse()
-            .map_err(|_| BuildError::Cpus(s.to_string()))?;
+        let cores: f64 = s.parse().map_err(|_| BuildError::Cpus(s.to_string()))?;
         (cores * 1_000_000_000.0) as i64
     };
     if nano <= 0 {

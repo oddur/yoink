@@ -39,10 +39,7 @@ impl HistoryRow {
         Self {
             host: host.to_string(),
             container: c.name.clone(),
-            version: c
-                .yoink_version
-                .clone()
-                .unwrap_or_else(|| "?".to_string()),
+            version: c.yoink_version.clone().unwrap_or_else(|| "?".to_string()),
             state: c.state.clone(),
             deployed_by: c
                 .yoink_deployed_by
@@ -110,7 +107,10 @@ impl HistoryState {
         if self.rows.is_empty() {
             return;
         }
-        let next = self.table.selected().map_or(0, |i| (i + 1) % self.rows.len());
+        let next = self
+            .table
+            .selected()
+            .map_or(0, |i| (i + 1) % self.rows.len());
         self.table.select(Some(next));
     }
 
@@ -163,7 +163,9 @@ impl HistoryState {
             Constraint::Min(12),    // deployed-by
         ];
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])]
         } else if self.rows.is_empty() && !self.errors.is_empty() {
             // All hosts errored — make that obvious instead of
             // implying the service has no history.
@@ -211,7 +213,11 @@ impl HistoryState {
         let footer_text = if self.errors.is_empty() {
             "↑↓/jk navigate · r rollback to selected (running rows are skipped) · R refresh · esc back".to_string()
         } else {
-            format!("⚠ {} host(s) unreachable: {}", self.errors.len(), self.errors.join(" · "))
+            format!(
+                "⚠ {} host(s) unreachable: {}",
+                self.errors.len(),
+                self.errors.join(" · ")
+            )
         };
         let footer_style = if self.errors.is_empty() {
             ratatui::style::Style::default()

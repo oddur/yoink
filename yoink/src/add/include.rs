@@ -19,11 +19,7 @@ pub enum IncludePlan {
 
 /// Decide whether the given dests are already covered by the config's
 /// existing `include:` entries. Doesn't mutate the file.
-pub fn plan(
-    config: &Config,
-    desired_glob: Option<&str>,
-    dests: &[PathBuf],
-) -> IncludePlan {
+pub fn plan(config: &Config, desired_glob: Option<&str>, dests: &[PathBuf]) -> IncludePlan {
     let Some(glob) = desired_glob else {
         return IncludePlan::AlreadyCovered;
     };

@@ -24,7 +24,12 @@ pub fn config_source(config_path: &Path) -> Option<String> {
     // and we only care whether *this config* differs from HEAD.
     let status = run_git(
         &repo_root,
-        &[OsStr::new("status"), OsStr::new("--porcelain"), OsStr::new("--"), config_path.as_os_str()],
+        &[
+            OsStr::new("status"),
+            OsStr::new("--porcelain"),
+            OsStr::new("--"),
+            config_path.as_os_str(),
+        ],
     );
     if status
         .as_deref()

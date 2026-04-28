@@ -67,7 +67,11 @@ where
         // inherits). Off explicitly disables. HSTS only emits when
         // the operator's actually serving HTTPS.
         let tls_active = !matches!(svc.tls, TlsMode::Off) || proxy_tls.is_some();
-        routes.push(render_route(svc, &container_names_for(&svc.name), tls_active)?);
+        routes.push(render_route(
+            svc,
+            &container_names_for(&svc.name),
+            tls_active,
+        )?);
     }
 
     // Auto :80 → :443 redirect when proxy-level TLS is in play. Caddy
@@ -98,15 +102,13 @@ where
                  trust_pool_secret"
             )
         })?;
-        let trust_pool = bundle
-            .get(&client_auth.trust_pool_secret)
-            .ok_or_else(|| {
-                anyhow!(
-                    "proxy.tls.client_auth.trust_pool_secret={:?} not found in the \
+        let trust_pool = bundle.get(&client_auth.trust_pool_secret).ok_or_else(|| {
+            anyhow!(
+                "proxy.tls.client_auth.trust_pool_secret={:?} not found in the \
                      secrets bundle",
-                    client_auth.trust_pool_secret,
-                )
-            })?;
+                client_auth.trust_pool_secret,
+            )
+        })?;
         let der_b64_certs = pem_to_der_b64_blocks(trust_pool);
         if der_b64_certs.is_empty() {
             return Err(anyhow!(
@@ -150,8 +152,7 @@ where
     // ACME is only for services that genuinely want it AND aren't
     // covered by a proxy-level inline cert. Proxy-level cert disables
     // ACME entirely (we never want both running on the same domains).
-    let any_acme = proxy_tls.is_none()
-        && proxied.iter().any(|s| matches!(s.tls, TlsMode::Auto));
+    let any_acme = proxy_tls.is_none() && proxied.iter().any(|s| matches!(s.tls, TlsMode::Auto));
     if any_acme {
         let email = cfg
             .proxy
@@ -257,9 +258,7 @@ where
 ///
 /// Caller pattern: clone the config, expand, then render. Render
 /// stays sync because all docker spawning happens here.
-pub async fn expand_caddyfile_snippets(
-    cfg: &mut crate::config::Config,
-) -> anyhow::Result<()> {
+pub async fn expand_caddyfile_snippets(cfg: &mut crate::config::Config) -> anyhow::Result<()> {
     for svc in &mut cfg.services {
         let Some(caddyfile) = svc.caddy_extra_caddyfile.take() else {
             continue;
@@ -307,9 +306,7 @@ async fn adapt_snippet_to_handlers(snippet: &str, svc_name: &str) -> anyhow::Res
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| {
-            format!(
-                "service {svc_name:?}: spawn `docker run caddy adapt` (is docker installed?)"
-            )
+            format!("service {svc_name:?}: spawn `docker run caddy adapt` (is docker installed?)")
         })?;
     child
         .stdin
@@ -480,10 +477,7 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
     // to know about `subroute` to inline a (match → handle).
     if let Some(extra) = svc.caddy_extra_json.as_deref() {
         let parsed: Value = serde_json::from_str(extra).with_context(|| {
-            format!(
-                "service {:?}: caddy_extra_json is not valid JSON",
-                svc.name,
-            )
+            format!("service {:?}: caddy_extra_json is not valid JSON", svc.name,)
         })?;
         for item in normalize_extra_json(parsed, &svc.name)? {
             handle.push(item);
@@ -545,10 +539,7 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
     // operator's value verbatim, so `/api/*` and `/api*` and
     // `/api/foo` all do what Caddy does with them.
     let mut matchers = serde_json::Map::new();
-    matchers.insert(
-        "host".into(),
-        json!(svc.domain.as_ref().unwrap().as_list()),
-    );
+    matchers.insert("host".into(), json!(svc.domain.as_ref().unwrap().as_list()));
     if let Some(prefix) = &svc.path_prefix {
         matchers.insert("path".into(), json!([prefix]));
     }
@@ -852,10 +843,12 @@ services:
         let json = render(&cfg, |_| vec!["api-1".into()], Some(&bundle)).expect("render");
         let entries = &json["apps"]["tls"]["certificates"]["load_pem"];
         assert_eq!(entries.as_array().unwrap().len(), 1);
-        assert!(entries[0]["certificate"]
-            .as_str()
-            .unwrap()
-            .starts_with("-----BEGIN CERT"));
+        assert!(
+            entries[0]["certificate"]
+                .as_str()
+                .unwrap()
+                .starts_with("-----BEGIN CERT")
+        );
     }
 
     #[test]
@@ -885,12 +878,14 @@ services:
 "#;
         let cfg = parse(yaml);
         let mut values = std::collections::BTreeMap::new();
-        values.insert("CF_CERT".to_string(), "-----BEGIN CERTIFICATE-----\n".into());
+        values.insert(
+            "CF_CERT".to_string(),
+            "-----BEGIN CERTIFICATE-----\n".into(),
+        );
         values.insert("CF_KEY".to_string(), "-----BEGIN PRIVATE KEY-----\n".into());
         values.insert(
             "CF_CA".to_string(),
-            "-----BEGIN CERTIFICATE-----\nMIIBfakeCAder\n-----END CERTIFICATE-----\n"
-                .into(),
+            "-----BEGIN CERTIFICATE-----\nMIIBfakeCAder\n-----END CERTIFICATE-----\n".into(),
         );
         let bundle = SecretsBundle::new(values);
         let json = render(&cfg, |_| vec!["api-1".into()], Some(&bundle)).expect("render");
@@ -917,19 +912,13 @@ services:
         let routes = json["apps"]["http"]["servers"]["main"]["routes"]
             .as_array()
             .unwrap();
-        assert_eq!(
-            routes[0]["match"][0]["protocol"].as_str(),
-            Some("http")
-        );
+        assert_eq!(routes[0]["match"][0]["protocol"].as_str(), Some("http"));
         assert_eq!(routes[0]["handle"][0]["status_code"].as_i64(), Some(308));
 
         // Inline cert is present (one entry covers everything).
         let pem = &json["apps"]["tls"]["certificates"]["load_pem"];
         assert_eq!(pem.as_array().unwrap().len(), 1);
-        assert_eq!(
-            pem[0]["tags"][0].as_str(),
-            Some("yoink:proxy-default")
-        );
+        assert_eq!(pem[0]["tags"][0].as_str(), Some("yoink:proxy-default"));
 
         // Both services routed (api + web).
         let host_routes: Vec<&Value> = routes.iter().skip(1).collect();

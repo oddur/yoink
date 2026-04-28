@@ -192,13 +192,16 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
             ]
         }
         Err(e) => vec![
-            Finding::error("secrets", "no age identity found for this config's recipients")
-                .with_detail(e.to_string())
-                .with_fix(
-                    "set YOINK_AGE_KEY (raw) or YOINK_AGE_KEY_FILE, \
+            Finding::error(
+                "secrets",
+                "no age identity found for this config's recipients",
+            )
+            .with_detail(e.to_string())
+            .with_fix(
+                "set YOINK_AGE_KEY (raw) or YOINK_AGE_KEY_FILE, \
                      or place a key at ~/.config/yoink/keys/<recipient>.key \
                      (which `yoink secrets key generate` does by default)",
-                ),
+            ),
         ],
     }
 }
@@ -317,10 +320,7 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
             out.push(
                 Finding::error(
                     "config",
-                    format!(
-                        "service `{}` has `domain:` but no `run.port`",
-                        svc.name
-                    ),
+                    format!("service `{}` has `domain:` but no `run.port`", svc.name),
                 )
                 .with_fix("set `run.port: <container-port>` so the proxy knows where to forward"),
             );
@@ -348,7 +348,10 @@ fn is_placeholder_email(email: &str) -> bool {
 // ---------- hosts ----------
 
 fn check_hosts_from_versions(
-    versions: &[(Host, Result<crate::docker_ops::DockerVersion, crate::docker_ops::DockerError>)],
+    versions: &[(
+        Host,
+        Result<crate::docker_ops::DockerVersion, crate::docker_ops::DockerError>,
+    )],
 ) -> Vec<Finding> {
     let mut out = Vec::new();
     for (host, result) in versions {
@@ -367,15 +370,12 @@ fn check_hosts_from_versions(
             }
             Err(e) => {
                 out.push(
-                    Finding::error(
-                        "host",
-                        format!("{}: cannot reach docker", host.address),
-                    )
-                    .with_detail(e.to_string())
-                    .with_fix(format!(
-                        "verify `ssh {}@{}` works and `docker info` runs on the host",
-                        host.user, host.address
-                    )),
+                    Finding::error("host", format!("{}: cannot reach docker", host.address))
+                        .with_detail(e.to_string())
+                        .with_fix(format!(
+                            "verify `ssh {}@{}` works and `docker info` runs on the host",
+                            host.user, host.address
+                        )),
                 );
             }
         }
@@ -388,7 +388,10 @@ fn check_hosts_from_versions(
 fn check_arch_alignment_from_versions(
     config: &Config,
     local_version: Option<&crate::docker_ops::DockerVersion>,
-    versions: &[(Host, Result<crate::docker_ops::DockerVersion, crate::docker_ops::DockerError>)],
+    versions: &[(
+        Host,
+        Result<crate::docker_ops::DockerVersion, crate::docker_ops::DockerError>,
+    )],
 ) -> Vec<Finding> {
     let any_local_build = config.services.iter().any(|s| s.build.is_some());
     if !any_local_build {
@@ -494,29 +497,25 @@ async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
     futures_util::future::join_all(lookups)
         .await
         .into_iter()
-        .map(|(host, result)| {
-            match result {
-                Ok(addrs) => {
-                    let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
-                    if ips.is_empty() {
-                        Finding::error("dns", format!("`{host}` doesn't resolve")).with_fix(
-                            format!(
-                                "add an A/AAAA record for `{host}` \
+        .map(|(host, result)| match result {
+            Ok(addrs) => {
+                let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
+                if ips.is_empty() {
+                    Finding::error("dns", format!("`{host}` doesn't resolve")).with_fix(format!(
+                        "add an A/AAAA record for `{host}` \
                                  pointing at the host's public IP — \
                                  Let's Encrypt validates by HTTP-01"
-                            ),
-                        )
-                    } else {
-                        Finding::pass("dns", format!("`{host}` resolves"))
-                            .with_detail(format!("→ {}", ips.join(", ")))
-                    }
+                    ))
+                } else {
+                    Finding::pass("dns", format!("`{host}` resolves"))
+                        .with_detail(format!("→ {}", ips.join(", ")))
                 }
-                Err(e) => Finding::error("dns", format!("`{host}` lookup failed"))
-                    .with_detail(e.to_string())
-                    .with_fix(format!(
-                        "add an A/AAAA record for `{host}` and wait for propagation"
-                    )),
             }
+            Err(e) => Finding::error("dns", format!("`{host}` lookup failed"))
+                .with_detail(e.to_string())
+                .with_fix(format!(
+                    "add an A/AAAA record for `{host}` and wait for propagation"
+                )),
         })
         .collect()
 }
@@ -558,7 +557,10 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
     vec![
         Finding::error(
             "secrets",
-            format!("{} doesn't exist but services reference secrets", path.display()),
+            format!(
+                "{} doesn't exist but services reference secrets",
+                path.display()
+            ),
         )
         .with_fix("run `yoink secrets edit` to create the bundle, then commit the file"),
     ]
@@ -802,9 +804,7 @@ fn check_tls_cert_secrets(
                                 svc.name
                             ),
                         )
-                        .with_fix(format!(
-                            "add `{k}=<pem-bytes>` via `yoink secrets edit`"
-                        )),
+                        .with_fix(format!("add `{k}=<pem-bytes>` via `yoink secrets edit`")),
                     );
                 }
                 _ => {}
@@ -847,10 +847,7 @@ fn check_secret_references(
                 out.push(
                     Finding::error(
                         "secrets",
-                        format!(
-                            "service `{}` references missing secret `{key}`",
-                            svc.name
-                        ),
+                        format!("service `{}` references missing secret `{key}`", svc.name),
                     )
                     .with_fix(format!(
                         "seal `{key}=<value>` (`yoink secrets edit`) or remove the reference"
@@ -987,7 +984,7 @@ mod tests {
     fn check_build_blocks_skips_hub_library_bare_image() {
         let cfg = Config::parse_str(
             "deploy:\n  networks: [yoink]\nhosts:\n  - { address: h, user: u }\n\
-             services:\n  - name: db\n    image: postgres\n    tag: \"16-alpine\"\n    run: {}\n"
+             services:\n  - name: db\n    image: postgres\n    tag: \"16-alpine\"\n    run: {}\n",
         )
         .unwrap();
         let f = check_build_blocks(&cfg);

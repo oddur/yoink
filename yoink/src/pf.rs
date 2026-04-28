@@ -65,6 +65,11 @@ const SIDECAR_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// nothing fronts the public internet even briefly.
 pub const SIDECAR_DIAL_HOST: &str = "127.0.0.1";
 
+/// Backoff between sidecar / tunnel cleanup retries. Matches the
+/// admin-API readiness backoff so cancellation latency is uniform
+/// across yoink's network paths.
+const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
 /// Operator-visible URL scheme override. `Auto` runs the
 /// port-number heuristic (`default_scheme`); `Http`/`Https` force
 /// the obvious wrapper; `Tcp`/`None` print bare `localhost:N` and
@@ -294,10 +299,7 @@ fn parse_publish_spec(spec: &str) -> Result<PublishedEndpoint, String> {
 /// invocation. Returns the host the service actually runs on (single-
 /// host configs are a no-op; multi-host needs the operator to disambiguate
 /// via `--host` later if/when that flag lands).
-pub fn resolve_service<'a>(
-    config: &'a Config,
-    name: &str,
-) -> Result<&'a ServiceConfig, PfError> {
+pub fn resolve_service<'a>(config: &'a Config, name: &str) -> Result<&'a ServiceConfig, PfError> {
     config
         .services
         .iter()
@@ -371,8 +373,7 @@ pub async fn resolve_target(
         .ok_or_else(|| PfError::SidecarNoNetwork {
             service: service.name.clone(),
         })?;
-    let handle =
-        spawn_sidecar(ops, host.clone(), &service.name, container_port, &network).await?;
+    let handle = spawn_sidecar(ops, host.clone(), &service.name, container_port, &network).await?;
     Ok(ResolvedTarget::Sidecar(handle))
 }
 
@@ -475,7 +476,7 @@ impl SidecarHandle {
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
                     }
                 }
             }
@@ -643,13 +644,14 @@ async fn wait_for_host_port(
 ) -> Result<u16, SidecarError> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let detail = ops.inspect_container(host, container_name).await.map_err(
-            |source| SidecarError::Inspect {
+        let detail = ops
+            .inspect_container(host, container_name)
+            .await
+            .map_err(|source| SidecarError::Inspect {
                 host: host.address.clone(),
                 name: container_name.to_string(),
                 source,
-            },
-        )?;
+            })?;
         if let Some(host_port) = host_port_from_detail(&detail.ports, internal_port) {
             return Ok(host_port);
         }
@@ -661,7 +663,7 @@ async fn wait_for_host_port(
                 timeout,
             });
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
     }
 }
 

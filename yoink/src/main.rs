@@ -575,8 +575,15 @@ enum Command {
     /// (uses service-name fallbacks) so this works without a host
     /// connection.
     ProxyRender,
-    /// Inspect / release the per-host deploy lock. Useful after a
-    /// crashed deploy left a sentinel container running.
+    /// Inspect or release the per-host deploy lock.
+    ///
+    /// Each `yoink up` acquires a sentinel container as a deploy lock so
+    /// concurrent deploys can't interleave their reconciles. On a clean
+    /// exit the sentinel goes away. On a crash (laptop closed mid-deploy,
+    /// SIGKILL, network partition), the sentinel can outlive the deploy
+    /// — `yoink lock status` shows where, and `yoink lock release` clears
+    /// it (with `--yes` to confirm, since releasing while another
+    /// operator is still deploying corrupts that deploy).
     Lock {
         #[command(subcommand)]
         action: LockAction,
@@ -604,7 +611,21 @@ enum Command {
         #[arg(value_enum)]
         what: CompleteKind,
     },
-    /// Manage `age`-sealed secrets (the batteries-included default).
+    /// Manage `age`-sealed secrets — the batteries-included default.
+    ///
+    /// `key generate` writes a fresh identity (default: `~/.config/yoink/keys/<recipient>.key`,
+    /// mode 0600) and prints the public recipient to paste into yoink.yaml.
+    /// `key public` prints the recipient yoink would use right now.
+    /// `edit` opens `secrets.age` in your `$EDITOR` as plaintext dotenv,
+    /// re-seals on save. `show` prints the masked or revealed contents.
+    /// `seal` is the non-interactive form of `edit` (read dotenv from
+    /// `--in` / stdin, write to `--out` / `secrets.age`). `rotate` swaps
+    /// in a new identity, re-sealing every value against both the old
+    /// and new recipients so CI can pick up the change without a flag-day.
+    ///
+    /// For non-age secrets (provider-managed via Doppler / 1Password /
+    /// Vault / etc.) configure `secrets.provider: command` in yoink.yaml
+    /// — the `secrets` subcommand only manages age-sealed files.
     Secrets {
         #[command(subcommand)]
         action: SecretsAction,
@@ -812,11 +833,7 @@ fn page_output(content: &str) {
         return;
     };
     let args: Vec<&str> = parts.collect();
-    let Ok(mut child) = Command::new(bin)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .spawn()
-    else {
+    let Ok(mut child) = Command::new(bin).args(&args).stdin(Stdio::piped()).spawn() else {
         // Pager binary not on PATH — print directly rather than fail.
         print!("{content}");
         return;
@@ -828,22 +845,13 @@ fn page_output(content: &str) {
 }
 
 /// TTY-gated interactive confirmation for destructive operations
-/// (clig.dev: severe changes require non-trivial confirmation). When
-/// stdin is a TTY, prompts for a literal "yes". When stdin is not a
-/// TTY (CI, scripts), errors out telling the caller to pass `--yes`.
+/// (clig.dev: severe changes require non-trivial confirmation).
+/// Thin wrapper around [`yoink::prompt::confirm`] in `Destructive`
+/// mode — kept for the `bail!`-on-reject ergonomic so callers can
+/// `confirm_destructive(...)?` without a separate match.
 fn confirm_destructive(prompt: &str) -> Result<()> {
-    if !io::stdin().is_terminal() {
-        anyhow::bail!(
-            "{prompt}\n\nstdin is not a TTY — pass --yes to confirm non-interactively."
-        );
-    }
-    eprint!("{prompt}\nType 'yes' to confirm: ");
-    io::stderr().flush().ok();
-    let mut buf = String::new();
-    io::stdin()
-        .read_line(&mut buf)
-        .context("read confirmation from stdin")?;
-    if buf.trim() != "yes" {
+    use yoink::prompt::{ConfirmKind, confirm};
+    if !confirm(prompt, ConfirmKind::Destructive, false)? {
         anyhow::bail!("aborted");
     }
     Ok(())
@@ -1136,7 +1144,7 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
     for host_cfg in &config.hosts {
         let host = Host::from(host_cfg);
         match ops.version(&host).await {
-            Ok(v) => println!(
+            Ok(v) => eprintln!(
                 "✓ {}: docker {} (api {}) on {}/{}",
                 host.address,
                 v.server_version.as_deref().unwrap_or("?"),
@@ -1195,7 +1203,10 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
         anyhow::bail!("--watch and --plan/--dry-run are mutually exclusive");
     }
 
-    eprintln!("● watching {} for changes (Ctrl-C to exit)", up.config_path.display());
+    eprintln!(
+        "● watching {} for changes (Ctrl-C to exit)",
+        up.config_path.display()
+    );
     let mut last_config = config.clone();
     let mut last_error: Option<String> = None;
     let mut tick = tokio::time::interval(WATCH_TICK);
@@ -1214,7 +1225,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
                         // Surface the recovery once so the operator
                         // knows yoink is happy again.
                         if last_error.is_some() {
-                            eprintln!("● config OK — resuming");
+                            eprintln!("✓ config OK — resuming");
                             last_error = None;
                         }
                         c
@@ -1247,7 +1258,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
 
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)] // single linear up-once flow; splitting fragments the build → push → reconcile sequence
 async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Result<()> {
     use yoink::docker_ops::Host;
     use yoink::lock::HostLock;
@@ -1294,7 +1305,11 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     } else {
         Vec::new()
     };
-    let tag_args: Vec<String> = tag_args.iter().chain(here_overrides.iter()).cloned().collect();
+    let tag_args: Vec<String> = tag_args
+        .iter()
+        .chain(here_overrides.iter())
+        .cloned()
+        .collect();
     let tag_overrides = parse_tag_overrides(&tag_args, services, allow_dirty)?;
 
     let services_filter = services_filter(services);
@@ -1433,7 +1448,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     }
 
     let reports = reconcile_result.context("reconcile")?;
-    println!("{}", output::format_deploy_summary(&reports));
+    eprintln!("{}", output::format_deploy_summary(&reports));
     Ok(())
 }
 
@@ -1655,7 +1670,7 @@ async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
         &report.removed
     };
     if items.is_empty() {
-        println!("nothing to prune");
+        eprintln!("nothing to prune");
         return Ok(());
     }
     let verb = if dry_run { "would remove" } else { "removed" };
@@ -1687,10 +1702,7 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
 /// already loads it for service-level secrets). Pass `None` when the
 /// caller doesn't otherwise need the bundle — it'll be loaded on
 /// demand only if a host actually declares `ssh_key_secret:`.
-async fn build_real_ops(
-    config: &Config,
-    bundle: Option<&SecretsBundle>,
-) -> Result<RealDockerOps> {
+async fn build_real_ops(config: &Config, bundle: Option<&SecretsBundle>) -> Result<RealDockerOps> {
     // Fast path: no host needs a managed key. Skip bundle access
     // entirely so commands that don't otherwise touch secrets pay
     // nothing.
@@ -1704,8 +1716,7 @@ async fn build_real_ops(
         owned_bundle = load_secrets_bundle(config).await?;
         owned_bundle.as_ref()
     };
-    let km = yoink::ssh_keys::prepare(config, bundle)
-        .context("prepare per-host ssh keys")?;
+    let km = yoink::ssh_keys::prepare(config, bundle).context("prepare per-host ssh keys")?;
     Ok(RealDockerOps::with_key_manager(km.map(std::sync::Arc::new)))
 }
 
@@ -1857,7 +1868,11 @@ async fn cmd_logs(
 /// `[host/container] ` prefix, or empty when there's only one replica
 /// (preserved so shell pipelines piping `yoink logs` into `grep` keep
 /// working unchanged for the single-replica case).
-fn replica_prefix(host: &yoink::docker_ops::Host, info: &yoink::docker_ops::ContainerInfo, multi: bool) -> String {
+fn replica_prefix(
+    host: &yoink::docker_ops::Host,
+    info: &yoink::docker_ops::ContainerInfo,
+    multi: bool,
+) -> String {
     if multi {
         format!("[{}/{}] ", host.address, info.name)
     } else {
@@ -2058,13 +2073,17 @@ async fn cmd_pf(
     // Resolve the path: published host endpoint OR sidecar handle.
     // `_sidecar` is bound here so its Drop fires after SIGINT even
     // though the variable is otherwise unused.
-    let resolved =
-        pf::resolve_target(ops.clone(), &host, service, container_port, mode).await?;
+    let resolved = pf::resolve_target(ops.clone(), &host, service, container_port, mode).await?;
     let (remote_dial_host, remote_port, mode_label, _sidecar) = match resolved {
         pf::ResolvedTarget::Published(ep) => (ep.host_ip, ep.host_port, "published", None),
         pf::ResolvedTarget::Sidecar(handle) => {
             let port = handle.host_port();
-            (pf::SIDECAR_DIAL_HOST.to_string(), port, "sidecar", Some(handle))
+            (
+                pf::SIDECAR_DIAL_HOST.to_string(),
+                port,
+                "sidecar",
+                Some(handle),
+            )
         }
     };
 
@@ -2107,9 +2126,7 @@ async fn cmd_pf(
         );
     }
 
-    if open_browser
-        && let Err(e) = pf::open_in_browser(&url)
-    {
+    if open_browser && let Err(e) = pf::open_in_browser(&url) {
         eprintln!("✗ failed to open browser: {e}\n  paste into one yourself: {url}");
     }
 
@@ -2161,7 +2178,8 @@ async fn cmd_pty(
 ) -> Result<()> {
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 
-    let ops: std::sync::Arc<dyn DockerOps> = std::sync::Arc::new(build_real_ops(config, None).await?);
+    let ops: std::sync::Arc<dyn DockerOps> =
+        std::sync::Arc::new(build_real_ops(config, None).await?);
     // For shell, we don't need a single-replica guarantee — pick a
     // healthy replica (or the first running one) and tell the operator
     // which one we landed on.
@@ -2170,8 +2188,7 @@ async fn cmd_pty(
         return Err(no_replicas_err(service, host_filter));
     }
     let multi = candidates.len() > 1;
-    let (host, info) =
-        pick_healthy_replica(candidates).expect("non-empty checked above");
+    let (host, info) = pick_healthy_replica(candidates).expect("non-empty checked above");
     let container = info.name.clone();
     if multi {
         eprintln!(
@@ -2484,7 +2501,7 @@ async fn cmd_pull(
     let mut had_err = false;
     for r in results {
         match r {
-            Ok(addr) => println!("✓ {addr}"),
+            Ok(addr) => eprintln!("✓ {addr}"),
             Err(e) => {
                 eprintln!("✗ {e:#}");
                 had_err = true;
@@ -3086,7 +3103,7 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
 }
 
 async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
-    use yoink::doctor::{run_doctor, tally, Severity};
+    use yoink::doctor::{Severity, run_doctor, tally};
 
     let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
         std::sync::Arc::new(build_real_ops(config, None).await?);
@@ -3150,18 +3167,23 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    let image = config
-        .proxy
-        .as_ref()
-        .map_or_else(|| "caddy:2".to_string(), yoink::config::ProxyConfig::resolved_image);
+    let image = config.proxy.as_ref().map_or_else(
+        || "caddy:2".to_string(),
+        yoink::config::ProxyConfig::resolved_image,
+    );
     let mut child = tokio::process::Command::new("docker")
         // JSON is Caddy's native config format — no `--adapter` flag.
         // (`--adapter caddyfile` would convert from Caddyfile syntax;
         // we feed JSON directly.)
         .args([
-            "run", "--rm", "-i",
+            "run",
+            "--rm",
+            "-i",
             &image,
-            "caddy", "validate", "--config", "/dev/stdin",
+            "caddy",
+            "validate",
+            "--config",
+            "/dev/stdin",
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3270,7 +3292,7 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
                 }
                 let h = Host::from(host_cfg);
                 match ops.force_remove_container(&h, LOCK_NAME).await {
-                    Ok(()) => println!("{}: released", h.address),
+                    Ok(()) => eprintln!("{}: released", h.address),
                     Err(e) => eprintln!("{}: {e:#}", h.address),
                 }
             }
@@ -3377,9 +3399,10 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             Some(Ok(()))
         }
         Command::Secrets {
-            action: SecretsAction::Key {
-                action: KeyAction::Generate { out, force, print },
-            },
+            action:
+                SecretsAction::Key {
+                    action: KeyAction::Generate { out, force, print },
+                },
         } => Some(cmd_secrets_key_generate(out.clone(), *force, *print)),
         Command::Init {
             host,
@@ -3436,11 +3459,7 @@ fn cmd_secrets_key_public(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn cmd_secrets_key_generate(
-    out: Option<PathBuf>,
-    force: bool,
-    print: bool,
-) -> Result<()> {
+fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool, print: bool) -> Result<()> {
     use yoink::sealed;
     let (secret, public) = sealed::keygen();
     let recipient_block =
@@ -3463,7 +3482,9 @@ fn cmd_secrets_key_generate(
         eprintln!("{recipient_block}");
         eprintln!();
         eprintln!("Suggested next steps:");
-        eprintln!("  • Pipe into a CI secret: `yoink secrets key generate --print | gh secret set YOINK_AGE_KEY`");
+        eprintln!(
+            "  • Pipe into a CI secret: `yoink secrets key generate --print | gh secret set YOINK_AGE_KEY`"
+        );
         eprintln!("  • Or pipe into a password manager (`op item create … password=-`).");
         eprintln!("  • Clear your terminal scrollback when done.");
         return Ok(());
@@ -3477,8 +3498,7 @@ fn cmd_secrets_key_generate(
         Some(p) => p,
         None => {
             let dir = sealed::keys_dir()?;
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create {}", dir.display()))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             sealed::keys_dir_path_for(&public)?
         }
     };
@@ -3493,23 +3513,23 @@ fn cmd_secrets_key_generate(
         chrono_like_now(),
     );
     sealed::write_atomically_secret(&path, body.as_bytes())?;
-    println!("wrote identity to {} (mode 0600)", path.display());
-    println!("public recipient: {public}");
-    println!();
-    println!("Add this to yoink.yaml:");
-    println!();
-    println!("{recipient_block}");
+    eprintln!("wrote identity to {} (mode 0600)", path.display());
+    eprintln!("public recipient: {public}");
+    eprintln!();
+    eprintln!("Add this to yoink.yaml:");
+    eprintln!();
+    eprintln!("{recipient_block}");
     if path.starts_with(sealed::keys_dir().unwrap_or_default()) {
         // In the default keys dir — yoink will discover it
         // automatically next time, no env var needed.
-        println!();
-        println!("yoink will discover this key automatically when sealing/unsealing.");
+        eprintln!();
+        eprintln!("yoink will discover this key automatically when sealing/unsealing.");
     } else {
         // Project-local or operator-chosen path — they own the
         // gitignore / env-var dance.
-        println!();
-        println!("Make sure {} is gitignored, then:", path.display());
-        println!("  export YOINK_AGE_KEY_FILE={}", path.display());
+        eprintln!();
+        eprintln!("Make sure {} is gitignored, then:", path.display());
+        eprintln!("  export YOINK_AGE_KEY_FILE={}", path.display());
     }
     Ok(())
 }
@@ -3531,7 +3551,7 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
     let canonical = sealed::render_dotenv(&parsed);
     let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
     sealed::write_atomically_secret(&path, &sealed_bytes)?;
-    println!("sealed {} key(s) to {}", parsed.len(), path.display());
+    eprintln!("sealed {} key(s) to {}", parsed.len(), path.display());
     Ok(())
 }
 
@@ -3581,8 +3601,8 @@ fn cmd_secrets_seal(config: &Config, input: Option<&Path>, out: Option<PathBuf>)
     let plaintext = match input {
         Some(p) if p.as_os_str() != "-" => {
             use std::io::Read;
-            let f = std::fs::File::open(p)
-                .with_context(|| format!("open input {}", p.display()))?;
+            let f =
+                std::fs::File::open(p).with_context(|| format!("open input {}", p.display()))?;
             let mut buf = String::new();
             f.take(SEAL_INPUT_CAP + 1)
                 .read_to_string(&mut buf)
@@ -3652,27 +3672,29 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     let resealed = sealed::seal(canonical.as_bytes(), &next)?;
     sealed::write_atomically_secret(&path, &resealed)?;
 
-    println!(
+    eprintln!(
         "re-sealed {} key(s) to {} ({} recipients)",
         parsed.len(),
         path.display(),
         next.len()
     );
-    println!();
-    println!("New CI identity (paste into GitHub Actions secret YOINK_AGE_KEY):");
-    println!();
+    eprintln!();
+    eprintln!("New CI identity (paste into GitHub Actions secret YOINK_AGE_KEY):");
+    eprintln!();
+    // The secret itself is the only stdout output — designed to pipe
+    // into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`).
     println!("{new_secret}");
-    println!();
-    println!("New public recipient (add to yoink.yaml under `secrets.recipients:`):");
-    println!();
-    println!("  - {new_public}");
-    println!();
-    println!("Next steps:");
-    println!("  1. Add the new recipient to yoink.yaml so future edits include it.");
-    println!("  2. Update the YOINK_AGE_KEY GitHub secret to the value above.");
-    println!("  3. Once CI is happily decrypting with the new key, remove the OLD");
-    println!("     recipient from yoink.yaml and run `yoink secrets edit` (save");
-    println!("     without changes) to drop it from the sealed file.");
+    eprintln!();
+    eprintln!("New public recipient (add to yoink.yaml under `secrets.recipients:`):");
+    eprintln!();
+    eprintln!("  - {new_public}");
+    eprintln!();
+    eprintln!("Next steps:");
+    eprintln!("  1. Add the new recipient to yoink.yaml so future edits include it.");
+    eprintln!("  2. Update the YOINK_AGE_KEY GitHub secret to the value above.");
+    eprintln!("  3. Once CI is happily decrypting with the new key, remove the OLD");
+    eprintln!("     recipient from yoink.yaml and run `yoink secrets edit` (save");
+    eprintln!("     without changes) to drop it from the sealed file.");
     Ok(())
 }
 
@@ -3774,7 +3796,7 @@ fn detected_ci_env() -> Option<&'static str> {
         "CIRCLECI",
         "BUILDKITE",
         "TRAVIS",
-        "TF_BUILD",          // Azure Pipelines
+        "TF_BUILD", // Azure Pipelines
         "TEAMCITY_VERSION",
         "BITBUCKET_BUILD_NUMBER",
         "DRONE",
@@ -3811,4 +3833,3 @@ fn chrono_like_now() -> String {
         .unwrap_or_default();
     format!("unix={secs}")
 }
-

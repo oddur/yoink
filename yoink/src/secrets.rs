@@ -385,14 +385,13 @@ async fn load_command_bundle(
         });
     }
 
-    let bundle =
-        parse_bundle_bytes(&stdout_buf, format).map_err(|(format, detail)| {
-            SecretsError::CommandParse {
-                command: pretty.clone(),
-                format,
-                detail: truncate_for_error(&detail, ERROR_DETAIL_CAP),
-            }
-        })?;
+    let bundle = parse_bundle_bytes(&stdout_buf, format).map_err(|(format, detail)| {
+        SecretsError::CommandParse {
+            command: pretty.clone(),
+            format,
+            detail: truncate_for_error(&detail, ERROR_DETAIL_CAP),
+        }
+    })?;
     if bundle.is_empty() && any_secrets_referenced {
         // Provider exited 0 but produced nothing parseable as a
         // key=value. Most commonly: wrong project / wrong scope /
@@ -475,9 +474,7 @@ fn parse_bundle_bytes(
     // both of our parsers would otherwise choke on it (auto-detect
     // would fall through to dotenv since BOM ≠ `{`, then dotenv would
     // reject the leading non-ASCII bytes).
-    let bytes = bytes
-        .strip_prefix(&[0xEF_u8, 0xBB, 0xBF])
-        .unwrap_or(bytes);
+    let bytes = bytes.strip_prefix(&[0xEF_u8, 0xBB, 0xBF]).unwrap_or(bytes);
     let chosen = match format {
         SecretsFormat::Json => SecretsFormat::Json,
         SecretsFormat::Dotenv => SecretsFormat::Dotenv,
@@ -504,9 +501,9 @@ fn parse_bundle_bytes(
 fn parse_json_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
     let raw: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
-    let obj = raw.as_object().ok_or_else(|| {
-        "expected a top-level JSON object of \"KEY\":\"VALUE\" pairs".to_string()
-    })?;
+    let obj = raw
+        .as_object()
+        .ok_or_else(|| "expected a top-level JSON object of \"KEY\":\"VALUE\" pairs".to_string())?;
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in obj {
         let value = match v {

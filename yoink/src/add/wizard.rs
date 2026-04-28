@@ -6,7 +6,7 @@ use std::io::{self, IsTerminal, Write};
 
 use anyhow::Result;
 
-use super::manifest::{regex_match, VariableSpec};
+use super::manifest::{VariableSpec, regex_match};
 
 /// Collect values for every manifest variable.
 ///
@@ -92,7 +92,11 @@ fn ask_choice(prompt_label: &str, spec: &VariableSpec) -> Result<String> {
     loop {
         writeln!(out, "{prompt_label}:")?;
         for (i, choice) in spec.choices.iter().enumerate() {
-            let marker = if Some(i) == default_idx { " (default)" } else { "" };
+            let marker = if Some(i) == default_idx {
+                " (default)"
+            } else {
+                ""
+            };
             writeln!(out, "  {}) {choice}{marker}", i + 1)?;
         }
         match default_idx {
@@ -127,11 +131,7 @@ fn ask_choice(prompt_label: &str, spec: &VariableSpec) -> Result<String> {
 
 fn validate(value: &str, spec: &VariableSpec) -> Result<()> {
     if !spec.choices.is_empty() && !spec.choices.iter().any(|c| c == value) {
-        anyhow::bail!(
-            "{} must be one of: {}",
-            spec.name,
-            spec.choices.join(", ")
-        );
+        anyhow::bail!("{} must be one of: {}", spec.name, spec.choices.join(", "));
     }
     if let Some(pat) = &spec.pattern
         && !regex_match(pat, value)
@@ -158,7 +158,12 @@ pub fn parse_var_overrides(raw: &[String]) -> Result<BTreeMap<String, String>> {
 mod tests {
     use super::*;
 
-    fn spec(name: &str, default: Option<&str>, choices: &[&str], pattern: Option<&str>) -> VariableSpec {
+    fn spec(
+        name: &str,
+        default: Option<&str>,
+        choices: &[&str],
+        pattern: Option<&str>,
+    ) -> VariableSpec {
         VariableSpec {
             name: name.into(),
             prompt: None,

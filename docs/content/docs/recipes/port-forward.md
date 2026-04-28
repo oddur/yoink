@@ -1,14 +1,9 @@
 ---
 title: Port-forward to any service
-weight: 8
+weight: 12
 ---
 
-`yoink pf <service>` opens a tunnel from your laptop to a container port — the same shape `kubectl port-forward` gives you, reusing the SSH connection yoink already has to the host. Two paths under the hood, picked automatically:
-
-- **Published path.** When the service declares a `publish:` entry that matches the requested container port, yoink does a single `ssh -L` to the host's existing `docker-proxy` listener. No extra container, ~50 ms to bind.
-- **Sidecar path.** When the service has no `publish:` (the secure-by-default api/web shape — only reachable via Caddy on :443), yoink spawns an ephemeral `alpine/socat` sidecar that joins the same docker network, listens on its own internal port, and forwards to `<service-alias>:<container-port>`. Yoink then `ssh -L`s to the sidecar's published-on-loopback port. The sidecar lives only as long as the `pf` invocation; Drop force-removes it.
-
-Either way the operator-visible UX is identical: an open URL, `Ctrl-C` / `Shift-F` closes everything cleanly. **You don't need to publish a port to debug a service.** The sidecar path is the secure-by-default story: production stays "no `publish:` for api/web" and `yoink pf` Just Works.
+`yoink pf <service>` opens a tunnel from your laptop to a container port — the same shape `kubectl port-forward` gives you, reusing the SSH connection yoink already has to the host. Works whether or not the service publishes a host port; **you don't need to publish anything to debug a service**. Open URL, `Ctrl-C` to close.
 
 ## Why this matters — make the secure default the easy one
 
@@ -38,10 +33,10 @@ In other words: the security posture and the debugging posture stop fighting. Th
 
 Anything yoink runs:
 
-- **Published** (pgadmin on `127.0.0.1:5050:80`, the operator UI): published path. ~50 ms cold-start.
-- **Caddy-fronted, sealed-network** (api on the `api` network, no `publish:`): sidecar path. ~1–2 s cold-start (image pull + container start), ~50 ms warm; ~5 MB image pulled once per host.
-- **Multi-network** (web on `web` + `otel`): sidecar joins the first declared network and the operator dials the service's docker DNS alias.
-- **Replicated** (`replicas: 2`): the published path is sticky to one replica (one host port → one container); the sidecar path round-robins across replicas via docker DNS. See [Replicas](#replicas) below for caveats.
+- Services that **publish** a host port (pgadmin / admin UIs).
+- Services with **no `publish:`** — the secure-by-default api/web shape only reachable via Caddy on `:443`.
+- Services on a single network or multi-network.
+- Replicated services. See [Replicas](#replicas) below for routing caveats.
 
 ## CLI
 
@@ -97,53 +92,33 @@ backtrack-eu-1  ↦ api        api-186bd0cd-0       running  ...   ← yoink pf 
 backtrack-eu-1  ↦ api        api-186bd0cd-1       running  ...   ← marked too (CLI = all replicas)
 ```
 
-Sidecars themselves are filtered out of the container lists (their names start with `yoink-pf-`); they exist for the duration of the tunnel and aren't user-facing.
-
 While any tunnel is open, a one-line footer band stays visible across every pane:
 
 ```
 ↦ api :8080 → http://localhost:54321  pgadmin :80 → http://localhost:54322   [o] open  [F] close all
 ```
 
-The band is hard to miss on purpose — open tunnels are the kind of thing operators forget about and accidentally leave running between sessions. Yoink's TUI exit (`q` / Ctrl-C) closes every tunnel cleanly: ssh children die synchronously, sidecar containers force-remove via the `auto_remove: true` belt-and-braces.
+The band is hard to miss on purpose — open tunnels are the kind of thing operators forget about and accidentally leave running between sessions. Quitting the TUI closes every tunnel cleanly.
 
 ## Replicas
 
-Services with `replicas: > 1` get one container per replica (`web-13584766-0`, `web-13584766-1`, …). How `pf` reaches them depends on the path:
+For services with `replicas: > 1`, the tunnel may land on any healthy replica per connection. Pin the routing with one of:
 
-- **Published path.** `docker-proxy` is bound to a specific host port that ultimately maps to a specific container, so traffic is sticky to one replica for the duration of the tunnel.
-- **Sidecar path.** The sidecar dials the service's docker DNS alias (`socat tcp:web:3000`). Inside docker, that name resolves round-robin across all healthy replicas — so a given TCP connection through the sidecar may land on any one of them. The tunnel is *to a specific sidecar*, but the sidecar's outbound connection is *across the replica set*.
+- **`--host <ADDRESS>`** — restrict the tunnel to replicas on a specific host. With one replica per host, that's enough to pin.
+- **Use a `publish:` entry per replica** with distinct host ports for fully deterministic single-replica access.
+- **`--replica <N>` (0-based)** is accepted but currently validates range only; sticky per-replica routing is on the roadmap.
 
-The TUI's `↦` marker reflects which row the operator pressed `f` on — useful as a "this is the tunnel I opened" cue, not a guarantee that "every byte goes to this replica" through the sidecar path.
+The TUI's `↦` marker shows which replica row was selected when you pressed `f`. Treat it as "this is the tunnel I opened" — not a routing guarantee.
 
-Flags that influence which replica a connection lands on:
+## What's guaranteed
 
-- **`--host <ADDRESS>`** — restricts both the published path and the sidecar's network attachment to replicas on that host. With one replica per host this is enough to pin a tunnel.
-- **`--replica <N>` (0-based)** — currently validates range only (errors if `>= replicas`). Defaults to `0`. Sticky per-replica routing in the sidecar path is follow-up work — it would require the sidecar to dial the target container's IP rather than the service alias.
-- **TUI: select the row first, then press `f`.** Marks the focused replica with `↦`; same routing semantics as the CLI otherwise.
+- **Same auth path as everything else.** If `yoink up` works against the host, `yoink pf` works.
+- **No image dependencies on the target.** Whether the target is `FROM scratch`, distroless, or full Debian, `pf` reaches it.
+- **Nothing crosses the public internet.** Tunnel is loopback-on-host bridged over SSH.
+- **Auto-cleanup on exit.** Ctrl-C / `Shift-F` / TUI exit / crash all force-remove any sidecars and free the local port.
 
-For deterministic single-replica access today: use the published path (`publish:` per replica with distinct host ports), pin via `--host`, or run the service with `replicas: 1`.
+## See also
 
-## How it works
-
-### Published path
-
-When the service publishes the requested port, yoink runs `ssh -N -L laptop_port:remote_dial_host:remote_port user@host` against the same SSH config bollard already uses for the docker daemon connection. The remote-dial-host comes from the publish block (`127.0.0.1` for two-token publishes, the explicit IP for three-token); the remote port is the host port. `docker-proxy` was already listening before `pf` ran. ~50 ms cold-start.
-
-### Sidecar path
-
-When the service doesn't publish the requested port, yoink:
-
-1. Pulls `alpine/socat:latest` on the host (no-op after the first run; ~5 MB).
-2. Spawns a one-shot container named `yoink-pf-<service>-<port>-<id>` that joins the same docker network as the target and publishes its own internal port `1080` to a random `127.0.0.1:<host_port>` on the host. Inside, it runs `socat tcp-listen:1080,fork,reuseaddr tcp:<service-alias>:<container-port>`.
-3. Inspects the container for the docker-assigned host port.
-4. SSH-tunnels the laptop to that loopback host port.
-5. On `pf` exit (Ctrl-C, `Shift-F`, TUI exit, panic), Drop fires a `force-remove` against the sidecar. Belt-and-braces `auto_remove: true` catches the case where Drop runs after the runtime has torn down.
-
-The sidecar is labelled `yoink.kind=pf-sidecar` so a future `yoink prune` pass can sweep stragglers if `pf` ever crashes mid-flight.
-
-What both paths share:
-
-- **Same auth path as everything else.** If `yoink up` works against the host, `yoink pf` works. No separate SSH config, no extra keys.
-- **No image dependencies on the target.** Whether the target is `FROM scratch` or full Debian, `pf` reaches it the same way (the published path doesn't enter the target; the sidecar speaks docker DNS to it).
-- **Loopback-only on the host.** Both the published path and the sidecar's published port bind `127.0.0.1` — the laptop reaches them through SSH; nothing fronts the public internet.
+- [Secure by default](/docs/guide/security-defaults) — why `publish:` should be the exception, not the rule.
+- [TanStack Start + postgres](/docs/recipes/tanstack-stack) — end-to-end recipe that uses `yoink pf` to verify the deploy.
+- [CLI reference: pf](/docs/reference/cli) — full flag surface.

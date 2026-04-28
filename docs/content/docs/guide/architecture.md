@@ -43,8 +43,8 @@ How it works:
 - On `up`, yoink tries to start a container named `yoink-deploy-lock` on each host. Image: `alpine:latest`, command: a tiny shell loop that watches `/tmp/heartbeat` and exits when the file is older than ~30s.
 - If the container is already running on a host, `up` errors with "another deploy in progress." The competing operator either waits or — if the sentinel is stale — re-runs (the sentinel will have self-exited).
 - If the container exists but is stopped (a crashed previous deploy), yoink force-removes it and starts fresh. That's the "stopped orphan, sweep + acquire" branch.
-- Once acquired, a tokio task on the operator side `docker exec`s into the sentinel every 5 seconds to touch `/tmp/heartbeat`. Three missed pings (`HEARTBEAT_STALE_SECS`) and the sentinel self-exits.
-- On `up` finish (success or error), `release()` aborts the heartbeat task and force-removes the sentinel. Next deploy: instant acquire.
+- Once acquired, the operator side `docker exec`s into the sentinel every 5 seconds to touch `/tmp/heartbeat`. After ~30s of missed pings the sentinel self-exits.
+- On `up` finish (success or error), yoink aborts the heartbeat and force-removes the sentinel. Next deploy: instant acquire.
 
 Failure modes the design handles:
 
@@ -81,7 +81,7 @@ For the config above:
 
 Where it matters: the `pre_deploy` hooks for a service run *before* that service's wave starts, so a database migration completes before the `api` container that depends on it ever pulls.
 
-`Config::topo_sort_services` rejects cycles at config load time (not at deploy time). A cycle is a config error, surfaced before yoink touches a host.
+`yoink validate` (and any deploy command) rejects `depends_on:` cycles at config load time, before yoink touches a host.
 
 ## Secrets resolution
 
@@ -92,7 +92,7 @@ Two providers, dispatched by `secrets.provider:`:
 
 There's no first-party integration with any specific manager. Operators wire their tool of choice via its standard CLI: `doppler secrets download --format env`, `infisical export --format=dotenv`, `vault kv get -format=json`, `aws secretsmanager get-secret-value`, etc. See [external secrets via CLI](/docs/recipes/secrets-external-cli) for per-tool recipes.
 
-Both providers feed the same `SecretsBundle`. Every service that lists `secrets:` (or `env_from_secrets:`) gets its values picked out of that bundle and injected as env vars on the container — which means the values feed into `spec_hash`, which is why a rotated secret triggers a redeploy.
+Both providers produce the same shape: a key→value bundle. Every service that lists `secrets:` (or `env_from_secrets:`) gets its values picked out of that bundle and injected as env vars on the container — which means the values feed into `yoink.spec_hash`, which is why a rotated secret triggers a redeploy.
 
 ## Prune semantics
 
@@ -111,12 +111,12 @@ What `prune` does **not** remove:
 
 ## Runtime container shape
 
-When yoink creates a container, the bollard `HostConfig` it sends to docker is built from `service.run.options` plus a few fixed pieces:
+When yoink creates a container, the docker host config it sends is built from `service.run.options` plus a few fixed pieces:
 
 - **Auto-add to `tmpfs` mount options**: `noexec,nosuid,nodev` (unless operator explicitly opted in to `exec`/`suid`/`dev`)
 - **Auto-add to `binds`**: `:ro` suffix when no mode set (operator opts in to `:rw` explicitly)
 - **`init: true`** by default — tini as PID 1 reaps zombies + forwards SIGTERM
-- **Network mode** = first network in `effective_networks(svc, deploy)`; additional networks attached post-start via `connect_container_network`
+- **Network mode** = first network from the merged service+deploy `networks:` list; additional networks attached post-start
 - **Port bindings** parsed from `publish:` entries
 - **Restart policy** = the `restart:` string (`no` / `always` / `unless-stopped` / `on-failure`); default unset = no restart
 

@@ -1,6 +1,6 @@
 ---
 title: Multi-host distribution
-weight: 5
+weight: 9
 ---
 
 How services spread across hosts when you scale beyond one box. Two knobs: `replicas` (per host) and `services[].hosts` (which hosts run a service).
@@ -37,7 +37,8 @@ hosts:
 services:
   - name: api
     image: ghcr.io/you/api
-    # no `hosts:` → runs on all three; usually not what you want for stateful peers
+    domain: api.example.com                    # bundled Caddy auto-injects on every host that runs api
+    hosts: [prod-eu-1, prod-eu-2]              # public-facing tier; redis stays internal
     run: { port: 8080, replicas: 2 }
 
   - name: redis
@@ -45,13 +46,6 @@ services:
     tag: 7-alpine
     hosts: [prod-db-1]                         # pin to the db host only
     run: { port: 6379 }
-
-  - name: caddy
-    image: lucaslorentz/caddy-docker-proxy
-    tag: 2.10-alpine
-    hosts: [prod-eu-1, prod-eu-2]              # public-facing tier only
-    run:
-      publish: ["80:80", "443:443", "443:443/udp"]
 ```
 
 ## Common shapes
@@ -126,3 +120,9 @@ Wave ordering (`depends_on`) is global — `redis` finishes its host fan-out bef
 ## Pruning
 
 `yoink prune` walks every host independently, removing containers and images that don't match any current service definition. A service that used to run on `prod-eu-2` but is now pinned to `prod-eu-1` gets cleaned up on `prod-eu-2` automatically.
+
+## See also
+
+- [Run staging alongside prod](/docs/recipes/staging-alongside-prod) — same primitives, separate `yoink.yaml` per environment.
+- [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage) — proxy-side coordination when more than one host fronts the same domain.
+- [Configuration reference](/docs/reference/config) — full `hosts:` / `replicas:` / `pin:` schema.

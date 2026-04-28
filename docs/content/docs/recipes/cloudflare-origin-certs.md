@@ -1,6 +1,6 @@
 ---
 title: Cloudflare Origin Certificates
-weight: 10
+weight: 13
 ---
 
 If you're already on Cloudflare's edge, **Origin Certificates** are the simplest TLS story for your origin hosts: free, valid for 15 years, no ACME, no Let's Encrypt rate limits, no port-80 reachability requirement. Yoink supports them out of the box.
@@ -151,7 +151,7 @@ Origin certs are good for 15 years, but you'll probably want to rotate every 1â€
 3. `git commit -am 'rotate cf origin cert'`.
 4. `yoink up`.
 
-Yoink notices the cert bytes have changed (via the proxy's spec hash including the cert reference labels), redeploys the proxy container (~10s), and the new cert is live.
+Yoink notices the cert bytes have changed, redeploys the proxy container (~10s), and the new cert is live.
 
 For zero-downtime rotation, use `yoink up --service yoink-proxy` from one host at a time if you're multi-host.
 

@@ -1260,7 +1260,7 @@ impl DockerOps for RealDockerOps {
             if let (Some(id), Some(status)) = (info.id.as_ref(), info.status.as_ref())
                 && last.get(id) != Some(status)
             {
-                tracing::info!(host = %host.address, layer = %id, %status, "pull");
+                tracing::info!(host = %host.address, image = %id, %status, "pull");
                 last.insert(id.clone(), status.clone());
             }
         }

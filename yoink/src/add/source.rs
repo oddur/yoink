@@ -28,6 +28,10 @@ const TARBALL_DOWNLOAD_CAP: u64 = 50 * 1024 * 1024;
 /// Cap on cumulative *unpacked* bytes. Defends against gzip bombs:
 /// a 50 MB gzipped payload could expand to many GB.
 const TARBALL_UNPACK_CAP: u64 = 200 * 1024 * 1024;
+/// Per-request timeout for GitHub API + raw.githubusercontent.com fetches.
+/// 30s is enough that a slow link finishes a small tarball download but
+/// short enough that a stalled connection doesn't hang the CLI.
+const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum SourceError {
@@ -65,7 +69,9 @@ impl TemplateRef {
     fn is_default_source(&self) -> bool {
         self.owner == DEFAULT_OWNER
             && self.repo == DEFAULT_REPO
-            && self.subpath.starts_with(&format!("{DEFAULT_SUBPATH_PREFIX}/"))
+            && self
+                .subpath
+                .starts_with(&format!("{DEFAULT_SUBPATH_PREFIX}/"))
     }
 
     fn subpath_basename(&self) -> &str {
@@ -155,7 +161,7 @@ pub struct FetchedTemplate {
 /// quickly. A 30-second timeout means a stalled connection bails
 /// rather than hangs the whole CLI.
 fn build_client() -> Result<reqwest::Client> {
-    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
     let mut headers = HeaderMap::new();
     if let Some(token) = std::env::var("GITHUB_TOKEN")
@@ -170,7 +176,7 @@ fn build_client() -> Result<reqwest::Client> {
 
     reqwest::Client::builder()
         .user_agent(format!("yoink/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(HTTP_REQUEST_TIMEOUT)
         .default_headers(headers)
         .build()
         .context("build http client")
@@ -218,8 +224,7 @@ pub async fn fetch_index() -> Result<TemplateIndex> {
         anyhow::bail!("fetch templates index from {url}: HTTP {status}");
     }
     let text = resp.text().await.context("read templates index body")?;
-    let index: TemplateIndex =
-        yaml_serde::from_str(&text).context("parse templates index")?;
+    let index: TemplateIndex = yaml_serde::from_str(&text).context("parse templates index")?;
     Ok(index)
 }
 
@@ -230,10 +235,7 @@ pub fn from_local_path(path: &Path) -> Result<FetchedTemplate> {
     let canonical = std::fs::canonicalize(path)
         .with_context(|| format!("resolve --from-path {}", path.display()))?;
     if !canonical.is_dir() {
-        anyhow::bail!(
-            "--from-path {} is not a directory",
-            canonical.display()
-        );
+        anyhow::bail!("--from-path {} is not a directory", canonical.display());
     }
     if !canonical.join("template.yaml").exists() {
         anyhow::bail!(
@@ -271,9 +273,8 @@ pub async fn fetch(template: &TemplateRef, refresh: bool) -> Result<FetchedTempl
         // dir is only good for *that* template; a second `yoink add`
         // against the same SHA but a different template would silently
         // miss its files. Tarballs are capped at 50 MB on download.
-        extract_tarball(&bytes, &extract_root).with_context(|| {
-            format!("extract tarball for {}@{}", template.original, &sha[..7])
-        })?;
+        extract_tarball(&bytes, &extract_root)
+            .with_context(|| format!("extract tarball for {}@{}", template.original, &sha[..7]))?;
     }
 
     let template_root = locate_template_root(&extract_root, template, &sha)?;
@@ -396,9 +397,7 @@ fn extract_tarball(gz_bytes: &[u8], dest: &Path) -> Result<()> {
         }
         unpacked = unpacked.saturating_add(entry.size());
         if unpacked > TARBALL_UNPACK_CAP {
-            anyhow::bail!(
-                "tarball expansion exceeded {TARBALL_UNPACK_CAP} bytes (gzip bomb?)"
-            );
+            anyhow::bail!("tarball expansion exceeded {TARBALL_UNPACK_CAP} bytes (gzip bomb?)");
         }
         entry.unpack_in(dest)?;
     }
@@ -419,11 +418,7 @@ fn cache_dir(owner: &str, repo: &str, sha: &str) -> Result<PathBuf> {
 
 /// Locate the template root inside the extracted tarball. GitHub's
 /// codeload tarballs always wrap contents in `<repo>-<sha>/`.
-fn locate_template_root(
-    extract_root: &Path,
-    template: &TemplateRef,
-    sha: &str,
-) -> Result<PathBuf> {
+fn locate_template_root(extract_root: &Path, template: &TemplateRef, sha: &str) -> Result<PathBuf> {
     let template_root = extract_root
         .join(format!("{}-{}", template.repo, sha))
         .join(&template.subpath);
@@ -487,7 +482,13 @@ fn branch_mapping_path(template: &TemplateRef) -> Result<PathBuf> {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -561,9 +562,7 @@ mod tests {
     fn looks_like_sha_recognises_valid() {
         assert!(looks_like_sha("a1b2c3d"));
         assert!(looks_like_sha("a1b2c3d4e5f6"));
-        assert!(looks_like_sha(
-            "0123456789abcdef0123456789abcdef01234567"
-        ));
+        assert!(looks_like_sha("0123456789abcdef0123456789abcdef01234567"));
         assert!(!looks_like_sha("main"));
         assert!(!looks_like_sha("v1.0.0"));
         assert!(!looks_like_sha("abc"));

@@ -185,10 +185,9 @@ impl PortForwardState {
     /// invocations).
     #[must_use]
     pub fn is_container_forwarded(&self, host: &str, container: &str) -> bool {
-        self.forwards.values().any(|f| {
-            f.key.host == host
-                && f.target_container.as_deref() == Some(container)
-        })
+        self.forwards
+            .values()
+            .any(|f| f.key.host == host && f.target_container.as_deref() == Some(container))
     }
 
     /// `true` when the service has any active forward AND none of

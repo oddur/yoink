@@ -57,6 +57,7 @@ services:
   - name: api
     image: ghcr.io/you/api
     # tag: <required at deploy time via --tag api=<sha>>
+    domain: api.example.com                # bundled Caddy fronts this with HTTPS
     depends_on: [redis]                    # redis comes up first in the wave plan
     networks: [api, redis]                 # can dial redis; web/public dial api
     secrets: [DATABASE_URL]                # injected as env var of same name
@@ -81,7 +82,7 @@ services:
         # default to the hardened profile.
         tmpfs:
           /tmp: "size=64m,mode=1777"
-        network_aliases: [api]             # caddy upstreams to `api:8080`
+        network_aliases: [api]             # the proxy upstreams to `api:8080`
 ```
 
 ## `services/web.yaml`
@@ -91,6 +92,7 @@ services:
   - name: web
     image: ghcr.io/you/web
     # tag: <--tag web=<sha>>
+    domain: example.com                    # bundled Caddy fronts this with HTTPS
     depends_on: [api]
     networks: [web, api]                   # dial api by name
     run:
@@ -108,30 +110,9 @@ services:
         network_aliases: [web]
 ```
 
-## `services/caddy.yaml`
+## Reverse proxy
 
-```yaml
-services:
-  - name: caddy
-    image: lucaslorentz/caddy-docker-proxy
-    tag: 2.10-alpine
-    depends_on: [api, web]
-    networks: [public, api, web]           # public for the listener; api+web for upstreams
-    binds:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"  # caddy-docker-proxy needs the socket
-      - "/data/caddy:/data:rw"             # explicit :rw — cert storage persists
-    run:
-      port: 443
-      publish:
-        - "80:80"
-        - "443:443"
-      options:
-        memory: "64Mi"
-        cpus: "0.5"
-        # caddy needs to bind :80 / :443 (privileged) — re-add only the
-        # capability that lets it.
-        cap_add: [NET_BIND_SERVICE]
-```
+No `services/caddy.yaml` needed — the moment any service has `domain:` set, yoink synthesizes a `yoink-proxy` service running `caddy:2`, joins it to the right networks, and pushes the routing config via Caddy's admin API on every deploy. ACME for Let's Encrypt happens in-container; certs persist across redeploys in a managed volume. See [Reverse proxy](/docs/guide/proxy) for the full schema (forward_auth, basic_auth, h2c for gRPC, etc.).
 
 ## Deploying
 

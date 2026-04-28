@@ -11,6 +11,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use throbber_widgets_tui::ThrobberState;
 
 use crate::doctor::{Finding, Severity};
 
@@ -58,8 +59,7 @@ impl DoctorState {
             && !findings.is_empty()
         {
             let i = self.selected.selected().unwrap_or(0);
-            self.selected
-                .select(Some((i + 1).min(findings.len() - 1)));
+            self.selected.select(Some((i + 1).min(findings.len() - 1)));
         }
     }
 
@@ -73,7 +73,12 @@ impl DoctorState {
     }
 }
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut DoctorState) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut DoctorState,
+    throbber: &ThrobberState,
+) {
     if !state.is_open() {
         return;
     }
@@ -89,28 +94,21 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut DoctorState) {
     let inner = outer.inner(modal);
 
     // Footer for keybinds — claim a single line at the bottom.
-    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
-        .areas(inner);
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
     match &state.status {
         Status::Closed => {}
         Status::Loading => {
-            let p = Paragraph::new("running checks…").style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::ITALIC),
-            );
+            let p = Paragraph::new(super::ui::throbber_with_label(throbber, " running checks…"));
             frame.render_widget(p, body);
         }
         Status::Loaded(findings) => {
             // Two columns: the scrollable list of findings, and a
             // detail pane on the right showing the selected finding's
             // detail + fix.
-            let [list_area, detail_area] = Layout::horizontal([
-                Constraint::Percentage(55),
-                Constraint::Percentage(45),
-            ])
-            .areas(body);
+            let [list_area, detail_area] =
+                Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .areas(body);
 
             let items: Vec<ListItem> = findings
                 .iter()
@@ -136,10 +134,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut DoctorState) {
                 .collect();
 
             let list = List::new(items)
-                .highlight_style(
-                    Style::default()
-                        .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-                )
+                .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
                 .highlight_symbol(" ");
             frame.render_stateful_widget(list, list_area, &mut state.selected);
 
@@ -147,10 +142,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut DoctorState) {
                 .selected
                 .selected()
                 .and_then(|i| findings.get(i))
-                .map_or_else(
-                    || vec![Line::from("(no selection)")],
-                    detail_lines,
-                );
+                .map_or_else(|| vec![Line::from("(no selection)")], detail_lines);
             let detail = Paragraph::new(detail_text)
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .block(Block::default().borders(Borders::LEFT));
@@ -165,8 +157,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut DoctorState) {
         }
         _ => "r rerun, Esc close".to_string(),
     };
-    let footer_p =
-        Paragraph::new(summary).style(Style::default().fg(Color::DarkGray));
+    let footer_p = Paragraph::new(summary).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer_p, footer);
 }
 

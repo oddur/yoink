@@ -409,7 +409,9 @@ impl ResourcesState {
         let dangling_count = self.images.iter().filter(|i| i.dangling).count();
 
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])]
         } else if self.images.is_empty() {
             vec![Row::new(vec![Cell::from("(no images cached on any host)")])]
         } else if visible.is_empty() {
@@ -484,7 +486,9 @@ impl ResourcesState {
         clamp_selection(&mut self.volumes_table, visible.len());
 
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])]
         } else if self.volumes.is_empty() {
             vec![Row::new(vec![Cell::from("(no volumes on any host)")])]
         } else if visible.is_empty() {
@@ -537,7 +541,9 @@ impl ResourcesState {
         clamp_selection(&mut self.networks_table, visible.len());
 
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])]
         } else if self.networks.is_empty() {
             vec![Row::new(vec![Cell::from("(no networks)")])]
         } else if visible.is_empty() {

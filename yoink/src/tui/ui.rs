@@ -252,9 +252,7 @@ pub fn render_header(
         block = block.title(
             Line::from(Span::styled(
                 format!(" {text} "),
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ))
             .centered(),
         );
