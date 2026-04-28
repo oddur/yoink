@@ -164,8 +164,9 @@ enum Command {
     Add {
         /// Template ref. Bare (`postgres`), pinned (`postgres@<sha>`),
         /// or `gh:owner/repo[@ref]/path` for an external source.
-        /// Mutually exclusive with `--from-path`.
-        #[arg(required_unless_present = "from_path")]
+        /// Mutually exclusive with `--from-path`. Omit both to open
+        /// the interactive picker (or pipe `yoink add` for a
+        /// scriptable list dump).
         r#ref: Option<String>,
         /// Use a local directory as the template source instead of
         /// fetching from GitHub. For template authors iterating on a

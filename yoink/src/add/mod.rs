@@ -57,14 +57,28 @@ pub async fn cmd_add(
     opts: AddOpts,
 ) -> Result<AddOutcome> {
     let overrides = wizard::parse_var_overrides(&opts.vars)?;
+    let interactive = !opts.yes && io::stdin().is_terminal();
 
-    let (template_label, fetched) = match (&opts.r#ref, &opts.from_path) {
+    // `yoink add` with no positional ref and no `--from-path`: pick
+    // from the bundled index. Interactive mode pops a numbered
+    // picker; non-interactive prints the list and returns cleanly
+    // (handy as a `yoink add | head` discovery probe in scripts).
+    let resolved_ref = if opts.r#ref.is_none() && opts.from_path.is_none() {
+        if interactive {
+            Some(pick_from_index().await?)
+        } else {
+            print_index().await?;
+            return Ok(AddOutcome::default());
+        }
+    } else {
+        opts.r#ref.clone()
+    };
+
+    let (template_label, fetched) = match (&resolved_ref, &opts.from_path) {
         (Some(_), Some(_)) => anyhow::bail!(
             "pass either a template ref or `--from-path`, not both"
         ),
-        (None, None) => anyhow::bail!(
-            "missing template ref — pass a name (`yoink add postgres`) or `--from-path ./local-dir`"
-        ),
+        (None, None) => unreachable!("resolved above"),
         (Some(r), None) => {
             let template_ref = source::parse_ref(r)?;
             eprintln!(
@@ -107,8 +121,6 @@ pub async fn cmd_add(
             env!("CARGO_PKG_VERSION")
         );
     }
-
-    let interactive = !opts.yes && io::stdin().is_terminal();
 
     // Bootstrap sealed secrets up-front when the template needs them
     // and yoink.yaml has nothing configured. Reload the in-memory
@@ -385,6 +397,72 @@ fn print_confirmation(
         eprintln!("  + include: [\"{glob}\"]");
     }
     eprintln!();
+}
+
+/// Print the bundled-templates index to stderr in a stable, scannable
+/// table form. Used when `yoink add` runs without a ref in a
+/// non-interactive context — discovery without commitment.
+async fn print_index() -> Result<()> {
+    let index = source::fetch_index().await?;
+    eprintln!();
+    eprintln!("Available templates (yoink add <name>):");
+    let name_w = index
+        .templates
+        .iter()
+        .map(|e| e.name.len())
+        .max()
+        .unwrap_or(0);
+    for entry in &index.templates {
+        eprintln!(
+            "  {:<name_w$}  ({:<9}) {}",
+            entry.name, entry.kind, entry.summary,
+        );
+    }
+    eprintln!();
+    eprintln!("Run `yoink add <name>` to drop one in.");
+    Ok(())
+}
+
+/// Interactive picker: list bundled templates, accept a numeric pick,
+/// return the chosen name as a ref string suitable for `parse_ref`.
+async fn pick_from_index() -> Result<String> {
+    let index = source::fetch_index().await?;
+    if index.templates.is_empty() {
+        anyhow::bail!("templates index is empty");
+    }
+    let name_w = index
+        .templates
+        .iter()
+        .map(|e| e.name.len())
+        .max()
+        .unwrap_or(0);
+    eprintln!();
+    eprintln!("Available templates:");
+    for (i, entry) in index.templates.iter().enumerate() {
+        eprintln!(
+            "  {:>2}) {:<name_w$}  ({:<9}) {}",
+            i + 1,
+            entry.name,
+            entry.kind,
+            entry.summary,
+        );
+    }
+    loop {
+        eprint!("\npick [1-{}]: ", index.templates.len());
+        io::stderr().flush().ok();
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf)?;
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match trimmed.parse::<usize>() {
+            Ok(n) if (1..=index.templates.len()).contains(&n) => {
+                return Ok(index.templates[n - 1].name.clone());
+            }
+            _ => eprintln!("  ✗ pick a number 1-{}", index.templates.len()),
+        }
+    }
 }
 
 fn confirm(prompt: &str, default_yes: bool) -> Result<bool> {

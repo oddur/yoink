@@ -148,6 +148,81 @@ pub struct FetchedTemplate {
     pub root: PathBuf,
 }
 
+/// Build the shared HTTP client used for every GitHub call. Honours
+/// `GITHUB_TOKEN` / `GH_TOKEN` (in that order) by adding an
+/// Authorization header to every request — without auth the GitHub
+/// API caps at 60 requests/hour per IP, which a CI runner exhausts
+/// quickly. A 30-second timeout means a stalled connection bails
+/// rather than hangs the whole CLI.
+fn build_client() -> Result<reqwest::Client> {
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+
+    let mut headers = HeaderMap::new();
+    if let Some(token) = std::env::var("GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+    {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("GITHUB_TOKEN contains characters that aren't valid in an HTTP header")?;
+        headers.insert(AUTHORIZATION, value);
+    }
+
+    reqwest::Client::builder()
+        .user_agent(format!("yoink/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .default_headers(headers)
+        .build()
+        .context("build http client")
+}
+
+/// One entry in the bundled-templates index — what `yoink add` (no
+/// args) lists, and what `yoink template list` prints.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndexEntry {
+    pub name: String,
+    pub kind: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TemplateIndex {
+    pub templates: Vec<IndexEntry>,
+}
+
+/// Fetch the bundled-templates index from the default source's main
+/// branch. Used by the discovery picker; small file (well under 1 KB)
+/// so a single raw.githubusercontent.com GET is the cheapest path —
+/// no tarball, no extraction, no cache.
+pub async fn fetch_index() -> Result<TemplateIndex> {
+    let client = build_client()?;
+    let url = format!(
+        "https://raw.githubusercontent.com/{DEFAULT_OWNER}/{DEFAULT_REPO}/{DEFAULT_REF}/{DEFAULT_SUBPATH_PREFIX}/index.yaml"
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!(
+                "templates index not found at {url} (HTTP 404).\n\
+                 The picker depends on `templates/index.yaml` existing on \
+                 {DEFAULT_OWNER}/{DEFAULT_REPO}@{DEFAULT_REF}. If you're \
+                 running a pre-release build, pass a name directly \
+                 (e.g. `yoink add postgres`) or `--from-path ./templates/<name>`."
+            );
+        }
+        anyhow::bail!("fetch templates index from {url}: HTTP {status}");
+    }
+    let text = resp.text().await.context("read templates index body")?;
+    let index: TemplateIndex =
+        yaml_serde::from_str(&text).context("parse templates index")?;
+    Ok(index)
+}
+
 /// Use a local directory as the template source. Skips the
 /// fetch + extract pipeline entirely — for template authors iterating
 /// on a manifest without push-pull cycles to GitHub.
@@ -176,10 +251,7 @@ pub fn from_local_path(path: &Path) -> Result<FetchedTemplate> {
 /// when `refresh` is true or when the cache doesn't already hold the
 /// resolved SHA.
 pub async fn fetch(template: &TemplateRef, refresh: bool) -> Result<FetchedTemplate> {
-    let client = reqwest::Client::builder()
-        .user_agent(format!("yoink/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("build http client")?;
+    let client = build_client()?;
 
     let sha = if looks_like_sha(&template.git_ref) {
         template.git_ref.clone()

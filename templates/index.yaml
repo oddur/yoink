@@ -1,0 +1,20 @@
+# Bundled-template index. Read by `yoink add` (no args) to power the
+# discovery picker, and by `yoink template list` for an explicit
+# listing. Authoring guide: docs/recipes/authoring-templates.md.
+#
+# Each entry is shipped from the same `templates/<name>/` subdir as
+# the manifest itself; the index is the human-curated TL;DR.
+
+templates:
+  - name: postgres
+    kind: accessory
+    summary: PostgreSQL with sealed credentials and a named volume.
+  - name: redis
+    kind: accessory
+    summary: Redis 7 with secure-by-default options + tunable memory cap.
+  - name: meilisearch
+    kind: accessory
+    summary: Meilisearch with sealed master key and persistent index volume.
+  - name: openclaw
+    kind: app
+    summary: Placeholder web-app template — rename + repoint `image:` to suit.
