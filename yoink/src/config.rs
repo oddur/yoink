@@ -195,6 +195,39 @@ pub struct ProxyConfig {
     /// ```
     #[serde(default)]
     pub tls: Option<ProxyTls>,
+    /// Compile a custom caddy binary on each proxy host using xcaddy,
+    /// baking in the listed plugins (rate-limit, l4, redis-storage,
+    /// caddy-dns/*, etc.). Mutually exclusive with `image:` — pick one.
+    /// See `XcaddyConfig` for shape.
+    #[serde(default)]
+    pub xcaddy: Option<XcaddyConfig>,
+}
+
+/// Build inputs for an on-host xcaddy compile. The resulting image is
+/// tagged locally as `yoink-caddy:<short-hash>` where the hash is
+/// derived from these fields, so identical inputs across runs short-
+/// circuit via `image_present` and skip the rebuild.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XcaddyConfig {
+    /// Caddy modules to bake in. Bare module path (`github.com/foo/bar`)
+    /// or pinned (`github.com/foo/bar@v1.2.3`) — same syntax as
+    /// `xcaddy build --with`. Sorted alphabetically before hashing /
+    /// rendering so order in the config file doesn't change the tag.
+    pub plugins: Vec<String>,
+    /// Caddy version to compile (positional arg to `xcaddy build`).
+    /// Default `2` — matches the upstream `caddy:2` floating tag.
+    #[serde(default)]
+    pub caddy_version: Option<String>,
+    /// Runtime image used as the second stage of the build (`FROM ...`
+    /// at the bottom of the Dockerfile). Default `caddy:2`.
+    #[serde(default)]
+    pub base_image: Option<String>,
+    /// Builder image carrying xcaddy + Go toolchain. Default
+    /// `caddy:2-builder`. Pin to `caddy:<ver>-builder` to also pin the
+    /// xcaddy CLI version.
+    #[serde(default)]
+    pub builder_image: Option<String>,
 }
 
 /// Proxy-level TLS. When `cert_secret` + `key_secret` are set, ACME
@@ -264,9 +297,15 @@ fn default_client_auth_mode() -> ClientAuthMode {
 }
 
 impl ProxyConfig {
-    /// Resolve the Caddy image, applying the default.
+    /// Resolve the Caddy image, applying the default. When `xcaddy:` is
+    /// set, returns the content-addressed local tag the builder will
+    /// produce (`yoink-caddy:<hash>`); otherwise the user's `image:`
+    /// override or `caddy:2`.
     #[must_use]
     pub fn resolved_image(&self) -> String {
+        if let Some(x) = &self.xcaddy {
+            return x.resolved_local_tag();
+        }
         self.image.clone().unwrap_or_else(|| "caddy:2".to_string())
     }
 
@@ -276,6 +315,64 @@ impl ProxyConfig {
         self.cert_volume
             .clone()
             .unwrap_or_else(|| "yoink_caddy_data".to_string())
+    }
+}
+
+impl XcaddyConfig {
+    pub const DEFAULT_BASE_IMAGE: &'static str = "caddy:2";
+    pub const DEFAULT_BUILDER_IMAGE: &'static str = "caddy:2-builder";
+
+    #[must_use]
+    pub fn resolved_base_image(&self) -> &str {
+        self.base_image
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_BASE_IMAGE)
+    }
+
+    #[must_use]
+    pub fn resolved_builder_image(&self) -> &str {
+        self.builder_image
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_BUILDER_IMAGE)
+    }
+
+    /// Plugins, alphabetized. Both the rendered Dockerfile and the
+    /// `hash()` input use this so order in the config file is irrelevant.
+    #[must_use]
+    pub fn sorted_plugins(&self) -> Vec<String> {
+        let mut v = self.plugins.clone();
+        v.sort();
+        v
+    }
+
+    /// 16-hex-char content hash over `(caddy_version, base_image,
+    /// builder_image, sorted_plugins)`. Inputs are joined with `\n`
+    /// separators so distinct field orderings can't alias.
+    /// `caddy_version` hashes as the empty string when unset, matching
+    /// the Dockerfile renderer (which omits the positional arg →
+    /// xcaddy uses caddy's latest tagged release).
+    #[must_use]
+    pub fn hash(&self) -> String {
+        let mut input = String::new();
+        input.push_str(self.caddy_version.as_deref().unwrap_or(""));
+        input.push('\n');
+        input.push_str(self.resolved_base_image());
+        input.push('\n');
+        input.push_str(self.resolved_builder_image());
+        input.push('\n');
+        for p in self.sorted_plugins() {
+            input.push_str(&p);
+            input.push('\n');
+        }
+        crate::deploy::short_sha256(&input)
+    }
+
+    /// `yoink-caddy:<hash>` — the local tag produced by
+    /// `proxy::xcaddy::ensure_xcaddy_image` and consumed by
+    /// `ProxyConfig::resolved_image`.
+    #[must_use]
+    pub fn resolved_local_tag(&self) -> String {
+        format!("yoink-caddy:{}", self.hash())
     }
 }
 

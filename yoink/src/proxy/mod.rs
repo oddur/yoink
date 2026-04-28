@@ -19,6 +19,7 @@
 
 pub mod admin;
 pub mod caddy;
+pub mod xcaddy;
 
 use crate::config::{
     Config, ConfigError, ProxyConfig, ServiceConfig, ServiceKind, ServiceRun, TlsMode,
@@ -68,6 +69,35 @@ pub fn is_proxied(svc: &ServiceConfig) -> bool {
 pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
     if !proxy_enabled(cfg) {
         return Ok(());
+    }
+
+    if let Some(p) = cfg.proxy.as_ref() {
+        if let Some(x) = &p.xcaddy {
+            if p.image.is_some() {
+                return Err(ConfigError::Invalid(
+                    "proxy.image and proxy.xcaddy are mutually exclusive — `image:` is the \
+                     bring-your-own-image escape hatch; `xcaddy:` is the managed-build path. \
+                     Pick one."
+                        .to_string(),
+                ));
+            }
+            if x.plugins.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "proxy.xcaddy.plugins is empty — set at least one plugin or remove the \
+                     `xcaddy:` block to use vanilla `caddy:2`"
+                        .to_string(),
+                ));
+            }
+            for plugin in &x.plugins {
+                if !is_plausible_go_module(plugin) {
+                    return Err(ConfigError::Invalid(format!(
+                        "proxy.xcaddy.plugins entry {plugin:?} doesn't look like a Go module \
+                         path (expected `<host>/<owner>/<repo>` or \
+                         `<host>/<owner>/<repo>@<version>`)"
+                    )));
+                }
+            }
+        }
     }
 
     let proxy_has_inline_cert = cfg.proxy.as_ref().and_then(|p| p.tls.as_ref()).is_some();
@@ -318,6 +348,28 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
     }
 }
 
+/// Cheap shape-check for an xcaddy plugin entry. Accepts
+/// `<host>/<owner>/<repo>(/<sub>)*` optionally followed by `@<version>`.
+/// We don't try to parse Go module semantics here — xcaddy itself will
+/// reject anything truly malformed at build time. The goal is to catch
+/// obvious typos at config-load.
+fn is_plausible_go_module(s: &str) -> bool {
+    let module_part = s.split_once('@').map_or(s, |(m, _)| m);
+    if module_part.is_empty() || module_part.starts_with('/') || module_part.ends_with('/') {
+        return false;
+    }
+    let segments: Vec<&str> = module_part.split('/').collect();
+    if segments.len() < 3 {
+        return false;
+    }
+    if !segments[0].contains('.') {
+        return false;
+    }
+    segments
+        .iter()
+        .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_graphic() && c != '@'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +463,61 @@ services:
             config_with_one_service(Some(DomainSpec::Single("api.example.com".into())), None);
         let err = inject_implicit_proxy(&mut cfg).unwrap_err();
         assert!(format!("{err}").contains("run.port"), "got: {err}");
+    }
+
+    #[test]
+    fn xcaddy_and_image_mutually_exclusive() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            image: Some("ghcr.io/me/caddy:custom".into()),
+            xcaddy: Some(crate::config::XcaddyConfig {
+                plugins: vec!["github.com/caddy-dns/cloudflare".into()],
+                caddy_version: None,
+                base_image: None,
+                builder_image: None,
+            }),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(
+            format!("{err}").contains("mutually exclusive"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn xcaddy_empty_plugins_rejected() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            xcaddy: Some(crate::config::XcaddyConfig {
+                plugins: vec![],
+                caddy_version: None,
+                base_image: None,
+                builder_image: None,
+            }),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(format!("{err}").contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn xcaddy_plugin_shape_validation() {
+        assert!(is_plausible_go_module("github.com/caddy-dns/cloudflare"));
+        assert!(is_plausible_go_module("github.com/foo/bar@v1.2.3"));
+        assert!(is_plausible_go_module("git.example.org/owner/repo/sub"));
+        assert!(!is_plausible_go_module("not-a-module"));
+        assert!(!is_plausible_go_module("github.com/foo"));
+        assert!(!is_plausible_go_module("/leading/slash/repo"));
+        assert!(!is_plausible_go_module("nopath/in/firstseg"));
     }
 
     #[test]

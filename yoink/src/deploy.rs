@@ -205,7 +205,7 @@ pub fn build_labels(
     labels
 }
 
-fn short_sha256(s: &str) -> String {
+pub(crate) fn short_sha256(s: &str) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write;
     let mut h = Sha256::new();
@@ -1259,6 +1259,38 @@ pub async fn prefetch_images(
 ) -> Result<(), DeployError> {
     let credentials = registry_credentials(config, secrets);
 
+    // When `proxy.xcaddy:` is set the proxy image is built on each host
+    // (no registry pull is possible), so fan out the build across proxy
+    // hosts before the regular pull loop. Idempotent — `image_present`
+    // short-circuits subsequent runs once the tag is in the host cache.
+    if let Some(proxy_cfg) = config.proxy.as_ref()
+        && let Some(xcaddy_cfg) = proxy_cfg.xcaddy.as_ref()
+    {
+        let proxy_service = config
+            .services
+            .iter()
+            .find(|s| s.name == crate::proxy::PROXY_SERVICE_NAME);
+        if let Some(svc) = proxy_service {
+            let mut build_futs = Vec::new();
+            for host_cfg in svc.applicable_hosts(&config.hosts) {
+                let host = Host::from(host_cfg);
+                let ops = ops.clone();
+                let xcaddy_cfg = xcaddy_cfg.clone();
+                build_futs.push(async move {
+                    crate::proxy::xcaddy::ensure_xcaddy_image(&*ops, &host, &xcaddy_cfg)
+                        .await
+                        .map_err(|source| DeployError::Docker {
+                            host: host.address.clone(),
+                            source,
+                        })
+                });
+            }
+            for r in futures_util::future::join_all(build_futs).await {
+                r?;
+            }
+        }
+    }
+
     let mut futs = Vec::new();
     for service in &config.services {
         if let Some(filter) = services_filter
@@ -1272,6 +1304,14 @@ pub async fn prefetch_images(
         // Skip — the reconcile step's `image_present` check will pass
         // because the unregistry push already landed it on the host.
         if skip_locally_built && service.build.is_some() {
+            continue;
+        }
+        // Likewise the xcaddy-built proxy image only exists locally on
+        // each host; pulling it from a registry would 404. The build
+        // fan-out above has already produced the image.
+        if service.name == crate::proxy::PROXY_SERVICE_NAME
+            && config.proxy.as_ref().is_some_and(|p| p.xcaddy.is_some())
+        {
             continue;
         }
         let tag = match tag_overrides.get(&service.name).cloned() {

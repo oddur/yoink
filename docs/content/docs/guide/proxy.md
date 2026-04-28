@@ -75,10 +75,43 @@ Containers are named in upstream entries (not IPs), so a container restart with 
 |---|---|---|---|
 | `enabled` | bool | implicit when any service has `domain:` | |
 | `email` | string | — | Let's Encrypt registration email. **Required when any service uses `tls: auto`.** Unused when `proxy.tls:` is set. |
-| `image` | string | `caddy:2` | Override to use an [`xcaddy`](https://github.com/caddyserver/xcaddy)-built image with plugins (rate-limit, l4, redis-storage, …). |
+| `image` | string | `caddy:2` | Bring-your-own custom caddy image (registry-pulled). Mutually exclusive with `xcaddy:` — pick one. |
+| `xcaddy` | block (see below) | — | Build a custom caddy on each host using [`xcaddy`](https://github.com/caddyserver/xcaddy). Mutually exclusive with `image:`. |
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. Persisted across proxy restarts. |
 | `bind` | string | — (all interfaces) | Host IP to bind `:80` and `:443` to. Common use: bind to a Tailscale IP so the proxy is reachable only over the tailnet. Admin port stays on `127.0.0.1` regardless. |
 | `tls` | block (see below) | — | Proxy-level TLS — every routed service inherits this cert (and optional mTLS) by default. |
+
+### `proxy.xcaddy:` block — caddy plugins without a registry
+
+Want rate-limit, redis-storage, the L4 module, or a non-bundled DNS provider? Just list them and yoink builds caddy on each host the proxy runs on:
+
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/caddyserver/caddy-l4
+      - github.com/mholt/caddy-ratelimit@v0.1.0      # `module@version` to pin
+      - github.com/caddy-dns/cloudflare
+```
+
+On the next `yoink up`, each proxy host runs a one-shot xcaddy build (multi-stage `caddy:2-builder` → `caddy:2`) and tags the result locally as `yoink-caddy:<hash>`. The proxy service runs from that tag — no registry needed. The hash is content-addressed over the build inputs, so subsequent `yoink up` runs short-circuit (`image_present` skip) until plugins or version change.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `plugins` | list of strings | required (non-empty) | One entry per caddy module. Bare module path or pinned (`module@version`) — same syntax as `xcaddy build --with`. Sorted alphabetically before hashing/rendering so order in the config file doesn't change the tag. |
+| `caddy_version` | string | unset → xcaddy's latest tagged release | Caddy git tag to compile (e.g. `v2.8.4`). Pinned values are passed verbatim to `xcaddy build`, so use the form that's a real git tag in [caddyserver/caddy](https://github.com/caddyserver/caddy/tags). |
+| `base_image` | string | `caddy:2` | Runtime stage of the Dockerfile (final `FROM`). |
+| `builder_image` | string | `caddy:2-builder` | Builder stage (carries xcaddy + Go toolchain). Pin to `caddy:<v>-builder` to also pin the xcaddy CLI version. |
+
+Operational notes:
+
+- **Each host needs egress to `proxy.golang.org`** (xcaddy fetches Go modules during the build). Air-gapped hosts will fail at build time.
+- **First `up` is slow** on each fresh host (~2-5 min for the compile). Subsequent ones are no-ops until plugin set changes.
+- **Plugin rotation leaves stale images.** When you change plugins the new build is tagged `yoink-caddy:<new-hash>` and the old `yoink-caddy:<old-hash>` lingers. Run `docker image prune -a` on the host (or use the TUI's image-prune gesture) to reclaim. Stale builds are labelled `yoink.caddy.xcaddy_hash=...` for human inspection.
+- **Caddyfile snippets and plugin directives don't mix.** `caddy_extra_caddyfile:` adapts via the bundled `caddy:2` adapter on the operator's machine, which doesn't know plugin-provided directives like `rate_limit { ... }`. If your snippet uses one, write it as `caddy_extra_json:` instead. See [recipes/caddy-snippets](../recipes/caddy-snippets).
+- **`yoink validate` skips the docker-spawn check** when `xcaddy:` is set (the image only exists on hosts). The pure rendering path still runs and surfaces schema errors; Caddy refuses bad configs at `/load` time on the host.
+- **Debug:** `yoink proxy-dockerfile` prints the synthesized two-stage Dockerfile without running docker. Useful for code review or pinning a Dockerfile in CI.
 
 ### `proxy.tls:` block
 

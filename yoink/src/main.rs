@@ -577,6 +577,11 @@ enum Command {
     /// (uses service-name fallbacks) so this works without a host
     /// connection.
     ProxyRender,
+    /// Print the synthesized xcaddy Dockerfile for the current
+    /// `proxy.xcaddy:` config. No docker calls; useful for code review,
+    /// testing the build locally with `docker build -`, or pinning a
+    /// specific Dockerfile in CI.
+    ProxyDockerfile,
     /// Inspect or release the per-host deploy lock.
     ///
     /// Each `yoink up` acquires a sentinel container as a deploy lock so
@@ -1124,6 +1129,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
         Command::Doctor { json } => cmd_doctor(&config, json).await,
         Command::ProxyRender => cmd_proxy_render(&config).await,
+        Command::ProxyDockerfile => cmd_proxy_dockerfile(&config),
         Command::Lock { action } => cmd_lock(&config, action).await,
         Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
         Command::Completions { shell } => {
@@ -3188,6 +3194,20 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
         return Ok(());
     }
 
+    // With `proxy.xcaddy:` the proxy image is built per-host as
+    // `yoink-caddy:<hash>` and doesn't exist on the operator's machine,
+    // so spawning `docker run yoink-caddy:<hash>` here would 404. Skip
+    // — the rendered config still ran through `proxy::caddy::render`
+    // above (catches schema errors), and Caddy refuses bad configs at
+    // `/load` time on the host anyway.
+    if config.proxy.as_ref().is_some_and(|p| p.xcaddy.is_some()) {
+        eprintln!(
+            "  (skipping Caddy schema check — proxy.xcaddy is set; the proxy image only \
+             exists on hosts. Caddy will reject any bad config at /load time.)"
+        );
+        return Ok(());
+    }
+
     let image = config.proxy.as_ref().map_or_else(
         || "caddy:2".to_string(),
         yoink::config::ProxyConfig::resolved_image,
@@ -3246,6 +3266,22 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
         };
         anyhow::bail!("Caddy rejected the rendered config:\n{stderr}{hint}");
     }
+}
+
+fn cmd_proxy_dockerfile(config: &Config) -> Result<()> {
+    let xcaddy = config
+        .proxy
+        .as_ref()
+        .and_then(|p| p.xcaddy.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "proxy.xcaddy is not set — there's no Dockerfile to render. Add a \
+                 `proxy.xcaddy.plugins:` block first."
+            )
+        })?;
+    let dockerfile = yoink::proxy::xcaddy::render_dockerfile(xcaddy);
+    print!("{dockerfile}");
+    Ok(())
 }
 
 async fn cmd_proxy_render(config: &Config) -> Result<()> {

@@ -13,6 +13,19 @@ hosts:
   - address: host-a
     user: deploy
 
+# Uncomment to compile a custom caddy on each proxy host with extra
+# modules baked in — rate-limit, l4, redis-storage, third-party DNS
+# providers. No registry needed: each host runs xcaddy in a builder
+# container and tags the result locally. See docs/guide/proxy.md.
+#
+# proxy:
+#   email: ops@example.com
+#   xcaddy:
+#     plugins:
+#       - github.com/caddyserver/caddy-l4
+#       - github.com/mholt/caddy-ratelimit@v0.1.0
+#       - github.com/caddy-dns/cloudflare
+
 secrets:
   # Default: a sealed `secrets.age` file in the repo, decrypted at
   # deploy time with one age identity sourced from

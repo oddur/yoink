@@ -603,6 +603,22 @@ pub trait DockerOps: Send + Sync {
     async fn image_present(&self, host: &Host, image: &str, tag: &str)
     -> Result<bool, DockerError>;
 
+    /// Build an image on `host` from an in-memory tar context (a
+    /// Dockerfile + any files it `COPY`s). Tag is what the resulting
+    /// image is reachable as locally — e.g. `yoink-caddy:abc123`. The
+    /// underlying call is bollard `POST /build` over the same
+    /// SSH-tunnelled connection used by `pull_image`. Default impl
+    /// errors so test fakes that don't need it stay terse.
+    async fn build_image(
+        &self,
+        _host: &Host,
+        _tag: &str,
+        _context_tar: bytes::Bytes,
+        _build_args: BTreeMap<String, String>,
+    ) -> Result<(), DockerError> {
+        Err(DockerError::Invalid("build_image not supported".into()))
+    }
+
     async fn list_containers_by_label(
         &self,
         host: &Host,
@@ -1305,6 +1321,46 @@ impl DockerOps for RealDockerOps {
         // "Loaded image: ..." status messages.
         while let Some(item) = stream.next().await {
             item.map_err(|s| Self::err(host, s))?;
+        }
+        Ok(())
+    }
+
+    async fn build_image(
+        &self,
+        host: &Host,
+        tag: &str,
+        context_tar: bytes::Bytes,
+        build_args: BTreeMap<String, String>,
+    ) -> Result<(), DockerError> {
+        use bollard::query_parameters::BuildImageOptionsBuilder;
+        let docker = self.client_for(host).await?;
+        let buildargs: HashMap<String, String> = build_args.into_iter().collect();
+        let opts = BuildImageOptionsBuilder::default()
+            .dockerfile("Dockerfile")
+            .t(tag)
+            .rm(true)
+            .buildargs(&buildargs)
+            .build();
+        let mut stream = docker.build_image(opts, None, Some(bollard::body_full(context_tar)));
+        // Drain progress; bollard surfaces stream-level errors (including
+        // `errorDetail` chunks from the daemon) as `Err(_)` so we just
+        // propagate the first one. Stdout chunks are forwarded to tracing
+        // so an operator running with RUST_LOG=info sees the build log.
+        while let Some(item) = stream.next().await {
+            let info = item.map_err(|s| Self::err(host, s))?;
+            if let Some(line) = info.stream.as_ref().filter(|s| !s.trim().is_empty()) {
+                tracing::info!(host = %host.address, %tag, build = %line.trim_end(), "build");
+            }
+            if let Some(detail) = info.error_detail.as_ref() {
+                let msg = detail
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "build failed".into());
+                return Err(DockerError::Invalid(format!(
+                    "build_image {tag} on {}: {msg}",
+                    host.address
+                )));
+            }
         }
         Ok(())
     }
@@ -2309,6 +2365,11 @@ struct FakeState {
     ensure_network: VecDeque<Result<bool, DockerError>>,
     pull_image: VecDeque<Result<(), DockerError>>,
     load_image: VecDeque<Result<(), DockerError>>,
+    build_image: VecDeque<Result<(), DockerError>>,
+    /// `image:tag` → presence flag. Defaults `false` so existing tests
+    /// (which expect pulls to actually fire) keep working. After a
+    /// successful `build_image` the entry is upserted to `true`.
+    images_present: HashMap<String, bool>,
     list_containers: VecDeque<Result<Vec<ContainerInfo>, DockerError>>,
     create_container: VecDeque<Result<String, DockerError>>,
     start_container: VecDeque<Result<(), DockerError>>,
@@ -2332,6 +2393,7 @@ pub enum RecordedCall {
     EnsureNetwork(Host, String),
     PullImage(Host, String, String),
     LoadImage(Host),
+    BuildImage(Host, String, bytes::Bytes),
     ListContainersByLabel(Host, String),
     ListRunningContainers(Host),
     CreateContainer(Host, String),
@@ -2371,6 +2433,15 @@ impl FakeDockerOps {
     }
     pub fn push_pull_image(&self, v: Result<(), DockerError>) {
         self.lock().pull_image.push_back(v);
+    }
+    pub fn push_build_image(&self, v: Result<(), DockerError>) {
+        self.lock().build_image.push_back(v);
+    }
+    /// Mark `image:tag` as already present so `image_present` returns
+    /// `true` and the caller skips its pull/build.
+    pub fn mark_image_present(&self, image: &str, tag: &str) {
+        let key = crate::docker::image_reference(image, tag);
+        self.lock().images_present.insert(key, true);
     }
     pub fn push_list_containers(&self, v: Result<Vec<ContainerInfo>, DockerError>) {
         self.lock().list_containers.push_back(v);
@@ -2491,17 +2562,37 @@ impl DockerOps for FakeDockerOps {
     async fn image_present(
         &self,
         _host: &Host,
-        _image: &str,
-        _tag: &str,
+        image: &str,
+        tag: &str,
     ) -> Result<bool, DockerError> {
-        // Tests want pulls to actually fire by default; presence-check
-        // returning false keeps existing test expectations intact.
-        Ok(false)
+        let key = crate::docker::image_reference(image, tag);
+        Ok(*self.lock().images_present.get(&key).unwrap_or(&false))
     }
     async fn load_image(&self, host: &Host, _body: ImageTarStream) -> Result<(), DockerError> {
         let mut s = self.lock();
         s.calls.push(RecordedCall::LoadImage(host.clone()));
         pop(&mut s.load_image, "load_image")
+    }
+    async fn build_image(
+        &self,
+        host: &Host,
+        tag: &str,
+        context_tar: bytes::Bytes,
+        _build_args: BTreeMap<String, String>,
+    ) -> Result<(), DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::BuildImage(
+            host.clone(),
+            tag.into(),
+            context_tar,
+        ));
+        let result = pop(&mut s.build_image, "build_image");
+        if result.is_ok() {
+            // Successful build leaves the image present for subsequent
+            // `image_present` checks — mirrors real docker behavior.
+            s.images_present.insert(tag.into(), true);
+        }
+        result
     }
     async fn list_containers_by_label(
         &self,

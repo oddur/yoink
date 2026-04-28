@@ -23,26 +23,17 @@ The single Redis is a small SPOF, but a tractable one (it's only used for cert i
 
 ## Build a custom Caddy image with the storage plugin
 
-`caddy-storage-redis` isn't in the base `caddy:2` image. Build one with [`xcaddy`](https://github.com/caddyserver/xcaddy):
+`caddy-storage-redis` isn't in the base `caddy:2` image. Use yoink's `proxy.xcaddy:` block — it builds caddy on each proxy host with the plugin baked in (no registry needed):
 
-```dockerfile
-# Dockerfile.caddy-redis
-FROM caddy:2-builder AS builder
-RUN xcaddy build \
-    --with github.com/pberkel/caddy-storage-redis
-
-FROM caddy:2
-COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/pberkel/caddy-storage-redis
 ```
 
-```sh
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -f Dockerfile.caddy-redis \
-  -t ghcr.io/me/caddy-redis:2.7 \
-  --push .
-```
-
-(Or use `yoink build` against a service that wraps this Dockerfile, then `proxy.image:` it.)
+That's it. On the next `yoink up`, every proxy host runs a one-shot xcaddy build (multi-stage `caddy:2-builder` → `caddy:2`) and tags the result locally. Subsequent runs short-circuit until you change the plugin set. See the [proxy guide](../guide/proxy#proxyxcaddy-block--caddy-plugins-without-a-registry) for the full block.
 
 ## Run Redis as a yoink service
 
