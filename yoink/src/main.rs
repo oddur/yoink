@@ -462,6 +462,17 @@ enum Command {
         #[arg(long)]
         check_hosts: bool,
     },
+    /// Diagnose common deploy-blockers before running `yoink up`.
+    /// Checks every host is reachable, docker arches align (laptop vs
+    /// host for any service with a `build:` block), age identity is
+    /// loadable, DNS resolves for `domain:`-tagged services, and
+    /// flags configurations that would fail mid-deploy.
+    Doctor {
+        /// Output as JSON instead of the default human-readable list.
+        /// Each entry: `{severity, category, title, detail, fix}`.
+        #[arg(long)]
+        json: bool,
+    },
     /// Render the Caddy admin-API JSON yoink would push for the
     /// current config. Read-only; useful for inspecting the proxy
     /// config or piping into `caddy adapt` / a debug Caddy's `/load`
@@ -872,6 +883,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Volumes { host } => cmd_volumes(&config, host.as_deref()).await,
         Command::Dump { log_tail } => cmd_dump(&config, log_tail).await,
         Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
+        Command::Doctor { json } => cmd_doctor(&config, json).await,
         Command::ProxyRender => cmd_proxy_render(&config).await,
         Command::Lock { action } => cmd_lock(&config, action).await,
         Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
@@ -2643,6 +2655,73 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
     }
     if check_hosts {
         cmd_preflight(config).await?;
+    }
+    Ok(())
+}
+
+async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
+    use yoink::doctor::{run_doctor, Severity};
+
+    let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
+        std::sync::Arc::new(build_real_ops(config, None).await?);
+    let findings = run_doctor(config, ops).await;
+
+    if json {
+        let payload: Vec<serde_json::Value> = findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "severity": match f.severity {
+                        Severity::Pass => "pass",
+                        Severity::Warn => "warn",
+                        Severity::Error => "error",
+                    },
+                    "category": f.category,
+                    "title": f.title,
+                    "detail": f.detail,
+                    "fix": f.fix,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        for f in &findings {
+            let icon = match f.severity {
+                Severity::Pass => "✓",
+                Severity::Warn => "!",
+                Severity::Error => "✗",
+            };
+            eprintln!("{icon} [{}] {}", f.category, f.title);
+            if let Some(d) = &f.detail {
+                for line in d.lines() {
+                    eprintln!("    {line}");
+                }
+            }
+            if let Some(fix) = &f.fix {
+                eprintln!("    fix: {fix}");
+            }
+        }
+        eprintln!();
+        let pass = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Pass)
+            .count();
+        let warn = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Warn)
+            .count();
+        let err = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Error)
+            .count();
+        eprintln!("summary: {pass} pass, {warn} warn, {err} error");
+    }
+
+    let any_error = findings
+        .iter()
+        .any(|f| f.severity == Severity::Error);
+    if any_error {
+        anyhow::bail!("doctor found blocking issues");
     }
     Ok(())
 }

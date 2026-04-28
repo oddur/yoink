@@ -5,6 +5,7 @@ pub mod deploy;
 pub mod diff;
 pub mod docker;
 pub mod docker_ops;
+pub mod doctor;
 pub mod files;
 pub mod git;
 pub mod healthcheck;

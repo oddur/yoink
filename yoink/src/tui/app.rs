@@ -161,6 +161,7 @@ impl View {
             "  q / Ctrl-C    quit yoink",
             "  d h s l       dashboard / hosts / services / logs",
             "  R e           resources / encrypted-secrets",
+            "  D             doctor — diagnose deploy-blockers",
             "  E             edit config in $EDITOR (jumps to focused service/host)",
             "  ~             show drift detail for the focused service",
             "  Tab / S-Tab   cycle modes forward / backward",
@@ -410,6 +411,11 @@ enum Update {
         service: String,
         result: super::drift::DriftRefresh,
     },
+    /// Result of a doctor modal load — the full set of findings from
+    /// `crate::doctor::run_doctor`. `Err` carries a single message
+    /// when the run itself failed (vs returning an Error-severity
+    /// finding, which is normal output).
+    Doctor(Result<Vec<crate::doctor::Finding>, String>),
     /// Batch of `(host_address, container_name, stats)` samples produced
     /// by the always-on background stats poller. Each sample is folded
     /// into the per-container `StatsHistory` so that opening a
@@ -778,6 +784,10 @@ pub struct App {
     /// `Update::Drift`; the modal is rendered on top of whatever
     /// view was active.
     drift: super::drift::DriftState,
+    /// Doctor modal — same overlay shape as drift. Opens with `D`,
+    /// runs `crate::doctor::run_doctor` async, lands findings via
+    /// `Update::Doctor`. `r` rerun; Esc closes.
+    doctor: super::doctor::DoctorState,
     /// `Some((service, tag))` while a reconcile-confirmation modal
     /// is open. `y` / Enter confirms; anything else cancels.
     reconcile_target: Option<(String, String)>,
@@ -914,6 +924,7 @@ impl App {
             shown_errors: std::collections::HashSet::new(),
             kill_target: None,
             drift: super::drift::DriftState::default(),
+            doctor: super::doctor::DoctorState::default(),
             reconcile_target: None,
             prune_target: false,
             reconcile_all_target: false,
@@ -1545,6 +1556,31 @@ impl App {
             return false;
         }
 
+        // Doctor modal: capture keys while open so the underlying view
+        // doesn't see them. Esc closes; r reruns; ↑↓ navigates the
+        // findings list.
+        if self.doctor.is_open() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.doctor.close();
+                    return false;
+                }
+                KeyCode::Char('r') => {
+                    self.open_doctor();
+                    return false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.doctor.select_prev();
+                    return false;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.doctor.select_next();
+                    return false;
+                }
+                _ => return false, // swallow everything else while open
+            }
+        }
+
         // Kill-confirmation modal: `y` / Enter confirms, anything else
         // dismisses. Captured before view-specific keys so a stray `j`
         // can't both dismiss and select-next.
@@ -1737,6 +1773,12 @@ impl App {
                 // already used for refresh; the per-view handler can
                 // map capital R to other things if needed).
                 self.transition(View::Resources).await;
+                return false;
+            }
+            // Capital `D` opens the doctor modal — runs the same checks
+            // `yoink doctor` does, on top of the current view.
+            KeyCode::Char('D') => {
+                self.open_doctor();
                 return false;
             }
             // Capital `E` jumps into `$EDITOR` at the focused service /
@@ -2800,7 +2842,26 @@ impl App {
             } => {
                 self.drift.apply(&host, &service, result);
             }
+            Update::Doctor(result) => match result {
+                Ok(findings) => self.doctor.store(findings),
+                Err(msg) => self.doctor.fail(msg),
+            },
         }
+    }
+
+    /// Open the doctor modal and spawn the check-runner. Findings
+    /// land via `Update::Doctor`; the modal renders Loading until
+    /// they arrive. Idempotent — re-pressing `D` (or `r` while
+    /// open) just kicks off another run.
+    fn open_doctor(&mut self) {
+        self.doctor.mark_loading();
+        let ops = self.ops.clone();
+        let config = self.config.clone();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let findings = crate::doctor::run_doctor(&config, ops).await;
+            let _ = tx.send(Update::Doctor(Ok(findings)));
+        });
     }
 
     /// Open the drift modal for `(host, service)` and spawn the
@@ -3331,6 +3392,10 @@ impl App {
 
         if self.drift.is_visible() {
             super::drift::render_modal(frame, &self.drift, &self.throbber_state);
+        }
+
+        if self.doctor.is_open() {
+            super::doctor::render(frame, frame.area(), &mut self.doctor);
         }
 
         // Render last so it sits on top of everything else when a

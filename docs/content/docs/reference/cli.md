@@ -112,6 +112,10 @@ yoink top                                htop-style CPU/mem snapshot per running
 yoink version <SERVICE>                  print currently-running tag(s) per replica
 
 yoink validate                           lint the config; optionally ping each docker daemon
+yoink doctor                             diagnose deploy-blockers (host reachability, age
+                                         identity, DNS for `domain:` services, arch alignment,
+                                         common config friction). Exits non-zero on Errors.
+  --json                                 output as JSON for piping / agent consumption
 yoink lock                               inspect / release the per-host deploy lock (useful
                                          after a crashed deploy left a sentinel container)
 yoink completions <shell>                generate shell completions (bash/zsh/fish/...)

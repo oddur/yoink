@@ -5,6 +5,7 @@ mod app;
 mod chrome;
 mod container_detail;
 mod dashboard;
+mod doctor;
 mod drift;
 mod editor;
 mod history;
