@@ -101,7 +101,7 @@ pub fn cmd_init(opts: InitOpts) -> Result<()> {
     })?;
 
     crate::sealed::write_atomically(&yaml_path, yaml.as_bytes())
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", yaml_path.display()))?;
+        .with_context(|| format!("write yoink config to {}", yaml_path.display()))?;
 
     print_summary(&plan, &yaml_path, yaml.lines().count());
     if let Some(b) = &bootstrap {

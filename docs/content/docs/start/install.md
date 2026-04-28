@@ -60,7 +60,7 @@ yoink --version
 Yoink doesn't bootstrap docker; it expects:
 
 - **Docker on the host(s)** — installed, running, and the deploy user is in the `docker` group
-- **SSH access from the operator's machine to each host** — yoink uses `ssh://user@host` via bollard's SSH transport, no docker socket exposed over TCP
+- **SSH access from the operator's machine to each host** — yoink uses `ssh://user@host` to reach the docker daemon, no docker socket exposed over TCP
 - **For local-build workflows**: docker on the operator's machine too (`yoink build` shells out to `docker build`)
 
 [Tailscale](https://tailscale.com) pairs especially cleanly with the SSH transport — see [Pairing](/docs/guide/pairing).

@@ -170,7 +170,7 @@ yoink secrets rotate                     generate a new keypair and re-seal unde
                                          prints the new identity for pasting into
                                          your CI / secret manager
 
-yoink tui                                interactive ratatui dashboard (see TUI page)
+yoink tui                                interactive terminal dashboard (see TUI page)
 ```
 
 ## Resolving tags

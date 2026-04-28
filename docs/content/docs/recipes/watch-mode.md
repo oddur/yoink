@@ -57,7 +57,7 @@ yoink up --watch --build --no-registry         # ok, ship it on every save
 
 Polling means up to 2 s of latency between save and reconcile. For an editor flow that's typically below the threshold of "did I actually save?" — but if you're chaining `yoink up --watch` into a tighter feedback loop (test runner, screen recorder), be aware of the floor.
 
-The reconcile itself is cheap when nothing changed: `compute_spec_hash` short-circuits the no-op path before any image pull or container swap. So the cost of a fired but no-op reconcile is one round-trip per host.
+The reconcile itself is cheap when nothing changed: yoink computes a `yoink.spec_hash` from the desired spec and short-circuits when the running container's label already matches. So the cost of a fired but no-op reconcile is one round-trip per host.
 
 ## See also
 

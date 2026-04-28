@@ -95,7 +95,7 @@ For each host:
 
 The push runs entirely from the operator process — yoink never invokes `docker push` on the operator's daemon. This matters on macOS Docker Desktop (and Rancher Desktop / Colima): the daemon lives in a Linux VM, so a `docker push 127.0.0.1:<port>/...` from the daemon would hit the VM's loopback, not the operator's. By pushing from the operator process directly, yoink works on every platform without `insecure-registries` config.
 
-Concurrency: blob pushes per image run with a small parallelism (4) to overlap HEAD round-trips with PUT bodies. Multi-host fan-out across services is fully concurrent (`try_join_all` per image), so deploy time = max(per-host) instead of sum(per-host).
+Multi-host fan-out across services is fully concurrent, so deploy time = max(per-host) instead of sum(per-host).
 
 ```
 ✓ api:dev → host-1     done · unregistry
@@ -111,7 +111,7 @@ If the unregistry setup fails for any reason (host can't pull the unregistry ima
 yoink up --build --no-registry --transport tarball
 ```
 
-For each (service, host), streams `docker save <image>:<tag>` from the operator's local docker daemon directly into the host's docker daemon via the same ssh+bollard transport that `up` already uses (calling `POST /images/load`). The whole image crosses the wire every deploy — no dedup. Slower than unregistry on redeploy, but has zero dependencies on the host beyond docker. Useful when you can't pull the unregistry image (truly air-gapped hosts) or when you want to debug a transport issue.
+For each (service, host), streams `docker save <image>:<tag>` from the operator's local docker daemon directly into the host's docker daemon via the same SSH-tunnelled Docker API connection that `up` already uses (calling `POST /images/load`). The whole image crosses the wire every deploy — no dedup. Slower than unregistry on redeploy, but has zero dependencies on the host beyond docker. Useful when you can't pull the unregistry image (truly air-gapped hosts) or when you want to debug a transport issue.
 
 Per-host progress bars track bytes transferred + rate live in tarball mode:
 

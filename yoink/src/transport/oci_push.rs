@@ -28,11 +28,17 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use thiserror::Error;
+
+/// Per-request timeout for blob uploads. 120s comfortably covers a
+/// large layer over a slow link; lower values trip on multi-hundred-MB
+/// language-runtime layers.
+const PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How many blob uploads run concurrently against unregistry. Each
 /// connection is an SSH tunnel multiplex stream — modest concurrency
@@ -100,7 +106,7 @@ pub async fn push_image(
     let manifest: OciManifest = serde_json::from_slice(&manifest_blob)?;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(PUSH_REQUEST_TIMEOUT)
         .build()
         .expect("reqwest client builder with default config");
 

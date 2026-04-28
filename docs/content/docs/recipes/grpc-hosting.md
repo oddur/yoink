@@ -18,21 +18,9 @@ services:
 
 That's the whole opt-in. `yoink up`, point your gRPC client at `api.example.com:443`, done.
 
-## How it works
+> **Behind Cloudflare?** Cloudflare doesn't proxy gRPC by default. In the dashboard, go to **Network → gRPC** and toggle it on for the zone — without this, Cloudflare returns HTTP/2 connection errors regardless of how Caddy is configured. After enabling, regular CDN features (caching, WAF) still apply; Cloudflare just speaks h2 end-to-end.
 
-Without `upstream_h2c:`, Caddy talks to the backend over HTTP/1.1. gRPC clients (which use HTTP/2 framing) send requests Caddy can't proxy correctly — you'll see `INTERNAL` errors or empty responses.
-
-`upstream_h2c: true` renders an HTTP/2-cleartext transport on the auto-generated `reverse_proxy` handler:
-
-```json
-{
-  "handler": "reverse_proxy",
-  "transport": {"protocol": "http", "versions": ["h2c"]},
-  "upstreams": [{"dial": "api:50051"}]
-}
-```
-
-Caddy's TLS termination on the public side stays HTTP/2 (h2 with ALPN). The h2c is purely how Caddy talks to your container on the internal docker network.
+Without `upstream_h2c:`, Caddy talks to the backend over HTTP/1.1, which gRPC clients can't use — you'll see `INTERNAL` errors or empty responses. With it, the proxy speaks HTTP/2 cleartext (h2c) on the internal docker network; the public side stays TLS-terminated HTTP/2.
 
 ## Mixed gRPC + HTTP/1.1 backends
 

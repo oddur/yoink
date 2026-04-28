@@ -34,27 +34,29 @@ yoink tui --config yoink.staging.yaml      # TUI scoped to staging containers
 
 The TUI's drift detection, `prune`, and reconcile are all scoped to whatever `--config` references — `yoink prune --config staging.yaml` won't touch prod containers because their `yoink.service` labels don't match anything declared in the staging config.
 
-## Public surface (caddy-docker-proxy)
+## Public surface (bundled Caddy)
 
-The reverse proxy is the one shared piece of infra: caddy serves both envs from the same `:443` listener. Routing is by hostname:
-
-- `api.example.com` → containers labeled with that hostname (the prod api)
-- `staging-api.example.com` → containers labeled with the staging hostname (the staging api)
-
-Use the host network alias to keep it clean:
+The reverse proxy is the one shared piece of infra: yoink's bundled Caddy fronts both envs from the same `:443` listener. Routing is by hostname — set `domain:` on each service:
 
 ```yaml
+# services/prod/api.yaml
+- name: api
+  image: ghcr.io/you/api
+  domain: api.example.com              # → prod api
+  run:
+    port: 8080
+    network_aliases: [api]
+
 # services/staging/api.yaml
 - name: api-staging
   image: ghcr.io/you/api
-  labels:
-    caddy: staging-api.example.com
-    caddy.reverse_proxy: "{{upstreams 8080}}"
+  domain: staging-api.example.com      # → staging api
   run:
-    network_aliases: [api-staging]    # different alias from prod's `api`
+    port: 8080
+    network_aliases: [api-staging]     # different alias from prod's `api`
 ```
 
-caddy-docker-proxy picks both up and routes by `Host:` header. No collision.
+Each `yoink up` re-pushes the routing config via Caddy's admin API; both hostnames coexist on the same listener with no collision.
 
 ## Stateful accessories (redis, postgres, etc.)
 

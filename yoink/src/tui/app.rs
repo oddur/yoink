@@ -197,7 +197,7 @@ impl View {
                 "  enter        live logs",
                 "  i            container detail (labels, env, live cpu/mem)",
                 "  !            shell into container (bash/sh)",
-                "  D            debug sidecar (alpine, target's pid+net ns)",
+                "  B            debug sidecar (alpine, target's pid+net ns)",
                 "  S            start · X stop · R restart container",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
@@ -211,7 +211,7 @@ impl View {
             View::ContainerDetail { .. } => vec![
                 "container detail",
                 "  enter / l    live logs",
-                "  !            shell · D debug sidecar",
+                "  !            shell · B debug sidecar",
                 "  S            start · X stop · R restart container",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
@@ -236,7 +236,7 @@ impl View {
                 "  ↑↓ / j k     select replica",
                 "  enter        live logs",
                 "  i            container detail",
-                "  !            shell · D debug sidecar",
+                "  !            shell · B debug sidecar",
                 "  H            deploy history (with rollback)",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
@@ -261,7 +261,7 @@ impl View {
                 "container logs",
                 "  /            filter substring",
                 "  ↑↓ / PgUp PgDn  scroll · g top · G bottom",
-                "  !            shell · D debug sidecar",
+                "  !            shell · B debug sidecar",
                 "  y            yank visible buffer to system clipboard",
                 "  k            clear · esc back",
             ],
@@ -566,14 +566,17 @@ pub async fn run(
 ) -> Result<()> {
     let hl_disabled = std::env::var_os("YOINK_NO_HL").is_some();
     let hl_available = !hl_disabled && probe_hl().await;
-    if hl_disabled {
-        tracing::info!("YOINK_NO_HL set; skipping hl pipeline");
-    } else if hl_available {
-        tracing::info!("hl detected on PATH; piping log streams through it");
-    } else {
-        tracing::info!("hl not on PATH; using raw log forwarder");
-    }
-    let mut terminal = setup_terminal(mouse).context("setup terminal")?;
+    tracing::info!(
+        hl_disabled,
+        hl_available,
+        "log forwarder pipeline initialized"
+    );
+    let mut terminal = setup_terminal(mouse).with_context(|| {
+        format!(
+            "initialize TUI (TERM={})",
+            std::env::var("TERM").unwrap_or_else(|_| "<unset>".into())
+        )
+    })?;
     // Restore the terminal on panic before chaining to the previous
     // hook — without this a panic in render unwinds past
     // `restore_terminal` and leaves the operator stuck in raw+alt mode.
@@ -2010,7 +2013,7 @@ impl App {
                         .await;
                     }
                 }
-                KeyCode::Char('D') => {
+                KeyCode::Char('B') => {
                     if let (Some(host), Some(container)) = (
                         self.host_detail.host().cloned(),
                         self.host_detail.selected_container(),
@@ -2128,7 +2131,7 @@ impl App {
                     })
                     .await;
                 }
-                KeyCode::Char('D') => {
+                KeyCode::Char('B') => {
                     let host = host.clone();
                     let container = container.clone();
                     self.transition(View::ContainerShell {
@@ -2156,7 +2159,7 @@ impl App {
                     })
                     .await;
                 }
-                KeyCode::Char('D') => {
+                KeyCode::Char('B') => {
                     let host = host.clone();
                     let container = container.clone();
                     self.transition(View::ContainerShell {
@@ -2248,7 +2251,7 @@ impl App {
                         .await;
                     }
                 }
-                KeyCode::Char('D') => {
+                KeyCode::Char('B') => {
                     if let Some(row) = self.service_detail.selected_row() {
                         self.transition(View::ContainerShell {
                             host: row.host,

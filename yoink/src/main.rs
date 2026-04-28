@@ -1259,7 +1259,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
 
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)] // single linear up-once flow; splitting fragments the build → push → reconcile sequence
 async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Result<()> {
     use yoink::docker_ops::Host;
     use yoink::lock::HostLock;

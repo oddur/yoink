@@ -65,6 +65,11 @@ const SIDECAR_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// nothing fronts the public internet even briefly.
 pub const SIDECAR_DIAL_HOST: &str = "127.0.0.1";
 
+/// Backoff between sidecar / tunnel cleanup retries. Matches the
+/// admin-API readiness backoff so cancellation latency is uniform
+/// across yoink's network paths.
+const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
 /// Operator-visible URL scheme override. `Auto` runs the
 /// port-number heuristic (`default_scheme`); `Http`/`Https` force
 /// the obvious wrapper; `Tcp`/`None` print bare `localhost:N` and
@@ -475,7 +480,7 @@ impl SidecarHandle {
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
                     }
                 }
             }
@@ -661,7 +666,7 @@ async fn wait_for_host_port(
                 timeout,
             });
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
     }
 }
 

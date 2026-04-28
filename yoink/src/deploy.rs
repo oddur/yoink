@@ -271,7 +271,7 @@ pub fn build_env(
 /// Reconcile every service in the config to the spec. Top-level entry
 /// point for `yoink up`. `tag_overrides` lets the CLI override the tag
 /// for specific services (`yoink up --service api --tag a1b2c3d`).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)] // single linear reconcile flow; splitting fragments the wave-by-wave data flow
 /// Knobs the operator can flip on a single reconcile invocation. New
 /// fields here should default to "preserve existing behaviour" so that
 /// `reconcile()` (the no-options shim) stays a drop-in.
@@ -308,7 +308,7 @@ pub async fn reconcile(
     .await
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)] // single linear reconcile-with-options flow; same rationale as `reconcile`
 pub async fn reconcile_with_options(
     ops: &dyn DockerOps,
     config: &Config,
@@ -624,7 +624,7 @@ struct HostPrep {
     stop_first: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // every arg is genuine context for the per-host prepare flow
 async fn prepare_one_host(
     ops: &dyn DockerOps,
     config: &Config,
@@ -991,7 +991,7 @@ async fn push_caddy_config(
 /// Resolves `service.run.files` so the spec includes the same
 /// content-hashed bind strings deploy-time uses. The TUI's
 /// dashboard drift column calls this.
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err)] // DeployError carries diagnostic context; boxing each variant adds ceremony without callers benefitting
 pub fn build_desired_spec(
     config: &Config,
     service: &ServiceConfig,
@@ -1087,7 +1087,7 @@ fn docker_healthcheck_for(service: &ServiceConfig) -> Option<bollard::models::He
 /// Parse + content-hash every entry in `service.run.files`. Failure to
 /// read a local file aborts the whole deploy — there's no point
 /// uploading a partial set of mounts.
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err)] // DeployError carries diagnostic context; boxing each variant adds ceremony without callers benefitting
 pub fn resolve_files(
     config: &Config,
     service: &ServiceConfig,
@@ -1342,7 +1342,7 @@ async fn cleanup_prepared_replicas(ops: &dyn DockerOps, prepared: &[HostPrep]) {
 /// `finalize_one_host` later issues the start, after pre-deploy hooks
 /// (e.g. schema migrations) have run — minimizing the window between
 /// migration completion and the runtime container actually serving.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // create-pending threads service + spec + tag + hooks state; each is required context
 async fn create_pending_container(
     ops: &dyn DockerOps,
     host: &Host,

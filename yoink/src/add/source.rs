@@ -28,6 +28,10 @@ const TARBALL_DOWNLOAD_CAP: u64 = 50 * 1024 * 1024;
 /// Cap on cumulative *unpacked* bytes. Defends against gzip bombs:
 /// a 50 MB gzipped payload could expand to many GB.
 const TARBALL_UNPACK_CAP: u64 = 200 * 1024 * 1024;
+/// Per-request timeout for GitHub API + raw.githubusercontent.com fetches.
+/// 30s is enough that a slow link finishes a small tarball download but
+/// short enough that a stalled connection doesn't hang the CLI.
+const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum SourceError {
@@ -170,7 +174,7 @@ fn build_client() -> Result<reqwest::Client> {
 
     reqwest::Client::builder()
         .user_agent(format!("yoink/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(HTTP_REQUEST_TIMEOUT)
         .default_headers(headers)
         .build()
         .context("build http client")

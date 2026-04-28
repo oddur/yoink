@@ -11,7 +11,7 @@ weight: 5
 
 ## Tailscale for SSH (the connectivity layer)
 
-Yoink's transport is `ssh://user@host` via [bollard's SSH transport](https://docs.rs/bollard/), which opens an SSH tunnel and speaks the Docker Engine API over the remote daemon's Unix socket. Pairing this with **Tailscale SSH**:
+Yoink's transport is `ssh://user@host` — it opens an SSH tunnel and speaks the Docker Engine API over the remote daemon's Unix socket. Pairing this with **Tailscale SSH**:
 
 - **Hostnames work everywhere.** MagicDNS gives every host a stable name (`my-server`) reachable from your laptop, CI runner, anywhere on the tailnet. No `ssh_config` to maintain, no jump hosts, no bastion.
 - **Auth without keys.** Tailscale SSH issues short-lived certs based on tailnet membership and ACLs. Onboard a new operator: invite to the tailnet, grant ACL access to the `tag:server` group. Done. Off-board: revoke from tailnet. Their key is gone everywhere, immediately.

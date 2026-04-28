@@ -32,7 +32,7 @@ Single-host PaaS tools are wonderful for "one app, one host" but creak the momen
 - **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI) or — on a laptop — auto-discovered from `~/.config/yoink/keys/<recipient>.key` (where `yoink secrets key generate` saves by default; one identity per project, no env var to set). No remote vault required. For teams that prefer a managed store, `provider: command` shells out to whatever CLI you already use (Doppler, 1Password, Vault, AWS Secrets Manager, the Infisical CLI, …) — no first-party SDK to vendor.
 - **Bundled reverse proxy.** Set `domain:` on a service and yoink's bundled Caddy fronts it with HTTPS — automatic Let's Encrypt or sealed Cloudflare origin certs (with optional origin-pull mTLS). h2c for gRPC, HSTS, compression, multi-host canonical redirects — all one-line opt-ins.
 - **CLI + YAML, no GUI.** The entire control surface is the `yoink` binary plus `yoink.yaml`. No web dashboard to click, no API to script. The same workflow that you run by hand drives CI runners and AI coding agents identically — yoink is happy to be driven by Claude Code, Cursor, or a GitHub Actions job.
-- **k9s-style TUI.** A `ratatui` dashboard with one-key reconcile, prune, kill, shell-into, debug-sidecar, log filter, deploy history with one-press rollback. Keyboard-only.
+- **k9s-style TUI.** A terminal dashboard with one-key reconcile, prune, kill, shell-into, debug-sidecar, log filter, deploy history with one-press rollback. Keyboard-only.
 
 ## Batteries included, extensible at the edges
 

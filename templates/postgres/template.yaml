@@ -9,8 +9,8 @@ variables:
     pattern: "^[a-z][a-z0-9-]*$"
   - name: version
     prompt: Postgres major version
-    default: "16"
-    choices: ["15", "16", "17"]
+    default: "18"
+    choices: ["16", "17", "18"]
   - name: database
     prompt: Default database name
     default: app

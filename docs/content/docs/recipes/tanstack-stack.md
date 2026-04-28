@@ -139,7 +139,7 @@ inferred:
 yoink add postgres
 ```
 
-Generates a fragment in `services/postgres.yaml` (postgres:16-alpine + sealed `POSTGRES_PASSWORD`), seals the password into `secrets.age`, and extends `yoink.yaml`'s `include:` list.
+Generates a fragment in `services/postgres.yaml` (postgres:18-alpine + sealed `POSTGRES_PASSWORD`), seals the password into `secrets.age`, and extends `yoink.yaml`'s `include:` list.
 
 After the add succeeds, yoink prints a **paste-ready connection block** that uses only fields already in the schema (`depends_on:`, `env:`, `env_from_secrets:`):
 
@@ -251,9 +251,33 @@ Five files (`Dockerfile`, `.dockerignore`, `src/lib/db.server.ts`, `src/routes/i
 - All inter-service traffic on a private docker network — nothing exposed publicly yet.
 - Spec-hash drift detection on every container, so a manual `docker exec` in production shows up in `yoink status` next time you check.
 
-For public HTTPS exposure (`domain:` + bundled Caddy + Let's Encrypt), see the dedicated recipe once published.
-
 For the full `yoink up` flag list, see [first deploy](/docs/start/first-deploy) and the [CLI reference](/docs/reference/cli).
+
+## Going public — HTTPS with Let's Encrypt
+
+The recipe above stays internal so you can verify the stack without owning a domain. Once you have one and an A record pointing at the host, swapping `yoink pf` for public HTTPS is a two-line edit:
+
+```yaml
+# yoink.yaml — top-level
+proxy:
+  email: you@example.com           # Let's Encrypt registration / expiry warnings
+
+services:
+  - name: my-app
+    # …everything else stays the same…
+    domain: app.example.com        # ← the new line
+```
+
+`yoink up` notices a `domain:`-tagged service and synthesizes a `yoink-proxy` running `caddy:2` alongside your app. Caddy joins the same docker network, requests a Let's Encrypt cert (HTTP-01 against `app.example.com`), and routes incoming traffic to `my-app:3000` automatically. No `publish:` on the app — only the proxy binds host ports `:80` / `:443`.
+
+Two things to check before deploying:
+
+1. **DNS** — `dig +short A app.example.com` must resolve to the host's public IP. Let's Encrypt validates over HTTP-01; an unpointed record produces self-signed certs and a permanent browser warning.
+2. **`proxy.email:`** — yoink doctor warns when this is the docs placeholder. Use a real address you read; LE expiry warnings go there.
+
+Re-deploy and the app is live at `https://app.example.com`. `yoink doctor` confirms ahead of `yoink up` that the host is reachable, the domain resolves, and the email isn't a placeholder.
+
+For Cloudflare-fronted setups (so you don't need an open `:80` for ACME), see [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs). For multi-host shared ACME storage, see [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage).
 
 ## Multiple projects on one host
 

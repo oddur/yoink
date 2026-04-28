@@ -27,6 +27,19 @@ use crate::transport::tunnel::{SshTunnel, TunnelError};
 
 use super::{ADMIN_PORT, PROXY_SERVICE_NAME};
 
+/// How long the SSH tunnel + Caddy admin readiness probe each get
+/// before giving up. 20s comfortably covers a cold proxy boot on a
+/// laggy host without making transient ssh blips look like real outages.
+const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// HTTP timeout for the actual admin-API push. The push uploads the
+/// rendered Caddy JSON; 60s is plenty for any realistic config.
+const ADMIN_API_TIMEOUT: Duration = Duration::from_secs(60);
+/// HTTP timeout for the readiness probe loop. Short — we expect a
+/// fast no-content response or fast failure.
+const ADMIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Backoff between readiness probes while the proxy is coming up.
+const ADMIN_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
 #[derive(Debug, Error)]
 pub enum AdminError {
     #[error("docker op against {host}: {source}")]
@@ -100,16 +113,16 @@ pub async fn push_config(
         &host.user,
         &host.address,
         host_port,
-        Duration::from_secs(20),
+        TUNNEL_READY_TIMEOUT,
         keyfile.as_deref(),
     )
     .await?;
 
-    wait_until_ready(tunnel.local_port(), Duration::from_secs(20)).await?;
+    wait_until_ready(tunnel.local_port(), TUNNEL_READY_TIMEOUT).await?;
 
     let url = format!("http://127.0.0.1:{}/load", tunnel.local_port());
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(ADMIN_API_TIMEOUT)
         .build()
         .expect("reqwest client builder");
     let resp = client
@@ -162,7 +175,7 @@ fn redact_pem_blocks(body: &str) -> String {
 async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), AdminError> {
     let url = format!("http://127.0.0.1:{local_port}/config/");
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(ADMIN_PROBE_TIMEOUT)
         .build()
         .expect("reqwest client builder");
     let deadline = Instant::now() + timeout;
@@ -173,7 +186,7 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
         if Instant::now() >= deadline {
             return Err(AdminError::NotReady { timeout });
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(ADMIN_POLL_INTERVAL).await;
     }
 }
 

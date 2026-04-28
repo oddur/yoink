@@ -37,7 +37,8 @@ hosts:
 services:
   - name: api
     image: ghcr.io/you/api
-    # no `hosts:` → runs on all three; usually not what you want for stateful peers
+    domain: api.example.com                    # bundled Caddy auto-injects on every host that runs api
+    hosts: [prod-eu-1, prod-eu-2]              # public-facing tier; redis stays internal
     run: { port: 8080, replicas: 2 }
 
   - name: redis
@@ -45,13 +46,6 @@ services:
     tag: 7-alpine
     hosts: [prod-db-1]                         # pin to the db host only
     run: { port: 6379 }
-
-  - name: caddy
-    image: lucaslorentz/caddy-docker-proxy
-    tag: 2.10-alpine
-    hosts: [prod-eu-1, prod-eu-2]              # public-facing tier only
-    run:
-      publish: ["80:80", "443:443", "443:443/udp"]
 ```
 
 ## Common shapes

@@ -54,7 +54,7 @@ Heavily inspired by [k9s](https://k9scli.io/) and [lazydocker](https://github.co
 | `A` | reconcile **all** services (with confirmation) |
 | `P` | prune stale + orphan containers (with confirmation) |
 | `!` | shell into container (`bash` then fallback to `sh`) |
-| `D` | debug sidecar (alpine in target's pid+net ns — for distroless / shell-less images) |
+| `B` | debug sidecar (alpine in target's pid+net ns — for distroless / shell-less images) |
 | `H` | service deploy history; on a stopped row press `r` to roll back |
 | `~` | show drift detail for the focused service (image / tag / spec_hash / env keys / label keys) |
 | `f` | port-forward the focused service. Auto-mode: published path when the service has a matching `publish:` entry, else spawns an ephemeral `alpine/socat` sidecar that joins the service's docker network. Footer band stays visible across panes until closed. |
@@ -84,7 +84,7 @@ Plus, at the bottom of the pane, a rolling tail of the container's logs.
 |---|---|
 | `enter` / `l` | open dedicated logs view |
 | `!` | exec a shell inside (`bash` → `sh`) |
-| `D` | debug sidecar (alpine sharing pid+net ns) |
+| `B` | debug sidecar (alpine sharing pid+net ns) |
 | `S` / `X` / `R` | start / stop / restart |
 | `K` | SIGKILL (with confirmation) |
 | `U` | reconcile this service |
@@ -92,7 +92,7 @@ Plus, at the bottom of the pane, a rolling tail of the container's logs.
 | `r` | refresh |
 | `esc` | back to host detail |
 
-If your image is distroless or otherwise has no shell, `!` will fail. **Fall back to `D`** — the debug sidecar attaches an alpine container sharing the target's PID and network namespaces, so you can run `ps`, `ss`, `cat /proc/<pid>/...` against the target without modifying the production image. The sidecar auto-removes when you `exit` / Ctrl-D.
+If your image is distroless or otherwise has no shell, `!` will fail. **Fall back to `B`** — the debug sidecar attaches an alpine container sharing the target's PID and network namespaces, so you can run `ps`, `ss`, `cat /proc/<pid>/...` against the target without modifying the production image. The sidecar auto-removes when you `exit` / Ctrl-D.
 
 ## Drift detail (`~`)
 
@@ -123,7 +123,7 @@ Per-host summary table:
 | col | meaning |
 |---|---|
 | `host` | `user@address` from `yoink.yaml` |
-| `status` | ssh probe + bollard handshake — `ok` / `unreachable` (with classified hint for Tailscale auth, `ssh-add` reminders, etc.) |
+| `status` | ssh probe + Docker API handshake — `ok` / `unreachable` (with classified hint for Tailscale auth, `ssh-add` reminders, etc.) |
 | `daemon` | docker server version, OS / kernel |
 | `cpu`, `mem` | aggregate across all running containers (sum of `docker stats`) — gauge-coloured |
 
@@ -134,7 +134,7 @@ Per-host summary table:
 | `↑↓` / `j` `k` | select container |
 | `enter` | live logs |
 | `i` | container detail (env, mounts, security, history charts, …) |
-| `!` | shell · `D` debug sidecar |
+| `!` | shell · `B` debug sidecar |
 | `S` / `X` / `R` | start · stop · restart |
 | `K` | SIGKILL (with confirmation) |
 | `U` | reconcile this service |
@@ -160,7 +160,7 @@ Three sub-tabs covering the introspection lazydocker users expect, fanned out ac
 
 `Tab` / `Shift-Tab` cycles between the three sub-tabs (instead of cycling the top-level modes — only inside Resources). `/` filters across host/name/tag substrings; partial fetch errors per host appear as a red footer ribbon rather than blanking the whole table. Dangling images sort to the top so they're trivial to prune.
 
-There's intentionally **no volume file browsing** — drop into the container with `!` (or, for distroless containers, `D` for the debug sidecar) and use the shell. That's strictly more capable than the half-baked file UI lazydocker has, and it's what most operators reach for anyway.
+There's intentionally **no volume file browsing** — drop into the container with `!` (or, for distroless containers, `B` for the debug sidecar) and use the shell. That's strictly more capable than the half-baked file UI lazydocker has, and it's what most operators reach for anyway.
 
 ## Secrets pane (`e`)
 
@@ -195,15 +195,15 @@ The buffer is bounded at 5,000 lines; older lines fall off as new ones arrive. F
 
 ### `ContainerLogs` (single container)
 
-Reached via `Enter` from any list view. Same shape as the multiplexed Logs pane, scoped to one container. Same keybindings; `Esc` returns to the parent. `!` and `D` are also bound here for quick "tail logs → drop into shell" pivots.
+Reached via `Enter` from any list view. Same shape as the multiplexed Logs pane, scoped to one container. Same keybindings; `Esc` returns to the parent. `!` and `B` are also bound here for quick "tail logs → drop into shell" pivots.
 
-## Shell / debug sidecar (`!`, `D`)
+## Shell / debug sidecar (`!`, `B`)
 
-Both gestures put you on a PTY inside the host's docker daemon, no SSH on top — bollard's exec API does the heavy lifting and the TUI streams bytes both ways through `vt100::Parser`.
+Both gestures put you on a PTY inside the host's docker daemon, no SSH on top — yoink uses the Docker exec API and the TUI streams bytes both ways through a terminal-emulator parser.
 
 `!` runs `bash` (falls back to `sh`) inside the existing container — equivalent to `yoink shell <service>` but staying in the TUI. Useful when the image has a shell and you want quick access to the running process's filesystem, env, etc.
 
-`D` spins up an ephemeral **alpine debug sidecar** sharing the target container's PID and network namespaces. The fallback for distroless / scratch / shell-less images: you get `ps`, `ss`, `cat /proc/<pid>/...`, `tcpdump`, `apk add` whatever you need — without modifying the production image. The sidecar is `--rm` and force-removed when you `exit` / Ctrl-D, even if the TUI crashes.
+`B` spins up an ephemeral **alpine debug sidecar** sharing the target container's PID and network namespaces. The fallback for distroless / scratch / shell-less images: you get `ps`, `ss`, `cat /proc/<pid>/...`, `tcpdump`, `apk add` whatever you need — without modifying the production image. The sidecar is `--rm` and force-removed when you `exit` / Ctrl-D, even if the TUI crashes.
 
 | key inside the shell view | action |
 |---|---|
@@ -266,7 +266,7 @@ A consistent set of letters has the same meaning everywhere they appear:
 | `/` | begin filter input |
 | `r` | refresh the current pane |
 | `!` | shell into selection |
-| `D` | debug sidecar |
+| `B` | debug sidecar |
 | `i` | inspect (container detail) |
 | `K` | kill (SIGKILL with confirmation) |
 | `S` / `X` / `R` | start · stop · restart container |

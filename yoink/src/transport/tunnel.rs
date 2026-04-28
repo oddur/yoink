@@ -13,6 +13,11 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tracing::warn;
 
+/// How often to retry the local-port TCP connect while waiting for
+/// the SSH tunnel to come up. 100 ms balances responsiveness against
+/// kernel-level connection-attempt cost.
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Error)]
 pub enum TunnelError {
     #[error("failed to bind a local port for ssh tunnel: {0}")]
@@ -204,7 +209,7 @@ async fn wait_until_ready(
                 timeout,
             });
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
     }
 }
 
