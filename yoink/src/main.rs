@@ -1938,15 +1938,16 @@ async fn cmd_pf(
         .await
         .map_err(|e| anyhow::anyhow!("ssh probe to {}: {e}", host.address))?;
 
-    // Resolve the path: published host endpoint OR sidecar handle +
-    // host port. `_sidecar` is bound here so its Drop fires after
-    // SIGINT even though the variable is otherwise unused.
+    // Resolve the path: published host endpoint OR sidecar handle.
+    // `_sidecar` is bound here so its Drop fires after SIGINT even
+    // though the variable is otherwise unused.
     let resolved =
         pf::resolve_target(ops.clone(), &host, service, container_port, mode).await?;
     let (remote_dial_host, remote_port, mode_label, _sidecar) = match resolved {
         pf::ResolvedTarget::Published(ep) => (ep.host_ip, ep.host_port, "published", None),
-        pf::ResolvedTarget::Sidecar { handle, host_port } => {
-            ("127.0.0.1".to_string(), host_port, "sidecar", Some(handle))
+        pf::ResolvedTarget::Sidecar(handle) => {
+            let port = handle.host_port();
+            (pf::SIDECAR_DIAL_HOST.to_string(), port, "sidecar", Some(handle))
         }
     };
 

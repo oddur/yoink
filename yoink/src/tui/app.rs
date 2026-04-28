@@ -3098,16 +3098,19 @@ impl App {
                 crate::pf::ResolvedTarget::Published(ep) => {
                     (ep.host_ip.clone(), ep.host_port, ep, None)
                 }
-                crate::pf::ResolvedTarget::Sidecar { handle, host_port } => (
-                    "127.0.0.1".to_string(),
-                    host_port,
-                    crate::pf::PublishedEndpoint {
-                        host_ip: "127.0.0.1".into(),
+                crate::pf::ResolvedTarget::Sidecar(handle) => {
+                    let host_port = handle.host_port();
+                    (
+                        crate::pf::SIDECAR_DIAL_HOST.to_string(),
                         host_port,
-                        container_port,
-                    },
-                    Some(handle),
-                ),
+                        crate::pf::PublishedEndpoint {
+                            host_ip: crate::pf::SIDECAR_DIAL_HOST.into(),
+                            host_port,
+                            container_port,
+                        },
+                        Some(handle),
+                    )
+                }
             };
             match crate::transport::tunnel::SshTunnel::open_with_local_port(
                 &host_for_task.user,

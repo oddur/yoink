@@ -60,6 +60,11 @@ const SIDECAR_INTERNAL_PORT: u16 = 1080;
 /// image pull on first use.
 const SIDECAR_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Host-side IP the sidecar's port-binding lands on. Loopback-only
+/// is the whole point of `pf` — operators tunnel to it via SSH;
+/// nothing fronts the public internet even briefly.
+pub const SIDECAR_DIAL_HOST: &str = "127.0.0.1";
+
 /// Operator-visible URL scheme override. `Auto` runs the
 /// port-number heuristic (`default_scheme`); `Http`/`Https` force
 /// the obvious wrapper; `Tcp`/`None` print bare `localhost:N` and
@@ -317,13 +322,11 @@ pub enum Mode {
 /// What the auto-resolution decided and produced for a single
 /// `pf` invocation. `Published` carries the resolved host endpoint
 /// to SSH-forward to. `Sidecar` carries an opaque handle that owns
-/// the spun-up container; dropping the handle force-removes it.
+/// the spun-up container; the host-side port is a method on the
+/// handle so the two can't drift.
 pub enum ResolvedTarget {
     Published(PublishedEndpoint),
-    Sidecar {
-        handle: SidecarHandle,
-        host_port: u16,
-    },
+    Sidecar(SidecarHandle),
 }
 
 /// Decide which path to take for `(service, container_port)` and
@@ -368,9 +371,9 @@ pub async fn resolve_target(
         .ok_or_else(|| PfError::SidecarNoNetwork {
             service: service.name.clone(),
         })?;
-    let (handle, host_port) =
+    let handle =
         spawn_sidecar(ops, host.clone(), &service.name, container_port, &network).await?;
-    Ok(ResolvedTarget::Sidecar { handle, host_port })
+    Ok(ResolvedTarget::Sidecar(handle))
 }
 
 #[derive(Debug, Error)]
@@ -426,11 +429,22 @@ pub enum SidecarError {
 pub struct SidecarHandle {
     pub container_name: String,
     pub host: Host,
+    /// Docker-assigned host port that maps to the sidecar's
+    /// internal listener. The CLI / TUI tunnel into this port via
+    /// `ssh -L`. Authoritative; no caller-side duplication.
+    host_port: u16,
     ops: Arc<dyn DockerOps>,
     cleanup_done: bool,
 }
 
 impl SidecarHandle {
+    /// Host-side port the sidecar listens on. Pass to `ssh -L
+    /// laptop:CONTAINER_HOST_PORT` to reach the target.
+    #[must_use]
+    pub fn host_port(&self) -> u16 {
+        self.host_port
+    }
+
     /// Force-remove the sidecar container. Call this in your async
     /// context after the operator's done with the tunnel; Drop is
     /// only a best-effort fallback and may not complete if the
@@ -514,19 +528,31 @@ async fn spawn_sidecar(
     target_alias: &str,
     target_port: u16,
     network: &str,
-) -> Result<(SidecarHandle, u16), SidecarError> {
+) -> Result<SidecarHandle, SidecarError> {
     use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
 
     let container_name = unique_sidecar_name(target_alias, target_port);
 
-    // Pull (no-op if cached). Bollard treats "image already present"
-    // as success so this is safe to run unconditionally.
-    ops.pull_image(&host, SIDECAR_IMAGE, SIDECAR_TAG, None)
+    // Skip the pull when the image is already cached. Bollard
+    // tolerates a redundant pull but the registry round-trip is
+    // visible (~hundreds of ms on a slow link) and pf is the kind
+    // of debug primitive operators run mid-incident; the warm-start
+    // path should be sub-second.
+    let cached = ops
+        .image_present(&host, SIDECAR_IMAGE, SIDECAR_TAG)
         .await
         .map_err(|source| SidecarError::Pull {
             host: host.address.clone(),
             source,
         })?;
+    if !cached {
+        ops.pull_image(&host, SIDECAR_IMAGE, SIDECAR_TAG, None)
+            .await
+            .map_err(|source| SidecarError::Pull {
+                host: host.address.clone(),
+                source,
+            })?;
+    }
 
     let internal_key = format!("{SIDECAR_INTERNAL_PORT}/tcp");
     let mut port_bindings = HashMap::new();
@@ -599,15 +625,13 @@ async fn spawn_sidecar(
     )
     .await?;
 
-    Ok((
-        SidecarHandle {
-            container_name,
-            host,
-            ops,
-            cleanup_done: false,
-        },
+    Ok(SidecarHandle {
+        container_name,
+        host,
         host_port,
-    ))
+        ops,
+        cleanup_done: false,
+    })
 }
 
 async fn wait_for_host_port(
