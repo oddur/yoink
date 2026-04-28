@@ -233,7 +233,10 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
         .filter(|s| s.domain.is_some())
         .collect();
     if proxied.is_empty() {
-        return out;
+        return vec![Finding::pass(
+            "config",
+            "proxy/domain checks skipped (no services have `domain:` set)",
+        )];
     }
 
     if config.proxy.as_ref().and_then(|p| p.email.as_deref()).is_none() {
@@ -310,7 +313,10 @@ async fn check_hosts(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding> {
 async fn check_arch_alignment(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding> {
     let any_local_build = config.services.iter().any(|s| s.build.is_some());
     if !any_local_build {
-        return Vec::new();
+        return vec![Finding::pass(
+            "build",
+            "arch-alignment check skipped (no services have `build:` blocks)",
+        )];
     }
 
     // We need both local docker (for the build) and each remote
@@ -401,6 +407,13 @@ async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
     use tokio::net::lookup_host;
 
     let mut out = Vec::new();
+    let any_domain = config.services.iter().any(|s| s.domain.is_some());
+    if !any_domain {
+        return vec![Finding::pass(
+            "dns",
+            "DNS check skipped (no services have `domain:` set)",
+        )];
+    }
     for svc in &config.services {
         let Some(domain) = &svc.domain else { continue };
         for host in domain.as_list() {
@@ -455,17 +468,26 @@ async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
 
 fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
     let Some(SecretsConfig::Age { file, recipients }) = &config.secrets else {
-        return Vec::new();
+        return vec![Finding::pass(
+            "secrets",
+            "sealed file check skipped (not using `provider: age`)",
+        )];
     };
     if recipients.is_empty() {
-        return Vec::new();
+        return vec![Finding::pass(
+            "secrets",
+            "sealed file check skipped (no `secrets.recipients:`)",
+        )];
     }
     let any_refs = config
         .services
         .iter()
         .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty());
     if !any_refs {
-        return Vec::new();
+        return vec![Finding::pass(
+            "secrets",
+            "sealed file check skipped (no services reference secrets)",
+        )];
     }
     let path = match sealed::resolve_sealed_path(config, file.as_deref()) {
         Ok(p) => p,
@@ -490,7 +512,10 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
 
 fn check_provider_command(config: &Config) -> Vec<Finding> {
     let Some(SecretsConfig::Command { command, .. }) = &config.secrets else {
-        return Vec::new();
+        return vec![Finding::pass(
+            "secrets",
+            "provider command check skipped (not using `provider: command`)",
+        )];
     };
     let Some(prog) = command.first() else {
         return vec![
@@ -542,9 +567,16 @@ fn check_keys_dir_perms() -> Vec<Finding> {
         return Vec::new();
     };
     if !dir.exists() {
-        return Vec::new();
+        return vec![Finding::pass(
+            "secrets",
+            format!(
+                "keys-dir perms check skipped ({} doesn't exist)",
+                dir.display()
+            ),
+        )];
     }
-    let mut out = Vec::new();
+    let mut bad = Vec::new();
+    let mut scanned = 0_usize;
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -553,10 +585,11 @@ fn check_keys_dir_perms() -> Vec<Finding> {
         if path.extension().and_then(|s| s.to_str()) != Some("key") {
             continue;
         }
+        scanned += 1;
         let Ok(meta) = entry.metadata() else { continue };
         let mode = meta.mode() & 0o777;
         if mode & 0o077 != 0 {
-            out.push(
+            bad.push(
                 Finding::warn(
                     "secrets",
                     format!(
@@ -569,12 +602,27 @@ fn check_keys_dir_perms() -> Vec<Finding> {
             );
         }
     }
-    out
+    if scanned == 0 {
+        return vec![Finding::pass(
+            "secrets",
+            format!("keys-dir perms check skipped ({} is empty)", dir.display()),
+        )];
+    }
+    if bad.is_empty() {
+        return vec![Finding::pass(
+            "secrets",
+            format!("all {scanned} key file(s) in keys-dir are mode 0600"),
+        )];
+    }
+    bad
 }
 
 #[cfg(not(unix))]
 fn check_keys_dir_perms() -> Vec<Finding> {
-    Vec::new()
+    vec![Finding::pass(
+        "secrets",
+        "keys-dir perms check skipped (non-unix)",
+    )]
 }
 
 // ---------- Dockerfile path resolves ----------
@@ -585,8 +633,10 @@ fn check_dockerfile_paths(config: &Config) -> Vec<Finding> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
     let mut out = Vec::new();
+    let mut scanned = 0_usize;
     for svc in &config.services {
         let Some(build) = &svc.build else { continue };
+        scanned += 1;
         let context = base.join(&build.context);
         let dockerfile = context.join(build.dockerfile.as_deref().unwrap_or("Dockerfile"));
         if !dockerfile.exists() {
@@ -607,6 +657,18 @@ fn check_dockerfile_paths(config: &Config) -> Vec<Finding> {
                 )),
             );
         }
+    }
+    if scanned == 0 {
+        return vec![Finding::pass(
+            "build",
+            "Dockerfile-path check skipped (no services have a `build:` block)",
+        )];
+    }
+    if out.is_empty() {
+        return vec![Finding::pass(
+            "build",
+            format!("all {scanned} service Dockerfile path(s) resolve"),
+        )];
     }
     out
 }
@@ -630,7 +692,10 @@ async fn check_tls_cert_secrets(config: &Config) -> Vec<Finding> {
         .iter()
         .any(|s| matches!(s.tls, TlsMode::Cert));
     if !needs_bundle {
-        return Vec::new();
+        return vec![Finding::pass(
+            "config",
+            "TLS cert-mode check skipped (no services use `tls: cert`)",
+        )];
     }
     let bundle = match crate::secrets::load_bundle(config).await {
         Ok(Some(b)) => b,
