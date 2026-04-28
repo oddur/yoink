@@ -443,6 +443,11 @@ enum Update {
         /// path. The handle's Drop force-removes the alpine/socat
         /// container.
         sidecar: Option<crate::pf::SidecarHandle>,
+        /// Specific replica the operator was on when they pressed
+        /// `f`. `None` for CLI invocations or views that don't have
+        /// a focused container — the row marker falls back to per-
+        /// service in that case.
+        target_container: Option<String>,
     },
 }
 
@@ -1077,6 +1082,21 @@ impl App {
                     .cloned()
                     .map(|s| (host.clone(), s))
             }
+            _ => None,
+        }
+    }
+
+    /// Specific container the operator's row is on, when one
+    /// applies. Used to scope the `↦` marker to the exact replica
+    /// being forwarded instead of lighting up every replica of the
+    /// service. Returns `None` for views that don't have a focused
+    /// container (Services list, Hosts list, …); the resolver falls
+    /// back to per-service semantics in that case.
+    fn pf_focused_container(&self) -> Option<String> {
+        match &self.view {
+            View::Dashboard => self.dashboard.selected().map(|r| r.container),
+            View::HostDetail(_) => self.host_detail.selected_container(),
+            View::ContainerDetail { container, .. } => Some(container.clone()),
             _ => None,
         }
     }
@@ -1869,7 +1889,8 @@ impl App {
             // the system browser.
             KeyCode::Char('f') => {
                 if let Some((host, service)) = self.drift_focus() {
-                    self.open_port_forward(host, service);
+                    let target_container = self.pf_focused_container();
+                    self.open_port_forward(host, service, target_container);
                 }
                 return false;
             }
@@ -2960,9 +2981,17 @@ impl App {
                 url,
                 tunnel,
                 sidecar,
+                target_container,
             } => {
                 self.forwards.insert(super::pf::ActiveForward::new(
-                    &host, &service, endpoint, local_port, url, tunnel, sidecar,
+                    &host,
+                    &service,
+                    endpoint,
+                    local_port,
+                    url,
+                    target_container,
+                    tunnel,
+                    sidecar,
                 ));
             }
         }
@@ -3064,7 +3093,12 @@ impl App {
     /// published-port fast path when available, sidecar fallback for
     /// secure-by-default services with no `publish:` block (api/web).
     /// No-op when an active forward already exists for the same key.
-    fn open_port_forward(&mut self, host: Host, service_name: String) {
+    fn open_port_forward(
+        &mut self,
+        host: Host,
+        service_name: String,
+        target_container: Option<String>,
+    ) {
         let Some(service) = self
             .config
             .services
@@ -3177,6 +3211,7 @@ impl App {
                         url: url.clone(),
                         tunnel,
                         sidecar,
+                        target_container,
                     });
                     let _ = tx.send(Update::Toast(format!(
                         "{toast_prefix} → {url}  [o] open  [F] close"

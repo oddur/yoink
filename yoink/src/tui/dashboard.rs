@@ -326,8 +326,13 @@ impl DashboardState {
                 let drift_cell = render_drift_cell(c, config, secrets);
 
                 let service_cell = match c.yoink_service.as_deref() {
-                    Some(svc) if forwards.is_service_forwarded(svc) => Cell::from(format!("↦ {svc}"))
-                        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)),
+                    Some(svc)
+                        if forwards.is_container_forwarded(&host.host, &c.name)
+                            || forwards.is_service_forwarded_unscoped(svc) =>
+                    {
+                        Cell::from(format!("↦ {svc}"))
+                            .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan))
+                    }
                     Some(svc) => Cell::from(svc.to_string()),
                     None => Cell::from("-"),
                 };

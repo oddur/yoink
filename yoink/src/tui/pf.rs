@@ -55,6 +55,13 @@ pub struct ActiveForward {
     #[allow(dead_code)]
     pub local_port: u16,
     pub url: String,
+    /// The specific container the operator focused when they
+    /// pressed `f`. Used to scope the `↦` row marker to that one
+    /// replica instead of lighting up every replica of the service.
+    /// `None` for CLI invocations or when the focused row didn't
+    /// resolve to a specific container — those fall back to the
+    /// per-service mark.
+    pub target_container: Option<String>,
     /// Owning the ssh child here means the process dies with the App.
     /// `Option` so unit tests can build the surface without spawning
     /// a real ssh; production code always passes `Some(tunnel)`.
@@ -73,6 +80,7 @@ impl ActiveForward {
         endpoint: PublishedEndpoint,
         local_port: u16,
         url: String,
+        target_container: Option<String>,
         tunnel: SshTunnel,
         sidecar: Option<crate::pf::SidecarHandle>,
     ) -> Self {
@@ -85,6 +93,7 @@ impl ActiveForward {
             endpoint,
             local_port,
             url,
+            target_container,
             _tunnel: Some(tunnel),
             _sidecar: sidecar,
         }
@@ -92,6 +101,17 @@ impl ActiveForward {
 
     #[cfg(test)]
     fn for_test(host: &str, service: &str, port: u16, local: u16) -> Self {
+        Self::for_test_with_container(host, service, port, local, None)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_container(
+        host: &str,
+        service: &str,
+        port: u16,
+        local: u16,
+        target_container: Option<&str>,
+    ) -> Self {
         Self {
             key: ForwardKey {
                 host: host.into(),
@@ -105,6 +125,7 @@ impl ActiveForward {
             },
             local_port: local,
             url: format!("http://localhost:{local}"),
+            target_container: target_container.map(str::to_string),
             _tunnel: None,
             _sidecar: None,
         }
@@ -154,6 +175,31 @@ impl PortForwardState {
     #[must_use]
     pub fn is_service_forwarded(&self, service: &str) -> bool {
         self.forwards.values().any(|f| f.key.service == service)
+    }
+
+    /// `true` when this exact `(host, container)` pair is the target
+    /// of an active forward. Lets row renderers light up the specific
+    /// replica the operator pressed `f` on instead of every replica
+    /// of the service. Falls back to the per-service mark for
+    /// forwards that didn't capture a specific container (CLI
+    /// invocations).
+    #[must_use]
+    pub fn is_container_forwarded(&self, host: &str, container: &str) -> bool {
+        self.forwards.values().any(|f| {
+            f.key.host == host
+                && f.target_container.as_deref() == Some(container)
+        })
+    }
+
+    /// `true` when the service has any active forward AND none of
+    /// the tunnels picked a specific container. The renderer uses
+    /// this to fall back to the "all replicas marked" behavior for
+    /// CLI-opened forwards that don't carry a focused-row hint.
+    #[must_use]
+    pub fn is_service_forwarded_unscoped(&self, service: &str) -> bool {
+        self.forwards
+            .values()
+            .any(|f| f.key.service == service && f.target_container.is_none())
     }
 
     /// Drop a single tunnel. Wired up but not yet keyed (the focused-
@@ -282,6 +328,35 @@ mod tests {
         assert_eq!(state.len(), 2);
         state.clear();
         assert!(state.is_empty());
+    }
+
+    #[test]
+    fn container_scoped_marker_lights_up_only_target_replica() {
+        let mut state = PortForwardState::default();
+        state.insert(ActiveForward::for_test_with_container(
+            "host-a",
+            "web",
+            8080,
+            9000,
+            Some("web-1"),
+        ));
+        assert!(state.is_container_forwarded("host-a", "web-1"));
+        assert!(!state.is_container_forwarded("host-a", "web-2"));
+        // Other replica of the same service is not "unscoped" because
+        // the active forward DID pick a specific container.
+        assert!(!state.is_service_forwarded_unscoped("web"));
+        // The broad per-service predicate still matches (CLI / footer use it).
+        assert!(state.is_service_forwarded("web"));
+    }
+
+    #[test]
+    fn cli_forward_with_no_focus_falls_back_to_unscoped_per_service() {
+        let mut state = PortForwardState::default();
+        state.insert(ActiveForward::for_test("host-a", "web", 8080, 9000));
+        // No specific container: every replica row should mark via
+        // `is_service_forwarded_unscoped` fallback.
+        assert!(state.is_service_forwarded_unscoped("web"));
+        assert!(!state.is_container_forwarded("host-a", "web-1"));
     }
 
     #[test]

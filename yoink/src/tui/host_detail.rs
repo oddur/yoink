@@ -234,11 +234,14 @@ impl HostDetailState {
                         .map(|h| h.address.clone())
                         .unwrap_or_default();
                     let stats = history
-                        .get(&(host_addr, c.name.clone()))
+                        .get(&(host_addr.clone(), c.name.clone()))
                         .and_then(StatsHistory::latest);
                     let health = c.health_hint().unwrap_or("-");
                     let service_cell = match c.yoink_service.as_deref() {
-                        Some(svc) if forwards.is_service_forwarded(svc) => {
+                        Some(svc)
+                            if forwards.is_container_forwarded(&host_addr, &c.name)
+                                || forwards.is_service_forwarded_unscoped(svc) =>
+                        {
                             Cell::from(format!("↦ {svc}")).style(
                                 ratatui::style::Style::default().fg(ratatui::style::Color::Cyan),
                             )
