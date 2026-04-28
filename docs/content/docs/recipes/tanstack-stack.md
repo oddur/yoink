@@ -215,15 +215,17 @@ First deploy of the app is the slow one — pulling Docker Hub's `node:22-alpine
 
 ## Verify
 
-The app is reachable on the host's docker network at `my-app:3000`, but not yet exposed to your laptop. Two quick options:
+The app is reachable on the host's docker network at `my-app:3000` but isn't bound to a host port — that's the secure default. To open it on your laptop:
 
-- **`yoink exec`** — runs a one-shot command inside the running container:
-  ```sh
-  yoink exec my-app -- wget -qO- localhost:3000/
-  ```
-- **port-forward from your laptop** — see the [port-forward recipe](/docs/recipes/port-forward).
+```sh
+yoink pf my-app -o
+```
 
-The JSON should report `ok: true` with a postgres version string.
+`yoink pf` notices `my-app` has no `publish:` entry, spawns an ephemeral `alpine/socat` sidecar inside the docker network, bridges over the existing SSH connection, and prints a `http://localhost:<port>` URL (`-o` opens it in your browser). `Ctrl-C` tears down the tunnel and force-removes the sidecar.
+
+No yaml changes, no host ports bound — see the [port-forward recipe](/docs/recipes/port-forward) for the full sidecar-vs-published design.
+
+The page should render JSON with `ok: true` and a postgres version string.
 
 ## Re-deploys
 
