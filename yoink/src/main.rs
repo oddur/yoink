@@ -107,12 +107,18 @@ impl ColorChoice {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a starter `yoink.yaml` for the current repo with
-    /// best-practices defaults. Detects cwd / Dockerfile / git remote /
-    /// `~/.ssh/config` and writes a complete validated config with
-    /// zero prompts in the happy path. Pass HOST as a positional arg
-    /// when ssh config can't infer one. `--interactive` engages a
-    /// stdio prompt fallback.
+    /// Generate a starter `yoink.yaml` for the current repo, plus an
+    /// age identity for sealed secrets. Detects cwd / Dockerfile /
+    /// git remote / `~/.ssh/config` and writes a validated config with
+    /// zero prompts in the happy path; the identity lands at
+    /// `~/.config/yoink/keys/<recipient>.key` (mode 0600) and yoink
+    /// finds it automatically next time. Back up the printed key —
+    /// it's the only thing that decrypts what you'll seal.
+    ///
+    /// Pass HOST as a positional arg when ssh config can't infer one.
+    /// `--interactive` for stdio prompts. `--no-secrets` to skip the
+    /// identity generation (e.g. you'll bring your own key, or use
+    /// `provider: command` for secrets).
     Init {
         /// Ssh target (e.g. `deploy@prod-eu-1` or just `prod-eu-1`).
         /// Optional when `~/.ssh/config` has a non-wildcard Host
@@ -139,6 +145,15 @@ enum Command {
         /// Override the inferred image reference.
         #[arg(long, value_name = "PATH")]
         image: Option<String>,
+        /// Skip generating an age identity. By default `init` writes
+        /// a fresh keypair to `~/.config/yoink/keys/<recipient>.key`
+        /// and renders the matching `secrets:` block into yoink.yaml,
+        /// so the project is ready for `yoink secrets edit` and
+        /// `yoink add` immediately. Use this flag when you'll bring
+        /// your own key, or when the project will use
+        /// `provider: command` for secrets.
+        #[arg(long)]
+        no_secrets: bool,
     },
     /// Verify Docker is reachable on each configured host.
     Preflight,
@@ -550,24 +565,32 @@ enum SecretsAction {
 #[derive(clap::Subcommand)]
 enum KeyAction {
     /// Generate a fresh age identity. By default the secret key is
-    /// printed to stdout — operator decides where to route it
-    /// (gitignored file, GitHub Actions secret, 1Password item, …).
-    /// The public recipient is also printed for adding to
-    /// `secrets.recipients:` in `yoink.yaml`. Pass `--out PATH` to
-    /// write the secret to a specific file with mode 0o600 instead.
+    /// saved to `~/.config/yoink/keys/<public-recipient>.key` (mode
+    /// 0o600) and yoink will discover it automatically next time —
+    /// no env var, no per-project gitignore. The public recipient is
+    /// printed for adding to `secrets.recipients:` in `yoink.yaml`.
     ///
-    /// Yoink intentionally does NOT default to a global location
-    /// like `~/.config/yoink/age.key` — multiple projects with
-    /// distinct identities would collide there.
+    /// Filename = public recipient means multiple projects with
+    /// distinct identities coexist in one dir without collisions.
+    ///
+    /// Pass `--out PATH` to write to a specific file (e.g. for CI or
+    /// to keep the key alongside a project), or `--print` to send the
+    /// secret to stdout for piping/pasting yourself.
     Generate {
-        /// Write the secret key to PATH (mode 0o600) instead of
-        /// printing it to stdout. Refuses to overwrite an existing
-        /// file unless `--force`. Make sure PATH is gitignored.
-        #[arg(long)]
+        /// Write the secret key to PATH (mode 0o600) instead of the
+        /// default keys dir. Refuses to overwrite an existing file
+        /// unless `--force`.
+        #[arg(long, conflicts_with = "print")]
         out: Option<PathBuf>,
-        /// Overwrite an existing identity at `--out`.
+        /// Overwrite an existing identity at the destination.
         #[arg(long)]
         force: bool,
+        /// Print the secret to stdout instead of writing it to disk.
+        /// Use when piping into a CI secret (`yoink secrets key
+        /// generate --print | gh secret set YOINK_AGE_KEY`) or a
+        /// password manager.
+        #[arg(long)]
+        print: bool,
     },
     /// Print the public recipient (`age1…`) derived from the
     /// currently-resolved identity. Useful for "is the key in my
@@ -2879,9 +2902,9 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
         }
         Command::Secrets {
             action: SecretsAction::Key {
-                action: KeyAction::Generate { out, force },
+                action: KeyAction::Generate { out, force, print },
             },
-        } => Some(cmd_secrets_key_generate(out.clone(), *force)),
+        } => Some(cmd_secrets_key_generate(out.clone(), *force, *print)),
         Command::Init {
             host,
             force,
@@ -2890,6 +2913,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             port,
             no_port,
             image,
+            no_secrets,
         } => Some(yoink::init::cmd_init(yoink::init::InitOpts {
             host: host.clone(),
             force: *force,
@@ -2898,6 +2922,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             port: *port,
             no_port: *no_port,
             image: image.clone(),
+            no_secrets: *no_secrets,
         })),
         _ => None,
     }
@@ -2906,8 +2931,10 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
 fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     match action {
         SecretsAction::Key { action } => match action {
-            KeyAction::Generate { out, force } => cmd_secrets_key_generate(out, force),
-            KeyAction::Public => cmd_secrets_key_public(),
+            KeyAction::Generate { out, force, print } => {
+                cmd_secrets_key_generate(out, force, print)
+            }
+            KeyAction::Public => cmd_secrets_key_public(config),
         },
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
@@ -2916,42 +2943,68 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     }
 }
 
-fn cmd_secrets_key_public() -> Result<()> {
+fn cmd_secrets_key_public(config: &Config) -> Result<()> {
+    use yoink::config::SecretsConfig;
     use yoink::sealed;
-    let identity = sealed::load_identity()
-        .with_context(|| "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, or place one at ~/.config/yoink/age.key")?;
+    // Pull recipients from the config so the keys-dir scan can pick
+    // the matching identity. If the operator has many keys in
+    // ~/.config/yoink/keys/, this answers "the one for *this*
+    // project," not whichever happened to load first.
+    let recipients: &[String] = match &config.secrets {
+        Some(SecretsConfig::Age { recipients, .. }) => recipients,
+        _ => &[],
+    };
+    let identity = sealed::load_identity(recipients)
+        .with_context(|| "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, or place a key in ~/.config/yoink/keys/")?;
     println!("{}", identity.to_public());
     Ok(())
 }
 
-fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool) -> Result<()> {
+fn cmd_secrets_key_generate(
+    out: Option<PathBuf>,
+    force: bool,
+    print: bool,
+) -> Result<()> {
     use yoink::sealed;
     let (secret, public) = sealed::keygen();
     let recipient_block =
         format!("  secrets:\n    provider: age\n    recipients:\n      - {public}");
-    let Some(path) = out else {
-        // No --out: print the secret to stdout. Operator decides
-        // where to save (typically a gitignored file alongside the
-        // project's yoink.yaml, or pasted into a CI secret).
-        // Yoink intentionally does NOT default-write to a global
-        // path like ~/.config/yoink/age.key because multiple
-        // projects with distinct identities would collide there.
-        println!("New age identity. Save the secret somewhere — yoink won't.");
-        println!();
-        println!("Secret (private — never commit; gitignore the file you save it to):");
-        println!();
+
+    if print {
+        // Explicit stdout mode — operator pipes / pastes themselves.
+        // Discipline: only the *secret itself* goes to stdout, so a
+        // pipe like `... --print | gh secret set YOINK_AGE_KEY`
+        // captures exactly the key bytes. Everything else (header,
+        // recipient, follow-up instructions) goes to stderr where the
+        // operator reads it without contaminating the pipe.
+        eprintln!("New age identity. Save the secret somewhere — yoink won't.");
+        eprintln!();
+        eprintln!("Secret (private — never commit) — piped to stdout:");
         println!("{secret}");
-        println!();
-        println!("Public recipient (add to yoink.yaml):");
-        println!();
-        println!("{recipient_block}");
-        println!();
-        println!("Suggested next steps:");
-        println!("  • Save the secret to ./age.key (gitignored), then:");
-        println!("      export YOINK_AGE_KEY_FILE=$(pwd)/age.key");
-        println!("  • Or paste it into a CI secret named YOINK_AGE_KEY.");
-        println!("  • Clear your terminal scrollback when done.");
+        eprintln!();
+        eprintln!("Public recipient (add to yoink.yaml):");
+        eprintln!();
+        eprintln!("{recipient_block}");
+        eprintln!();
+        eprintln!("Suggested next steps:");
+        eprintln!("  • Pipe into a CI secret: `yoink secrets key generate --print | gh secret set YOINK_AGE_KEY`");
+        eprintln!("  • Or pipe into a password manager (`op item create … password=-`).");
+        eprintln!("  • Clear your terminal scrollback when done.");
         return Ok(());
+    }
+
+    // Default: write to ~/.config/yoink/keys/<public>.key. Filename =
+    // public recipient lets `load_identity` find it cheaply (and lets
+    // multiple projects coexist — one identity per project, no
+    // collisions). `--out` overrides the destination.
+    let path = match out {
+        Some(p) => p,
+        None => {
+            let dir = sealed::keys_dir()?;
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+            sealed::keys_dir_path_for(&public)?
+        }
     };
     if path.exists() && !force {
         return Err(anyhow::anyhow!(
@@ -2970,8 +3023,18 @@ fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool) -> Result<()> {
     println!("Add this to yoink.yaml:");
     println!();
     println!("{recipient_block}");
-    println!();
-    println!("Make sure {} is gitignored.", path.display());
+    if path.starts_with(sealed::keys_dir().unwrap_or_default()) {
+        // In the default keys dir — yoink will discover it
+        // automatically next time, no env var needed.
+        println!();
+        println!("yoink will discover this key automatically when sealing/unsealing.");
+    } else {
+        // Project-local or operator-chosen path — they own the
+        // gitignore / env-var dance.
+        println!();
+        println!("Make sure {} is gitignored, then:", path.display());
+        println!("  export YOINK_AGE_KEY_FILE={}", path.display());
+    }
     Ok(())
 }
 
@@ -2982,7 +3045,7 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
     let plaintext = if path.exists() {
         let bytes =
             std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
-        let identity = sealed::load_identity()?;
+        let identity = sealed::load_identity(recipients)?;
         sealed::unseal(&bytes, &identity)?
     } else {
         String::from("# yoink secrets — KEY=value, one per line\n")
@@ -3013,13 +3076,13 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
              not into build logs), set YOINK_ALLOW_REVEAL_IN_CI=1"
         ));
     }
-    let SecretsConfig::Age { file, .. } = expect_secrets_provider_age(config)? else {
+    let SecretsConfig::Age { file, recipients } = expect_secrets_provider_age(config)? else {
         unreachable!()
     };
     let path = sealed::resolve_sealed_path(config, file.as_deref())?;
     let bytes =
         std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
-    let identity = sealed::load_identity()?;
+    let identity = sealed::load_identity(recipients)?;
     let plaintext = sealed::unseal(&bytes, &identity)?;
     let parsed = sealed::parse_dotenv(&plaintext)?;
     for (k, v) in &parsed {
@@ -3097,7 +3160,7 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     // Decrypt with the current identity before generating the new key.
     let bytes =
         std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
-    let identity = sealed::load_identity()?;
+    let identity = sealed::load_identity(current_recipients)?;
     let plaintext = sealed::unseal(&bytes, &identity)?;
     let parsed = sealed::parse_dotenv(&plaintext)?;
     let canonical = sealed::render_dotenv(&parsed);

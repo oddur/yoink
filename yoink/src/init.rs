@@ -47,6 +47,11 @@ pub struct InitOpts {
     pub port: Option<u16>,
     pub no_port: bool,
     pub image: Option<String>,
+    /// Skip generating an age identity. Use when an existing key
+    /// should keep being used (e.g. you already have a teammate's
+    /// `recipients:` block to drop in) or when the project will use
+    /// `provider: command` instead.
+    pub no_secrets: bool,
 }
 
 pub fn cmd_init(opts: InitOpts) -> Result<()> {
@@ -61,7 +66,7 @@ pub fn cmd_init(opts: InitOpts) -> Result<()> {
     }
 
     let detection = detect(&cwd);
-    let plan = if opts.interactive {
+    let mut plan = if opts.interactive {
         if !io::stdin().is_terminal() {
             anyhow::bail!(
                 "--interactive requires a terminal (stdin is not a tty)"
@@ -71,6 +76,18 @@ pub fn cmd_init(opts: InitOpts) -> Result<()> {
     } else {
         infer_plan(&detection, &opts)?
     };
+
+    // Bootstrap an age identity unless the operator opted out. We do
+    // this BEFORE rendering yoink.yaml so the recipient lands in
+    // `secrets:` from the start — a freshly-init'd repo is ready for
+    // `yoink secrets edit` and `yoink add postgres` with zero further
+    // setup. Cognitive overhead reduction is the whole point.
+    let bootstrap = if opts.no_secrets {
+        None
+    } else {
+        Some(bootstrap_age_identity()?)
+    };
+    plan.age_recipient = bootstrap.as_ref().map(|b| b.public.clone());
 
     let yaml = render(&plan);
     // `Config::parse_str` runs `validate()` internally, so a clean
@@ -87,7 +104,90 @@ pub fn cmd_init(opts: InitOpts) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("write {}: {e}", yaml_path.display()))?;
 
     print_summary(&plan, &yaml_path, yaml.lines().count());
+    if let Some(b) = &bootstrap {
+        print_backup_warning(b);
+    }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct AgeBootstrap {
+    public: String,
+    key_path: PathBuf,
+}
+
+/// Generate a fresh age identity and save it to the multi-identity
+/// keys dir (`~/.config/yoink/keys/<recipient>.key`, mode 0600). The
+/// public recipient is returned so the caller can render it into
+/// `yoink.yaml`.
+fn bootstrap_age_identity() -> Result<AgeBootstrap> {
+    let dir = crate::sealed::keys_dir().context("resolve ~/.config/yoink/keys/")?;
+    bootstrap_age_identity_in_dir(&dir)
+}
+
+/// Inner: writes into an explicit dir so tests can drive it against
+/// a tempdir without mutating `HOME`.
+fn bootstrap_age_identity_in_dir(dir: &Path) -> Result<AgeBootstrap> {
+    let (secret, public) = crate::sealed::keygen();
+    write_age_identity(dir, &secret, &public)
+}
+
+/// Innermost: deterministic keypair → on-disk file. Lets tests pin
+/// the public recipient and exercise the duplicate-detection branch.
+fn write_age_identity(dir: &Path, secret: &str, public: &str) -> Result<AgeBootstrap> {
+    use crate::sealed;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    let key_path = dir.join(format!("{public}.key"));
+    if key_path.exists() {
+        // x25519 collisions are vanishingly unlikely; if this fires
+        // it's almost certainly a `--force` re-init in the same
+        // process. Refuse to clobber rather than silently overwrite.
+        anyhow::bail!(
+            "{} already exists — refusing to overwrite an existing identity",
+            key_path.display()
+        );
+    }
+    let body = format!(
+        "# created by `yoink init`\n# public: {public}\n{secret}\n"
+    );
+    sealed::write_atomically_secret(&key_path, body.as_bytes())
+        .with_context(|| format!("write {}", key_path.display()))?;
+    Ok(AgeBootstrap {
+        public: public.to_string(),
+        key_path,
+    })
+}
+
+fn print_backup_warning(b: &AgeBootstrap) {
+    let key_str = b.key_path.display();
+    let bar = "─".repeat(72);
+    eprintln!();
+    eprintln!("{bar}");
+    eprintln!("  ⚠  BACK UP THIS KEY  —  do this BEFORE you seal any secrets");
+    eprintln!("{bar}");
+    eprintln!("  identity: {key_str}");
+    eprintln!("  public:   {}", b.public);
+    eprintln!();
+    eprintln!("  This key is the ONLY thing that can decrypt your sealed");
+    eprintln!("  secrets. Lose it and every sealed value in this repo");
+    eprintln!("  becomes unrecoverable. Pick at least one of:");
+    eprintln!();
+    eprintln!("    1) Password manager (recommended):");
+    eprintln!("         cat {key_str}");
+    eprintln!("       …then paste the contents into a 1Password / Bitwarden /");
+    eprintln!("       Keychain item titled e.g. \"yoink: <project>\".");
+    eprintln!();
+    eprintln!("    2) Encrypted backup volume:");
+    eprintln!("         cp {key_str} ~/Backups/");
+    eprintln!();
+    eprintln!("    3) Teammate handoff (also good defence in depth):");
+    eprintln!("       Add a teammate's `age1...` recipient to yoink.yaml's");
+    eprintln!("       secrets.recipients, then `yoink secrets edit` to re-seal.");
+    eprintln!();
+    eprintln!("  A fresh repo with no sealed values is recoverable; one with");
+    eprintln!("  weeks of secrets isn't. Do this now, not later.");
+    eprintln!("{bar}");
 }
 
 #[derive(Debug, Clone, Default)]
@@ -229,6 +329,10 @@ struct WizardPlan {
     port: Option<u16>,
     user_override: Option<String>,
     sources: InferredSources,
+    /// `Some(public_recipient)` when init bootstrapped an age identity
+    /// — render emits a `secrets:` block. `None` when the operator
+    /// passed `--no-secrets`.
+    age_recipient: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +407,7 @@ fn infer_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
             user_override: user_origin,
             healthcheck_dup,
         },
+        age_recipient: None,
     })
 }
 
@@ -360,6 +465,7 @@ fn fallback_plan(detection: &Detection) -> Result<WizardPlan> {
         port: Some(DEFAULT_PORT),
         user_override: None,
         sources: InferredSources::default(),
+        age_recipient: None,
     })
 }
 
@@ -551,6 +657,13 @@ fn render(plan: &WizardPlan) -> String {
         "  - {{ address: {}, user: {} }}\n\n",
         plan.host_address, plan.host_user
     ));
+    if let Some(public) = &plan.age_recipient {
+        out.push_str("secrets:\n");
+        out.push_str("  provider: age\n");
+        out.push_str("  recipients:\n");
+        out.push_str(&format!("    - {public}\n"));
+        out.push('\n');
+    }
     out.push_str("services:\n");
     out.push_str(&format!("  - name: {}\n", plan.service));
     let image = match &plan.image {
@@ -779,6 +892,7 @@ mod tests {
             port: Some(8080),
             user_override: Some("hono".into()),
             sources: InferredSources::default(),
+            age_recipient: None,
         };
         let yaml = render(&plan);
         // `parse_str` validates internally, so a clean parse implies
@@ -798,11 +912,113 @@ mod tests {
             port: None,
             user_override: None,
             sources: InferredSources::default(),
+            age_recipient: None,
         };
         let yaml = render(&plan);
         // `parse_str` validates internally, so a clean parse implies
         // a valid config.
         Config::parse_str(&yaml).expect("parse + validate");
+    }
+
+    #[test]
+    fn bootstrap_writes_key_with_pubkey_filename_and_safe_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("keys");
+
+        let result = bootstrap_age_identity_in_dir(&dir).unwrap();
+
+        assert!(result.public.starts_with("age1"));
+        assert_eq!(
+            result.key_path.parent().unwrap(),
+            dir,
+            "key landed inside the dir we asked for"
+        );
+        assert_eq!(
+            result.key_path.file_stem().unwrap().to_str().unwrap(),
+            result.public,
+            "filename equals the public recipient — load_identity scan relies on this"
+        );
+
+        // The on-disk file contains the secret yoink generated. Reading
+        // it back and matching the public half is the round-trip
+        // contract that lets `yoink secrets edit` find this key after
+        // `yoink init` exits.
+        let body = std::fs::read_to_string(&result.key_path).unwrap();
+        assert!(
+            body.contains(&format!("# public: {}", result.public)),
+            "header should record the public recipient"
+        );
+        assert!(
+            body.lines().any(|l| l.starts_with("AGE-SECRET-KEY-1")),
+            "body should contain the AGE secret key"
+        );
+
+        // File mode is 0600 on unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let mode = std::fs::metadata(&result.key_path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o600, "private key file must be 0600");
+        }
+    }
+
+    #[test]
+    fn bootstrap_creates_keys_dir_when_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Two-level missing path — must be created without error.
+        let dir = tmp.path().join("config").join("yoink").join("keys");
+        assert!(!dir.exists());
+
+        let result = bootstrap_age_identity_in_dir(&dir).unwrap();
+
+        assert!(dir.is_dir());
+        assert!(result.key_path.exists());
+    }
+
+    #[test]
+    fn bootstrap_refuses_to_overwrite_existing_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("keys");
+        let (secret, public) = crate::sealed::keygen();
+
+        write_age_identity(&dir, &secret, &public).unwrap();
+
+        let err = write_age_identity(&dir, &secret, &public).unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "bail message should make the safety check obvious; got {err}"
+        );
+    }
+
+    #[test]
+    fn render_with_age_recipient_round_trips_and_includes_secrets_block() {
+        let plan = WizardPlan {
+            service: "demo".into(),
+            image: ImageSource::Bare("demo".into()),
+            tag: "latest".into(),
+            host_address: "h".into(),
+            host_user: "u".into(),
+            host_user_origin: HostUserOrigin::Default,
+            port: Some(8080),
+            user_override: None,
+            sources: InferredSources::default(),
+            age_recipient: Some(
+                "age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45".into(),
+            ),
+        };
+        let yaml = render(&plan);
+        assert!(yaml.contains("secrets:\n  provider: age\n"));
+        assert!(yaml.contains("age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45"));
+        let cfg = Config::parse_str(&yaml).expect("parse + validate");
+        match cfg.secrets.expect("secrets block") {
+            crate::config::SecretsConfig::Age { recipients, .. } => {
+                assert_eq!(recipients.len(), 1);
+                assert!(recipients[0].starts_with("age1"));
+            }
+            crate::config::SecretsConfig::Command { .. } => {
+                panic!("expected age provider")
+            }
+        }
     }
 
     /// Test helper: parse_dockerfile_hints reads from disk; this is

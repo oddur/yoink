@@ -17,11 +17,14 @@ Every subcommand accepts:
 ## Subcommand reference
 
 ```
-yoink init [HOST]                        generate a starter yoink.yaml in cwd. Detects
-                                         Dockerfile (EXPOSE/USER/HEALTHCHECK) + git remote
-                                         + ~/.ssh/config and writes a validated config
-                                         with zero prompts. HOST optional when ssh config
-                                         supplies a non-wildcard Host entry.
+yoink init [HOST]                        generate yoink.yaml + an age identity for sealed
+                                         secrets. Detects Dockerfile / git remote /
+                                         ~/.ssh/config and writes a validated config with
+                                         zero prompts. The identity lands at
+                                         ~/.config/yoink/keys/<recipient>.key (mode 0600);
+                                         a matching `secrets:` block goes into the yaml.
+                                         HOST optional when ssh config has a non-wildcard
+                                         entry.
   --force                                overwrite an existing yoink.yaml
   --interactive                          prompt for every field instead of inferring
                                          (defaults match the inferences)
@@ -29,6 +32,9 @@ yoink init [HOST]                        generate a starter yoink.yaml in cwd. D
   --port <N>                             override inferred port (Dockerfile EXPOSE or 8080)
   --no-port                              skip port + healthcheck (no HTTP surface)
   --image <PATH>                         override the inferred image reference
+  --no-secrets                           skip generating an age identity (use when bringing
+                                         your own key, or when the project will use
+                                         `provider: command` for secrets)
 
 yoink preflight                          verify Docker is reachable on each configured host
 
@@ -110,16 +116,22 @@ yoink lock                               inspect / release the per-host deploy l
                                          after a crashed deploy left a sentinel container)
 yoink completions <shell>                generate shell completions (bash/zsh/fish/...)
 
-yoink secrets key generate               generate an age keypair. Prints both
-                                         the IDENTITY (private, AGE-SECRET-KEY-1…)
-                                         and matching RECIPIENT (public, age1…) —
-                                         identity goes in your secret manager,
-                                         recipient gets committed to yoink.yaml.
+yoink secrets key generate               generate an age keypair. By default the
+                                         IDENTITY (private) is saved to
+                                         ~/.config/yoink/keys/<recipient>.key
+                                         (mode 0600) and yoink finds it
+                                         automatically next time. The matching
+                                         RECIPIENT (public, age1…) is printed
+                                         for adding to yoink.yaml.
   --out <PATH>                           write the identity to PATH (mode 0600)
-                                         instead of stdout. Make sure PATH is
-                                         gitignored. The recipient still prints
-                                         to stdout.
-  --force                                overwrite an existing identity at --out
+                                         instead of the default keys dir.
+  --print                                print the secret to stdout (for piping
+                                         into a CI secret store, e.g.
+                                         `… --print | gh secret set YOINK_AGE_KEY`).
+                                         Recipient/header/notes go to stderr so
+                                         the pipe captures only the key bytes.
+  --force                                overwrite an existing identity at the
+                                         destination
 yoink secrets key public                 re-derive the recipient from whichever
                                          identity yoink would use right now
                                          (sanity-check vs yoink.yaml)

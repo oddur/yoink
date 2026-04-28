@@ -588,7 +588,7 @@ fn load(config: &Config) -> LoadStatus {
                 Ok(p) => p,
                 Err(e) => return LoadStatus::Failed(e.to_string()),
             };
-            let identity = match sealed::load_identity() {
+            let identity = match sealed::load_identity(recipients) {
                 Ok(id) => id,
                 Err(e) => {
                     return LoadStatus::Failed(format!(
