@@ -2935,7 +2935,7 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
             KeyAction::Generate { out, force, print } => {
                 cmd_secrets_key_generate(out, force, print)
             }
-            KeyAction::Public => cmd_secrets_key_public(),
+            KeyAction::Public => cmd_secrets_key_public(config),
         },
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
@@ -2944,12 +2944,18 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     }
 }
 
-fn cmd_secrets_key_public() -> Result<()> {
+fn cmd_secrets_key_public(config: &Config) -> Result<()> {
+    use yoink::config::SecretsConfig;
     use yoink::sealed;
-    // No recipients available here — this command answers "what
-    // public key does my current identity correspond to," which is
-    // purely a function of env vars + legacy fallback.
-    let identity = sealed::load_identity(&[])
+    // Pull recipients from the config so the keys-dir scan can pick
+    // the matching identity. If the operator has many keys in
+    // ~/.config/yoink/keys/, this answers "the one for *this*
+    // project," not whichever happened to load first.
+    let recipients: &[String] = match &config.secrets {
+        Some(SecretsConfig::Age { recipients, .. }) => recipients,
+        _ => &[],
+    };
+    let identity = sealed::load_identity(recipients)
         .with_context(|| "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, or place a key in ~/.config/yoink/keys/")?;
     println!("{}", identity.to_public());
     Ok(())
