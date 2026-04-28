@@ -386,14 +386,17 @@ fn seal_new_secrets(
     let path = sealed::resolve_sealed_path(config, file.as_deref())?;
 
     // Merge with existing sealed contents if the file already exists.
-    let mut values: BTreeMap<String, String> = if path.exists() {
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("read sealed file {}", path.display()))?;
-        let identity = sealed::load_identity(recipients)?;
-        let plaintext = sealed::unseal(&bytes, &identity)?;
-        sealed::parse_dotenv(&plaintext)?
-    } else {
-        BTreeMap::new()
+    // Try-read directly (avoids a TOCTOU race between exists() and read).
+    let mut values: BTreeMap<String, String> = match std::fs::read(&path) {
+        Ok(bytes) => {
+            let identity = sealed::load_identity(recipients)?;
+            let plaintext = sealed::unseal(&bytes, &identity)?;
+            sealed::parse_dotenv(&plaintext)?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("read sealed file {}", path.display()));
+        }
     };
 
     let mut added = 0;

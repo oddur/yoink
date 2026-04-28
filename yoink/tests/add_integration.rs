@@ -131,14 +131,24 @@ fn secrets_referenced_in_env_from_secrets_match_generated_names() {
 }
 
 #[test]
-fn templates_directory_includes_expected_starter_set() {
-    let names = list_template_names();
-    for expected in ["postgres", "redis", "meilisearch", "openclaw"] {
-        assert!(
-            names.iter().any(|n| n == expected),
-            "missing starter template `{expected}`; found {names:?}"
-        );
-    }
+fn templates_directory_matches_index() {
+    // index.yaml is the human-curated TL;DR `yoink add` (no args)
+    // shows; every dir on disk should be listed there and vice versa,
+    // so a new template can't slip in without an index entry (or a
+    // dropped template leave behind a dangling listing).
+    let dirs = list_template_names();
+    let index_text = std::fs::read_to_string(templates_dir().join("index.yaml"))
+        .expect("read templates/index.yaml");
+    let mut indexed: Vec<String> = index_text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- name:"))
+        .map(|s| s.trim().to_string())
+        .collect();
+    indexed.sort();
+    assert_eq!(
+        dirs, indexed,
+        "templates/ on disk and index.yaml's `name:` entries diverged"
+    );
 }
 
 #[test]

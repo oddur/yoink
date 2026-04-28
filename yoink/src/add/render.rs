@@ -227,14 +227,7 @@ fn base32_encode(bytes: &[u8]) -> String {
 }
 
 fn reject_escape(p: &str, field: &str) -> Result<()> {
-    let path = Path::new(p);
-    if path.is_absolute() {
-        anyhow::bail!("rendered {field} `{p}` is absolute");
-    }
-    if path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    if super::manifest::escapes_root(Path::new(p)) {
         anyhow::bail!("rendered {field} `{p}` escapes the repo root");
     }
     Ok(())

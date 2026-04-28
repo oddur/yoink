@@ -384,14 +384,11 @@ fn extract_tarball(gz_bytes: &[u8], dest: &Path) -> Result<()> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
-        if path.is_absolute() {
-            anyhow::bail!("tarball contains absolute path {}", path.display());
-        }
-        if path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            anyhow::bail!("tarball contains `..` component in {}", path.display());
+        if super::manifest::escapes_root(&path) {
+            anyhow::bail!(
+                "tarball contains unsafe path (absolute or `..` component): {}",
+                path.display()
+            );
         }
         let kind = entry.header().entry_type();
         if kind.is_symlink() || kind.is_hard_link() {

@@ -692,17 +692,23 @@ fn render(plan: &WizardPlan) -> String {
 
 /// True if the current directory is inside a git working tree. Used
 /// to gate the `--tag $(git rev-parse HEAD)` hint so non-git repos
-/// don't see suggestions that would error.
+/// don't see suggestions that would error. Memoised: the answer
+/// can't change between the yaml-render and summary-print sites
+/// inside a single `cmd_init` run.
 fn is_git_repo() -> bool {
-    let mut p = std::env::current_dir().unwrap_or_default();
-    loop {
-        if p.join(".git").exists() {
-            return true;
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let mut p = std::env::current_dir().unwrap_or_default();
+        loop {
+            if p.join(".git").exists() {
+                return true;
+            }
+            if !p.pop() {
+                return false;
+            }
         }
-        if !p.pop() {
-            return false;
-        }
-    }
+    })
 }
 
 fn print_summary(plan: &WizardPlan, path: &Path, line_count: usize) {

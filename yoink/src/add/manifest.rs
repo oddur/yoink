@@ -193,22 +193,22 @@ impl TemplateManifest {
     }
 }
 
-/// Reject `..` components and absolute paths — both `dest` (operator's
-/// filesystem) and `template` (sandbox inside the cached template dir)
-/// must stay inside their respective roots.
+/// Returns true if `p` would escape its containing root — i.e. is
+/// absolute or contains a `..` component. Used at three points: the
+/// manifest validator (this file), the post-render dest check
+/// ([`render`](super::render)), and tarball entry inspection
+/// ([`source::extract_tarball`](super::source)). Each caller formats
+/// its own error message — the predicate is the only shared bit.
+pub(super) fn escapes_root(p: &Path) -> bool {
+    p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 fn check_relative_path(p: &str, field: &str) -> Result<(), ManifestError> {
-    let path = Path::new(p);
-    if path.is_absolute() {
+    if escapes_root(Path::new(p)) {
         return Err(ManifestError::Invalid(format!(
-            "{field} must be relative (got {p:?})"
-        )));
-    }
-    if path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(ManifestError::Invalid(format!(
-            "{field} must not contain `..` (got {p:?})"
+            "{field} must be a relative path with no `..` components (got {p:?})"
         )));
     }
     Ok(())
