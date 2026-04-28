@@ -164,7 +164,15 @@ enum Command {
     Add {
         /// Template ref. Bare (`postgres`), pinned (`postgres@<sha>`),
         /// or `gh:owner/repo[@ref]/path` for an external source.
-        r#ref: String,
+        /// Mutually exclusive with `--from-path`.
+        #[arg(required_unless_present = "from_path")]
+        r#ref: Option<String>,
+        /// Use a local directory as the template source instead of
+        /// fetching from GitHub. For template authors iterating on a
+        /// manifest without push-pull cycles. The path must contain
+        /// a `template.yaml`.
+        #[arg(long, value_name = "PATH", conflicts_with = "ref")]
+        from_path: Option<PathBuf>,
         /// Skip every confirmation prompt (use defaults). Required in
         /// non-interactive contexts (CI).
         #[arg(long)]
@@ -923,12 +931,22 @@ async fn run(cli: Cli) -> Result<()> {
         return result;
     }
 
-    let config = Config::load_from_path(&cli.config)
-        .with_context(|| format!("loading {}", cli.config.display()))?;
+    // `yoink add` may be the very command that fixes a dangling
+    // reference (e.g. `depends_on: [postgres]` written before
+    // `yoink add postgres` ran), so it loads through the relaxed
+    // path that skips cross-service validation. Every other command
+    // assumes a deployable config.
+    let config = if matches!(cli.command, Command::Add { .. }) {
+        Config::load_from_path_relaxed(&cli.config)
+    } else {
+        Config::load_from_path(&cli.config)
+    }
+    .with_context(|| format!("loading {}", cli.config.display()))?;
 
     match cli.command {
         Command::Add {
             r#ref,
+            from_path,
             yes,
             up,
             refresh,
@@ -939,6 +957,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &cli.config,
                 yoink::add::AddOpts {
                     r#ref,
+                    from_path,
                     yes,
                     up,
                     refresh,
@@ -1298,10 +1317,26 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // separately. Push is intentionally not auto-engaged — kamal-style
     // flows still go through the explicit `yoink build --push` step.
     if build {
-        for svc in config.selected_services(services_filter) {
-            if svc.build.is_none() {
-                continue;
-            }
+        let buildable: Vec<&yoink::config::ServiceConfig> = config
+            .selected_services(services_filter)
+            .filter(|s| s.build.is_some())
+            .collect();
+        if buildable.is_empty() {
+            // Silent no-op was the worst UX — operator passes --build,
+            // assumes building happened, deploys an unchanged image.
+            // Loud-fail with the diagnosis.
+            let selected: Vec<&str> = config
+                .selected_services(services_filter)
+                .map(|s| s.name.as_str())
+                .collect();
+            anyhow::bail!(
+                "--build was set but no selected service has a `build:` block. \
+                 Selected: [{}]. Add `build: {{ context: . }}` to a service, \
+                 or drop --build for an image-only deploy.",
+                selected.join(", ")
+            );
+        }
+        for svc in buildable {
             let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
             yoink::build::build_service(config, svc, &tag, false, false)
                 .await
@@ -1366,6 +1401,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             &tag_overrides,
             services_filter,
             bundle.as_ref(),
+            no_registry,
             prefetch_cb,
         )
         .await

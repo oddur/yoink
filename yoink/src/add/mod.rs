@@ -31,7 +31,10 @@ pub mod wizard;
 
 #[derive(Debug, Clone)]
 pub struct AddOpts {
-    pub r#ref: String,
+    /// Either `r#ref` (GitHub-fetched) or `from_path` (local dir)
+    /// must be set; both being set is rejected by the caller.
+    pub r#ref: Option<String>,
+    pub from_path: Option<PathBuf>,
     pub yes: bool,
     pub up: bool,
     pub refresh: bool,
@@ -53,17 +56,44 @@ pub async fn cmd_add(
     config_path: &Path,
     opts: AddOpts,
 ) -> Result<AddOutcome> {
-    let template_ref = source::parse_ref(&opts.r#ref)?;
     let overrides = wizard::parse_var_overrides(&opts.vars)?;
 
-    eprintln!(
-        "fetching template `{}` from {}/{}@{}…",
-        template_ref.subpath.rsplit('/').next().unwrap_or("?"),
-        template_ref.owner,
-        template_ref.repo,
-        template_ref.git_ref
-    );
-    let fetched = source::fetch(&template_ref, opts.refresh).await?;
+    let (template_label, fetched) = match (&opts.r#ref, &opts.from_path) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "pass either a template ref or `--from-path`, not both"
+        ),
+        (None, None) => anyhow::bail!(
+            "missing template ref — pass a name (`yoink add postgres`) or `--from-path ./local-dir`"
+        ),
+        (Some(r), None) => {
+            let template_ref = source::parse_ref(r)?;
+            eprintln!(
+                "fetching template `{}` from {}/{}@{}…",
+                template_ref.subpath.rsplit('/').next().unwrap_or("?"),
+                template_ref.owner,
+                template_ref.repo,
+                template_ref.git_ref
+            );
+            let fetched = source::fetch(&template_ref, opts.refresh).await?;
+            (
+                template_ref.display_short(&fetched.sha),
+                fetched,
+            )
+        }
+        (None, Some(path)) => {
+            let fetched = source::from_local_path(path)?;
+            eprintln!(
+                "using template from local path: {}",
+                fetched.root.display()
+            );
+            let label = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("local")
+                .to_string();
+            (format!("{label} (local)"), fetched)
+        }
+    };
 
     let manifest_path = fetched.root.join("template.yaml");
     let manifest = manifest::TemplateManifest::parse_file(&manifest_path)?;
@@ -158,8 +188,7 @@ pub async fn cmd_add(
         .collect();
 
     print_confirmation(
-        &template_ref,
-        &fetched.sha,
+        &template_label,
         manifest.kind,
         &rendered,
         &absolute_dests,
@@ -318,8 +347,7 @@ fn seal_new_secrets(
 }
 
 fn print_confirmation(
-    template_ref: &source::TemplateRef,
-    sha: &str,
+    template_label: &str,
     kind: manifest::TemplateKind,
     rendered: &render::Rendered,
     absolute_dests: &[PathBuf],
@@ -331,10 +359,7 @@ fn print_confirmation(
         manifest::TemplateKind::App => "app",
     };
     eprintln!();
-    eprintln!(
-        "Template: {} ({kind_label})",
-        template_ref.display_short(sha)
-    );
+    eprintln!("Template: {template_label} ({kind_label})");
     eprintln!("Files to write:");
     for abs in absolute_dests {
         let exists = if abs.exists() { " (overwrites existing)" } else { "" };

@@ -1235,6 +1235,7 @@ pub async fn prefetch_images(
     tag_overrides: &BTreeMap<String, String>,
     services_filter: Option<&[String]>,
     secrets: Option<&SecretsBundle>,
+    skip_locally_built: bool,
     on_event: Arc<dyn Fn(DeployEvent) + Send + Sync>,
 ) -> Result<(), DeployError> {
     let credentials = registry_credentials(config, secrets);
@@ -1244,6 +1245,14 @@ pub async fn prefetch_images(
         if let Some(filter) = services_filter
             && !filter.iter().any(|n| n == &service.name)
         {
+            continue;
+        }
+        // With `--no-registry` the locally-built image is shipped via
+        // unregistry/tarball before this phase, so trying to pull it
+        // from a registry would 404 (the image doesn't exist there).
+        // Skip — the reconcile step's `image_present` check will pass
+        // because the unregistry push already landed it on the host.
+        if skip_locally_built && service.build.is_some() {
             continue;
         }
         let tag = match tag_overrides.get(&service.name).cloned() {

@@ -148,6 +148,30 @@ pub struct FetchedTemplate {
     pub root: PathBuf,
 }
 
+/// Use a local directory as the template source. Skips the
+/// fetch + extract pipeline entirely — for template authors iterating
+/// on a manifest without push-pull cycles to GitHub.
+pub fn from_local_path(path: &Path) -> Result<FetchedTemplate> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("resolve --from-path {}", path.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!(
+            "--from-path {} is not a directory",
+            canonical.display()
+        );
+    }
+    if !canonical.join("template.yaml").exists() {
+        anyhow::bail!(
+            "no `template.yaml` in {} — is this a yoink template directory?",
+            canonical.display()
+        );
+    }
+    Ok(FetchedTemplate {
+        sha: "local".to_string(),
+        root: canonical,
+    })
+}
+
 /// Fetch a template, using cache if possible. Network calls only happen
 /// when `refresh` is true or when the cache doesn't already hold the
 /// resolved SHA.
