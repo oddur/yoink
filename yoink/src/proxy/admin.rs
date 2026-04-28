@@ -120,11 +120,43 @@ pub async fn push_config(
         .map_err(|source| AdminError::Http { source })?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        // Caddy parser errors can echo a slice of the submitted JSON,
+        // which carries inline cert+key PEMs from
+        // `tls.certificates.load_pem`. Strip them before the error
+        // lands in stderr / tracing / TUI toasts.
+        let body = redact_pem_blocks(&resp.text().await.unwrap_or_default());
         return Err(AdminError::LoadRejected { status, body });
     }
     drop(tunnel);
     Ok(())
+}
+
+const REDACTED_PEM: &str = "<redacted PEM>";
+
+/// Replace `-----BEGIN <kind>----- … -----END <kind>-----` regions
+/// with a placeholder; an unterminated BEGIN is over-redacted to the
+/// end of the body (better than leaking).
+fn redact_pem_blocks(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    loop {
+        let Some(begin_pos) = rest.find("-----BEGIN ") else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..begin_pos]);
+        let after_begin = &rest[begin_pos..];
+        let Some(end_marker_pos) = after_begin.find("-----END ") else {
+            out.push_str(REDACTED_PEM);
+            return out;
+        };
+        let tail = &after_begin[end_marker_pos..];
+        let after_end_label = tail
+            .find("-----")
+            .map_or(after_begin.len(), |idx| idx + "-----".len());
+        out.push_str(REDACTED_PEM);
+        rest = &after_begin[end_marker_pos + after_end_label..];
+    }
 }
 
 async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), AdminError> {
@@ -142,6 +174,34 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
             return Err(AdminError::NotReady { timeout });
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_strips_full_pem_blocks() {
+        let body = "json error at offset 42: -----BEGIN CERTIFICATE-----\nABCDEF\n-----END CERTIFICATE-----\n more context";
+        let out = redact_pem_blocks(body);
+        assert!(out.contains("<redacted PEM>"));
+        assert!(!out.contains("ABCDEF"));
+        assert!(out.contains("more context"));
+    }
+
+    #[test]
+    fn redact_handles_unterminated_pem() {
+        let body = "load failed: -----BEGIN PRIVATE KEY-----\nMIIabc... (truncated)";
+        let out = redact_pem_blocks(body);
+        assert!(out.contains("<redacted PEM>"));
+        assert!(!out.contains("MIIabc"));
+    }
+
+    #[test]
+    fn redact_passthrough_when_no_pem() {
+        let body = r#"{"error":"unknown directive 'foo'"}"#;
+        assert_eq!(redact_pem_blocks(body), body);
     }
 }
 

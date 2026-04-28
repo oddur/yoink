@@ -552,7 +552,9 @@ pub async fn deploy_service(
     // gap between schema migration and runtime container start as
     // close to zero as possible. `--service` filtering skips the
     // service and its hooks together (`yoink up --service api` will
-    // not run web's migrations).
+    // not run web's migrations). On hook failure we clean up the
+    // pre-created replicas so a failed deploy doesn't leave
+    // `created`-state containers hanging around until the next prune.
     for hook in &service.pre_deploy {
         let hook_tag = resolve_hook_tag(hook, &BTreeMap::new(), &config.services);
         let resolved_tag = if matches!(hook.tag, HookTag::Ref { .. }) {
@@ -565,7 +567,10 @@ pub async fn deploy_service(
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
         });
-        run_hook(ops, config, hook, &resolved_tag, secrets).await?;
+        if let Err(e) = run_hook(ops, config, hook, &resolved_tag, secrets).await {
+            cleanup_prepared_replicas(ops, &prepared).await;
+            return Err(e);
+        }
         on_event(DeployEvent::HookFinished {
             name: hook.name.clone(),
         });
@@ -1254,6 +1259,21 @@ async fn force_remove_name(ops: &dyn DockerOps, host: &Host, name: &str) {
     if let Err(e) = ops.force_remove_container(host, name).await {
         warn!(host = %host.address, container = %name, error = %e, "force_remove_container failed; continuing");
     }
+}
+
+/// Best-effort cleanup of pre-created (pending) containers after a
+/// pre-deploy hook fails — fanned out across hosts × replicas so
+/// recovery isn't gated on N×M serial round-trips. Idempotent (404 =
+/// already gone); errors are logged inside `force_remove_name` and
+/// never mask the original hook error.
+async fn cleanup_prepared_replicas(ops: &dyn DockerOps, prepared: &[HostPrep]) {
+    let futs = prepared.iter().flat_map(|prep| {
+        prep.replicas
+            .iter()
+            .filter(|r| !r.already_running)
+            .map(move |r| force_remove_name(ops, &prep.host, &r.name))
+    });
+    futures_util::future::join_all(futs).await;
 }
 
 /// Create the new container in `created` state but do not start it.

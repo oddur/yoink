@@ -66,7 +66,10 @@ impl ServicesState {
         if let Some(r) = report {
             self.report = Some(r);
         }
-        clamp_selection(&mut self.table, self.service_names.len());
+        // Clamp against the *filtered* count — table.selected() indexes
+        // into visible_indices(), not the full service_names list.
+        let n = self.visible_indices().len();
+        clamp_selection(&mut self.table, n);
     }
 
     pub fn select_next(&mut self) {
@@ -279,7 +282,10 @@ impl ServiceDetailState {
                 }
             }
             self.rows = rows;
-            clamp_selection(&mut self.table, self.rows.len());
+            // Clamp against the *filtered* count — `table.selected()`
+            // indexes into `visible_indices()`, not `self.rows`.
+            let n = self.visible_indices().len();
+            clamp_selection(&mut self.table, n);
         }
     }
 
