@@ -1,9 +1,9 @@
 ---
-title: TanStack Start + postgres + redis from scratch
+title: TanStack Start + postgres from scratch
 weight: 5
 ---
 
-A TanStack Start app deploying alongside a managed postgres and redis, built locally and shipped without a registry. Five files, three commands, working stack on the host in about ten minutes.
+A TanStack Start app deploying alongside a managed postgres, built locally and shipped without a registry. Five files, three commands, working stack on the host in about ten minutes. Adding more accessories (redis, meilisearch, …) is the same shape — `yoink add <name>`, paste the connection block.
 
 This is the "indie one-shot" pattern — single laptop, single host, no CI, no Docker Hub account, no Vault. Public exposure (HTTPS, domains) is intentionally out of scope here; the [port-forward recipe](/docs/recipes/port-forward) covers reaching the deployed stack from your laptop.
 
@@ -17,22 +17,20 @@ This is the "indie one-shot" pattern — single laptop, single host, no CI, no D
 ```sh
 npm create @tanstack/start@latest my-app
 cd my-app
-npm install pg ioredis
+npm install pg
 ```
 
-The scaffolder produces a Vite-backed Nitro SSR setup. We add `pg` + `ioredis` for the demo integration.
+The scaffolder produces a Vite-backed Nitro SSR setup. We add `pg` for the demo integration.
 
 Drop the database client into a server-only module so the secrets never reach the browser bundle:
 
 ```ts
 // src/lib/db.server.ts — the .server.ts suffix keeps this off the client
 import { Client } from 'pg'
-import Redis from 'ioredis'
 
-export type DbStatus = {
-  postgres: { ok: true; version: string } | { ok: false; error: string }
-  redis: { ok: true; value: string | null } | { ok: false; error: string }
-}
+export type DbStatus =
+  | { ok: true; version: string }
+  | { ok: false; error: string }
 
 export async function checkStack(): Promise<DbStatus> {
   const pgUrl = `postgres://${process.env.POSTGRES_USER}:${
@@ -40,35 +38,15 @@ export async function checkStack(): Promise<DbStatus> {
   }@${process.env.POSTGRES_HOST}:5432/${process.env.POSTGRES_DB}`
 
   const pg = new Client({ connectionString: pgUrl })
-  let postgres: DbStatus['postgres']
   try {
     await pg.connect()
     const r = await pg.query('SELECT version()')
-    postgres = { ok: true, version: r.rows[0].version }
+    return { ok: true, version: r.rows[0].version }
   } catch (e) {
-    postgres = { ok: false, error: (e as Error).message }
+    return { ok: false, error: (e as Error).message }
   } finally {
     await pg.end().catch(() => {})
   }
-
-  const redis = new Redis({
-    host: process.env.REDIS_HOST,
-    port: 6379,
-    lazyConnect: true,
-    maxRetriesPerRequest: 1,
-  })
-  let redisStatus: DbStatus['redis']
-  try {
-    await redis.connect()
-    await redis.set('demo', 'it works', 'EX', 60)
-    redisStatus = { ok: true, value: await redis.get('demo') }
-  } catch (e) {
-    redisStatus = { ok: false, error: (e as Error).message }
-  } finally {
-    redis.disconnect()
-  }
-
-  return { postgres, redis: redisStatus }
 }
 ```
 
@@ -153,21 +131,15 @@ inferred:
 
 **Back up the key now** (paste into a password manager) — see [Sealed secrets](/docs/recipes/sealed-secrets) for backup options. Lose it and the sealed values in this repo are gone.
 
-## Step 4: drop in postgres + redis
+## Step 4: drop in postgres
 
 ```sh
 yoink add postgres
-yoink add redis
 ```
 
-Each generates a fragment in `services/`, seals any random credentials into `secrets.age`, and extends `yoink.yaml`'s `include:` list. Two files appear:
+Generates a fragment in `services/postgres.yaml` (postgres:16-alpine + sealed `POSTGRES_PASSWORD`), seals the password into `secrets.age`, and extends `yoink.yaml`'s `include:` list.
 
-```
-services/postgres.yaml   # postgres:16-alpine + sealed POSTGRES_PASSWORD
-services/redis.yaml      # redis:7-alpine, secure-by-default options
-```
-
-After each `add` succeeds, yoink prints a **paste-ready connection block** that uses only fields already in the schema (`depends_on:`, `env:`, `env_from_secrets:`):
+After the add succeeds, yoink prints a **paste-ready connection block** that uses only fields already in the schema (`depends_on:`, `env:`, `env_from_secrets:`):
 
 ```
 connect another service to postgres:
@@ -185,12 +157,11 @@ connect another service to postgres:
 
 The keys are the accessory's suggestion — neutral, conventional. If your app reads a different shape (e.g. `DATABASE_URL`, `PG_HOST`), rename them in the paste; yoink doesn't care which env names the consuming service uses, only that they're present.
 
-## Step 5: wire the app to the accessories
+> **Need redis, meilisearch, …?** Same shape: `yoink add redis` (or `yoink add meilisearch`) prints its own connection block. Paste alongside this one, merging the `depends_on:` lists.
 
-Paste the two `connect another service to …` blocks into your app's `services[]` entry. Two cleanups after pasting:
+## Step 5: wire the app to the accessory
 
-- Each block prints its own `depends_on: [...]`. Merge them into one list (`depends_on: [postgres, redis]`).
-- The keys are conventional but not magic — drop any your app doesn't read (the demo `db.server.ts` ignores `POSTGRES_PORT` / `REDIS_PORT` since both are hard-coded).
+Paste the `connect another service to …` block into your app's `services[]` entry. The keys are conventional but not magic — drop any your app doesn't read (the demo `db.server.ts` ignores `POSTGRES_PORT` since the port is hard-coded).
 
 Then add the `build:` block. The whole file ends up looking like:
 
@@ -212,12 +183,11 @@ services:
       # Cross-build to amd64 when developing on Apple Silicon.
       # Drop this if your laptop matches the host's arch.
       extra_args: ["--platform", "linux/amd64"]
-    depends_on: [postgres, redis]
+    depends_on: [postgres]
     env:
       POSTGRES_HOST: postgres
       POSTGRES_DB: app
       POSTGRES_USER: app
-      REDIS_HOST: redis
     env_from_secrets:
       POSTGRES_PASSWORD: POSTGRES_PASSWORD
     run:
@@ -233,11 +203,11 @@ include:
 ## Step 6: deploy
 
 ```sh
-yoink up --service postgres --service redis     # pass 1: accessories
+yoink up --service postgres                     # pass 1: accessory
 yoink up --build --no-registry --service my-app # pass 2: app, local build → unregistry push
 ```
 
-Pass 1 pulls postgres + redis from Docker Hub, starts them on the `yoink` network. Pass 2 builds the app image locally and ships it via [unregistry](https://github.com/psviderski/unregistry) over SSH (no registry account required), starts the container, and runs the healthcheck.
+Pass 1 pulls postgres from Docker Hub, starts it on the `yoink` network. Pass 2 builds the app image locally and ships it via [unregistry](https://github.com/psviderski/unregistry) over SSH (no registry account required), starts the container, and runs the healthcheck.
 
 > **Why two passes?** With a single `yoink up --build --no-registry`, yoink's image-prefetch step still tries to pull every image — including the locally-built app, which 404s on Hub. Scoping with `--service` avoids the prefetch for accessories that don't need updating.
 
@@ -253,7 +223,7 @@ The app is reachable on the host's docker network at `my-app:3000`, but not yet 
   ```
 - **port-forward from your laptop** — see the [port-forward recipe](/docs/recipes/port-forward).
 
-Both `postgres.ok` and `redis.ok` should be `true` in the JSON.
+The JSON should report `ok: true` with a postgres version string.
 
 ## Re-deploys
 
@@ -273,9 +243,9 @@ yoink up --build --no-registry --here --service my-app
 
 ## What just happened
 
-Five files (`Dockerfile`, `.dockerignore`, `src/lib/db.server.ts`, `src/routes/index.tsx`, `yoink.yaml`) plus three yoink commands (`init`, two `add`s, `up`):
+Five files (`Dockerfile`, `.dockerignore`, `src/lib/db.server.ts`, `src/routes/index.tsx`, `yoink.yaml`) plus three yoink commands (`init`, `add`, `up`):
 
-- Three containers on one host: postgres, redis, your app.
+- Two containers on one host: postgres and your app.
 - Random `POSTGRES_PASSWORD` generated, sealed into `secrets.age`, and committed to the repo. Decryption needs the age key in `~/.config/yoink/keys/`.
 - All inter-service traffic on a private docker network — nothing exposed publicly yet.
 - Spec-hash drift detection on every container, so a manual `docker exec` in production shows up in `yoink status` next time you check.
