@@ -136,11 +136,10 @@ pub struct SecretSpec {
 
 impl TemplateManifest {
     pub fn parse_str(text: &str, source_label: &str) -> Result<Self, ManifestError> {
-        let manifest: Self =
-            yaml_serde::from_str(text).map_err(|source| ManifestError::Parse {
-                path: source_label.to_string(),
-                source,
-            })?;
+        let manifest: Self = yaml_serde::from_str(text).map_err(|source| ManifestError::Parse {
+            path: source_label.to_string(),
+            source,
+        })?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -316,15 +315,16 @@ mod tiny_regex {
             let mut ranges = Vec::new();
             while j < pat.len() && pat[j] != ']' {
                 let lo = pat[j];
-                let (range_lo, range_hi) =
-                    if pat.get(j + 1).copied() == Some('-') && pat.get(j + 2).is_some_and(|c| *c != ']') {
-                        let hi = pat[j + 2];
-                        j += 3;
-                        (lo, hi)
-                    } else {
-                        j += 1;
-                        (lo, lo)
-                    };
+                let (range_lo, range_hi) = if pat.get(j + 1).copied() == Some('-')
+                    && pat.get(j + 2).is_some_and(|c| *c != ']')
+                {
+                    let hi = pat[j + 2];
+                    j += 3;
+                    (lo, hi)
+                } else {
+                    j += 1;
+                    (lo, lo)
+                };
                 ranges.push((range_lo, range_hi));
             }
             // skip closing ']'

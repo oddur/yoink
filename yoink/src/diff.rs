@@ -342,8 +342,9 @@ fn field_diff_scoped(
     env_changed.retain(|k| managed_env.contains(k));
 
     let user_labels: BTreeSet<String> = service.labels.keys().cloned().collect();
-    let label_in_scope =
-        |k: &String| (k.starts_with("yoink.") || user_labels.contains(k)) && !is_yoink_internal_label(k);
+    let label_in_scope = |k: &String| {
+        (k.starts_with("yoink.") || user_labels.contains(k)) && !is_yoink_internal_label(k)
+    };
     let (mut labels_added, mut labels_removed, mut labels_changed) =
         diff_kv(current_labels, desired_labels);
     labels_added.retain(&label_in_scope);
@@ -582,9 +583,7 @@ fn field_diff_lines(fields: &FieldDiff, indent: &str) -> String {
 
 fn markdown_cells(d: &ServiceDiff) -> (&'static str, String, String) {
     match &d.change {
-        ChangeKind::Create { desired_image } => {
-            ("🟢", "new".into(), format!("`{desired_image}`"))
-        }
+        ChangeKind::Create { desired_image } => ("🟢", "new".into(), format!("`{desired_image}`")),
         ChangeKind::Update {
             current_hash,
             current_image,
@@ -683,7 +682,11 @@ mod tests {
     #[test]
     fn text_render_includes_each_change_kind() {
         let r = diff_with(
-            vec![create("a", "h1", "a:v1"), update("b", "h1"), noop("c", "h1")],
+            vec![
+                create("a", "h1", "a:v1"),
+                update("b", "h1"),
+                noop("c", "h1"),
+            ],
             vec![],
         );
         let t = r.render(Format::Text);
@@ -754,7 +757,9 @@ mod tests {
         // remain visible in the diff.
         assert!(!is_yoink_internal_label("yoink.caddy.domain"));
         assert!(!is_yoink_internal_label("yoink.service"));
-        assert!(!is_yoink_internal_label("org.opencontainers.image.description"));
+        assert!(!is_yoink_internal_label(
+            "org.opencontainers.image.description"
+        ));
     }
 
     fn service_with_managed_keys() -> crate::config::ServiceConfig {

@@ -132,7 +132,9 @@ impl ServicesState {
         let visible = self.visible_indices();
         clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])]
         } else if visible.is_empty() && !self.service_names.is_empty() {
             vec![Row::new(vec![Cell::from("(no services match filter)")])]
         } else {
@@ -405,7 +407,9 @@ impl ServiceDetailState {
         let visible = self.visible_indices();
         clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])]
         } else if self.rows.is_empty() {
             vec![Row::new(vec![Cell::from("(no instances)")])]
         } else if visible.is_empty() {

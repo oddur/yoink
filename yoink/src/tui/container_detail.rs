@@ -441,7 +441,11 @@ impl ContainerDetailState {
             };
             let datasets = vec![
                 Dataset::default()
-                    .name(if history.mem_uncapped { "mem MB" } else { "mem%" })
+                    .name(if history.mem_uncapped {
+                        "mem MB"
+                    } else {
+                        "mem%"
+                    })
                     .marker(Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(Color::Magenta))
@@ -495,14 +499,8 @@ impl ContainerDetailState {
                 cols[2],
             );
         } else {
-            let rx_peak = rx_rates_pos
-                .iter()
-                .map(|(_, v)| *v)
-                .fold(0.0_f64, f64::max);
-            let tx_peak = tx_rates
-                .iter()
-                .map(|(_, v)| *v)
-                .fold(0.0_f64, f64::max);
+            let rx_peak = rx_rates_pos.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
+            let tx_peak = tx_rates.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
             // Symmetric y-axis around zero so the visual zero-line
             // sits halfway down the panel regardless of whether
             // download or upload is dominant. `.max(1.0)` keeps the
@@ -714,16 +712,10 @@ impl ContainerDetailState {
             // total" — useful for spotting the runaway egress case.
             right_lines.push(Line::from(vec![
                 Span::styled("NET ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "↓ ".to_string(),
-                    Style::default().fg(Color::Green),
-                ),
+                Span::styled("↓ ".to_string(), Style::default().fg(Color::Green)),
                 Span::raw(format_bytes(s.net_rx_bytes)),
                 Span::raw("  "),
-                Span::styled(
-                    "↑ ".to_string(),
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled("↑ ".to_string(), Style::default().fg(Color::Yellow)),
                 Span::raw(format_bytes(s.net_tx_bytes)),
             ]));
         } else {

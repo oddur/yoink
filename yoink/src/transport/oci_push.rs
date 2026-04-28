@@ -52,8 +52,10 @@ pub enum OciPushError {
     TarRead(#[source] std::io::Error),
     #[error("invalid OCI image tarball: {0}")]
     InvalidTar(String),
-    #[error("expected single-platform image, found manifest list with {count} entries — \
-             multi-arch images aren't yet supported by the unregistry transport")]
+    #[error(
+        "expected single-platform image, found manifest list with {count} entries — \
+             multi-arch images aren't yet supported by the unregistry transport"
+    )]
     MultiArch { count: usize },
     #[error("blob {digest} referenced by manifest but not found in tarball")]
     MissingBlob { digest: String },
@@ -141,7 +143,10 @@ pub async fn push_image(
     let manifest_url = format!("{base_url}/v2/{repo}/manifests/{tag}");
     let resp = client
         .put(&manifest_url)
-        .header(reqwest::header::CONTENT_TYPE, manifest_descriptor.media_type.as_str())
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            manifest_descriptor.media_type.as_str(),
+        )
         .body(manifest_blob)
         .send()
         .await
@@ -353,9 +358,8 @@ fn extract_oci_layout(tar_bytes: &[u8]) -> Result<OciLayout, OciPushError> {
                 .to_string(),
         ));
     }
-    let index_bytes = index_bytes.ok_or_else(|| {
-        OciPushError::InvalidTar("missing `index.json` in image tarball".into())
-    })?;
+    let index_bytes = index_bytes
+        .ok_or_else(|| OciPushError::InvalidTar("missing `index.json` in image tarball".into()))?;
     let index: OciIndex = serde_json::from_slice(&index_bytes)?;
 
     Ok(OciLayout { index, blobs })
@@ -378,21 +382,23 @@ fn extract_oci_layout(tar_bytes: &[u8]) -> Result<OciLayout, OciPushError> {
 /// that's the platform the operator actually has and the only one we
 /// can push.
 fn pick_image_manifest(layout: &OciLayout) -> Result<Descriptor, OciPushError> {
-    let first = layout.index.manifests.first().ok_or_else(|| {
-        OciPushError::InvalidTar("index.json has empty manifests array".into())
-    })?;
+    let first =
+        layout.index.manifests.first().ok_or_else(|| {
+            OciPushError::InvalidTar("index.json has empty manifests array".into())
+        })?;
 
     if is_image_manifest(&first.media_type) {
         return Ok(first.clone());
     }
 
     // It's an index — descend.
-    let nested_bytes = layout
-        .blobs
-        .get(&first.digest)
-        .ok_or_else(|| OciPushError::MissingBlob {
-            digest: first.digest.clone(),
-        })?;
+    let nested_bytes =
+        layout
+            .blobs
+            .get(&first.digest)
+            .ok_or_else(|| OciPushError::MissingBlob {
+                digest: first.digest.clone(),
+            })?;
     let nested: OciIndex = serde_json::from_slice(nested_bytes)?;
 
     // Skip attestation manifests (platform.arch == "unknown") — they
@@ -430,7 +436,12 @@ fn manifest_blobs_present(descriptor: &Descriptor, layout: &OciLayout) -> Option
     if !layout.blobs.contains_key(&manifest.config.digest) {
         return Some(false);
     }
-    Some(manifest.layers.iter().all(|l| layout.blobs.contains_key(&l.digest)))
+    Some(
+        manifest
+            .layers
+            .iter()
+            .all(|l| layout.blobs.contains_key(&l.digest)),
+    )
 }
 
 fn is_image_manifest(media_type: &str) -> bool {
@@ -447,10 +458,14 @@ mod tests {
 
     #[test]
     fn is_image_manifest_recognizes_oci_and_docker_v2() {
-        assert!(is_image_manifest("application/vnd.oci.image.manifest.v1+json"));
+        assert!(is_image_manifest(
+            "application/vnd.oci.image.manifest.v1+json"
+        ));
         assert!(is_image_manifest(
             "application/vnd.docker.distribution.manifest.v2+json"
         ));
-        assert!(!is_image_manifest("application/vnd.oci.image.index.v1+json"));
+        assert!(!is_image_manifest(
+            "application/vnd.oci.image.index.v1+json"
+        ));
     }
 }

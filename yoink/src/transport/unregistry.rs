@@ -314,8 +314,6 @@ fn sidecar_create_body() -> ContainerCreateBody {
     }
 }
 
-
-
 /// RAII guard that force-removes the sidecar if Drop runs before
 /// [`SidecarCleanup::run_now`] consumes it. `run_now` is the happy-path
 /// async cleanup that surfaces removal errors to the caller; the Drop

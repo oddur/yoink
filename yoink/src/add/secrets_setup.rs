@@ -85,8 +85,8 @@ pub fn bootstrap(config_path: &Path, key_path: &Path) -> Result<BootstrapResult>
     sealed::write_atomically_secret(key_path, body.as_bytes())
         .with_context(|| format!("write {}", key_path.display()))?;
 
-    let gitignore_updated = ensure_gitignored(config_path, key_path)
-        .context("update .gitignore")?;
+    let gitignore_updated =
+        ensure_gitignored(config_path, key_path).context("update .gitignore")?;
 
     append_secrets_block(config_path, &public)
         .with_context(|| format!("append secrets: block to {}", config_path.display()))?;

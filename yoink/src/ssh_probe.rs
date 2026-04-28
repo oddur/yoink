@@ -87,7 +87,10 @@ pub async fn probe(host: &Host, keyfile_override: Option<&str>) -> Result<(), St
 
     let translated = classify(&stderr);
     let prefix = if timed_out {
-        format!("ssh probe timed out after {}s: {translated}", PROBE_DEADLINE.as_secs())
+        format!(
+            "ssh probe timed out after {}s: {translated}",
+            PROBE_DEADLINE.as_secs()
+        )
     } else {
         format!("ssh probe failed: {translated}")
     };
@@ -112,8 +115,7 @@ pub fn classify(stderr: &str) -> String {
     if stderr.contains("Host key verification failed") {
         return "host key verification failed — the host's key changed. Inspect ~/.ssh/known_hosts and re-add if expected".into();
     }
-    if stderr.contains("Could not resolve hostname")
-        || stderr.contains("Name or service not known")
+    if stderr.contains("Could not resolve hostname") || stderr.contains("Name or service not known")
     {
         return "could not resolve hostname — typo in `address:`, or DNS / Tailscale magicDNS not reachable".into();
     }

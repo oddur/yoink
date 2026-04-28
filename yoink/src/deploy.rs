@@ -436,8 +436,13 @@ pub async fn reconcile_with_options(
                     // admin state even when nothing has drifted.
                     let desired = build_desired_spec(config_ref, service, &tag, secrets_ref)?;
                     let desired_hash = docker::compute_spec_hash(&desired);
-                    if !options.force && let Some(host_results) =
-                        service_already_at_spec(snapshot_ref, config_ref, service, &desired_hash)
+                    if !options.force
+                        && let Some(host_results) = service_already_at_spec(
+                            snapshot_ref,
+                            config_ref,
+                            service,
+                            &desired_hash,
+                        )
                     {
                         let mut g = sink_ref.lock().expect("sink poisoned");
                         for r in &host_results {
@@ -551,9 +556,10 @@ pub async fn deploy_service(
     // `docker start` away from running.
     let mut prepared: Vec<HostPrep> = Vec::with_capacity(hosts.len());
     for host_cfg in &hosts {
-        let prep =
-            prepare_one_host(ops, config, service, tag, secrets, host_cfg, force, on_event)
-                .await?;
+        let prep = prepare_one_host(
+            ops, config, service, tag, secrets, host_cfg, force, on_event,
+        )
+        .await?;
         prepared.push(prep);
     }
 
@@ -879,12 +885,13 @@ async fn build_upstream_names(
             expected.iter().cloned().collect()
         } else {
             let label = format!("yoink.service={}", svc.name);
-            let containers = ops.list_containers_by_label(host, &label).await.map_err(
-                |source| DeployError::Docker {
-                    host: host.address.clone(),
-                    source,
-                },
-            )?;
+            let containers =
+                ops.list_containers_by_label(host, &label)
+                    .await
+                    .map_err(|source| DeployError::Docker {
+                        host: host.address.clone(),
+                        source,
+                    })?;
             containers
                 .into_iter()
                 .filter(crate::docker_ops::ContainerInfo::is_running)
@@ -944,11 +951,15 @@ async fn push_caddy_config(
         .collect();
     let upstream_names = build_upstream_names(ops, host, &routed, in_flight_upstreams).await?;
 
-    let json = crate::proxy::caddy::render(config, |s| upstream_names.get(s).cloned().unwrap_or_default(), secrets)
-        .map_err(|source| DeployError::Custom {
-            host: host.address.clone(),
-            detail: format!("render Caddy config: {source}"),
-        })?;
+    let json = crate::proxy::caddy::render(
+        config,
+        |s| upstream_names.get(s).cloned().unwrap_or_default(),
+        secrets,
+    )
+    .map_err(|source| DeployError::Custom {
+        host: host.address.clone(),
+        detail: format!("render Caddy config: {source}"),
+    })?;
     crate::proxy::admin::push_config(host, ops, &json)
         .await
         .map_err(|source| {
@@ -1766,9 +1777,17 @@ services:
         let cfg = config_one_service();
         let mut events: Vec<DeployEvent> = Vec::new();
         let mut sink = |e: DeployEvent| events.push(e);
-        let report = deploy_service(&ops, &cfg, &cfg.services[0], "a1b2c3d", None, false, &mut sink)
-            .await
-            .unwrap();
+        let report = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.service, "app-a");
         assert_eq!(report.tag, "a1b2c3d");
         assert!(
@@ -1884,9 +1903,17 @@ services:
 
         let mut events: Vec<DeployEvent> = Vec::new();
         let mut sink = |e: DeployEvent| events.push(e);
-        let report = deploy_service(&ops, &cfg, &cfg.services[0], "a1b2c3d", None, false, &mut sink)
-            .await
-            .unwrap();
+        let report = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.hosts[0].container, expected_name);
         assert!(report.hosts[0].stopped_old.is_empty());
         assert!(events.iter().any(|e| matches!(
@@ -2053,8 +2080,7 @@ services:
             container_with_state("api-NEWHASH-1", "running"),
         ]));
 
-        let mut expected: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut expected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         expected.insert("api-NEWHASH-0".into());
         expected.insert("api-NEWHASH-1".into());
 
@@ -2062,14 +2088,16 @@ services:
             user: "deploy".into(),
             address: "host-a".into(),
         };
-        let names =
-            build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
-                .await
-                .unwrap();
+        let names = build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
+            .await
+            .unwrap();
 
         assert_eq!(
             names.get("api"),
-            Some(&vec!["api-NEWHASH-0".to_string(), "api-NEWHASH-1".to_string()]),
+            Some(&vec![
+                "api-NEWHASH-0".to_string(),
+                "api-NEWHASH-1".to_string()
+            ]),
             "in-flight service must use expected_names, not the live container list"
         );
         // `list_containers_by_label` must NOT have been called for
@@ -2124,23 +2152,18 @@ services:
             container_with_state("web-OLDHASH-1", "exited"),
         ]));
 
-        let mut expected: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut expected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         expected.insert("api-NEWHASH-0".into());
 
         let host = Host {
             user: "deploy".into(),
             address: "host-a".into(),
         };
-        let names =
-            build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
-                .await
-                .unwrap();
+        let names = build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
+            .await
+            .unwrap();
 
-        assert_eq!(
-            names.get("api"),
-            Some(&vec!["api-NEWHASH-0".to_string()]),
-        );
+        assert_eq!(names.get("api"), Some(&vec!["api-NEWHASH-0".to_string()]),);
         assert_eq!(
             names.get("web"),
             Some(&vec!["web-OLDHASH-0".to_string()]),

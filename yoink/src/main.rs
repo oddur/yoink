@@ -833,11 +833,7 @@ fn page_output(content: &str) {
         return;
     };
     let args: Vec<&str> = parts.collect();
-    let Ok(mut child) = Command::new(bin)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .spawn()
-    else {
+    let Ok(mut child) = Command::new(bin).args(&args).stdin(Stdio::piped()).spawn() else {
         // Pager binary not on PATH — print directly rather than fail.
         print!("{content}");
         return;
@@ -854,7 +850,7 @@ fn page_output(content: &str) {
 /// mode — kept for the `bail!`-on-reject ergonomic so callers can
 /// `confirm_destructive(...)?` without a separate match.
 fn confirm_destructive(prompt: &str) -> Result<()> {
-    use yoink::prompt::{confirm, ConfirmKind};
+    use yoink::prompt::{ConfirmKind, confirm};
     if !confirm(prompt, ConfirmKind::Destructive, false)? {
         anyhow::bail!("aborted");
     }
@@ -1207,7 +1203,10 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
         anyhow::bail!("--watch and --plan/--dry-run are mutually exclusive");
     }
 
-    eprintln!("● watching {} for changes (Ctrl-C to exit)", up.config_path.display());
+    eprintln!(
+        "● watching {} for changes (Ctrl-C to exit)",
+        up.config_path.display()
+    );
     let mut last_config = config.clone();
     let mut last_error: Option<String> = None;
     let mut tick = tokio::time::interval(WATCH_TICK);
@@ -1306,7 +1305,11 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     } else {
         Vec::new()
     };
-    let tag_args: Vec<String> = tag_args.iter().chain(here_overrides.iter()).cloned().collect();
+    let tag_args: Vec<String> = tag_args
+        .iter()
+        .chain(here_overrides.iter())
+        .cloned()
+        .collect();
     let tag_overrides = parse_tag_overrides(&tag_args, services, allow_dirty)?;
 
     let services_filter = services_filter(services);
@@ -1699,10 +1702,7 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
 /// already loads it for service-level secrets). Pass `None` when the
 /// caller doesn't otherwise need the bundle — it'll be loaded on
 /// demand only if a host actually declares `ssh_key_secret:`.
-async fn build_real_ops(
-    config: &Config,
-    bundle: Option<&SecretsBundle>,
-) -> Result<RealDockerOps> {
+async fn build_real_ops(config: &Config, bundle: Option<&SecretsBundle>) -> Result<RealDockerOps> {
     // Fast path: no host needs a managed key. Skip bundle access
     // entirely so commands that don't otherwise touch secrets pay
     // nothing.
@@ -1716,8 +1716,7 @@ async fn build_real_ops(
         owned_bundle = load_secrets_bundle(config).await?;
         owned_bundle.as_ref()
     };
-    let km = yoink::ssh_keys::prepare(config, bundle)
-        .context("prepare per-host ssh keys")?;
+    let km = yoink::ssh_keys::prepare(config, bundle).context("prepare per-host ssh keys")?;
     Ok(RealDockerOps::with_key_manager(km.map(std::sync::Arc::new)))
 }
 
@@ -1869,7 +1868,11 @@ async fn cmd_logs(
 /// `[host/container] ` prefix, or empty when there's only one replica
 /// (preserved so shell pipelines piping `yoink logs` into `grep` keep
 /// working unchanged for the single-replica case).
-fn replica_prefix(host: &yoink::docker_ops::Host, info: &yoink::docker_ops::ContainerInfo, multi: bool) -> String {
+fn replica_prefix(
+    host: &yoink::docker_ops::Host,
+    info: &yoink::docker_ops::ContainerInfo,
+    multi: bool,
+) -> String {
     if multi {
         format!("[{}/{}] ", host.address, info.name)
     } else {
@@ -2070,13 +2073,17 @@ async fn cmd_pf(
     // Resolve the path: published host endpoint OR sidecar handle.
     // `_sidecar` is bound here so its Drop fires after SIGINT even
     // though the variable is otherwise unused.
-    let resolved =
-        pf::resolve_target(ops.clone(), &host, service, container_port, mode).await?;
+    let resolved = pf::resolve_target(ops.clone(), &host, service, container_port, mode).await?;
     let (remote_dial_host, remote_port, mode_label, _sidecar) = match resolved {
         pf::ResolvedTarget::Published(ep) => (ep.host_ip, ep.host_port, "published", None),
         pf::ResolvedTarget::Sidecar(handle) => {
             let port = handle.host_port();
-            (pf::SIDECAR_DIAL_HOST.to_string(), port, "sidecar", Some(handle))
+            (
+                pf::SIDECAR_DIAL_HOST.to_string(),
+                port,
+                "sidecar",
+                Some(handle),
+            )
         }
     };
 
@@ -2119,9 +2126,7 @@ async fn cmd_pf(
         );
     }
 
-    if open_browser
-        && let Err(e) = pf::open_in_browser(&url)
-    {
+    if open_browser && let Err(e) = pf::open_in_browser(&url) {
         eprintln!("✗ failed to open browser: {e}\n  paste into one yourself: {url}");
     }
 
@@ -2173,7 +2178,8 @@ async fn cmd_pty(
 ) -> Result<()> {
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 
-    let ops: std::sync::Arc<dyn DockerOps> = std::sync::Arc::new(build_real_ops(config, None).await?);
+    let ops: std::sync::Arc<dyn DockerOps> =
+        std::sync::Arc::new(build_real_ops(config, None).await?);
     // For shell, we don't need a single-replica guarantee — pick a
     // healthy replica (or the first running one) and tell the operator
     // which one we landed on.
@@ -2182,8 +2188,7 @@ async fn cmd_pty(
         return Err(no_replicas_err(service, host_filter));
     }
     let multi = candidates.len() > 1;
-    let (host, info) =
-        pick_healthy_replica(candidates).expect("non-empty checked above");
+    let (host, info) = pick_healthy_replica(candidates).expect("non-empty checked above");
     let container = info.name.clone();
     if multi {
         eprintln!(
@@ -3098,7 +3103,7 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
 }
 
 async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
-    use yoink::doctor::{run_doctor, tally, Severity};
+    use yoink::doctor::{Severity, run_doctor, tally};
 
     let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
         std::sync::Arc::new(build_real_ops(config, None).await?);
@@ -3162,18 +3167,23 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    let image = config
-        .proxy
-        .as_ref()
-        .map_or_else(|| "caddy:2".to_string(), yoink::config::ProxyConfig::resolved_image);
+    let image = config.proxy.as_ref().map_or_else(
+        || "caddy:2".to_string(),
+        yoink::config::ProxyConfig::resolved_image,
+    );
     let mut child = tokio::process::Command::new("docker")
         // JSON is Caddy's native config format — no `--adapter` flag.
         // (`--adapter caddyfile` would convert from Caddyfile syntax;
         // we feed JSON directly.)
         .args([
-            "run", "--rm", "-i",
+            "run",
+            "--rm",
+            "-i",
             &image,
-            "caddy", "validate", "--config", "/dev/stdin",
+            "caddy",
+            "validate",
+            "--config",
+            "/dev/stdin",
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3389,9 +3399,10 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             Some(Ok(()))
         }
         Command::Secrets {
-            action: SecretsAction::Key {
-                action: KeyAction::Generate { out, force, print },
-            },
+            action:
+                SecretsAction::Key {
+                    action: KeyAction::Generate { out, force, print },
+                },
         } => Some(cmd_secrets_key_generate(out.clone(), *force, *print)),
         Command::Init {
             host,
@@ -3448,11 +3459,7 @@ fn cmd_secrets_key_public(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn cmd_secrets_key_generate(
-    out: Option<PathBuf>,
-    force: bool,
-    print: bool,
-) -> Result<()> {
+fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool, print: bool) -> Result<()> {
     use yoink::sealed;
     let (secret, public) = sealed::keygen();
     let recipient_block =
@@ -3475,7 +3482,9 @@ fn cmd_secrets_key_generate(
         eprintln!("{recipient_block}");
         eprintln!();
         eprintln!("Suggested next steps:");
-        eprintln!("  • Pipe into a CI secret: `yoink secrets key generate --print | gh secret set YOINK_AGE_KEY`");
+        eprintln!(
+            "  • Pipe into a CI secret: `yoink secrets key generate --print | gh secret set YOINK_AGE_KEY`"
+        );
         eprintln!("  • Or pipe into a password manager (`op item create … password=-`).");
         eprintln!("  • Clear your terminal scrollback when done.");
         return Ok(());
@@ -3489,8 +3498,7 @@ fn cmd_secrets_key_generate(
         Some(p) => p,
         None => {
             let dir = sealed::keys_dir()?;
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create {}", dir.display()))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             sealed::keys_dir_path_for(&public)?
         }
     };
@@ -3593,8 +3601,8 @@ fn cmd_secrets_seal(config: &Config, input: Option<&Path>, out: Option<PathBuf>)
     let plaintext = match input {
         Some(p) if p.as_os_str() != "-" => {
             use std::io::Read;
-            let f = std::fs::File::open(p)
-                .with_context(|| format!("open input {}", p.display()))?;
+            let f =
+                std::fs::File::open(p).with_context(|| format!("open input {}", p.display()))?;
             let mut buf = String::new();
             f.take(SEAL_INPUT_CAP + 1)
                 .read_to_string(&mut buf)
@@ -3788,7 +3796,7 @@ fn detected_ci_env() -> Option<&'static str> {
         "CIRCLECI",
         "BUILDKITE",
         "TRAVIS",
-        "TF_BUILD",          // Azure Pipelines
+        "TF_BUILD", // Azure Pipelines
         "TEAMCITY_VERSION",
         "BITBUCKET_BUILD_NUMBER",
         "DRONE",
@@ -3825,4 +3833,3 @@ fn chrono_like_now() -> String {
         .unwrap_or_default();
     format!("unix={secs}")
 }
-

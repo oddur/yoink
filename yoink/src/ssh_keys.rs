@@ -205,10 +205,13 @@ services:
         let mut values = std::collections::BTreeMap::new();
         values.insert(
             "h1_key".to_string(),
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----".to_string(),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----"
+                .to_string(),
         );
         let bundle = SecretsBundle::new(values);
-        let mgr = prepare(&cfg, Some(&bundle)).expect("prepare ok").expect("some");
+        let mgr = prepare(&cfg, Some(&bundle))
+            .expect("prepare ok")
+            .expect("some");
         let h1 = Host {
             address: "h1".into(),
             user: "deploy".into(),

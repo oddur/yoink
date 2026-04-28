@@ -90,15 +90,16 @@ fn render_connection(
     spec: &ConnectionSpec,
     ctx: &minijinja::Value,
 ) -> Result<ConnectionSpec> {
-    let render_map = |label: &str, m: &BTreeMap<String, String>| -> Result<BTreeMap<String, String>> {
-        m.iter()
-            .map(|(k, v)| {
-                let key = render_string(env, &format!("{label}.key({k})"), k, ctx)?;
-                let val = render_string(env, &format!("{label}.value({k})"), v, ctx)?;
-                Ok((key, val))
-            })
-            .collect()
-    };
+    let render_map =
+        |label: &str, m: &BTreeMap<String, String>| -> Result<BTreeMap<String, String>> {
+            m.iter()
+                .map(|(k, v)| {
+                    let key = render_string(env, &format!("{label}.key({k})"), k, ctx)?;
+                    let val = render_string(env, &format!("{label}.value({k})"), v, ctx)?;
+                    Ok((key, val))
+                })
+                .collect()
+        };
 
     let depends_on = spec
         .depends_on
@@ -162,12 +163,14 @@ fn render_file(
             spec.template
         );
     }
-    let template_text = std::fs::read_to_string(&template_path).with_context(|| {
-        format!("read template body {}", template_path.display())
-    })?;
+    let template_text = std::fs::read_to_string(&template_path)
+        .with_context(|| format!("read template body {}", template_path.display()))?;
     let body = render_string(env, &spec.template, &template_text, ctx)?;
 
-    Ok(RenderedFile { dest, contents: body })
+    Ok(RenderedFile {
+        dest,
+        contents: body,
+    })
 }
 
 fn render_secret(
@@ -289,7 +292,12 @@ mod tests {
         assert_eq!(r.secrets[0].name, "POSTGRES_PASSWORD");
         // 16 bytes → ceil(128/5) = 26 base32 chars
         assert!(r.secrets[0].value.len() >= 25);
-        assert!(r.secrets[0].value.chars().all(|c| B32_ALPHABET.contains(&(c as u8))));
+        assert!(
+            r.secrets[0]
+                .value
+                .chars()
+                .all(|c| B32_ALPHABET.contains(&(c as u8)))
+        );
     }
 
     #[test]

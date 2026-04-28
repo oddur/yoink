@@ -254,11 +254,9 @@ impl SecretsState {
                 };
                 None
             }
-            EditState::AddingValue { key, buffer }
-            | EditState::EditingValue { key, buffer } => Some(EditCommit::Set {
-                key,
-                value: buffer,
-            }),
+            EditState::AddingValue { key, buffer } | EditState::EditingValue { key, buffer } => {
+                Some(EditCommit::Set { key, value: buffer })
+            }
             other => {
                 self.edit = other;
                 None
@@ -471,7 +469,9 @@ impl SecretsState {
 
         let mut rows: Vec<Row<'_>> = Vec::new();
         if bundle.keys.is_empty() {
-            rows.push(Row::new(vec![Cell::from("(no secrets yet — press `a` to add)")]));
+            rows.push(Row::new(vec![Cell::from(
+                "(no secrets yet — press `a` to add)",
+            )]));
         } else if visible.is_empty() {
             rows.push(Row::new(vec![Cell::from("(no secrets match filter)")]));
         } else {
@@ -479,10 +479,7 @@ impl SecretsState {
                 let k = &bundle.keys[*src];
                 let v = bundle.values.get(k).map_or("", String::as_str);
                 let display = if self.reveal { v.to_string() } else { mask(v) };
-                rows.push(Row::new(vec![
-                    Cell::from(k.clone()),
-                    Cell::from(display),
-                ]));
+                rows.push(Row::new(vec![Cell::from(k.clone()), Cell::from(display)]));
             }
         }
 
@@ -510,7 +507,9 @@ impl SecretsState {
     fn input_buffer_view(&self) -> Option<(String, &str)> {
         match &self.edit {
             EditState::AddingKey { buffer } => Some(("(new key)".into(), buffer.as_str())),
-            EditState::AddingValue { key, buffer } => Some((format!("(new value for {key})"), buffer.as_str())),
+            EditState::AddingValue { key, buffer } => {
+                Some((format!("(new value for {key})"), buffer.as_str()))
+            }
             EditState::EditingValue { key, buffer } => {
                 Some((format!("(editing {key})"), buffer.as_str()))
             }
@@ -562,7 +561,8 @@ fn is_valid_key(key: &str) -> bool {
 fn load(config: &Config) -> LoadStatus {
     let Some(secrets_cfg) = &config.secrets else {
         return LoadStatus::Failed(
-            "no `secrets:` block in yoink.yaml — run `yoink secrets key generate` to bootstrap".into(),
+            "no `secrets:` block in yoink.yaml — run `yoink secrets key generate` to bootstrap"
+                .into(),
         );
     };
 
@@ -658,8 +658,8 @@ fn persist(bundle: &LoadedBundle) -> Result<(), String> {
         .as_ref()
         .ok_or_else(|| "this provider is read-only".to_string())?;
     let canonical = sealed::render_dotenv(&bundle.values);
-    let bytes = sealed::seal(canonical.as_bytes(), &target.recipients)
-        .map_err(|e| format!("seal: {e}"))?;
+    let bytes =
+        sealed::seal(canonical.as_bytes(), &target.recipients).map_err(|e| format!("seal: {e}"))?;
     sealed::write_atomically(&target.path, &bytes)
         .map_err(|e| format!("write {}: {e}", target.path.display()))?;
     Ok(())

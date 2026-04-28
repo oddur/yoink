@@ -214,7 +214,9 @@ impl HostDetailState {
         let visible = self.visible_indices();
         clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded && self.last_error.is_none() {
-            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])]
         } else if visible.is_empty() && !self.containers.is_empty() {
             vec![Row::new(vec![Cell::from("(no containers match filter)")])]
         } else if self.containers.is_empty() {
@@ -426,9 +428,8 @@ impl HostDetailState {
                 let running = i.containers_running.unwrap_or(0);
                 let total = i.containers.unwrap_or(0);
                 let images = i.images.unwrap_or(0);
-                let info_text = format!(
-                    "{os} · {kernel} · {running}/{total} containers · {images} images"
-                );
+                let info_text =
+                    format!("{os} · {kernel} · {running}/{total} containers · {images} images");
                 frame.render_widget(
                     Paragraph::new(info_text).style(Style::default().fg(Color::DarkGray)),
                     chunks[2],

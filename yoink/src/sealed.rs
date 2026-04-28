@@ -55,7 +55,9 @@ pub enum SealedError {
     IdentityParse(String),
     #[error("parse age recipient {raw:?}: {reason}")]
     RecipientParse { raw: String, reason: String },
-    #[error("no recipients configured — add at least one age public key under `secrets.recipients:` in yoink.yaml")]
+    #[error(
+        "no recipients configured — add at least one age public key under `secrets.recipients:` in yoink.yaml"
+    )]
     NoRecipients,
     #[error("age encryption failed: {0}")]
     Encrypt(String),
@@ -255,10 +257,7 @@ fn scan_dir_for_match(
             Err(e) => {
                 // A broken key file in the dir shouldn't block
                 // loading a sibling that works. Skip and move on.
-                tracing::debug!(
-                    "skipping {}: {e}",
-                    path.display()
-                );
+                tracing::debug!("skipping {}: {e}", path.display());
             }
         }
     }
@@ -335,10 +334,11 @@ pub fn seal(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>, SealedEr
     let parsed: Vec<Box<dyn age::Recipient + Send>> = recipients
         .iter()
         .map(|r| {
-            let key: x25519::Recipient = r.parse().map_err(|e: &str| SealedError::RecipientParse {
-                raw: r.clone(),
-                reason: e.to_string(),
-            })?;
+            let key: x25519::Recipient =
+                r.parse().map_err(|e: &str| SealedError::RecipientParse {
+                    raw: r.clone(),
+                    reason: e.to_string(),
+                })?;
             Ok(Box::new(key) as Box<dyn age::Recipient + Send>)
         })
         .collect::<Result<_, SealedError>>()?;
@@ -411,9 +411,7 @@ pub fn parse_dotenv(input: &str) -> Result<BTreeMap<String, String>, SealedError
                 reason: "empty key".into(),
             });
         }
-        if !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             || key.chars().next().is_some_and(|c| c.is_ascii_digit())
         {
             return Err(SealedError::Dotenv {
@@ -506,11 +504,7 @@ pub fn write_atomically_secret(path: &Path, bytes: &[u8]) -> Result<(), SealedEr
     write_atomically_inner(path, bytes, Some(0o600))
 }
 
-fn write_atomically_inner(
-    path: &Path,
-    bytes: &[u8],
-    mode: Option<u32>,
-) -> Result<(), SealedError> {
+fn write_atomically_inner(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), SealedError> {
     use std::io::Write as _;
     let parent = path
         .parent()
@@ -825,14 +819,8 @@ BAZ=plain
 
         // Recipients name `other_public` so the dir scan WOULD match
         // — but env_key takes precedence regardless.
-        let id = load_identity_resolved(
-            Some(env_secret),
-            None,
-            &keys,
-            &legacy,
-            &[other_public],
-        )
-        .expect("env wins");
+        let id = load_identity_resolved(Some(env_secret), None, &keys, &legacy, &[other_public])
+            .expect("env wins");
         assert_eq!(id.to_public().to_string(), env_public);
     }
 
@@ -890,13 +878,7 @@ BAZ=plain
         std::fs::create_dir(&keys).unwrap();
         let legacy = tmp.path().join("expected-legacy-path.key");
 
-        match load_identity_resolved(
-            None,
-            None,
-            &keys,
-            &legacy,
-            &["age1nothing-matches".into()],
-        ) {
+        match load_identity_resolved(None, None, &keys, &legacy, &["age1nothing-matches".into()]) {
             Err(SealedError::NoIdentity(p)) => assert_eq!(p, legacy),
             Err(other) => panic!("expected NoIdentity, got {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),

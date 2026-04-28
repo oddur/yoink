@@ -51,11 +51,7 @@ pub struct AddOutcome {
 }
 
 #[allow(clippy::too_many_lines)] // single linear orchestration; splitting fragments the flow.
-pub async fn cmd_add(
-    config: &Config,
-    config_path: &Path,
-    opts: AddOpts,
-) -> Result<AddOutcome> {
+pub async fn cmd_add(config: &Config, config_path: &Path, opts: AddOpts) -> Result<AddOutcome> {
     let overrides = wizard::parse_var_overrides(&opts.vars)?;
     let interactive = !opts.yes && io::stdin().is_terminal();
 
@@ -75,9 +71,9 @@ pub async fn cmd_add(
     };
 
     let (template_label, fetched) = match (&resolved_ref, &opts.from_path) {
-        (Some(_), Some(_)) => anyhow::bail!(
-            "pass either a template ref or `--from-path`, not both"
-        ),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("pass either a template ref or `--from-path`, not both")
+        }
         (None, None) => unreachable!("resolved above"),
         (Some(r), None) => {
             let template_ref = source::parse_ref(r)?;
@@ -89,17 +85,11 @@ pub async fn cmd_add(
                 template_ref.git_ref
             );
             let fetched = source::fetch(&template_ref, opts.refresh).await?;
-            (
-                template_ref.display_short(&fetched.sha),
-                fetched,
-            )
+            (template_ref.display_short(&fetched.sha), fetched)
         }
         (None, Some(path)) => {
             let fetched = source::from_local_path(path)?;
-            eprintln!(
-                "using template from local path: {}",
-                fetched.root.display()
-            );
+            eprintln!("using template from local path: {}", fetched.root.display());
             let label = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -149,17 +139,38 @@ pub async fn cmd_add(
             }
             let key_path = secrets_setup::default_key_path(config_path);
             let result = secrets_setup::bootstrap(config_path, &key_path)?;
-            eprintln!("  ✓ wrote identity to {} (mode 0600)", result.key_path.display());
+            eprintln!(
+                "  ✓ wrote identity to {} (mode 0600)",
+                result.key_path.display()
+            );
             if result.gitignore_updated {
-                eprintln!("  ✓ added {} to .gitignore", result.key_path.file_name().unwrap_or_default().to_string_lossy());
+                eprintln!(
+                    "  ✓ added {} to .gitignore",
+                    result
+                        .key_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                );
             }
             eprintln!("  ✓ added secrets: block to {}", config_path.display());
             eprintln!();
             eprintln!("    set this in your shell so future yoink commands find the key:");
-            eprintln!("      export YOINK_AGE_KEY_FILE=$(pwd)/{}", result.key_path.file_name().unwrap_or_default().to_string_lossy());
+            eprintln!(
+                "      export YOINK_AGE_KEY_FILE=$(pwd)/{}",
+                result
+                    .key_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
             eprintln!();
-            config_reloaded = Config::load_from_path(config_path)
-                .with_context(|| format!("reloading {} after secrets bootstrap", config_path.display()))?;
+            config_reloaded = Config::load_from_path(config_path).with_context(|| {
+                format!(
+                    "reloading {} after secrets bootstrap",
+                    config_path.display()
+                )
+            })?;
             &config_reloaded
         }
         secrets_setup::SetupNeed::ExternalProvider => {
@@ -181,13 +192,15 @@ pub async fn cmd_add(
     // touch the operator's filesystem.
     for file in &rendered.files {
         validate_fragment(&file.contents).with_context(|| {
-            format!("rendered file `{}` failed yoink validation", file.dest.display())
+            format!(
+                "rendered file `{}` failed yoink validation",
+                file.dest.display()
+            )
         })?;
     }
 
     let dests: Vec<PathBuf> = rendered.files.iter().map(|f| f.dest.clone()).collect();
-    let include_plan =
-        include::plan(config, rendered.include_glob.as_deref(), &dests);
+    let include_plan = include::plan(config, rendered.include_glob.as_deref(), &dests);
 
     let target_dir = config
         .config_dir
@@ -237,7 +250,9 @@ pub async fn cmd_add(
             }
             Err(e) => {
                 eprintln!("  ✗ failed to seal secrets: {e}");
-                eprintln!("    fragment files were written; re-run after fixing the secrets config");
+                eprintln!(
+                    "    fragment files were written; re-run after fixing the secrets config"
+                );
                 return Err(e);
             }
         }
@@ -247,7 +262,10 @@ pub async fn cmd_add(
         let do_apply = if opts.yes {
             true
         } else if interactive {
-            confirm(&format!("Add `include: [\"{glob}\"]` to {}?", config_path.display()), true)?
+            confirm(
+                &format!("Add `include: [\"{glob}\"]` to {}?", config_path.display()),
+                true,
+            )?
         } else {
             false
         };
@@ -255,7 +273,10 @@ pub async fn cmd_add(
             include::apply(config_path, glob)?;
             eprintln!("  ✓ updated {} include:", config_path.display());
         } else {
-            eprintln!("  ! skipped include edit — add this to {} yourself:", config_path.display());
+            eprintln!(
+                "  ! skipped include edit — add this to {} yourself:",
+                config_path.display()
+            );
             eprintln!("      include:\n        - \"{glob}\"");
         }
     }
@@ -369,13 +390,11 @@ enum SealReport {
     Skipped { reason: String },
 }
 
-fn seal_new_secrets(
-    config: &Config,
-    new_secrets: &[render::RenderedSecret],
-) -> Result<SealReport> {
+fn seal_new_secrets(config: &Config, new_secrets: &[render::RenderedSecret]) -> Result<SealReport> {
     let Some(SecretsConfig::Age { file, recipients }) = &config.secrets else {
         return Ok(SealReport::Skipped {
-            reason: "no `secrets:` block configured (run `yoink secrets key generate` first)".into(),
+            reason: "no `secrets:` block configured (run `yoink secrets key generate` first)"
+                .into(),
         });
     };
     if recipients.is_empty() {
@@ -438,7 +457,11 @@ fn print_confirmation(
     eprintln!("Template: {template_label} ({kind_label})");
     eprintln!("Files to write:");
     for abs in absolute_dests {
-        let exists = if abs.exists() { " (overwrites existing)" } else { "" };
+        let exists = if abs.exists() {
+            " (overwrites existing)"
+        } else {
+            ""
+        };
         eprintln!("  + {}{exists}", abs.display());
     }
     if !rendered.secrets.is_empty() {

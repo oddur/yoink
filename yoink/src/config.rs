@@ -947,9 +947,9 @@ impl Config {
         &'a self,
         filter: Option<&'a [String]>,
     ) -> impl Iterator<Item = &'a ServiceConfig> {
-        self.services.iter().filter(move |svc| {
-            filter.is_none_or(|names| names.iter().any(|n| n == &svc.name))
-        })
+        self.services
+            .iter()
+            .filter(move |svc| filter.is_none_or(|names| names.iter().any(|n| n == &svc.name)))
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
@@ -1787,7 +1787,10 @@ secrets:
         // post-parse validate error). Either branch confirms bogus
         // providers don't load — the test only cares that they don't.
         let err = Config::parse_str(s).unwrap_err();
-        assert!(matches!(err, ConfigError::Parse(_) | ConfigError::Invalid(_)));
+        assert!(matches!(
+            err,
+            ConfigError::Parse(_) | ConfigError::Invalid(_)
+        ));
     }
 
     #[test]

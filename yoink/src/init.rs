@@ -68,9 +68,7 @@ pub fn cmd_init(opts: InitOpts) -> Result<()> {
     let detection = detect(&cwd);
     let mut plan = if opts.interactive {
         if !io::stdin().is_terminal() {
-            anyhow::bail!(
-                "--interactive requires a terminal (stdin is not a tty)"
-            );
+            anyhow::bail!("--interactive requires a terminal (stdin is not a tty)");
         }
         prompt_plan(&detection, &opts)?
     } else {
@@ -136,8 +134,7 @@ fn bootstrap_age_identity_in_dir(dir: &Path) -> Result<AgeBootstrap> {
 /// the public recipient and exercise the duplicate-detection branch.
 fn write_age_identity(dir: &Path, secret: &str, public: &str) -> Result<AgeBootstrap> {
     use crate::sealed;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let key_path = dir.join(format!("{public}.key"));
     if key_path.exists() {
         // x25519 collisions are vanishingly unlikely; if this fires
@@ -148,9 +145,7 @@ fn write_age_identity(dir: &Path, secret: &str, public: &str) -> Result<AgeBoots
             key_path.display()
         );
     }
-    let body = format!(
-        "# created by `yoink init`\n# public: {public}\n{secret}\n"
-    );
+    let body = format!("# created by `yoink init`\n# public: {public}\n{secret}\n");
     sealed::write_atomically_secret(&key_path, body.as_bytes())
         .with_context(|| format!("write {}", key_path.display()))?;
     Ok(AgeBootstrap {
@@ -213,10 +208,7 @@ struct SshHostHint {
 
 fn detect(cwd: &Path) -> Detection {
     Detection {
-        cwd_basename: cwd
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string),
+        cwd_basename: cwd.file_name().and_then(|s| s.to_str()).map(str::to_string),
         dockerfile: parse_dockerfile_hints(&cwd.join("Dockerfile")),
         git_remote: read_git_remote(cwd),
         ssh_host: read_ssh_config_first_host(),
@@ -233,8 +225,16 @@ fn parse_dockerfile_hints(path: &Path) -> Option<DockerfileHints> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let lower_first = line.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
-        let rest = line.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+        let lower_first = line
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let rest = line
+            .split_whitespace()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(" ");
         match lower_first.as_str() {
             "EXPOSE" => {
                 if let Some(p) = rest.split_whitespace().next() {
@@ -363,8 +363,7 @@ fn infer_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
     let dockerfile = detection.dockerfile.as_ref();
     let (image, image_origin) = resolve_image(opts, detection, &service, dockerfile.is_some());
 
-    let (host_address, host_user, host_user_origin, host_origin) =
-        resolve_host(opts, detection)?;
+    let (host_address, host_user, host_user_origin, host_origin) = resolve_host(opts, detection)?;
 
     let port = if opts.no_port {
         None
@@ -425,7 +424,10 @@ fn prompt_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
     let image_str = match &plan.image {
         ImageSource::Registry(s) | ImageSource::Bare(s) => s.clone(),
     };
-    let image = ask("image (registry path or bare name for local-build)", &image_str)?;
+    let image = ask(
+        "image (registry path or bare name for local-build)",
+        &image_str,
+    )?;
     plan.image = if image.contains('/') {
         ImageSource::Registry(image)
     } else {
@@ -469,10 +471,7 @@ fn fallback_plan(detection: &Detection) -> Result<WizardPlan> {
     })
 }
 
-fn resolve_service(
-    opts: &InitOpts,
-    detection: &Detection,
-) -> Result<(String, &'static str)> {
+fn resolve_service(opts: &InitOpts, detection: &Detection) -> Result<(String, &'static str)> {
     if let Some(name) = opts.service.as_deref() {
         let normalized =
             sanitize_service_name(name).context("--service name must be a DNS label")?;
@@ -506,9 +505,15 @@ fn resolve_image(
         return (ImageSource::Registry(suggestion), "git remote");
     }
     if has_dockerfile {
-        return (ImageSource::Bare(service.to_string()), "Dockerfile (bare name)");
+        return (
+            ImageSource::Bare(service.to_string()),
+            "Dockerfile (bare name)",
+        );
     }
-    (ImageSource::Bare(service.to_string()), "service name (bare)")
+    (
+        ImageSource::Bare(service.to_string()),
+        "service name (bare)",
+    )
 }
 
 fn resolve_host(
@@ -610,7 +615,8 @@ pub fn sanitize_service_name(input: &str) -> Option<String> {
     for c in lower.chars() {
         if c.is_ascii_alphanumeric() {
             out.push(c);
-        } else if matches!(c, '-' | '_' | '.' | '/' | ' ') && !out.is_empty() && !out.ends_with('-') {
+        } else if matches!(c, '-' | '_' | '.' | '/' | ' ') && !out.is_empty() && !out.ends_with('-')
+        {
             out.push('-');
         }
     }
@@ -671,11 +677,17 @@ fn render(plan: &WizardPlan) -> String {
     };
     out.push_str(&format!("    image: {image}\n"));
     let tag_comment = if is_git_repo() {
-        format!("# use --tag {}=$(git rev-parse HEAD) at deploy", plan.service)
+        format!(
+            "# use --tag {}=$(git rev-parse HEAD) at deploy",
+            plan.service
+        )
     } else {
         "# pin a stable tag before going to production".to_string()
     };
-    out.push_str(&format!("    tag: {}                   {tag_comment}\n", plan.tag));
+    out.push_str(&format!(
+        "    tag: {}                   {tag_comment}\n",
+        plan.tag
+    ));
     out.push_str("    run:\n");
     if let Some(p) = plan.port {
         out.push_str(&format!("      port: {p}\n"));
@@ -1057,8 +1069,16 @@ mod tests {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let kw = line.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
-            let rest = line.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+            let kw = line
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            let rest = line
+                .split_whitespace()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" ");
             match kw.as_str() {
                 "EXPOSE" => {
                     if let Some(p) = rest.split_whitespace().next() {

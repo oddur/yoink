@@ -217,4 +217,3 @@ mod tests {
         assert_eq!(redact_pem_blocks(body), body);
     }
 }
-

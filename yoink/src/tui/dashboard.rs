@@ -272,9 +272,13 @@ impl DashboardState {
             // and errored (loaded=true), don't pretend we're still
             // loading — the error footer carries the detail.
             if self.loaded {
-                return vec![Row::new(vec![Cell::from("(no data — see error in footer)")])];
+                return vec![Row::new(vec![Cell::from(
+                    "(no data — see error in footer)",
+                )])];
             }
-            return vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])];
+            return vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])];
         };
         let mut rows: Vec<Row<'_>> = Vec::new();
         for host in &report.hosts {

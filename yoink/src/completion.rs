@@ -124,11 +124,7 @@ mod tests {
             "hosts: []\nservices: []\n",
         )
         .unwrap();
-        fs::write(
-            root.join("prod.yoink.yaml"),
-            "hosts: []\nservices: []\n",
-        )
-        .unwrap();
+        fs::write(root.join("prod.yoink.yaml"), "hosts: []\nservices: []\n").unwrap();
 
         // Fragment under `services/` — should NOT be picked up.
         fs::create_dir_all(root.join("services")).unwrap();
@@ -170,7 +166,10 @@ mod tests {
             .collect();
         // Newest (staging) bubbles up first — the file the operator
         // most recently edited is almost always the one they want.
-        assert_eq!(found.first().map(String::as_str), Some("staging.yoink.yaml"));
+        assert_eq!(
+            found.first().map(String::as_str),
+            Some("staging.yoink.yaml")
+        );
         assert_eq!(found.get(1).map(String::as_str), Some("yoink.yaml"));
     }
 }

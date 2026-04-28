@@ -1174,9 +1174,14 @@ impl App {
             self.start_stats_history_pollers();
             // Drop event rings for hosts no longer in the config so a
             // re-added address doesn't inherit stale events.
-            let active: std::collections::HashSet<&str> =
-                self.config.hosts.iter().map(|h| h.address.as_str()).collect();
-            self.host_events.retain(|addr, _| active.contains(addr.as_str()));
+            let active: std::collections::HashSet<&str> = self
+                .config
+                .hosts
+                .iter()
+                .map(|h| h.address.as_str())
+                .collect();
+            self.host_events
+                .retain(|addr, _| active.contains(addr.as_str()));
             self.schedule_hosts_refresh();
         }
         self.schedule_dashboard_refresh();
@@ -1834,9 +1839,7 @@ impl App {
             // Secrets and Resources panes — both bind `d` to delete the
             // selected item, and a delete key shouldn't surprise-route
             // to a pane switch when the operator's intent is "remove."
-            KeyCode::Char('d')
-                if !matches!(self.view, View::Secrets | View::Resources) =>
-            {
+            KeyCode::Char('d') if !matches!(self.view, View::Secrets | View::Resources) => {
                 self.transition(View::Dashboard).await;
                 return false;
             }
@@ -1924,9 +1927,7 @@ impl App {
                     .or_else(|| self.forwards.first().map(|f| f.url.clone()));
                 let Some(url) = target_url else {
                     if !self.forwards.is_empty() {
-                        self.push_toast(
-                            "no port-forward URL resolved for this row".to_string(),
-                        );
+                        self.push_toast("no port-forward URL resolved for this row".to_string());
                     }
                     return false;
                 };
@@ -3149,11 +3150,9 @@ impl App {
         let toast_prefix = format!("→ {service_name} :{container_port}");
         tokio::spawn(async move {
             let keyfile = ops.ssh_keyfile(&host_for_task);
-            if let Err(e) = crate::ssh_probe::probe(
-                &host_for_task,
-                keyfile.as_deref().and_then(|p| p.to_str()),
-            )
-            .await
+            if let Err(e) =
+                crate::ssh_probe::probe(&host_for_task, keyfile.as_deref().and_then(|p| p.to_str()))
+                    .await
             {
                 let _ = tx.send(Update::Toast(format!(
                     "✗ ssh probe to {} failed: {e}",
@@ -3477,8 +3476,7 @@ impl App {
                 );
             }
             View::ServiceHistory(_) => {
-                self.history
-                    .render(frame, pane_area, &self.throbber_state);
+                self.history.render(frame, pane_area, &self.throbber_state);
             }
             View::Logs | View::ContainerLogs { .. } => {
                 self.logs.render(frame, pane_area, &self.config);
@@ -3669,10 +3667,7 @@ impl App {
             );
             let success = matches!(progress.finished, Some(Ok(_)));
             let failure = matches!(progress.finished, Some(Err(_)));
-            let running_throbber = progress
-                .finished
-                .is_none()
-                .then_some(&self.throbber_state);
+            let running_throbber = progress.finished.is_none().then_some(&self.throbber_state);
             // ReconcileAll gets a status table on top of the scrolling
             // log so concurrent waves don't make the operator hunt for
             // "where is service X right now?".
@@ -3711,12 +3706,7 @@ impl App {
         }
 
         if self.doctor.is_open() {
-            super::doctor::render(
-                frame,
-                frame.area(),
-                &mut self.doctor,
-                &self.throbber_state,
-            );
+            super::doctor::render(frame, frame.area(), &mut self.doctor, &self.throbber_state);
         }
 
         // Render last so it sits on top of everything else when a
