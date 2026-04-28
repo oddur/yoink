@@ -12,6 +12,12 @@ services:
         - pgdata-{{ service_name }}:/var/lib/postgresql/data
       options:
         memory: {{ memory }}
-        # Postgres writes to /var/run/postgresql for the unix socket and
-        # /tmp during initdb; the data directory is on a volume.
+        # The postgres entrypoint runs initdb as root, chowns the data
+        # volume, then drops privileges to the postgres user via gosu.
+        # Override yoink's `user: nobody` default so initdb can do its
+        # thing; add back the caps it needs (yoink's default drops
+        # ALL); leave the rootfs writable for /var/run/postgresql and
+        # initdb's tempfiles.
+        user: "0:0"
+        cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
         read_only: false
