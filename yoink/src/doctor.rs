@@ -13,9 +13,10 @@
 //! share the engine. CLI formats `Vec<Finding>` as a list; the TUI
 //! pane renders the same vector in a scrolling table.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{Config, SecretsConfig, ServiceConfig};
+use crate::config::{Config, SecretsConfig, ServiceConfig, TlsMode};
 use crate::docker_ops::{DockerOps, Host};
 use crate::sealed;
 
@@ -101,8 +102,14 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
     let mut findings: Vec<Finding> = Vec::new();
 
     findings.extend(check_secrets(config));
+    findings.extend(check_sealed_file_exists(config));
+    findings.extend(check_provider_command(config));
+    findings.extend(check_keys_dir_perms());
     findings.extend(check_build_blocks(config));
+    findings.extend(check_dockerfile_paths(config));
     findings.extend(check_proxied_services(config));
+    findings.extend(check_tls_cert_secrets(config).await);
+    findings.extend(check_secret_references(config).await);
     findings.extend(check_hosts(config, ops.clone()).await);
     findings.extend(check_arch_alignment(config, ops.clone()).await);
     findings.extend(check_dns_for_domains(config).await);
@@ -444,6 +451,320 @@ async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
     out
 }
 
+// ---------- sealed.age existence ----------
+
+fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
+    let Some(SecretsConfig::Age { file, recipients }) = &config.secrets else {
+        return Vec::new();
+    };
+    if recipients.is_empty() {
+        return Vec::new();
+    }
+    let any_refs = config
+        .services
+        .iter()
+        .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty());
+    if !any_refs {
+        return Vec::new();
+    }
+    let path = match sealed::resolve_sealed_path(config, file.as_deref()) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    if path.exists() {
+        return vec![Finding::pass(
+            "secrets",
+            format!("sealed file present at {}", path.display()),
+        )];
+    }
+    vec![
+        Finding::error(
+            "secrets",
+            format!("{} doesn't exist but services reference secrets", path.display()),
+        )
+        .with_fix("run `yoink secrets edit` to create the bundle, then commit the file"),
+    ]
+}
+
+// ---------- provider: command binary on PATH ----------
+
+fn check_provider_command(config: &Config) -> Vec<Finding> {
+    let Some(SecretsConfig::Command { command, .. }) = &config.secrets else {
+        return Vec::new();
+    };
+    let Some(prog) = command.first() else {
+        return vec![
+            Finding::error("secrets", "`secrets.command:` is empty")
+                .with_fix("set the binary as the first list element"),
+        ];
+    };
+    if which_on_path(prog).is_some() {
+        vec![Finding::pass(
+            "secrets",
+            format!("provider command `{prog}` is on PATH"),
+        )]
+    } else {
+        vec![
+            Finding::error(
+                "secrets",
+                format!("provider command `{prog}` not found on PATH"),
+            )
+            .with_fix(format!(
+                "install `{prog}` (or fix PATH so yoink can spawn it at deploy time)"
+            )),
+        ]
+    }
+}
+
+/// Lightweight `which` — walk `PATH` and return the first match. We
+/// don't pull in the `which` crate for one call site.
+fn which_on_path(program: &str) -> Option<PathBuf> {
+    if program.contains('/') {
+        let p = PathBuf::from(program);
+        return p.is_file().then_some(p);
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// ---------- keys-dir file modes ----------
+
+#[cfg(unix)]
+fn check_keys_dir_perms() -> Vec<Finding> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dir) = sealed::keys_dir() else {
+        return Vec::new();
+    };
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("key") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            out.push(
+                Finding::warn(
+                    "secrets",
+                    format!(
+                        "{} has permissive mode {:o} (group/world readable)",
+                        path.display(),
+                        mode
+                    ),
+                )
+                .with_fix(format!("chmod 600 {}", path.display())),
+            );
+        }
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn check_keys_dir_perms() -> Vec<Finding> {
+    Vec::new()
+}
+
+// ---------- Dockerfile path resolves ----------
+
+fn check_dockerfile_paths(config: &Config) -> Vec<Finding> {
+    let base = config
+        .config_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut out = Vec::new();
+    for svc in &config.services {
+        let Some(build) = &svc.build else { continue };
+        let context = base.join(&build.context);
+        let dockerfile = context.join(build.dockerfile.as_deref().unwrap_or("Dockerfile"));
+        if !dockerfile.exists() {
+            out.push(
+                Finding::error(
+                    "build",
+                    format!(
+                        "service `{}`: Dockerfile not found at {}",
+                        svc.name,
+                        dockerfile.display()
+                    ),
+                )
+                .with_fix(format!(
+                    "create {}, or set `build.dockerfile:` to an existing path \
+                     relative to the build context (`{}`)",
+                    dockerfile.display(),
+                    context.display()
+                )),
+            );
+        }
+    }
+    out
+}
+
+// ---------- TLS cert mode requires bundle entries ----------
+
+async fn check_tls_cert_secrets(config: &Config) -> Vec<Finding> {
+    let proxy_default_cert = config
+        .proxy
+        .as_ref()
+        .and_then(|p| p.tls.as_ref())
+        .map(|t| t.cert_secret.clone());
+    let proxy_default_key = config
+        .proxy
+        .as_ref()
+        .and_then(|p| p.tls.as_ref())
+        .map(|t| t.key_secret.clone());
+
+    let needs_bundle = config
+        .services
+        .iter()
+        .any(|s| matches!(s.tls, TlsMode::Cert));
+    if !needs_bundle {
+        return Vec::new();
+    }
+    let bundle = match crate::secrets::load_bundle(config).await {
+        Ok(Some(b)) => b,
+        // If we can't load the bundle, `check_secret_references` will
+        // already have surfaced that — don't double-report.
+        _ => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for svc in &config.services {
+        if !matches!(svc.tls, TlsMode::Cert) {
+            continue;
+        }
+        let cert_key = svc
+            .tls_cert_secret
+            .clone()
+            .or_else(|| proxy_default_cert.clone());
+        let key_key = svc
+            .tls_key_secret
+            .clone()
+            .or_else(|| proxy_default_key.clone());
+        for (label, key) in [("tls_cert_secret", cert_key), ("tls_key_secret", key_key)] {
+            match key {
+                None => {
+                    out.push(
+                        Finding::error(
+                            "config",
+                            format!(
+                                "service `{}` uses `tls: cert` but {label} is unset",
+                                svc.name
+                            ),
+                        )
+                        .with_fix(format!(
+                            "set `{label}: <SECRET_NAME>` on the service \
+                             (or `proxy.tls.{}` to inherit)",
+                            label.trim_start_matches("tls_").trim_end_matches("_secret")
+                        )),
+                    );
+                }
+                Some(k) if bundle.get(&k).is_none() => {
+                    out.push(
+                        Finding::error(
+                            "secrets",
+                            format!(
+                                "service `{}` references {label} `{k}` not in the bundle",
+                                svc.name
+                            ),
+                        )
+                        .with_fix(format!(
+                            "add `{k}=<pem-bytes>` via `yoink secrets edit`"
+                        )),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+// ---------- env_from_secrets / secrets references match the bundle ----------
+
+async fn check_secret_references(config: &Config) -> Vec<Finding> {
+    let any_refs = config
+        .services
+        .iter()
+        .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty());
+    if !any_refs {
+        return Vec::new();
+    }
+    let bundle = match crate::secrets::load_bundle(config).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return vec![
+                Finding::error(
+                    "secrets",
+                    "services reference secrets but no bundle is configured",
+                )
+                .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)"),
+            ];
+        }
+        Err(e) => {
+            return vec![
+                Finding::error("secrets", "couldn't load secrets bundle for cross-check")
+                    .with_detail(e.to_string()),
+            ];
+        }
+    };
+
+    let mut out = Vec::new();
+    for svc in &config.services {
+        for key in &svc.secrets {
+            if bundle.get(key).is_none() {
+                out.push(
+                    Finding::error(
+                        "secrets",
+                        format!(
+                            "service `{}` references missing secret `{key}`",
+                            svc.name
+                        ),
+                    )
+                    .with_fix(format!(
+                        "seal `{key}=<value>` (`yoink secrets edit`) or remove the reference"
+                    )),
+                );
+            }
+        }
+        for (env_name, secret_key) in &svc.env_from_secrets {
+            if bundle.get(secret_key).is_none() {
+                out.push(
+                    Finding::error(
+                        "secrets",
+                        format!(
+                            "service `{}`: env_from_secrets `{env_name}: {secret_key}` — `{secret_key}` not in bundle",
+                            svc.name
+                        ),
+                    )
+                    .with_fix(format!(
+                        "seal `{secret_key}=<value>` (typo? — bundle has {} keys)",
+                        bundle.len()
+                    )),
+                );
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(Finding::pass(
+            "secrets",
+            "every service's secret references resolve in the bundle",
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +814,53 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::Warn);
         assert!(f[0].title.contains("my-tool"));
+    }
+
+    #[test]
+    fn dockerfile_path_check_errors_when_missing() {
+        let cfg = Config::parse_str(
+            "deploy:\n  networks: [yoink]\nhosts:\n  - { address: h, user: u }\n\
+             services:\n  - name: app\n    image: app\n    build: { context: nonexistent-dir }\n    run: { port: 8080, healthcheck_path: / }\n"
+        )
+        .unwrap();
+        let f = check_dockerfile_paths(&cfg);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Error);
+        assert!(f[0].title.contains("Dockerfile not found"));
+    }
+
+    #[test]
+    fn provider_command_missing_binary_errors() {
+        let cfg = Config::parse_str(
+            "deploy:\n  networks: [yoink]\nhosts:\n  - { address: h, user: u }\n\
+             secrets: { provider: command, command: [\"definitely-not-a-real-binary-xyzzy\"] }\n\
+             services:\n  - name: a\n    image: a\n    run: {}\n",
+        )
+        .unwrap();
+        let f = check_provider_command(&cfg);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Error);
+        assert!(f[0].title.contains("not found on PATH"));
+    }
+
+    #[test]
+    fn provider_command_present_passes() {
+        // `sh` is on every reasonable PATH.
+        let cfg = Config::parse_str(
+            "deploy:\n  networks: [yoink]\nhosts:\n  - { address: h, user: u }\n\
+             secrets: { provider: command, command: [sh, -c, \"echo X=1\"] }\n\
+             services:\n  - name: a\n    image: a\n    run: {}\n",
+        )
+        .unwrap();
+        let f = check_provider_command(&cfg);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Pass);
+    }
+
+    #[test]
+    fn which_on_path_finds_sh() {
+        assert!(which_on_path("sh").is_some());
+        assert!(which_on_path("definitely-not-on-path-xyzzy").is_none());
     }
 
     #[test]
