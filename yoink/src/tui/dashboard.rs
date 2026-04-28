@@ -78,6 +78,14 @@ impl DashboardState {
                 if !self.show_exited && !c.is_running() {
                     continue;
                 }
+                // Hide pf-sidecar containers from the overview — they're
+                // ephemeral implementation detail of an active port-forward.
+                // The name prefix is the reliable signal (we control it in
+                // `pf::unique_sidecar_name`); target service rows get a `↦`
+                // marker below, and the footer band carries the URLs.
+                if c.name.starts_with("yoink-pf-") {
+                    continue;
+                }
                 let searchable = format!(
                     "{} {} {} {} {} {}",
                     host.host,
@@ -183,6 +191,7 @@ impl DashboardState {
         config: &Config,
         secrets: Option<&SecretsBundle>,
         history: &HashMap<(String, String), StatsHistory>,
+        forwards: &super::pf::PortForwardState,
         throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         let layout = pane_layout(area);
@@ -197,7 +206,7 @@ impl DashboardState {
             Paragraph::new(format!("yoink dashboard · services: {services}")).style(bold());
         frame.render_widget(header, layout[0]);
 
-        let rows = self.build_rows(config, secrets, history, throbber);
+        let rows = self.build_rows(config, secrets, history, forwards, throbber);
         let widths = [
             Constraint::Length(18), // host
             Constraint::Length(14), // service
@@ -253,6 +262,7 @@ impl DashboardState {
         config: &Config,
         secrets: Option<&SecretsBundle>,
         history: &HashMap<(String, String), StatsHistory>,
+        forwards: &super::pf::PortForwardState,
         throbber: &throbber_widgets_tui::ThrobberState,
     ) -> Vec<Row<'static>> {
         let Some(report) = &self.report else {
@@ -286,6 +296,14 @@ impl DashboardState {
                 if !self.show_exited && !c.is_running() {
                     continue;
                 }
+                // Hide pf-sidecar containers from the overview — they're
+                // ephemeral implementation detail of an active port-forward.
+                // The name prefix is the reliable signal (we control it in
+                // `pf::unique_sidecar_name`); target service rows get a `↦`
+                // marker below, and the footer band carries the URLs.
+                if c.name.starts_with("yoink-pf-") {
+                    continue;
+                }
                 let searchable = format!(
                     "{} {} {} {} {} {}",
                     host.host,
@@ -307,9 +325,15 @@ impl DashboardState {
                 let mem_cell = render_mem_cell(stats);
                 let drift_cell = render_drift_cell(c, config, secrets);
 
+                let service_cell = match c.yoink_service.as_deref() {
+                    Some(svc) if forwards.is_service_forwarded(svc) => Cell::from(format!("↦ {svc}"))
+                        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)),
+                    Some(svc) => Cell::from(svc.to_string()),
+                    None => Cell::from("-"),
+                };
                 rows.push(Row::new(vec![
                     Cell::from(host.host.clone()),
-                    Cell::from(c.yoink_service.clone().unwrap_or_else(|| "-".into())),
+                    service_cell,
                     Cell::from(c.name.clone()),
                     Cell::from(c.state.clone()).style(state_style(&c.state)),
                     Cell::from(health.to_string()).style(health_style(health)),

@@ -138,6 +138,24 @@ impl PortForwardState {
         self.forwards.values().find(|f| f.key.service == service)
     }
 
+    /// Any active forward at all — fallback for the global `o` key
+    /// when the operator is on a view without a clear "focused
+    /// service" (Hosts list, Logs, Resources). Picks the BTreeMap-
+    /// first forward (deterministic; matches the footer's first
+    /// entry).
+    #[must_use]
+    pub fn first(&self) -> Option<&ActiveForward> {
+        self.forwards.values().next()
+    }
+
+    /// `true` when the service has at least one open forward. Used
+    /// by row renderers to prefix a `↦` marker on the service cell
+    /// so operators can see at a glance which rows are tunneled.
+    #[must_use]
+    pub fn is_service_forwarded(&self, service: &str) -> bool {
+        self.forwards.values().any(|f| f.key.service == service)
+    }
+
     /// Drop a single tunnel. Wired up but not yet keyed (the focused-
     /// row remove gesture lands in the follow-up "Tunnels pane" PR).
     #[allow(dead_code)]

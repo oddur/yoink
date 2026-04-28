@@ -164,8 +164,8 @@ impl View {
             "  D             doctor — diagnose deploy-blockers",
             "  E             edit config in $EDITOR (jumps to focused service/host)",
             "  ~             show drift detail for the focused service",
-            "  f             port-forward the focused service (single-publish only)",
-            "  o             open the active port-forward URL in the browser",
+            "  f             port-forward the focused service (auto: published or sidecar)",
+            "  o / O         open the active port-forward URL in the browser (any view)",
             "  F             close every active port-forward",
             "  Tab / S-Tab   cycle modes forward / backward",
             "  ?             toggle this help overlay",
@@ -1081,6 +1081,32 @@ impl App {
         }
     }
 
+    /// Resolve which service the operator's currently looking at,
+    /// for the global `o` (open port-forward URL) gesture. Wider
+    /// reach than `drift_focus` — covers the Services list (no
+    /// host context) and unwraps `yoink-pf-*` sidecar containers
+    /// back to their target service via the
+    /// `yoink.pf.target_service` label. Returns `None` for views
+    /// that don't have any service notion (Hosts list, Logs,
+    /// Resources, Secrets); the `o` handler then falls back to
+    /// "first active forward."
+    fn pf_focused_service(&self) -> Option<String> {
+        match &self.view {
+            View::Dashboard => self.dashboard.selected().and_then(|r| r.service),
+            View::HostDetail(_) => self.host_detail.selected_service(),
+            View::ServiceDetail(svc) => Some(svc.clone()),
+            View::Services => self.services.selected_service(),
+            View::ContainerDetail { .. } => {
+                let labels = &self.container_detail.inspect()?.labels;
+                labels
+                    .get("yoink.service")
+                    .or_else(|| labels.get("yoink.pf.target_service"))
+                    .cloned()
+            }
+            _ => None,
+        }
+    }
+
     /// Re-read the config from disk and swap it in if it parses + has
     /// actually changed. Silent no-op on parse errors so a half-saved
     /// edit doesn't blank the dashboard; the next tick will catch the
@@ -1855,16 +1881,29 @@ impl App {
                 }
                 return false;
             }
-            KeyCode::Char('o') => {
-                if let Some((_host, service)) = self.drift_focus()
-                    && let Some(fwd) = self.forwards.first_for_service(&service)
-                {
-                    let url = fwd.url.clone();
-                    if let Err(e) = crate::pf::open_in_browser(&url) {
-                        self.push_toast(format!("✗ open browser failed: {e} — {url}"));
-                    } else {
-                        self.push_toast(format!("→ opened {url}"));
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                // 1. Try to resolve a focused service in the current view
+                //    (Dashboard / Services / ServiceDetail / HostDetail /
+                //    ContainerDetail). 2. Fall back to "any active forward"
+                //    so the operator can press O on the Hosts pane and
+                //    still pop the most-recently-opened tunnel — same
+                //    "always available" feel as the footer band.
+                let target_url = self
+                    .pf_focused_service()
+                    .and_then(|s| self.forwards.first_for_service(&s).map(|f| f.url.clone()))
+                    .or_else(|| self.forwards.first().map(|f| f.url.clone()));
+                let Some(url) = target_url else {
+                    if !self.forwards.is_empty() {
+                        self.push_toast(
+                            "no port-forward URL resolved for this row".to_string(),
+                        );
                     }
+                    return false;
+                };
+                if let Err(e) = crate::pf::open_in_browser(&url) {
+                    self.push_toast(format!("✗ open browser failed: {e} — {url}"));
+                } else {
+                    self.push_toast(format!("→ opened {url}"));
                 }
                 return false;
             }
@@ -3337,6 +3376,7 @@ impl App {
                     &self.config,
                     secrets.as_deref(),
                     &self.container_history,
+                    &self.forwards,
                     &self.throbber_state,
                 );
             }
@@ -3356,6 +3396,7 @@ impl App {
                     secrets.as_deref(),
                     &events,
                     &self.container_history,
+                    &self.forwards,
                     &self.throbber_state,
                 );
             }
@@ -3379,6 +3420,7 @@ impl App {
                 frame,
                 pane_area,
                 &self.config,
+                &self.forwards,
                 &self.throbber_state,
             ),
             View::ServiceDetail(_) => {
