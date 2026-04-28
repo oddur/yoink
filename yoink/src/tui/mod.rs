@@ -12,6 +12,7 @@ mod history;
 mod host_detail;
 mod hosts;
 mod logs;
+mod pf;
 mod progress;
 mod resources;
 mod secrets;

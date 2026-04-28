@@ -111,6 +111,7 @@ impl ServicesState {
         frame: &mut Frame<'_>,
         area: ratatui::layout::Rect,
         config: &Config,
+        forwards: &super::pf::PortForwardState,
         throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         let layout = pane_layout(area);
@@ -137,7 +138,14 @@ impl ServicesState {
         } else {
             visible
                 .iter()
-                .map(|i| build_service_row(&self.service_names[*i], config, self.report.as_ref()))
+                .map(|i| {
+                    build_service_row(
+                        &self.service_names[*i],
+                        config,
+                        self.report.as_ref(),
+                        forwards,
+                    )
+                })
                 .collect()
         };
         let table = Table::new(rows, widths)
@@ -165,6 +173,7 @@ fn build_service_row<'a>(
     name: &'a str,
     config: &'a Config,
     report: Option<&StatusReport>,
+    forwards: &super::pf::PortForwardState,
 ) -> Row<'a> {
     let cfg_service = config.services.iter().find(|s| s.name == name);
     let image_tag = cfg_service.map_or_else(
@@ -209,8 +218,14 @@ fn build_service_row<'a>(
     } else {
         hosts.join(", ")
     };
+    let name_cell = if forwards.is_service_forwarded(name) {
+        Cell::from(format!("↦ {name}"))
+            .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan))
+    } else {
+        Cell::from(name.to_string())
+    };
     Row::new(vec![
-        Cell::from(name.to_string()),
+        name_cell,
         Cell::from(image_tag),
         Cell::from(running_str),
         Cell::from(health.to_string()).style(health_style(health)),

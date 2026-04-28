@@ -102,6 +102,23 @@ yoink shell <SERVICE>                    interactive PTY shell (`bash` if presen
 yoink ssh <SERVICE>                      alias for `yoink shell`
 yoink debug <SERVICE>                    alpine debug sidecar in target's pid+net ns (for
                                          distroless / shell-less images)
+yoink pf <SERVICE> [[LOCAL:]CPORT]       port-forward a container port to the laptop. Auto:
+                                         uses the host's `docker-proxy` listener when the
+                                         service has a matching `publish:` entry, else
+                                         spawns an `alpine/socat` sidecar that joins the
+                                         service's docker network and forwards. Holds
+                                         until SIGINT; sidecar is force-removed on exit.
+  --mode <auto|published|sidecar>        path selection. `auto` default; `published` errors
+                                         when no publish matches; `sidecar` always spawns a
+                                         sidecar even if a publish would have worked.
+  -o, --open                             open the URL in the system browser when ready
+  --scheme <SCHEME>                      override the URL scheme used by --open / printed
+                                         link (auto: 80/3000/5050/… → http, 443 → https)
+  --json                                 first stdout line is `{local_port, mode, url, …}`,
+                                         then keep tunneling. Useful for scripts that
+                                         need to read the assigned port.
+  -r, --replica <N>                      replica index (defaults to 0)
+  --host <ADDRESS>                       pin to a specific host on multi-host configs
 yoink restart <SERVICE>                  bounce the container without re-deploying
 yoink kill <SERVICE> [--yes]             SIGKILL a container; no graceful drain
 yoink pull <SERVICE> [--tag <value>]     pre-warm an image without deploying

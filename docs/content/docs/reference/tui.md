@@ -57,6 +57,9 @@ Heavily inspired by [k9s](https://k9scli.io/) and [lazydocker](https://github.co
 | `D` | debug sidecar (alpine in target's pid+net ns — for distroless / shell-less images) |
 | `H` | service deploy history; on a stopped row press `r` to roll back |
 | `~` | show drift detail for the focused service (image / tag / spec_hash / env keys / label keys) |
+| `f` | port-forward the focused service. Auto-mode: published path when the service has a matching `publish:` entry, else spawns an ephemeral `alpine/socat` sidecar that joins the service's docker network. Footer band stays visible across panes until closed. |
+| `o` / `O` | open the active port-forward URL in the system browser. Works in any view; falls back to the most-recently-opened tunnel when the focused row has no forward of its own. |
+| `F` | close every active port-forward (sidecars are force-removed; ssh children killed) |
 | `x` | toggle eXited containers visible in the table |
 | `r` | refresh |
 | `/` | filter substring (Esc clears) |
