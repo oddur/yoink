@@ -32,6 +32,35 @@ use crate::config::{Config, ServiceConfig};
 /// to the SSH host. Same default as the image-push tunnel.
 pub const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Operator-visible URL scheme override. `Auto` runs the
+/// port-number heuristic (`default_scheme`); `Http`/`Https` force
+/// the obvious wrapper; `Tcp`/`None` print bare `localhost:N` and
+/// suppress browser-open. Backed by a `clap::ValueEnum` derive at
+/// the CLI surface so `--scheme=tcp` validates at parse time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SchemeOverride {
+    #[default]
+    Auto,
+    Http,
+    Https,
+    Tcp,
+    /// Bare `localhost:N` — explicitly says "this isn't HTTP."
+    /// Equivalent to `Tcp` for `forward_url` but distinct in CLI
+    /// help so operators see the intent option.
+    None,
+}
+
+impl SchemeOverride {
+    fn web_scheme(self, container_port: u16) -> Option<&'static str> {
+        match self {
+            Self::Auto => default_scheme(container_port),
+            Self::Http => Some("http"),
+            Self::Https => Some("https"),
+            Self::Tcp | Self::None => None,
+        }
+    }
+}
+
 /// Default scheme heuristic mapping a container port to a URL
 /// scheme. Conservative: only well-known HTTP ports auto-resolve;
 /// everything else returns `None` and the operator gets `localhost:N`
@@ -46,14 +75,12 @@ pub fn default_scheme(container_port: u16) -> Option<&'static str> {
 }
 
 /// Render the URL the operator wants. `scheme` overrides the
-/// heuristic when set (e.g. an HTTPS service on port 8443 the
-/// operator knows is HTTPS even though the heuristic only flags 443).
+/// heuristic; defaults to `Auto` (port-based).
 #[must_use]
-pub fn forward_url(local_port: u16, container_port: u16, scheme: Option<&str>) -> String {
-    let scheme = scheme.or_else(|| default_scheme(container_port));
-    match scheme {
-        Some(s) if s != "tcp" && s != "none" => format!("{s}://localhost:{local_port}"),
-        _ => format!("localhost:{local_port}"),
+pub fn forward_url(local_port: u16, container_port: u16, scheme: SchemeOverride) -> String {
+    match scheme.web_scheme(container_port) {
+        Some(s) => format!("{s}://localhost:{local_port}"),
+        None => format!("localhost:{local_port}"),
     }
 }
 
@@ -383,18 +410,35 @@ services:
 
     #[test]
     fn forward_url_uses_heuristic_when_unforced() {
-        assert_eq!(forward_url(54321, 80, None), "http://localhost:54321");
-        assert_eq!(forward_url(54322, 443, None), "https://localhost:54322");
-        assert_eq!(forward_url(54323, 5432, None), "localhost:54323");
+        assert_eq!(
+            forward_url(54321, 80, SchemeOverride::Auto),
+            "http://localhost:54321"
+        );
+        assert_eq!(
+            forward_url(54322, 443, SchemeOverride::Auto),
+            "https://localhost:54322"
+        );
+        assert_eq!(
+            forward_url(54323, 5432, SchemeOverride::Auto),
+            "localhost:54323"
+        );
     }
 
     #[test]
-    fn forward_url_explicit_scheme_wins() {
+    fn forward_url_explicit_scheme_overrides() {
+        // Force https on a port the heuristic doesn't recognize.
         assert_eq!(
-            forward_url(54324, 5432, Some("postgres")),
-            "postgres://localhost:54324"
+            forward_url(54324, 8443, SchemeOverride::Https),
+            "https://localhost:54324"
         );
-        assert_eq!(forward_url(54325, 80, Some("none")), "localhost:54325");
-        assert_eq!(forward_url(54326, 80, Some("tcp")), "localhost:54326");
+        // Tcp / None suppress the http:// wrapper even on port 80.
+        assert_eq!(
+            forward_url(54325, 80, SchemeOverride::None),
+            "localhost:54325"
+        );
+        assert_eq!(
+            forward_url(54326, 80, SchemeOverride::Tcp),
+            "localhost:54326"
+        );
     }
 }

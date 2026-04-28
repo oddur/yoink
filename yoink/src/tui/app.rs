@@ -3088,7 +3088,7 @@ impl App {
                     let url = crate::pf::forward_url(
                         local_port,
                         endpoint_for_task.container_port,
-                        None,
+                        crate::pf::SchemeOverride::Auto,
                     );
                     let _ = tx.send(Update::PortForwardOpened {
                         host: host_for_task,

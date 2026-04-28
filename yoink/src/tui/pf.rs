@@ -24,9 +24,19 @@ use crate::transport::tunnel::SshTunnel;
 /// In-app collection of live forwards. Lookups are by `(host_address,
 /// service, container_port)`; the BTreeMap ordering gives us a stable
 /// render order in the footer.
+///
+/// No hard cap on the map size — fd / SSH child-process exhaustion
+/// would bite long before memory does, and operators don't realistically
+/// open dozens of tunnels in a single session. The footer truncates
+/// gracefully at the right edge of the terminal regardless.
 #[derive(Default)]
 pub struct PortForwardState {
     forwards: BTreeMap<ForwardKey, ActiveForward>,
+    /// Pre-rendered footer line, rebuilt on every insert/remove/clear
+    /// so the per-frame `render_footer` is a single widget render with
+    /// no Span allocations. Empty when no forwards are active (the
+    /// renderer short-circuits in that case).
+    footer_cache: Option<Line<'static>>,
 }
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -96,6 +106,7 @@ impl ActiveForward {
 impl PortForwardState {
     pub fn insert(&mut self, fwd: ActiveForward) {
         self.forwards.insert(fwd.key.clone(), fwd);
+        self.refresh_footer();
     }
 
     /// Returns the existing forward for `(host, service, port)` if
@@ -128,12 +139,14 @@ impl PortForwardState {
             service: service.to_string(),
             container_port,
         });
+        self.refresh_footer();
     }
 
     /// Close every active forward. Invoked by `Shift-F` from the
     /// dashboard or on App drop.
     pub fn clear(&mut self) {
         self.forwards.clear();
+        self.refresh_footer();
     }
 
     #[must_use]
@@ -151,42 +164,43 @@ impl PortForwardState {
     /// operator has too many tunnels open. Goal: an open tunnel
     /// is impossible to forget — the band stays on every pane.
     pub fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        if let Some(line) = &self.footer_cache {
+            frame.render_widget(Paragraph::new(line.clone()), area);
+        }
+    }
+
+    /// Rebuild `footer_cache` from the current map. Called once on
+    /// every state mutation (insert/remove/clear) so `render_footer`
+    /// — invoked every render tick — does no allocation. Returns
+    /// `None` for the empty-map case so the renderer can short-circuit.
+    fn refresh_footer(&mut self) {
         if self.forwards.is_empty() {
+            self.footer_cache = None;
             return;
         }
-        let mut spans = vec![Span::styled(
-            "↦ ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )];
+        let cyan_bold = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let dim = Style::default().fg(Color::DarkGray);
+        let url_style = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::UNDERLINED);
+        let mut spans = Vec::with_capacity(self.forwards.len() * 5 + 2);
+        spans.push(Span::styled("↦ ", cyan_bold));
         for (i, fwd) in self.forwards.values().enumerate() {
             if i > 0 {
-                spans.push(Span::styled("  ", Style::default()));
+                spans.push(Span::raw("  "));
             }
-            spans.push(Span::styled(
-                fwd.key.service.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled(fwd.key.service.clone(), cyan_bold));
             spans.push(Span::styled(
                 format!(" :{}", fwd.endpoint.container_port),
-                Style::default().fg(Color::DarkGray),
+                dim,
             ));
-            spans.push(Span::styled(" → ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(
-                fwd.url.clone(),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::UNDERLINED),
-            ));
+            spans.push(Span::styled(" → ", dim));
+            spans.push(Span::styled(fwd.url.clone(), url_style));
         }
-        spans.push(Span::styled(
-            "   [o] open  [F] close all",
-            Style::default().fg(Color::DarkGray),
-        ));
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        spans.push(Span::styled("   [o] open  [F] close all", dim));
+        self.footer_cache = Some(Line::from(spans));
     }
 }
 

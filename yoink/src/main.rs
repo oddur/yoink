@@ -387,9 +387,11 @@ enum Command {
         #[arg(short = 'o', long)]
         open: bool,
         /// Override the URL scheme used by the printed link / `--open`.
-        /// `tcp` / `none` disable auto-open.
-        #[arg(long)]
-        scheme: Option<String>,
+        /// `auto` runs the port-based heuristic (default); `http` /
+        /// `https` force-wrap; `tcp` / `none` print bare `localhost:N`
+        /// and suppress browser-open.
+        #[arg(long, value_enum, default_value_t = PfScheme::Auto)]
+        scheme: PfScheme,
         /// Print the assigned local port + remote endpoint as a single
         /// JSON line on stdout, then keep tunneling until SIGINT.
         /// Useful for scripts that want to read the chosen port.
@@ -559,6 +561,32 @@ enum Command {
         #[command(subcommand)]
         action: SecretsAction,
     },
+}
+
+/// CLI value enum mirror of `yoink::pf::SchemeOverride`. Lives in
+/// main.rs so it can carry clap's `ValueEnum` derive without
+/// pulling clap into the lib crate; converted via `From` on the
+/// way into `cmd_pf`.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum PfScheme {
+    #[default]
+    Auto,
+    Http,
+    Https,
+    Tcp,
+    None,
+}
+
+impl From<PfScheme> for yoink::pf::SchemeOverride {
+    fn from(s: PfScheme) -> Self {
+        match s {
+            PfScheme::Auto => Self::Auto,
+            PfScheme::Http => Self::Http,
+            PfScheme::Https => Self::Https,
+            PfScheme::Tcp => Self::Tcp,
+            PfScheme::None => Self::None,
+        }
+    }
 }
 
 /// What `yoink __complete` lists. Drives the dynamic-completion
@@ -922,7 +950,7 @@ async fn run(cli: Cli) -> Result<()> {
                 host.as_deref(),
                 replica,
                 open,
-                scheme.as_deref(),
+                scheme.into(),
                 json,
             )
             .await
@@ -1804,7 +1832,7 @@ async fn cmd_pf(
     host_filter: Option<&str>,
     replica: usize,
     open_browser: bool,
-    scheme_override: Option<&str>,
+    scheme_override: yoink::pf::SchemeOverride,
     json: bool,
 ) -> Result<()> {
     use yoink::pf;
