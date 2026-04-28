@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures_util::future::join_all;
 use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::style::{Color, Style};
@@ -12,11 +11,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::config::Config;
-use crate::docker_ops::{ContainerStats, DockerOps, Host};
+use crate::docker_ops::{ContainerStats, DockerOps};
 use crate::output::{format_bytes, format_relative_time};
 use crate::secrets::SecretsBundle;
 use crate::status::StatusReport;
 
+use super::container_detail::StatsHistory;
 use super::ui::{
     FilterState, bold, clamp_selection, filter_footer, gauge_color, health_style, inline_gauge,
     pane_layout, render_drift_cell, state_style,
@@ -24,16 +24,12 @@ use super::ui::{
 
 pub struct DashboardRefresh {
     pub report: Option<StatusReport>,
-    pub stats: HashMap<String, ContainerStats>,
     pub error: Option<String>,
 }
 
 #[derive(Default)]
 pub struct DashboardState {
     report: Option<StatusReport>,
-    /// Keyed by `<host>/<container>` so the render layer can look up live
-    /// stats alongside the container info from the listing.
-    stats: HashMap<String, ContainerStats>,
     last_error: Option<String>,
     loaded: bool,
     /// When `true`, render also includes containers in the `exited` /
@@ -177,7 +173,6 @@ impl DashboardState {
         self.loaded = true;
         if let Some(report) = data.report {
             self.report = Some(report);
-            self.stats = data.stats;
         }
     }
 
@@ -187,6 +182,7 @@ impl DashboardState {
         area: ratatui::layout::Rect,
         config: &Config,
         secrets: Option<&SecretsBundle>,
+        history: &HashMap<(String, String), StatsHistory>,
     ) {
         let layout = pane_layout(area);
 
@@ -200,7 +196,7 @@ impl DashboardState {
             Paragraph::new(format!("yoink dashboard · services: {services}")).style(bold());
         frame.render_widget(header, layout[0]);
 
-        let rows = self.build_rows(config, secrets);
+        let rows = self.build_rows(config, secrets, history);
         let widths = [
             Constraint::Length(18), // host
             Constraint::Length(14), // service
@@ -251,7 +247,12 @@ impl DashboardState {
         frame.render_widget(footer, layout[2]);
     }
 
-    fn build_rows(&self, config: &Config, secrets: Option<&SecretsBundle>) -> Vec<Row<'static>> {
+    fn build_rows(
+        &self,
+        config: &Config,
+        secrets: Option<&SecretsBundle>,
+        history: &HashMap<(String, String), StatsHistory>,
+    ) -> Vec<Row<'static>> {
         let Some(report) = &self.report else {
             // No cached report. If the first fetch already finished
             // and errored (loaded=true), don't pretend we're still
@@ -298,8 +299,9 @@ impl DashboardState {
                     continue;
                 }
                 let health = c.health_hint().unwrap_or("-");
-                let key = stats_key(&host.host, &c.name);
-                let stats = self.stats.get(&key);
+                let stats = history
+                    .get(&(host.host.clone(), c.name.clone()))
+                    .and_then(StatsHistory::latest);
 
                 let cpu_cell = render_cpu_cell(stats);
                 let mem_cell = render_mem_cell(stats);
@@ -322,10 +324,6 @@ impl DashboardState {
         }
         rows
     }
-}
-
-fn stats_key(host: &str, container: &str) -> String {
-    format!("{host}/{container}")
 }
 
 /// Comma-joined network list for the dashboard cell. Truncates with
@@ -399,66 +397,27 @@ pub async fn fetch_owned(ops: Arc<dyn DockerOps>, config: Arc<Config>) -> Dashbo
     fetch(ops.as_ref(), config.as_ref()).await
 }
 
+/// Just the container listing — live CPU/Mem stats arrive separately
+/// via the always-on stats poller and live in `App::container_history`.
+/// This keeps the docker daemon from being asked for the same stats
+/// twice on every fast tick.
 async fn fetch(ops: &dyn DockerOps, config: &Config) -> DashboardRefresh {
-    let report = match StatusReport::collect(ops, config).await {
-        Ok(r) => r,
-        Err(e) => {
-            return DashboardRefresh {
-                report: None,
-                stats: HashMap::new(),
-                error: Some(format!("{e:#}")),
-            };
-        }
-    };
-    let host_user_by_address: HashMap<String, String> = config
-        .hosts
-        .iter()
-        .map(|h| (h.address.clone(), h.user.clone()))
-        .collect();
-    let stats_futs = report
-        .hosts
-        .iter()
-        .flat_map(|h| {
-            let host_addr = h.host.clone();
-            let user = host_user_by_address
-                .get(&host_addr)
-                .cloned()
-                .unwrap_or_default();
-            h.containers
-                .iter()
-                .filter(|c| c.is_running())
-                .map(move |c| {
-                    let host = Host {
-                        user: user.clone(),
-                        address: host_addr.clone(),
-                    };
-                    let key = stats_key(&host_addr, &c.name);
-                    let name = c.name.clone();
-                    async move {
-                        let result = ops.container_stats(&host, &name).await;
-                        (key, result)
-                    }
-                })
-        })
-        .collect::<Vec<_>>();
-    let stats_results = join_all(stats_futs).await;
-    let mut stats = HashMap::new();
-    for (key, result) in stats_results {
-        if let Ok(s) = result {
-            stats.insert(key, s);
-        }
-    }
-    DashboardRefresh {
-        report: Some(report),
-        stats,
-        error: None,
+    match StatusReport::collect(ops, config).await {
+        Ok(r) => DashboardRefresh {
+            report: Some(r),
+            error: None,
+        },
+        Err(e) => DashboardRefresh {
+            report: None,
+            error: Some(format!("{e:#}")),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::docker_ops::{ContainerInfo, ContainerStats, FakeDockerOps};
+    use crate::docker_ops::{ContainerInfo, FakeDockerOps};
     use std::collections::BTreeMap;
 
     fn config() -> Config {
@@ -495,45 +454,14 @@ services:
     }
 
     #[tokio::test]
-    async fn refresh_collects_listing_then_stats_per_running_container() {
+    async fn refresh_populates_report() {
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![running_container()]));
-        ops.push_container_stats(Ok(ContainerStats {
-            cpu_pct: 12.5,
-            mem_used: 64 * 1024 * 1024,
-            mem_limit: Some(512 * 1024 * 1024),
-        }));
+        // Stats fetching no longer happens here — the always-on
+        // poller in App owns it. Refresh just collects the listing.
         let mut state = DashboardState::new();
         state.refresh(&ops, &config()).await;
         assert!(state.report.is_some());
-        assert_eq!(state.stats.len(), 1);
-        let s = state.stats.get("host-a/app-a-a1b2c3d").unwrap();
-        assert!((s.cpu_pct - 12.5).abs() < f64::EPSILON);
-        assert_eq!(s.mem_used, 64 * 1024 * 1024);
-    }
-
-    #[tokio::test]
-    async fn refresh_skips_stats_for_non_running_containers() {
-        let ops = FakeDockerOps::new();
-        let mut stopped = running_container();
-        stopped.state = "exited".into();
-        ops.push_list_containers(Ok(vec![stopped]));
-        // No push_container_stats — refresh shouldn't attempt one.
-        let mut state = DashboardState::new();
-        state.refresh(&ops, &config()).await;
-        assert!(state.stats.is_empty());
-    }
-
-    #[tokio::test]
-    async fn refresh_keeps_report_when_individual_stats_fails() {
-        let ops = FakeDockerOps::new();
-        ops.push_list_containers(Ok(vec![running_container()]));
-        // No stats response — fetch returns FakeExhausted, which we
-        // tolerate; report is still populated, stats map stays empty.
-        let mut state = DashboardState::new();
-        state.refresh(&ops, &config()).await;
-        assert!(state.report.is_some());
-        assert!(state.stats.is_empty());
     }
 
     #[tokio::test]

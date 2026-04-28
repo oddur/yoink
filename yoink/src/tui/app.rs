@@ -38,11 +38,12 @@ use crate::config::Config;
 use crate::docker_ops::{DockerEvent, DockerEventKind, DockerOps, Host, LogLine};
 use crate::status::StatusReport;
 
-use super::container_detail::{self, ContainerDetailRefresh, ContainerDetailState};
+use super::container_detail::{self, ContainerDetailRefresh, ContainerDetailState, StatsHistory};
 use super::dashboard::{self, DashboardRefresh, DashboardState};
 use super::host_detail::{self, HostDetailRefresh, HostDetailState};
 use super::hosts::{self, HostRow, HostsState};
 use super::logs::{LogsState, RenderedLine};
+use super::resources::{self, ResourceTab, ResourceTarget, ResourcesRefresh, ResourcesState};
 use super::services::{ServiceDetailState, ServicesState};
 use super::shell::{SessionResult, ShellState};
 
@@ -57,6 +58,21 @@ const TOAST_TTL: Duration = Duration::from_secs(5);
 /// Cap on toast ring buffer — older events fall off.
 const TOAST_CAP: usize = 8;
 const HOSTS_TICK: Duration = Duration::from_secs(10);
+/// How often to refresh the Resources pane (images / volumes / networks)
+/// while it's visible. Slower than the dashboard tick: this data
+/// changes far less often (image pulls, volume creates) and the
+/// per-host fan-out is the heaviest list query in the codebase.
+const RESOURCES_TICK: Duration = Duration::from_secs(15);
+/// Per-host docker-events ring buffer cap. Each event is a single
+/// formatted line — generous so an operator returning to a `HostDetail`
+/// pane after lunch sees recent context.
+const EVENT_HISTORY_PER_HOST: usize = 200;
+/// Cadence of the always-on stats-history poller (one task per host).
+/// Matches `FAST_TICK` — by the time the operator opens a container
+/// detail pane, the chart has whatever back-history the poller managed
+/// to collect at this rate. 2s is the same cadence dashboard uses, so
+/// the docker daemon load is comparable.
+const STATS_HISTORY_TICK: Duration = Duration::from_secs(2);
 /// How often to re-stat + re-parse the on-disk config so a `vim
 /// services/api.yaml` is reflected without restarting the TUI. Polling
 /// (vs notify/inotify) keeps the dep tree small; 2s latency is fine
@@ -71,6 +87,7 @@ pub enum Mode {
     Hosts,
     Services,
     Logs,
+    Resources,
     Secrets,
 }
 
@@ -109,6 +126,10 @@ pub enum View {
     /// Sealed-secrets management — view / add / edit / remove
     /// individual KEY=value entries without leaving the TUI.
     Secrets,
+    /// Per-host introspection of docker resources beyond yoink-managed
+    /// containers — Images / Volumes / Networks tabs. Reaches lazydocker
+    /// feature parity for browsing local docker state.
+    Resources,
 }
 
 impl View {
@@ -125,7 +146,8 @@ impl View {
             | View::ContainerDetail { .. } => 1,
             View::Services | View::ServiceDetail(_) | View::ServiceHistory(_) => 2,
             View::Logs => 3,
-            View::Secrets => 4,
+            View::Resources => 4,
+            View::Secrets => 5,
         }
     }
 
@@ -137,7 +159,8 @@ impl View {
         let global = vec![
             "global",
             "  q / Ctrl-C    quit yoink",
-            "  d h s l e     dashboard / hosts / services / logs / encrypted-secrets",
+            "  d h s l       dashboard / hosts / services / logs",
+            "  R e           resources / encrypted-secrets",
             "  Tab / S-Tab   cycle modes forward / backward",
             "  ?             toggle this help overlay",
             "",
@@ -166,23 +189,34 @@ impl View {
                 "host detail",
                 "  ↑↓ / j k     select container",
                 "  enter        live logs",
-                "  i            container detail (labels, env-ish, live cpu/mem)",
+                "  i            container detail (labels, env, live cpu/mem)",
                 "  !            shell into container (bash/sh)",
                 "  D            debug sidecar (alpine, target's pid+net ns)",
+                "  S            start · X stop · R restart container",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
                 "  /            filter substring · esc to clear",
                 "  r            refresh",
                 "  esc          back to hosts (when no active filter)",
+                "",
+                "events panel (bottom of pane) auto-collects start /",
+                "die / health-change events as they fire on the daemon",
             ],
             View::ContainerDetail { .. } => vec![
                 "container detail",
                 "  enter / l    live logs",
                 "  !            shell · D debug sidecar",
+                "  S            start · X stop · R restart container",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
+                "  p            processes (docker top)",
                 "  r            refresh",
                 "  esc          back to host detail",
+                "",
+                "5-minute history charts (collected for every container",
+                "across every host, even when not viewing them):",
+                "  cpu%   ·   mem   ·   net (tx ↑ above / rx ↓ below)",
+                "current values appear in each chart title.",
             ],
             View::Services => vec![
                 "services",
@@ -234,6 +268,20 @@ impl View {
                 "  e            edit selected value",
                 "  d            delete selected (with confirmation)",
                 "  esc          back",
+            ],
+            View::Resources => vec![
+                "resources (images / volumes / networks)",
+                "  Tab / S-Tab  cycle Images → Volumes → Networks",
+                "  ↑↓ / j k     select row",
+                "  d            remove selected (with confirmation)",
+                "  P            prune unused (with confirmation)",
+                "  A            (Images only) prune ALL unused, not just dangling",
+                "  /            filter substring · esc to clear",
+                "  r            refresh",
+                "",
+                "rows fan out across every configured host. dangling",
+                "images sort first; partial fetch errors per host appear",
+                "in red at the bottom rather than blanking the table.",
             ],
             View::ContainerShell { .. } => vec![
                 "shell",
@@ -290,6 +338,7 @@ impl View {
                 "detail".into(),
             ],
             View::Secrets => vec![root, "Secrets".into()],
+            View::Resources => vec![root, "Resources".into()],
         }
     }
 }
@@ -302,6 +351,7 @@ impl From<Mode> for View {
             Mode::Services => View::Services,
             Mode::Logs => View::Logs,
             Mode::Secrets => View::Secrets,
+            Mode::Resources => View::Resources,
         }
     }
 }
@@ -340,6 +390,24 @@ enum Update {
     /// failures the operator otherwise wouldn't see — log streams
     /// dying, event subscriptions failing, secrets loader blowing up.
     Toast(String),
+    /// Result of `schedule_resources_refresh` — drives the new
+    /// Resources pane.
+    Resources(ResourcesRefresh),
+    /// Result of a `docker top` background fetch. The receiver
+    /// pushes the table onto `ContainerDetailState` (or surfaces an
+    /// error toast on the failure path).
+    Top {
+        host: Host,
+        container: String,
+        result: Result<crate::docker_ops::ProcessTable, String>,
+    },
+    /// Batch of `(host_address, container_name, stats)` samples produced
+    /// by the always-on background stats poller. Each sample is folded
+    /// into the per-container `StatsHistory` so that opening a
+    /// container's detail pane shows the rolling 5-minute history
+    /// regardless of which view the operator was on while it was being
+    /// collected.
+    StatsBatch(Vec<(String, String, crate::docker_ops::ContainerStats)>),
 }
 
 /// Auto-pop error overlay carrying the full text (including URLs
@@ -374,6 +442,26 @@ enum JobKind {
         statuses: std::collections::BTreeMap<String, ReconcileServiceStatus>,
     },
     Prune,
+}
+
+/// One-shot container lifecycle action — start / stop / restart.
+/// Routed through `App::spawn_lifecycle`; the docker-events stream
+/// drives the corresponding UI refresh, so there's no progress modal.
+#[derive(Debug, Clone, Copy)]
+enum LifecycleOp {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl LifecycleOp {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
 }
 
 /// Per-service state machine for the reconcile-all status table.
@@ -505,6 +593,7 @@ async fn run_loop(
     app.schedule_hosts_refresh();
     app.schedule_dashboard_refresh();
     app.start_event_subscriptions();
+    app.start_stats_history_pollers();
     app.spawn_secrets_loader();
     if matches!(app.view, View::Logs) {
         app.start_service_log_streams().await;
@@ -513,6 +602,7 @@ async fn run_loop(
     let mut events = EventStream::new();
     let mut fast_tick = interval(FAST_TICK);
     let mut hosts_tick = interval(HOSTS_TICK);
+    let mut resources_tick = interval(RESOURCES_TICK);
     let mut config_tick = interval(CONFIG_RELOAD_TICK);
     // Drives the "starting shell…" spinner animation. Fires only
     // matters when the shell view is up and `inner` is None; the
@@ -520,6 +610,7 @@ async fn run_loop(
     let mut shell_spin_tick = interval(Duration::from_millis(125));
     fast_tick.tick().await;
     hosts_tick.tick().await;
+    resources_tick.tick().await;
     config_tick.tick().await;
     shell_spin_tick.tick().await;
 
@@ -550,6 +641,14 @@ async fn run_loop(
                 // Re-entry to Hosts schedules a fresh refresh anyway.
                 if matches!(app.view, View::Hosts) {
                     app.schedule_hosts_refresh();
+                }
+            }
+            _ = resources_tick.tick() => {
+                // Same lazy guard as `hosts_tick`: the Resources pane's
+                // 3-way fan-out per host is the heaviest list query,
+                // so only fire while it's actually visible.
+                if matches!(app.view, View::Resources) {
+                    app.schedule_resources_refresh();
                 }
             }
             _ = config_tick.tick() => {
@@ -595,6 +694,7 @@ pub struct App {
     pub history: super::history::HistoryState,
     pub container_detail: ContainerDetailState,
     pub logs: LogsState,
+    pub resources: ResourcesState,
     pub secrets_state: super::secrets::SecretsState,
     /// `Some` while a `ContainerShell` view is active; cleared on exit.
     shell: Option<ShellState>,
@@ -622,6 +722,14 @@ pub struct App {
     /// Equivalent of `yoink up` (no `--service` filter): every service
     /// in config order across every host. `y` / Enter confirms.
     reconcile_all_target: bool,
+    /// `Some` while a resource-remove confirmation modal is open
+    /// over the Resources pane. Confirm with `y` / Enter; anything
+    /// else dismisses.
+    resource_remove_target: Option<ResourceTarget>,
+    /// `Some((tab, dangling_only))` while a resource-prune modal is
+    /// open. `dangling_only=false` is the aggressive "docker image
+    /// prune -a" form; ignored for non-image tabs.
+    resource_prune_target: Option<(ResourceTab, bool)>,
     /// `Some` while a reconcile is in flight or its progress modal
     /// is still on screen. Owns the streaming event log; cleared
     /// when the operator presses Esc after completion.
@@ -662,6 +770,23 @@ pub struct App {
     dashboard_in_flight: bool,
     container_detail_in_flight: bool,
     history_in_flight: bool,
+    resources_in_flight: bool,
+    /// Per-host docker-event ring buffer (formatted for display).
+    /// Newest entries pushed at the back. Drives the events panel
+    /// at the bottom of the `HostDetail` pane.
+    host_events: std::collections::HashMap<String, std::collections::VecDeque<String>>,
+    /// Per-container stats history, populated by the always-on
+    /// background stats poller. Keyed by `(host_address,
+    /// container_name)` so opening any container's detail pane
+    /// renders the rolling 5-minute history immediately rather than
+    /// starting from zero. Last-update tracking is implicit in each
+    /// `StatsHistory`'s elapsed-time anchor; entries are GC'd when
+    /// their newest sample falls outside `2 × HISTORY_WINDOW_SECS`.
+    container_history:
+        std::collections::HashMap<(String, String), super::container_detail::StatsHistory>,
+    /// Per-host `JoinHandle`s for the always-on stats poller. Aborted
+    /// on Drop and re-spawned on `hosts:` config reload.
+    stats_history_tasks: Vec<JoinHandle<()>>,
     update_tx: UnboundedSender<Update>,
     update_rx: UnboundedReceiver<Update>,
 
@@ -703,6 +828,7 @@ impl App {
             history: super::history::HistoryState::new(),
             container_detail: ContainerDetailState::new(),
             logs: LogsState::new(),
+            resources: ResourcesState::new(),
             secrets_state: super::secrets::SecretsState::new(),
             shell: None,
             show_help: false,
@@ -712,6 +838,8 @@ impl App {
             reconcile_target: None,
             prune_target: false,
             reconcile_all_target: false,
+            resource_remove_target: None,
+            resource_prune_target: None,
             job_progress: None,
             job_tx,
             job_rx,
@@ -726,6 +854,10 @@ impl App {
             dashboard_in_flight: false,
             container_detail_in_flight: false,
             history_in_flight: false,
+            resources_in_flight: false,
+            host_events: std::collections::HashMap::new(),
+            container_history: std::collections::HashMap::new(),
+            stats_history_tasks: Vec::new(),
             update_tx,
             update_rx,
             log_tasks: Vec::new(),
@@ -763,6 +895,8 @@ impl App {
         if hosts_changed {
             self.stop_event_subscriptions();
             self.start_event_subscriptions();
+            self.stop_stats_history_pollers();
+            self.start_stats_history_pollers();
             self.schedule_hosts_refresh();
         }
         self.schedule_dashboard_refresh();
@@ -1071,6 +1205,106 @@ impl App {
         }
     }
 
+    /// Spawn one always-on stats-history poller per configured host.
+    /// The poller lists running containers on its host every
+    /// `STATS_HISTORY_TICK` and fetches `container_stats` for each
+    /// one in parallel, then ships the batch back through `update_tx`
+    /// as `Update::StatsBatch`. This keeps the rolling 5-minute
+    /// window alive for every container regardless of which view
+    /// the operator is currently on, so opening a container detail
+    /// pane shows immediate context instead of an empty chart.
+    ///
+    /// Idempotent on re-spawn: callers must invoke
+    /// `stop_stats_history_pollers` first (we do that on `hosts:`
+    /// config-reload before respawning, and on Drop).
+    fn start_stats_history_pollers(&mut self) {
+        for host_cfg in &self.config.hosts {
+            let host = Host::from(host_cfg);
+            let ops = self.ops.clone();
+            let tx = self.update_tx.clone();
+            let task = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(STATS_HISTORY_TICK);
+                // First tick fires immediately; eat it so we don't
+                // hammer the daemon during App startup when nothing's
+                // visible yet.
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let containers = match ops.list_running_containers(&host).await {
+                        Ok(cs) => cs,
+                        Err(e) => {
+                            tracing::debug!(
+                                host = %host.address,
+                                error = %e,
+                                "stats poller: list_running_containers failed",
+                            );
+                            continue;
+                        }
+                    };
+                    if containers.is_empty() {
+                        // Still send an empty batch so the receiver
+                        // gets a heartbeat (useful for future GC
+                        // strategies that key off "we polled at T").
+                        if tx.send(Update::StatsBatch(Vec::new())).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let stat_futs = containers.iter().map(|c| {
+                        let ops = ops.clone();
+                        let host = host.clone();
+                        let name = c.name.clone();
+                        async move {
+                            let res = ops.container_stats(&host, &name).await.ok();
+                            (host.address.clone(), name, res)
+                        }
+                    });
+                    let results = futures_util::future::join_all(stat_futs).await;
+                    let batch: Vec<(String, String, crate::docker_ops::ContainerStats)> = results
+                        .into_iter()
+                        .filter_map(|(h, n, s)| s.map(|stats| (h, n, stats)))
+                        .collect();
+                    if tx.send(Update::StatsBatch(batch)).is_err() {
+                        return;
+                    }
+                }
+            });
+            self.stats_history_tasks.push(task);
+        }
+    }
+
+    fn stop_stats_history_pollers(&mut self) {
+        for task in self.stats_history_tasks.drain(..) {
+            task.abort();
+        }
+    }
+
+    /// Push one stats sample into the per-container history store.
+    /// Cheap — each container gets its own bounded ring buffer.
+    fn record_stats_sample(
+        &mut self,
+        host: &str,
+        container: &str,
+        stats: &crate::docker_ops::ContainerStats,
+    ) {
+        let entry = self
+            .container_history
+            .entry((host.to_string(), container.to_string()))
+            .or_default();
+        entry.push(stats);
+    }
+
+    /// Drop history entries whose newest sample is older than
+    /// `2 × HISTORY_WINDOW_SECS`. Called from the slow ticks so a
+    /// long-running TUI doesn't slowly accumulate ghost containers.
+    fn gc_container_history(&mut self) {
+        // The `StatsHistory` window-trim logic already drops samples
+        // that have aged out, so an entry whose ring is empty has
+        // had no fresh sample for at least HISTORY_WINDOW_SECS — that's
+        // the GC signal.
+        self.container_history.retain(|_, h| !h.cpu_pct_is_empty());
+    }
+
     /// Returns true when the loop should exit.
     #[allow(clippy::too_many_lines)]
     async fn on_key(&mut self, key: KeyEvent) -> bool {
@@ -1163,6 +1397,28 @@ impl App {
                 self.confirm_reconcile_all();
             } else {
                 self.reconcile_all_target = false;
+            }
+            return false;
+        }
+
+        // Resource remove confirmation modal — same gesture as kill.
+        if self.resource_remove_target.is_some() {
+            let confirm = matches!(key.code, KeyCode::Char('y') | KeyCode::Enter);
+            let target = self.resource_remove_target.take();
+            if confirm && let Some(t) = target {
+                self.spawn_resource_remove(t);
+                self.schedule_resources_refresh();
+            }
+            return false;
+        }
+
+        // Resource prune confirmation modal.
+        if self.resource_prune_target.is_some() {
+            let confirm = matches!(key.code, KeyCode::Char('y') | KeyCode::Enter);
+            let target = self.resource_prune_target.take();
+            if confirm && let Some((kind, dangling_only)) = target {
+                self.spawn_resource_prune(kind, dangling_only);
+                self.schedule_resources_refresh();
             }
             return false;
         }
@@ -1276,14 +1532,35 @@ impl App {
                 self.transition(View::Secrets).await;
                 return false;
             }
+            KeyCode::Char('R') if !matches!(self.view, View::Resources) => {
+                // Capital `R` enters the Resources pane from any other
+                // top-level view. While *inside* Resources, we let the
+                // per-view match below own the `R` key (lower-case is
+                // already used for refresh; the per-view handler can
+                // map capital R to other things if needed).
+                self.transition(View::Resources).await;
+                return false;
+            }
             // Tab / Shift-Tab cycle through the top-level modes
             // (k9s-friendly alternative to direct-letter access).
+            // Inside Resources we override Tab to cycle sub-tabs
+            // (Images / Volumes / Networks); that match arm runs
+            // before the global one because we early-return below.
+            KeyCode::Tab if matches!(self.view, View::Resources) => {
+                self.resources.cycle_tab_forward();
+                return false;
+            }
+            KeyCode::BackTab if matches!(self.view, View::Resources) => {
+                self.resources.cycle_tab_backward();
+                return false;
+            }
             KeyCode::Tab => {
                 let next = match self.view.top_section() {
                     0 => View::Hosts,
                     1 => View::Services,
                     2 => View::Logs,
-                    3 => View::Secrets,
+                    3 => View::Resources,
+                    4 => View::Secrets,
                     _ => View::Dashboard,
                 };
                 self.transition(next).await;
@@ -1295,7 +1572,8 @@ impl App {
                     1 => View::Dashboard,
                     2 => View::Hosts,
                     3 => View::Services,
-                    _ => View::Logs,
+                    4 => View::Logs,
+                    _ => View::Resources,
                 };
                 self.transition(prev).await;
                 return false;
@@ -1369,6 +1647,30 @@ impl App {
                         self.kill_target = Some((host, container));
                     }
                 }
+                KeyCode::Char('S') => {
+                    if let (Some(host), Some(container)) = (
+                        self.host_detail.host().cloned(),
+                        self.host_detail.selected_container(),
+                    ) {
+                        self.spawn_lifecycle(host, container, LifecycleOp::Start);
+                    }
+                }
+                KeyCode::Char('X') => {
+                    if let (Some(host), Some(container)) = (
+                        self.host_detail.host().cloned(),
+                        self.host_detail.selected_container(),
+                    ) {
+                        self.spawn_lifecycle(host, container, LifecycleOp::Stop);
+                    }
+                }
+                KeyCode::Char('R') => {
+                    if let (Some(host), Some(container)) = (
+                        self.host_detail.host().cloned(),
+                        self.host_detail.selected_container(),
+                    ) {
+                        self.spawn_lifecycle(host, container, LifecycleOp::Restart);
+                    }
+                }
                 KeyCode::Char('U') => {
                     if let Some(service) = self.host_detail.selected_service() {
                         self.open_reconcile_modal(&service);
@@ -1379,6 +1681,21 @@ impl App {
                 _ => {}
             },
             View::ContainerDetail { host, container } => match key.code {
+                KeyCode::Esc if self.container_detail.top_visible() => {
+                    self.container_detail.dismiss_top();
+                }
+                KeyCode::Char('p') => {
+                    self.schedule_top_fetch();
+                }
+                KeyCode::Char('S') => {
+                    self.spawn_lifecycle(host.clone(), container.clone(), LifecycleOp::Start);
+                }
+                KeyCode::Char('X') => {
+                    self.spawn_lifecycle(host.clone(), container.clone(), LifecycleOp::Stop);
+                }
+                KeyCode::Char('R') => {
+                    self.spawn_lifecycle(host.clone(), container.clone(), LifecycleOp::Restart);
+                }
                 KeyCode::Char('K') => {
                     self.kill_target = Some((host.clone(), container.clone()));
                 }
@@ -1622,6 +1939,28 @@ impl App {
                 KeyCode::Char('d') => self.secrets_state.begin_remove_selected(),
                 _ => {}
             },
+            View::Resources => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.resources.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.resources.select_next(),
+                KeyCode::Char('i') => self.resources.set_tab(ResourceTab::Images),
+                KeyCode::Char('v') => self.resources.set_tab(ResourceTab::Volumes),
+                KeyCode::Char('n') => self.resources.set_tab(ResourceTab::Networks),
+                KeyCode::Char('d') => {
+                    if let Some(target) = self.resources.selected_target(&self.config) {
+                        self.resource_remove_target = Some(target);
+                    }
+                }
+                KeyCode::Char('P') => {
+                    self.resource_prune_target = Some((self.resources.current_tab(), true));
+                }
+                KeyCode::Char('A') if self.resources.current_tab() == ResourceTab::Images => {
+                    // Aggressive image prune ("docker image prune -a")
+                    // — only meaningful on the Images tab.
+                    self.resource_prune_target = Some((ResourceTab::Images, false));
+                }
+                KeyCode::Char('r') => self.schedule_resources_refresh(),
+                _ => {}
+            },
         }
         false
     }
@@ -1727,6 +2066,8 @@ impl App {
         self.reconcile_target = None;
         self.prune_target = false;
         self.reconcile_all_target = false;
+        self.resource_remove_target = None;
+        self.resource_prune_target = None;
         // Don't clear job_progress on transition — operator
         // may want to navigate around with the deploy still in flight.
         // It clears itself on Esc-after-finished.
@@ -1819,6 +2160,9 @@ impl App {
                 // via `ensure_loaded`. Clear any half-finished edit
                 // from a previous visit so the operator starts fresh.
                 self.secrets_state.cancel_edit();
+            }
+            View::Resources => {
+                self.schedule_resources_refresh();
             }
         }
         self.view = new_view;
@@ -1923,6 +2267,9 @@ impl App {
             View::HostDetail(_) => self.schedule_host_detail_refresh(),
             View::ContainerDetail { .. } => self.schedule_container_detail_refresh(),
             View::ContainerShell { .. } => self.shell_tick(),
+            // Resources fetches are heavier (3 list calls × N hosts);
+            // gate behind the dedicated `resources_tick` that fires
+            // less often. The fast tick is a no-op for the rest.
             _ => {}
         }
     }
@@ -1996,6 +2343,134 @@ impl App {
                 container,
                 data: Box::new(data),
             });
+        });
+    }
+
+    fn schedule_resources_refresh(&mut self) {
+        if self.resources_in_flight {
+            return;
+        }
+        self.resources_in_flight = true;
+        let ops = self.ops.clone();
+        let config = self.config.clone();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let data = resources::fetch_owned(ops, config).await;
+            let _ = tx.send(Update::Resources(data));
+        });
+    }
+
+    /// Spawn a background `docker top` for the currently-selected
+    /// container in `ContainerDetail`. Result lands via `Update::Top`
+    /// and is pushed onto `container_detail` for modal rendering.
+    fn schedule_top_fetch(&mut self) {
+        let Some((host, container)) = self.container_detail.target().cloned() else {
+            return;
+        };
+        self.container_detail.begin_top_load();
+        let ops = self.ops.clone();
+        let tx = self.update_tx.clone();
+        let host_for_msg = host.clone();
+        let container_for_msg = container.clone();
+        tokio::spawn(async move {
+            let result = container_detail::fetch_top(ops, host, container).await;
+            let _ = tx.send(Update::Top {
+                host: host_for_msg,
+                container: container_for_msg,
+                result,
+            });
+        });
+    }
+
+    /// Send a one-off lifecycle command (start / stop / restart) for
+    /// the given container; show a toast on failure. Stays on the
+    /// event loop because docker's lifecycle endpoints are usually
+    /// fast enough not to need a progress modal — and the operator
+    /// gets immediate feedback via the docker-events stream which
+    /// repaints the dashboard within milliseconds.
+    fn spawn_lifecycle(&self, host: Host, container: String, op: LifecycleOp) {
+        let ops = self.ops.clone();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let res = match op {
+                LifecycleOp::Start => ops.start_container(&host, &container).await,
+                LifecycleOp::Stop => {
+                    ops.stop_container(&host, &container, Duration::from_secs(10))
+                        .await
+                }
+                LifecycleOp::Restart => {
+                    ops.restart_container(&host, &container, Duration::from_secs(10))
+                        .await
+                }
+            };
+            if let Err(e) = res {
+                let _ = tx.send(Update::Toast(format!(
+                    "✗ {} {}/{container}: {e}",
+                    op.label(),
+                    host.address
+                )));
+            } else {
+                let _ = tx.send(Update::Toast(format!("✓ {} {}", op.label(), container)));
+            }
+        });
+    }
+
+    /// Background remove-resource. Same toast UX as `spawn_lifecycle`.
+    fn spawn_resource_remove(&self, target: ResourceTarget) {
+        let ops = self.ops.clone();
+        let tx = self.update_tx.clone();
+        let label = target.label.clone();
+        tokio::spawn(async move {
+            let res = match target.kind {
+                ResourceTab::Images => ops.remove_image(&target.host, &target.id, false).await,
+                ResourceTab::Volumes => ops.remove_volume(&target.host, &target.id, false).await,
+                ResourceTab::Networks => ops.remove_network(&target.host, &target.id).await,
+            };
+            match res {
+                Ok(()) => {
+                    let _ = tx.send(Update::Toast(format!("✓ removed {label}")));
+                }
+                Err(e) => {
+                    let _ = tx.send(Update::Toast(format!("✗ remove {label}: {e}")));
+                }
+            }
+        });
+    }
+
+    /// Background prune for whichever resource tab is active. Each
+    /// branch maps to the equivalent `docker {kind} prune` call
+    /// fanned out across every host.
+    fn spawn_resource_prune(&self, kind: ResourceTab, dangling_only: bool) {
+        let ops = self.ops.clone();
+        let hosts: Vec<Host> = self.config.hosts.iter().map(Host::from).collect();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let mut summaries: Vec<String> = Vec::new();
+            for host in hosts {
+                let res = match kind {
+                    ResourceTab::Images => ops.prune_images(&host, dangling_only).await,
+                    ResourceTab::Volumes => ops.prune_volumes(&host).await,
+                    ResourceTab::Networks => ops.prune_networks(&host).await,
+                };
+                match res {
+                    Ok(report) => summaries.push(format!(
+                        "{}: -{} ({} items)",
+                        host.address,
+                        crate::output::format_bytes(report.space_reclaimed_bytes),
+                        report.reclaimed.len()
+                    )),
+                    Err(e) => summaries.push(format!("{}: failed: {e}", host.address)),
+                }
+            }
+            let kind_label = match kind {
+                ResourceTab::Images => "image prune",
+                ResourceTab::Volumes => "volume prune",
+                ResourceTab::Networks => "network prune",
+            };
+            let _ = tx.send(Update::Toast(format!(
+                "✓ {kind_label} · {}",
+                summaries.join(" · ")
+            )));
         });
     }
 
@@ -2073,6 +2548,33 @@ impl App {
             }
             Update::Event { host, event } => self.on_docker_event(&host, &event),
             Update::Toast(msg) => self.push_toast(msg),
+            Update::Resources(data) => {
+                self.resources.apply(data);
+                self.resources_in_flight = false;
+            }
+            Update::StatsBatch(samples) => {
+                for (host, container, stats) in samples {
+                    self.record_stats_sample(&host, &container, &stats);
+                }
+                self.gc_container_history();
+            }
+            Update::Top {
+                host,
+                container,
+                result,
+            } => match result {
+                Ok(table) => {
+                    if self.container_detail.target().map(|(h, c)| (h, c.as_str()))
+                        == Some((&host, container.as_str()))
+                    {
+                        self.container_detail.set_top(table);
+                    }
+                }
+                Err(e) => {
+                    self.container_detail.dismiss_top();
+                    self.push_toast(format!("✗ docker top {container}: {e}"));
+                }
+            },
         }
     }
 
@@ -2109,6 +2611,25 @@ impl App {
         // Surface the event as a toast in the breadcrumb header.
         let container = event.container.as_deref().unwrap_or("?");
         let line = format!("{} · {} {}", host.address, container, event.action);
+        // Append to the per-host ring so HostDetail's events panel
+        // can show recent activity. Format includes a relative
+        // timestamp ("now") that ages on each render — kept simple
+        // for now (just the action), but the entry is timestamped
+        // below for future "5m ago" rendering.
+        let ring = self.host_events.entry(host.address.clone()).or_default();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let stamped = format!(
+            "{}  {} {}",
+            crate::output::format_relative_time(i64::try_from(now_secs).ok()),
+            container,
+            event.action
+        );
+        ring.push_back(stamped);
+        while ring.len() > EVENT_HISTORY_PER_HOST {
+            ring.pop_front();
+        }
         self.toasts
             .push_back((std::time::Instant::now() + TOAST_TTL, line));
         while self.toasts.len() > TOAST_CAP {
@@ -2159,10 +2680,7 @@ impl App {
             Ok(rx) => rx,
             Err(e) => {
                 warn!(host = %host.address, container = %container, error = %e, "open_log_stream failed");
-                self.push_toast(format!(
-                    "✗ logs {}/{container}: {e}",
-                    host.address
-                ));
+                self.push_toast(format!("✗ logs {}/{container}: {e}", host.address));
                 return;
             }
         };
@@ -2202,22 +2720,45 @@ impl App {
             },
             |(_, msg)| format!("● {msg}"),
         );
-        let tabs = ["Dashboard", "Hosts", "Services", "Logs", "Secrets"];
+        let tabs = [
+            "Dashboard",
+            "Hosts",
+            "Services",
+            "Logs",
+            "Resources",
+            "Secrets",
+        ];
         let selected_tab = Some(self.view.top_section());
         super::ui::render_header(frame, header_area, &tabs, selected_tab, &crumbs, &right);
 
         let secrets = self.secrets.try_read().ok().and_then(|g| g.clone());
         match &self.view {
             View::Dashboard => {
-                self.dashboard
-                    .render(frame, pane_area, &self.config, secrets.as_deref());
+                self.dashboard.render(
+                    frame,
+                    pane_area,
+                    &self.config,
+                    secrets.as_deref(),
+                    &self.container_history,
+                );
             }
             View::Hosts => self.hosts.render(frame, pane_area, &self.config),
-            View::HostDetail(_) => {
-                self.host_detail
-                    .render(frame, pane_area, &self.config, secrets.as_deref());
+            View::HostDetail(host) => {
+                let events: Vec<String> = self
+                    .host_events
+                    .get(&host.address)
+                    .map(|q| q.iter().cloned().collect())
+                    .unwrap_or_default();
+                self.host_detail.render(
+                    frame,
+                    pane_area,
+                    &self.config,
+                    secrets.as_deref(),
+                    &events,
+                    &self.container_history,
+                );
             }
-            View::ContainerDetail { .. } => {
+            View::ContainerDetail { host, container } => {
                 // Split: top 2/3 = inspect data, bottom 1/3 = live log tail.
                 let split = ratatui::layout::Layout::default()
                     .direction(ratatui::layout::Direction::Vertical)
@@ -2226,7 +2767,10 @@ impl App {
                         ratatui::layout::Constraint::Length(12),
                     ])
                     .split(pane_area);
-                self.container_detail.render(frame, split[0]);
+                let history: Option<&StatsHistory> = self
+                    .container_history
+                    .get(&(host.address.clone(), container.clone()));
+                self.container_detail.render(frame, split[0], history);
                 self.logs.render(frame, split[1], &self.config);
             }
             View::Services => self.services.render(frame, pane_area, &self.config),
@@ -2255,6 +2799,9 @@ impl App {
             View::Secrets => {
                 self.secrets_state.ensure_loaded(&self.config, false);
                 self.secrets_state.render(frame, pane_area);
+            }
+            View::Resources => {
+                self.resources.render(frame, pane_area, &self.config);
             }
         }
 
@@ -2325,6 +2872,67 @@ impl App {
                 "[any]         cancel",
             ];
             super::ui::render_modal(frame, "reconcile ALL services?", &lines);
+        }
+        if let Some(target) = &self.resource_remove_target {
+            let kind = match target.kind {
+                ResourceTab::Images => "image",
+                ResourceTab::Volumes => "volume",
+                ResourceTab::Networks => "network",
+            };
+            let host_line = format!("host:   {}", target.host.address);
+            let target_line = format!("target: {}", target.label);
+            let title = format!("remove {kind}?");
+            let lines = vec![
+                "About to remove the selected resource.",
+                "",
+                host_line.as_str(),
+                target_line.as_str(),
+                "",
+                "Container references that point at the resource will",
+                "block removal — the daemon returns an error and the",
+                "row is left in place. Force removal isn't wired up;",
+                "kill referencing containers first.",
+                "",
+                "[y] / Enter   confirm",
+                "[any]         cancel",
+            ];
+            super::ui::render_modal(frame, &title, &lines);
+        }
+        if let Some((kind, dangling_only)) = &self.resource_prune_target {
+            let host_count = format!("hosts:  {}", self.config.hosts.len());
+            let title = match kind {
+                ResourceTab::Images => {
+                    if *dangling_only {
+                        "prune dangling images?"
+                    } else {
+                        "prune ALL unused images?"
+                    }
+                }
+                ResourceTab::Volumes => "prune unused volumes?",
+                ResourceTab::Networks => "prune unused networks?",
+            };
+            let body_line = match kind {
+                ResourceTab::Images => {
+                    if *dangling_only {
+                        "Removes <none>:<none> layers (no live tag) on every host."
+                    } else {
+                        "Removes every image with NO live container reference."
+                    }
+                }
+                ResourceTab::Volumes => "Removes named volumes with no attached container.",
+                ResourceTab::Networks => {
+                    "Removes user-defined networks with no attached container."
+                }
+            };
+            let lines = vec![
+                body_line,
+                "",
+                host_count.as_str(),
+                "",
+                "[y] / Enter   confirm",
+                "[any]         cancel",
+            ];
+            super::ui::render_modal(frame, title, &lines);
         }
         if self.prune_target {
             let host_count = format!("hosts:    {}", self.config.hosts.len());
@@ -2398,6 +3006,7 @@ impl Drop for App {
     fn drop(&mut self) {
         self.stop_log_streams();
         self.stop_event_subscriptions();
+        self.stop_stats_history_pollers();
     }
 }
 

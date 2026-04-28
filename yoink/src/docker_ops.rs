@@ -212,7 +212,7 @@ pub struct HostInfo {
 }
 
 /// One-shot snapshot of a container's CPU + memory utilization.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContainerStats {
     /// CPU% across all online CPUs — max ≈ `n_cpu * 100`.
     pub cpu_pct: f64,
@@ -220,6 +220,54 @@ pub struct ContainerStats {
     pub mem_used: i64,
     /// Limit in bytes if a memory cap is set, else None.
     pub mem_limit: Option<i64>,
+    /// Cumulative bytes received across every interface, since the
+    /// container started. Time-series consumers diff successive samples
+    /// to get rates.
+    pub net_rx_bytes: i64,
+    /// Cumulative bytes transmitted, see `net_rx_bytes`.
+    pub net_tx_bytes: i64,
+    /// Cumulative bytes read from block devices.
+    pub block_read_bytes: i64,
+    /// Cumulative bytes written to block devices.
+    pub block_write_bytes: i64,
+    /// Number of pids running inside the container at sample time.
+    pub pids: i64,
+}
+
+/// One image as the dashboard / `yoink images` show it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ImageInfo {
+    pub host: String,
+    /// Short SHA-256 (first 12 hex chars).
+    pub id: String,
+    /// All `repo:tag` references this image is known by.
+    pub repo_tags: Vec<String>,
+    pub size_bytes: i64,
+    /// Unix epoch seconds, if reported.
+    pub created_unix: Option<i64>,
+    /// `true` when no container references this image (eligible for prune).
+    pub dangling: bool,
+}
+
+/// Single process row from `docker top` (output of `ps -ef` inside the
+/// container). Column meanings vary by container-side ps; we surface
+/// the daemon's reported titles verbatim alongside the values so the
+/// operator can interpret them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProcessTable {
+    pub titles: Vec<String>,
+    pub processes: Vec<Vec<String>>,
+}
+
+/// Result of a `docker {images,volumes,networks} prune` call. Object
+/// is uniform across all three so the TUI's prune-confirmation flow
+/// can render the same toast format.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Names / IDs reclaimed.
+    pub reclaimed: Vec<String>,
+    /// Bytes reclaimed (0 for prunes that don't free disk — networks).
+    pub space_reclaimed_bytes: i64,
 }
 
 /// Realtime change notification from a host's docker daemon. Currently
@@ -427,6 +475,88 @@ pub trait DockerOps: Send + Sync {
     /// List every docker volume on `host`. Used by `yoink volumes`.
     async fn list_volumes(&self, host: &Host) -> Result<Vec<VolumeInfo>, DockerError>;
 
+    /// List every image cached on `host`. The TUI's Resources pane
+    /// renders this as a sortable table with size + age columns.
+    /// Default impl returns an empty list so callers (Fake / future
+    /// alt backends) keep working without an explicit override.
+    async fn list_images(&self, _host: &Host) -> Result<Vec<ImageInfo>, DockerError> {
+        Ok(Vec::new())
+    }
+
+    /// Remove a single image by id or `repo:tag`. `force=true` removes
+    /// even when there are tag references; `false` errors out when
+    /// other tags point at the same image id.
+    async fn remove_image(
+        &self,
+        _host: &Host,
+        _name: &str,
+        _force: bool,
+    ) -> Result<(), DockerError> {
+        Err(DockerError::Invalid("remove_image not supported".into()))
+    }
+
+    /// Prune unused images. `dangling_only=true` matches `docker image
+    /// prune` (default — only `<none>:<none>` layers); `false` matches
+    /// `docker image prune -a` (every image with no live container
+    /// reference).
+    async fn prune_images(
+        &self,
+        _host: &Host,
+        _dangling_only: bool,
+    ) -> Result<PruneReport, DockerError> {
+        Ok(PruneReport::default())
+    }
+
+    /// Remove one volume. `force` corresponds to `docker volume rm -f`.
+    async fn remove_volume(
+        &self,
+        _host: &Host,
+        _name: &str,
+        _force: bool,
+    ) -> Result<(), DockerError> {
+        Err(DockerError::Invalid("remove_volume not supported".into()))
+    }
+
+    /// `docker volume prune` — drop volumes that no container references.
+    async fn prune_volumes(&self, _host: &Host) -> Result<PruneReport, DockerError> {
+        Ok(PruneReport::default())
+    }
+
+    /// Remove one user-defined network. Default networks (`bridge`,
+    /// `host`, `none`) reject removal.
+    async fn remove_network(&self, _host: &Host, _name: &str) -> Result<(), DockerError> {
+        Err(DockerError::Invalid("remove_network not supported".into()))
+    }
+
+    /// `docker network prune` — drop user-defined networks with no
+    /// attached containers.
+    async fn prune_networks(&self, _host: &Host) -> Result<PruneReport, DockerError> {
+        Ok(PruneReport::default())
+    }
+
+    /// `docker restart` with the standard 10s SIGTERM grace period.
+    /// Implemented separately from stop+start so the daemon does the
+    /// state transition atomically (no observer-visible "stopped" gap).
+    async fn restart_container(
+        &self,
+        _host: &Host,
+        _name: &str,
+        _drain: Duration,
+    ) -> Result<(), DockerError> {
+        Err(DockerError::Invalid(
+            "restart_container not supported".into(),
+        ))
+    }
+
+    /// `docker top` — list processes running inside the container.
+    /// Used by the container detail pane's `p` gesture.
+    async fn top_container(&self, _host: &Host, _name: &str) -> Result<ProcessTable, DockerError> {
+        Ok(ProcessTable {
+            titles: Vec::new(),
+            processes: Vec::new(),
+        })
+    }
+
     async fn pull_image(
         &self,
         host: &Host,
@@ -438,11 +568,7 @@ pub trait DockerOps: Send + Sync {
     /// Stream a `docker save`-style tarball into the host's docker
     /// daemon (`POST /images/load`). Body is a `Stream<Bytes>` so
     /// memory stays bounded by the chunk size, not the image size.
-    async fn load_image(
-        &self,
-        host: &Host,
-        body: ImageTarStream,
-    ) -> Result<(), DockerError>;
+    async fn load_image(&self, host: &Host, body: ImageTarStream) -> Result<(), DockerError>;
 
     /// `true` if `image:tag` is already present in the host's local
     /// image cache (no pull needed). Used to skip redundant pulls
@@ -918,6 +1044,166 @@ impl DockerOps for RealDockerOps {
             .collect())
     }
 
+    async fn list_images(&self, host: &Host) -> Result<Vec<ImageInfo>, DockerError> {
+        let docker = self.client_for(host).await?;
+        let opts = bollard::query_parameters::ListImagesOptionsBuilder::new()
+            .all(false)
+            .build();
+        let images = docker
+            .list_images(Some(opts))
+            .await
+            .map_err(|s| Self::err(host, s))?;
+        Ok(images
+            .into_iter()
+            .map(|img| {
+                let mut id = img.id;
+                if let Some(rest) = id.strip_prefix("sha256:") {
+                    id = rest.chars().take(12).collect();
+                }
+                let dangling = img
+                    .repo_tags
+                    .iter()
+                    .all(|t| t == "<none>:<none>" || t.is_empty());
+                ImageInfo {
+                    host: host.address.clone(),
+                    id,
+                    repo_tags: img.repo_tags,
+                    size_bytes: img.size,
+                    created_unix: Some(img.created),
+                    dangling,
+                }
+            })
+            .collect())
+    }
+
+    async fn remove_image(&self, host: &Host, name: &str, force: bool) -> Result<(), DockerError> {
+        let docker = self.client_for(host).await?;
+        let opts = bollard::query_parameters::RemoveImageOptionsBuilder::new()
+            .force(force)
+            .noprune(false)
+            .build();
+        // 404 is idempotent: image already gone.
+        match docker.remove_image(name, Some(opts), None).await {
+            Ok(_)
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(other) => Err(Self::err(host, other)),
+        }
+    }
+
+    async fn prune_images(
+        &self,
+        host: &Host,
+        dangling_only: bool,
+    ) -> Result<PruneReport, DockerError> {
+        let docker = self.client_for(host).await?;
+        // `dangling=true` → only `<none>` images. `dangling=false` →
+        // every image with no live container reference (matches `-a`).
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert(
+            "dangling".to_string(),
+            vec![if dangling_only { "true" } else { "false" }.to_string()],
+        );
+        let opts = bollard::query_parameters::PruneImagesOptionsBuilder::new()
+            .filters(&filters)
+            .build();
+        let resp = docker
+            .prune_images(Some(opts))
+            .await
+            .map_err(|s| Self::err(host, s))?;
+        let reclaimed = resp
+            .images_deleted
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|d| d.deleted.or(d.untagged))
+            .collect();
+        Ok(PruneReport {
+            reclaimed,
+            space_reclaimed_bytes: resp.space_reclaimed.unwrap_or(0),
+        })
+    }
+
+    async fn remove_volume(&self, host: &Host, name: &str, force: bool) -> Result<(), DockerError> {
+        let docker = self.client_for(host).await?;
+        let opts = bollard::query_parameters::RemoveVolumeOptionsBuilder::new()
+            .force(force)
+            .build();
+        match docker.remove_volume(name, Some(opts)).await {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(other) => Err(Self::err(host, other)),
+        }
+    }
+
+    async fn prune_volumes(&self, host: &Host) -> Result<PruneReport, DockerError> {
+        let docker = self.client_for(host).await?;
+        let resp = docker
+            .prune_volumes(None::<bollard::query_parameters::PruneVolumesOptions>)
+            .await
+            .map_err(|s| Self::err(host, s))?;
+        Ok(PruneReport {
+            reclaimed: resp.volumes_deleted.unwrap_or_default(),
+            space_reclaimed_bytes: resp.space_reclaimed.unwrap_or(0),
+        })
+    }
+
+    async fn remove_network(&self, host: &Host, name: &str) -> Result<(), DockerError> {
+        let docker = self.client_for(host).await?;
+        match docker.remove_network(name).await {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(other) => Err(Self::err(host, other)),
+        }
+    }
+
+    async fn prune_networks(&self, host: &Host) -> Result<PruneReport, DockerError> {
+        let docker = self.client_for(host).await?;
+        let resp = docker
+            .prune_networks(None::<bollard::query_parameters::PruneNetworksOptions>)
+            .await
+            .map_err(|s| Self::err(host, s))?;
+        Ok(PruneReport {
+            reclaimed: resp.networks_deleted.unwrap_or_default(),
+            space_reclaimed_bytes: 0,
+        })
+    }
+
+    async fn restart_container(
+        &self,
+        host: &Host,
+        name: &str,
+        drain: Duration,
+    ) -> Result<(), DockerError> {
+        let docker = self.client_for(host).await?;
+        let opts = bollard::query_parameters::RestartContainerOptionsBuilder::new()
+            .t(i32::try_from(drain.as_secs()).unwrap_or(i32::MAX))
+            .build();
+        docker
+            .restart_container(name, Some(opts))
+            .await
+            .map_err(|s| Self::err(host, s))
+    }
+
+    async fn top_container(&self, host: &Host, name: &str) -> Result<ProcessTable, DockerError> {
+        let docker = self.client_for(host).await?;
+        let opts = bollard::query_parameters::TopOptionsBuilder::new()
+            .ps_args("-ef")
+            .build();
+        let resp = docker
+            .top_processes(name, Some(opts))
+            .await
+            .map_err(|s| Self::err(host, s))?;
+        Ok(ProcessTable {
+            titles: resp.titles.unwrap_or_default(),
+            processes: resp.processes.unwrap_or_default(),
+        })
+    }
+
     async fn pull_image(
         &self,
         host: &Host,
@@ -978,11 +1264,7 @@ impl DockerOps for RealDockerOps {
         }
     }
 
-    async fn load_image(
-        &self,
-        host: &Host,
-        body: ImageTarStream,
-    ) -> Result<(), DockerError> {
+    async fn load_image(&self, host: &Host, body: ImageTarStream) -> Result<(), DockerError> {
         use bollard::query_parameters::ImportImageOptions;
         let docker = self.client_for(host).await?;
         let mut stream = docker.import_image(
@@ -1702,10 +1984,57 @@ fn parse_stats(stats: &bollard::models::ContainerStatsResponse) -> ContainerStat
         .and_then(|m| m.limit)
         .and_then(|l| i64::try_from(l).ok());
 
+    // Sum bytes across every interface — bollard's `networks` is a map
+    // keyed by interface name (`eth0`, `eth1`, …). Container-side `lo`
+    // doesn't appear, so this is the meaningful "total network usage".
+    let (mut net_rx, mut net_tx): (i64, i64) = (0, 0);
+    if let Some(nets) = stats.networks.as_ref() {
+        for v in nets.values() {
+            if let Some(rx) = v.rx_bytes
+                && let Ok(rx) = i64::try_from(rx)
+            {
+                net_rx = net_rx.saturating_add(rx);
+            }
+            if let Some(tx) = v.tx_bytes
+                && let Ok(tx) = i64::try_from(tx)
+            {
+                net_tx = net_tx.saturating_add(tx);
+            }
+        }
+    }
+
+    let (mut block_read, mut block_write): (i64, i64) = (0, 0);
+    if let Some(io) = stats
+        .blkio_stats
+        .as_ref()
+        .and_then(|b| b.io_service_bytes_recursive.as_ref())
+    {
+        for entry in io {
+            let val = entry.value.and_then(|v| i64::try_from(v).ok()).unwrap_or(0);
+            match entry.op.as_deref() {
+                Some("read" | "Read") => block_read = block_read.saturating_add(val),
+                Some("write" | "Write") => block_write = block_write.saturating_add(val),
+                _ => {}
+            }
+        }
+    }
+
+    let pids: i64 = stats
+        .pids_stats
+        .as_ref()
+        .and_then(|p| p.current)
+        .and_then(|p| i64::try_from(p).ok())
+        .unwrap_or(0);
+
     ContainerStats {
         cpu_pct,
         mem_used,
         mem_limit,
+        net_rx_bytes: net_rx,
+        net_tx_bytes: net_tx,
+        block_read_bytes: block_read,
+        block_write_bytes: block_write,
+        pids,
     }
 }
 
@@ -1840,9 +2169,7 @@ fn parse_inspect(name: &str, resp: &bollard::models::ContainerInspectResponse) -
         security_opt: host_config
             .and_then(|h| h.security_opt.clone())
             .unwrap_or_default(),
-        read_only: host_config
-            .and_then(|h| h.readonly_rootfs)
-            .unwrap_or(false),
+        read_only: host_config.and_then(|h| h.readonly_rootfs).unwrap_or(false),
         labels,
     }
 }
@@ -2145,11 +2472,7 @@ impl DockerOps for FakeDockerOps {
         // returning false keeps existing test expectations intact.
         Ok(false)
     }
-    async fn load_image(
-        &self,
-        host: &Host,
-        _body: ImageTarStream,
-    ) -> Result<(), DockerError> {
+    async fn load_image(&self, host: &Host, _body: ImageTarStream) -> Result<(), DockerError> {
         let mut s = self.lock();
         s.calls.push(RecordedCall::LoadImage(host.clone()));
         pop(&mut s.load_image, "load_image")
