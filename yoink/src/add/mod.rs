@@ -25,6 +25,7 @@ use crate::sealed;
 pub mod include;
 pub mod manifest;
 pub mod render;
+pub mod secrets_setup;
 pub mod source;
 pub mod wizard;
 
@@ -70,13 +71,65 @@ pub async fn cmd_add(
     if let Some(min) = &manifest.yoink_min_version
         && version_lt(env!("CARGO_PKG_VERSION"), min)
     {
-        eprintln!(
-            "warning: template requires yoink >= {min}, you have {} — render may fail",
+        anyhow::bail!(
+            "template `{}` requires yoink >= {min}, you have {} — upgrade yoink or pin the template to an older version",
+            manifest.name,
             env!("CARGO_PKG_VERSION")
         );
     }
 
     let interactive = !opts.yes && io::stdin().is_terminal();
+
+    // Bootstrap sealed secrets up-front when the template needs them
+    // and yoink.yaml has nothing configured. Reload the in-memory
+    // config so the rest of the flow (sealing, validation) sees the
+    // newly-added recipients.
+    let config_reloaded;
+    let working_config = match secrets_setup::assess(config, &manifest) {
+        secrets_setup::SetupNeed::Ready | secrets_setup::SetupNeed::NotApplicable => config,
+        secrets_setup::SetupNeed::BootstrapAge => {
+            if !interactive {
+                anyhow::bail!(
+                    "template `{}` seals {} secret(s) but `yoink.yaml` has no `secrets:` block. Run `yoink add` interactively to bootstrap, or configure `secrets:` first (`yoink secrets key generate`).",
+                    manifest.name,
+                    manifest.secrets.len()
+                );
+            }
+            eprintln!();
+            eprintln!(
+                "this template seals {} secret(s) but `yoink.yaml` has no `secrets:` block.",
+                manifest.secrets.len()
+            );
+            if !confirm("set up sealed secrets now?", true)? {
+                anyhow::bail!(
+                    "skipped — set up `secrets:` and re-run, or use a template that doesn't seal secrets"
+                );
+            }
+            let key_path = secrets_setup::default_key_path(config_path);
+            let result = secrets_setup::bootstrap(config_path, &key_path)?;
+            eprintln!("  ✓ wrote identity to {} (mode 0600)", result.key_path.display());
+            if result.gitignore_updated {
+                eprintln!("  ✓ added {} to .gitignore", result.key_path.file_name().unwrap_or_default().to_string_lossy());
+            }
+            eprintln!("  ✓ added secrets: block to {}", config_path.display());
+            eprintln!();
+            eprintln!("    set this in your shell so future yoink commands find the key:");
+            eprintln!("      export YOINK_AGE_KEY_FILE=$(pwd)/{}", result.key_path.file_name().unwrap_or_default().to_string_lossy());
+            eprintln!();
+            config_reloaded = Config::load_from_path(config_path)
+                .with_context(|| format!("reloading {} after secrets bootstrap", config_path.display()))?;
+            &config_reloaded
+        }
+        secrets_setup::SetupNeed::ExternalProvider => {
+            anyhow::bail!(
+                "template `{}` generates {} secret(s), but your `yoink.yaml` uses `provider: command` (external secrets). Generated values can't be written to an external store from yoink. Either set the secret(s) in your provider, or temporarily switch to age sealing.",
+                manifest.name,
+                manifest.secrets.len()
+            );
+        }
+    };
+    let config = working_config;
+
     let variables = wizard::collect_variables(&manifest.variables, &overrides, interactive)?;
 
     let rendered = render::render(&manifest, &fetched.root, &variables)?;
@@ -174,6 +227,12 @@ pub async fn cmd_add(
         for line in notes.lines() {
             eprintln!("  {line}");
         }
+    }
+
+    if !rendered.secrets.is_empty() {
+        eprintln!();
+        eprintln!("to inspect a generated value (e.g. to paste into a 3rd-party UI):");
+        eprintln!("  yoink secrets show {} --reveal", rendered.secrets[0].name);
     }
 
     let deploy = if opts.up {
