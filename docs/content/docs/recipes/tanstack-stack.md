@@ -3,14 +3,13 @@ title: TanStack Start + postgres + redis from scratch
 weight: 5
 ---
 
-A TanStack Start app deploying alongside a managed postgres and redis, built locally and shipped without a registry. Five files of yaml, three commands, real HTTPS.
+A TanStack Start app deploying alongside a managed postgres and redis, built locally and shipped without a registry. Five files, three commands, working stack on the host in about ten minutes.
 
-This is the "indie one-shot" pattern — single laptop, single host, no CI, no Docker Hub account, no Vault. End-to-end works on a fresh repo in about ten minutes.
+This is the "indie one-shot" pattern — single laptop, single host, no CI, no Docker Hub account, no Vault. Public exposure (HTTPS, domains) is intentionally out of scope here; the [port-forward recipe](/docs/recipes/port-forward) covers reaching the deployed stack from your laptop.
 
 ## What you need
 
-- A host with Docker installed and key-based ssh login. A fresh Hetzner / DigitalOcean / Hetzner Cloud / Linode box qualifies.
-- A domain whose A/AAAA record points at that host's public IP. **Set this up before deploying** — Let's Encrypt validates by HTTP-01 against the live IP, so an unpointed domain produces self-signed certs and a permanent browser warning. (You can deploy without `domain:` first and add HTTPS later; both flows work.)
+- A host with Docker installed and key-based ssh login. A fresh Hetzner / DigitalOcean / Linode box qualifies.
 - yoink, node, and docker on your laptop.
 
 ## Step 1: scaffold the app
@@ -188,22 +187,16 @@ The keys are the accessory's suggestion — neutral, conventional. If your app r
 
 ## Step 5: wire the app to the accessories
 
-Paste the two `connect another service to …` blocks into your app's `services[]` entry. Two things to clean up after the paste:
+Paste the two `connect another service to …` blocks into your app's `services[]` entry. Two cleanups after pasting:
 
 - Each block prints its own `depends_on: [...]`. Merge them into one list (`depends_on: [postgres, redis]`).
 - The keys are conventional but not magic — drop any your app doesn't read (the demo `db.server.ts` ignores `POSTGRES_PORT` / `REDIS_PORT` since both are hard-coded).
 
-Then add `domain:`, a real `proxy.email:` (Let's Encrypt sends expiry warnings there — `yoink doctor` flags the placeholder), and the `build:` block. The whole file ends up looking like:
+Then add the `build:` block. The whole file ends up looking like:
 
 ```yaml
 hosts:
   - { address: your-host, user: root }
-
-# Bundled Caddy fronts every `domain:`-tagged service with HTTPS.
-# `email:` is sent to Let's Encrypt for ACME registration / expiry
-# warnings — use a real address you actually read.
-proxy:
-  email: you@example.com           # ← REPLACE BEFORE DEPLOY
 
 secrets:
   provider: age
@@ -214,9 +207,6 @@ services:
   - name: my-app
     image: my-app
     tag: latest
-    # Public domain. Set DNS to point at the host's IP BEFORE
-    # deploying — Let's Encrypt validates against the live IP.
-    domain: app.example.com
     build:
       context: .
       # Cross-build to amd64 when developing on Apple Silicon.
@@ -238,42 +228,42 @@ include:
   - "services/*.yaml"
 ```
 
-Run `yoink validate` to confirm the config parses, then `yoink doctor` for a deploy-readiness check. Doctor surfaces unreachable hosts, unresolved domains, and placeholder emails before you spend time on a deploy that would fail.
-
-The `domain:` line opts the app into yoink's bundled Caddy. Caddy will request a Let's Encrypt cert on first deploy — if your DNS isn't pointed at the host yet, you'll get a self-signed fallback and can re-deploy after fixing the record.
-
-> **DNS is your responsibility.** Point an A record (and AAAA if you serve IPv6) for `app.example.com` at the host's public IP. yoink doesn't touch DNS — and Let's Encrypt won't issue without a working HTTP-01 path. Verify with `dig +short A app.example.com` before the deploy.
+`yoink validate` confirms the config parses; `yoink doctor` checks deploy-readiness (unreachable host, missing identity, etc.).
 
 ## Step 6: deploy
 
 ```sh
-yoink up --service postgres --service redis    # pass 1: accessories
+yoink up --service postgres --service redis     # pass 1: accessories
 yoink up --build --no-registry --service my-app # pass 2: app, local build → unregistry push
 ```
 
-Pass 1 pulls postgres + redis from Docker Hub, starts them on the `yoink` network. Pass 2 builds the app image locally, ships it via [unregistry](https://github.com/psviderski/unregistry) over SSH (no registry account required), starts the container, runs the healthcheck, then auto-injects a Caddy proxy that fronts `app.example.com` with HTTPS.
+Pass 1 pulls postgres + redis from Docker Hub, starts them on the `yoink` network. Pass 2 builds the app image locally and ships it via [unregistry](https://github.com/psviderski/unregistry) over SSH (no registry account required), starts the container, and runs the healthcheck.
 
-> **Why two passes?** With a single `yoink up --build --no-registry`, yoink's image-prefetch step still tries to pull every image — including the locally-built app, which 404s on Hub. Scoping with `--service` avoids the prefetch for accessories that don't need updating. (See [issue tracking the prefetch fix](#).)
+> **Why two passes?** With a single `yoink up --build --no-registry`, yoink's image-prefetch step still tries to pull every image — including the locally-built app, which 404s on Hub. Scoping with `--service` avoids the prefetch for accessories that don't need updating.
 
-The first deploy of the app is the slow one — pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry only ships changed layers (typically tens of KB for a code edit).
+First deploy of the app is the slow one — pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry ships only changed layers.
 
 ## Verify
 
-Open `https://app.example.com/` (or `https://<host-ip>/` to bypass DNS). The index page renders the `DbStatus` JSON the loader fetched — both `postgres.ok` and `redis.ok` should be `true`, with the postgres version and the redis round-trip value visible.
+The app is reachable on the host's docker network at `my-app:3000`, but not yet exposed to your laptop. Two quick options:
 
-If both report `ok: false` with `EAI_AGAIN`, the network alias didn't take — `yoink add` (versions before the fix that landed network_aliases in the templates) used to omit them. Update to a current `yoink add postgres` / `yoink add redis` and re-deploy.
+- **`yoink exec`** — runs a one-shot command inside the running container:
+  ```sh
+  yoink exec my-app -- wget -qO- localhost:3000/
+  ```
+- **port-forward from your laptop** — see the [port-forward recipe](/docs/recipes/port-forward).
+
+Both `postgres.ok` and `redis.ok` should be `true` in the JSON.
 
 ## Re-deploys
-
-Edit a route, save, deploy:
 
 ```sh
 yoink up --build --no-registry --service my-app
 ```
 
-~15 seconds for a typical code change. unregistry's layer dedup means only the rebuilt application layer ships across SSH; Node base images, the npm install layer, and the build dependencies stay cached on the host.
+~15 seconds for a typical code change. unregistry's layer dedup means only the rebuilt application layer ships over SSH.
 
-For tag-stamped deploys (so `yoink history` shows commits, not a string of `latest`s):
+For tag-stamped deploys (so `yoink history` shows commits, not `latest`s):
 
 ```sh
 yoink up --build --no-registry --here --service my-app
@@ -281,36 +271,27 @@ yoink up --build --no-registry --here --service my-app
 
 `--here` substitutes `git rev-parse --short HEAD` for the tag.
 
-## Real HTTPS, no certs to manage
-
-The bundled Caddy handles ACME automatically. First deploy after DNS is correct: cert issuance happens in the background, takes ~10 seconds, persists across redeploys (sealed under yoink's keys). Renewals are automatic. The `proxy.email:` you set is what Let's Encrypt uses for expiry warnings.
-
-If your DNS is on Cloudflare (or any other provider that proxies HTTP and rewrites the IP), see [Cloudflare origin certs](/docs/recipes/cloudflare-origin-certs) for the alternative pattern that doesn't require an LE handshake from the operator's host.
-
 ## What just happened
 
-Five files (`Dockerfile`, `.dockerignore`, `src/lib/db.server.ts`, the modified `src/routes/index.tsx`, the edited `yoink.yaml`) plus three yoink commands (`init`, two `add`s, `up`). The result:
+Five files (`Dockerfile`, `.dockerignore`, `src/lib/db.server.ts`, `src/routes/index.tsx`, `yoink.yaml`) plus three yoink commands (`init`, two `add`s, `up`):
 
 - Three containers on one host: postgres, redis, your app.
-- Caddy auto-injected to front the app with HTTPS.
 - Random `POSTGRES_PASSWORD` generated, sealed into `secrets.age`, and committed to the repo. Decryption needs the age key in `~/.config/yoink/keys/`.
-- All inter-service traffic on a private docker network — neither postgres nor redis is exposed publicly.
+- All inter-service traffic on a private docker network — nothing exposed publicly yet.
 - Spec-hash drift detection on every container, so a manual `docker exec` in production shows up in `yoink status` next time you check.
+
+For public HTTPS exposure (`domain:` + bundled Caddy + Let's Encrypt), see the dedicated recipe once published.
 
 For the full `yoink up` flag list, see [first deploy](/docs/start/first-deploy) and the [CLI reference](/docs/reference/cli).
 
 ## Multiple projects on one host
 
-Each `yoink up` against a config with any `domain:` service auto-injects a Caddy proxy that binds host ports 80 and 443. **Two separate `yoink.yaml`s on the same host fight over those ports** — and the second deploy wins, clobbering the first config's routes.
-
-The pattern that works is "one yoink.yaml per host, multiple service fragments." The host's central yaml aggregates services from each project repo via the `include:` mechanism:
+Pattern that scales: **one `yoink.yaml` per host, multiple service fragments**. The host's central yaml aggregates services from each project repo via the `include:` mechanism.
 
 ```yaml
 # host-prod/yoink.yaml — the canonical config for `your-host`
 hosts:
   - { address: your-host, user: root }
-proxy:
-  email: you@example.com
 secrets:
   provider: age
   recipients: [age1…]
@@ -321,8 +302,6 @@ include:
   - "../project-b/services/*.yaml"   # alongside its own repo
 ```
 
-Each project's repo keeps its `services/<project>.yaml` fragment alongside its code; the host config aggregates them. Two services pointing at different domains get routed by the same Caddy. Two services sharing one domain need `path_prefix:` to disambiguate (see the [config reference](/docs/reference/config) for the routing rules).
+Each project's repo keeps its `services/<project>.yaml` fragment alongside its code; the host config aggregates them. `yoink up` from the host config sees every project's services as one cluster. Per-project deploys are still possible — `yoink up --service project-a-app` from inside the host config — they just need to run from the directory with the central `yoink.yaml`.
 
-`yoink up` from the host config sees every project's services as one cluster and updates Caddy with all routes at once. Per-project deploys are still possible — `yoink up --service project-a-app` from inside the host config — they just need to run from the directory with the central `yoink.yaml`.
-
-Coordination cost: every project's CI runner needs the host config's age identity (or the per-project services need to ship their own `provider: command` entry that the host config inherits). Manageable for a few projects per host; switch to per-host yoink configs (different hosts, different proxies) once you outgrow the single-Caddy bottleneck.
+Coordination cost: every project's CI runner needs the host config's age identity (or the per-project services need to ship their own `provider: command` entry that the host config inherits).
