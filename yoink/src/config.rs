@@ -1121,6 +1121,19 @@ impl Config {
             }
         }
 
+        if let Some(SecretsConfig::Age { recipients, .. }) = &self.secrets
+            && recipients.is_empty()
+        {
+            // Without recipients, every `yoink secrets edit/seal/rotate`
+            // would fail at the encrypt step with a generic "no
+            // recipients" error from the sealed module. Catch it at
+            // config-load time so the operator sees the actionable
+            // message, not the internals.
+            return Err(ConfigError::Invalid(
+                "secrets.recipients: must list at least one age public key (age1...) — `yoink secrets key generate` prints one".into(),
+            ));
+        }
+
         if self.services.is_empty() {
             return Err(ConfigError::Invalid(
                 "at least one entry under `services:` required".into(),

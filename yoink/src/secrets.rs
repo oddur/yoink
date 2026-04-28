@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -25,6 +26,63 @@ use tokio::process::Command;
 
 use crate::config::{Config, SecretsConfig, SecretsFormat};
 use crate::sealed;
+
+/// Cap on stdout (and stderr) bytes read from a `provider: command`
+/// child. Real bundles are well under 100 KB; the limit defends
+/// against a buggy or malicious provider that runs away with stdout
+/// and OOMs the deploy / CI runner.
+const COMMAND_OUTPUT_CAP: usize = 10 * 1024 * 1024;
+/// Hard wall-clock deadline for a `provider: command` invocation. A
+/// stuck `op read` / `vault kv get` would otherwise hang `yoink up`
+/// indefinitely. Picked to comfortably cover slow KMS round-trips
+/// without surprising operators.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Env vars that survive `env_clear()` when spawning a secrets
+/// provider. Most CLIs need at least PATH; HOME / USER are commonly
+/// referenced for default-config-file resolution. Anything else
+/// (`DOPPLER_TOKEN`, `OP_SERVICE_ACCOUNT_TOKEN`, `AWS_*`, `VAULT_*`) is the
+/// operator's responsibility to wire through their environment —
+/// see the docs.
+const COMMAND_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "TZ",
+    // Per-tool auth tokens commonly needed; passing through is
+    // safer than forcing operators to wrap every CLI in a script
+    // that re-exports them.
+    "DOPPLER_TOKEN",
+    "INFISICAL_TOKEN",
+    "INFISICAL_CLIENT_ID",
+    "INFISICAL_CLIENT_SECRET",
+    "OP_SERVICE_ACCOUNT_TOKEN",
+    "OP_CONNECT_HOST",
+    "OP_CONNECT_TOKEN",
+    "VAULT_ADDR",
+    "VAULT_TOKEN",
+    "VAULT_NAMESPACE",
+    "VAULT_CACERT",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
+    "BWS_ACCESS_TOKEN",
+    "SOPS_AGE_KEY",
+    "SOPS_AGE_KEY_FILE",
+];
 
 #[derive(Debug, Error)]
 pub enum SecretsError {
@@ -68,6 +126,28 @@ pub enum SecretsError {
         format: &'static str,
         detail: String,
     },
+    #[error(
+        "`{command}` did not finish within {timeout:?} — increase the wait or fix the upstream"
+    )]
+    CommandTimeout { command: String, timeout: Duration },
+    #[error(
+        "`{command}` produced more than {cap} bytes on {stream} — provider misbehaving or output not bundle-shaped"
+    )]
+    CommandOutputCap {
+        command: String,
+        stream: &'static str,
+        cap: usize,
+    },
+    #[error(
+        "secrets bundle from `{command}` is empty, but services declare `secrets:` keys — check provider auth + scope"
+    )]
+    CommandEmpty { command: String },
+    #[error(
+        "sealed bundle decrypted to an empty map, but services declare `secrets:` keys — re-seal with `yoink secrets edit`"
+    )]
+    SealedEmpty,
+    #[error(transparent)]
+    Sealed(#[from] sealed::SealedError),
 }
 
 /// In-memory map of resolved secret keys → values. Built once at the
@@ -114,23 +194,53 @@ impl fmt::Debug for SecretsBundle {
 
 /// Load whatever the operator configured. `Ok(None)` when no
 /// `[secrets]` block is declared (services that don't need secrets).
+///
+/// An empty bundle is a hard error when *any* service in the config
+/// references secret keys (`secrets:` / `env_from_secrets:`) — that
+/// scenario almost always means the provider auth/scope is wrong
+/// rather than "you legitimately have zero secrets". `provider:
+/// command` returns its own `CommandEmpty` (we have the command
+/// string for the error message); the age path returns `SealedEmpty`.
 pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, SecretsError> {
     let Some(cfg) = &config.secrets else {
         return Ok(None);
     };
+    let any_secrets_referenced = config_references_secrets(config);
     let bundle = match cfg {
         SecretsConfig::Age { file, .. } => {
-            let path = sealed::resolve_sealed_path(config, file.as_deref());
-            load_age_bundle(&path)?
+            let path = sealed::resolve_sealed_path(config, file.as_deref())?;
+            load_age_bundle(&path, any_secrets_referenced)?
         }
         SecretsConfig::Command { command, format } => {
-            load_command_bundle(command, *format).await?
+            load_command_bundle(command, *format, any_secrets_referenced).await?
         }
     };
     Ok(Some(bundle))
 }
 
-fn load_age_bundle(path: &Path) -> Result<SecretsBundle, SecretsError> {
+fn config_references_secrets(config: &Config) -> bool {
+    let any_in = |s: &crate::config::ServiceConfig| -> bool {
+        !s.secrets.is_empty() || !s.env_from_secrets.is_empty()
+    };
+    if config.services.iter().any(any_in) {
+        return true;
+    }
+    if let Some(reg) = &config.registry
+        && (!reg.username_secret.is_empty() || !reg.password_secret.is_empty())
+    {
+        return true;
+    }
+    config
+        .hooks
+        .pre_deploy
+        .iter()
+        .any(|h| !h.secrets.is_empty() || !h.env_from_secrets.is_empty())
+}
+
+fn load_age_bundle(
+    path: &Path,
+    any_secrets_referenced: bool,
+) -> Result<SecretsBundle, SecretsError> {
     let bytes = std::fs::read(path).map_err(|source| SecretsError::SealedRead {
         path: path.to_path_buf(),
         source,
@@ -145,44 +255,103 @@ fn load_age_bundle(path: &Path) -> Result<SecretsBundle, SecretsError> {
         path: path.to_path_buf(),
         source,
     })?;
+    if map.is_empty() && any_secrets_referenced {
+        return Err(SecretsError::SealedEmpty);
+    }
     Ok(SecretsBundle::new(map))
 }
 
 async fn load_command_bundle(
     command: &[String],
     format: SecretsFormat,
+    any_secrets_referenced: bool,
 ) -> Result<SecretsBundle, SecretsError> {
     let Some((bin, args)) = command.split_first() else {
         return Err(SecretsError::CommandMissing);
     };
     let pretty = command.join(" ");
 
-    let mut child = Command::new(bin)
-        .args(args)
+    // Lock the child's environment down to the explicit allowlist —
+    // without env_clear, every yoink-process env var (including
+    // YOINK_AGE_KEY when both providers are in play) flows into the
+    // third-party CLI. PATH stays so the binary can resolve its own
+    // sub-tools; per-tool auth tokens are forwarded explicitly.
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| SecretsError::CommandSpawn {
-            command: pretty.clone(),
-            source,
-        })?;
+        .env_clear();
+    for key in COMMAND_ENV_ALLOWLIST {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
 
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_end(&mut stdout_buf).await.ok();
-    }
-    if let Some(mut err) = child.stderr.take() {
-        err.read_to_end(&mut stderr_buf).await.ok();
-    }
-    let status = child
-        .wait()
-        .await
-        .map_err(|source| SecretsError::CommandSpawn {
+    let mut child = cmd.spawn().map_err(|source| SecretsError::CommandSpawn {
+        command: pretty.clone(),
+        source,
+    })?;
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+
+    // Wrap the whole drain+wait in a timeout so a wedged provider
+    // can't hang the deploy. On expiry, kill the child and surface
+    // a CommandTimeout — operator gets a clear "X did not finish
+    // within Ns" instead of a silent hang.
+    let drain = async {
+        // Drain stdout + stderr concurrently so a child that fills
+        // the stderr pipe before exiting doesn't deadlock on us
+        // (we'd otherwise block reading stdout while it blocks on
+        // a full stderr pipe).
+        let stdout_fut = async {
+            if let Some(out) = stdout_pipe.as_mut() {
+                read_capped(out, COMMAND_OUTPUT_CAP).await
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let stderr_fut = async {
+            if let Some(err) = stderr_pipe.as_mut() {
+                read_capped(err, COMMAND_OUTPUT_CAP).await
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let (stdout_res, stderr_res) = tokio::join!(stdout_fut, stderr_fut);
+        let stdout_buf = stdout_res.map_err(|()| SecretsError::CommandOutputCap {
             command: pretty.clone(),
-            source,
+            stream: "stdout",
+            cap: COMMAND_OUTPUT_CAP,
         })?;
+        let stderr_buf = stderr_res.map_err(|()| SecretsError::CommandOutputCap {
+            command: pretty.clone(),
+            stream: "stderr",
+            cap: COMMAND_OUTPUT_CAP,
+        })?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|source| SecretsError::CommandSpawn {
+                command: pretty.clone(),
+                source,
+            })?;
+        Ok::<_, SecretsError>((stdout_buf, stderr_buf, status))
+    };
+    let (stdout_buf, stderr_buf, status) = if let Ok(res) =
+        tokio::time::timeout(COMMAND_TIMEOUT, drain).await
+    {
+        res?
+    } else {
+        // Best-effort kill; child may have already exited.
+        let _ = child.start_kill();
+        return Err(SecretsError::CommandTimeout {
+            command: pretty,
+            timeout: COMMAND_TIMEOUT,
+        });
+    };
+
     if !status.success() {
         return Err(SecretsError::CommandExit {
             command: pretty,
@@ -191,13 +360,65 @@ async fn load_command_bundle(
         });
     }
 
-    parse_bundle_bytes(&stdout_buf, format).map_err(|(format, detail)| {
-        SecretsError::CommandParse {
-            command: pretty,
-            format,
-            detail,
+    let bundle =
+        parse_bundle_bytes(&stdout_buf, format).map_err(|(format, detail)| {
+            SecretsError::CommandParse {
+                command: pretty.clone(),
+                format,
+                detail,
+            }
+        })?;
+    if bundle.is_empty() && any_secrets_referenced {
+        // Provider exited 0 but produced nothing parseable as a
+        // key=value. Most commonly: wrong project / wrong scope /
+        // expired token returning an empty list. Better to fail
+        // loud than silently substitute zeros for every secret a
+        // service expects. Skipped when the config doesn't actually
+        // reference any secrets — early-config validation runs
+        // load_bundle just to check the provider works.
+        return Err(SecretsError::CommandEmpty { command: pretty });
+    }
+    Ok(bundle)
+}
+
+fn json_value_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Read at most `cap` bytes; returns `Err(())` if the producer
+/// exceeds the cap (we stop reading and signal cap-hit so the caller
+/// surfaces a clear error rather than silently truncating).
+async fn read_capped<R: AsyncReadExt + Unpin>(reader: &mut R, cap: usize) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::with_capacity(8 * 1024);
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        let n = match reader.read(&mut buf).await {
+            // Both EOF and a mid-read error mean "producer is done";
+            // surface what we have rather than failing — the caller
+            // separately verifies the child's exit status.
+            Ok(0) | Err(_) => return Ok(out),
+            Ok(n) => n,
+        };
+        if out.len().saturating_add(n) > cap {
+            // Drain remaining bytes to avoid the producer blocking
+            // on a full pipe before we kill it. Bounded scratch.
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            return Err(());
         }
-    })
+        out.extend_from_slice(&buf[..n]);
+    }
 }
 
 /// Pick a parser for `bytes`: `auto` looks at the first non-whitespace
@@ -208,6 +429,13 @@ fn parse_bundle_bytes(
     bytes: &[u8],
     format: SecretsFormat,
 ) -> Result<SecretsBundle, (&'static str, String)> {
+    // Strip a UTF-8 BOM if present — Windows tooling emits one, and
+    // both of our parsers would otherwise choke on it (auto-detect
+    // would fall through to dotenv since BOM ≠ `{`, then dotenv would
+    // reject the leading non-ASCII bytes).
+    let bytes = bytes
+        .strip_prefix(&[0xEF_u8, 0xBB, 0xBF])
+        .unwrap_or(bytes);
     let chosen = match format {
         SecretsFormat::Json => SecretsFormat::Json,
         SecretsFormat::Dotenv => SecretsFormat::Dotenv,
@@ -242,7 +470,19 @@ fn parse_json_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
         let value = match v {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Null => continue,
-            other => other.to_string(),
+            // Reject non-string scalars + nested objects/arrays
+            // rather than silently stringifying. A boolean `true`
+            // would otherwise become the string `"true"` which most
+            // consumers handle by accident; a number would lose
+            // precision via Display formatting; nested structures
+            // would round-trip as JSON text the operator never
+            // intended.
+            other => {
+                return Err(format!(
+                    "key {k:?} has non-string value (got {kind}); secrets bundles must be a flat string→string map",
+                    kind = json_value_kind(other),
+                ));
+            }
         };
         out.insert(k.clone(), value);
     }
@@ -302,12 +542,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_bundle_drops_nulls_and_stringifies_numbers() {
-        let bytes = br#"{"PORT":8080,"NIL":null,"NAME":"x"}"#;
+    fn parse_json_bundle_drops_nulls_keeps_strings() {
+        let bytes = br#"{"NAME":"x","NIL":null,"OTHER":"y"}"#;
         let bundle = parse_json_bundle(bytes).unwrap();
-        assert_eq!(bundle.get("PORT"), Some("8080"));
-        assert_eq!(bundle.get("NIL"), None);
         assert_eq!(bundle.get("NAME"), Some("x"));
+        assert_eq!(bundle.get("NIL"), None);
+        assert_eq!(bundle.get("OTHER"), Some("y"));
+    }
+
+    #[test]
+    fn parse_json_bundle_rejects_non_string_scalars() {
+        let bytes = br#"{"PORT":8080}"#;
+        let err = parse_json_bundle(bytes).unwrap_err();
+        assert!(err.contains("non-string"), "got: {err}");
+        let bytes = br#"{"FLAG":true}"#;
+        let err = parse_json_bundle(bytes).unwrap_err();
+        assert!(err.contains("non-string"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_bundle_strips_utf8_bom() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"FOO=bar\n");
+        let bundle = parse_bundle_bytes(&bytes, SecretsFormat::Auto).unwrap();
+        assert_eq!(bundle.get("FOO"), Some("bar"));
     }
 
     #[test]
@@ -366,6 +624,7 @@ mod tests {
                 "printf 'A=1\\nB=two\\n'".into(),
             ],
             SecretsFormat::Auto,
+            true,
         )
         .await
         .unwrap();
@@ -382,6 +641,7 @@ mod tests {
                 "echo oh no >&2; exit 7".into(),
             ],
             SecretsFormat::Auto,
+            true,
         )
         .await
         .unwrap_err();

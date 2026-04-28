@@ -570,7 +570,10 @@ fn load(config: &Config) -> LoadStatus {
             })
         }
         SecretsConfig::Age { file, recipients } => {
-            let path = sealed::resolve_sealed_path(config, file.as_deref());
+            let path = match sealed::resolve_sealed_path(config, file.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return LoadStatus::Failed(e.to_string()),
+            };
             let identity = match sealed::load_identity() {
                 Ok(id) => id,
                 Err(e) => {

@@ -2649,7 +2649,7 @@ fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool) -> Result<()> {
 fn cmd_secrets_edit(config: &Config) -> Result<()> {
     use yoink::sealed;
     let (file_override, recipients) = expect_age_block(config)?;
-    let path = sealed::resolve_sealed_path(config, file_override.as_deref());
+    let path = sealed::resolve_sealed_path(config, file_override.as_deref())?;
     let plaintext = if path.exists() {
         let bytes =
             std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
@@ -2670,10 +2670,23 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
 fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
     use yoink::config::SecretsConfig;
     use yoink::sealed;
+    if reveal && std::env::var_os("CI").is_some() {
+        // CI runners log stdout into build artifacts that get
+        // shared / archived / scraped — `--reveal` printing real
+        // values there is almost always a mistake. Force operators
+        // to override consciously when they really mean it.
+        if std::env::var_os("YOINK_ALLOW_REVEAL_IN_CI").is_none() {
+            return Err(anyhow::anyhow!(
+                "refusing to print real secret values: $CI is set. \
+                 If this is intentional (you're capturing the bundle into a managed secret store, \
+                 not into build logs), set YOINK_ALLOW_REVEAL_IN_CI=1"
+            ));
+        }
+    }
     let SecretsConfig::Age { file, .. } = expect_secrets_provider_age(config)? else {
         unreachable!()
     };
-    let path = sealed::resolve_sealed_path(config, file.as_deref());
+    let path = sealed::resolve_sealed_path(config, file.as_deref())?;
     let bytes =
         std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
     let identity = sealed::load_identity()?;
@@ -2698,16 +2711,27 @@ fn cmd_secrets_seal(config: &Config, input: Option<&Path>, out: Option<PathBuf>)
         }
         _ => {
             use std::io::Read;
+            // Cap stdin at 10 MiB so a runaway producer (cat-ed
+            // wrong file, infinite stream, etc.) can't OOM the host.
+            // Real secrets bundles are kilobytes.
+            const STDIN_CAP: u64 = 10 * 1024 * 1024;
             let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf)?;
+            io::stdin().take(STDIN_CAP + 1).read_to_string(&mut buf)?;
+            if buf.len() as u64 > STDIN_CAP {
+                return Err(anyhow::anyhow!(
+                    "stdin produced more than {STDIN_CAP} bytes — refusing to seal an oversized bundle"
+                ));
+            }
             buf
         }
     };
     let parsed = sealed::parse_dotenv(&plaintext)?;
     let canonical = sealed::render_dotenv(&parsed);
     let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
-    let target =
-        out.unwrap_or_else(|| sealed::resolve_sealed_path(config, file_override.as_deref()));
+    let target = match out {
+        Some(p) => p,
+        None => sealed::resolve_sealed_path(config, file_override.as_deref())?,
+    };
     sealed::write_atomically(&target, &sealed_bytes)?;
     println!("sealed {} key(s) to {}", parsed.len(), target.display());
     Ok(())
@@ -2717,7 +2741,7 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     use yoink::sealed;
 
     let (file_override, current_recipients) = expect_age_block(config)?;
-    let path = sealed::resolve_sealed_path(config, file_override.as_deref());
+    let path = sealed::resolve_sealed_path(config, file_override.as_deref())?;
     if !path.exists() {
         return Err(anyhow::anyhow!(
             "{} doesn't exist — nothing to rotate. `yoink secrets edit` to create it first",
@@ -2809,66 +2833,55 @@ fn open_in_editor(initial: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("EDITOR/VISUAL is empty"))?;
     let editor_args: Vec<&str> = tokens.collect();
 
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let path = dir.join(format!("yoink-secrets-{pid}.env"));
-
-    // Open the scratch file with mode 0600 from creation — never let
-    // the plaintext sit on disk world-readable, even briefly. On
-    // non-Unix the regular create path applies (no perm model).
-    write_scratch_file(&path, initial.as_bytes())
-        .with_context(|| format!("create scratch file {}", path.display()))?;
+    // tempfile::NamedTempFile gives us:
+    //   - randomized filename (no PID-predictable path another user
+    //     on the box could pre-create as a symlink)
+    //   - RAII cleanup, so the plaintext is removed even if a panic
+    //     unwinds past the explicit drop below
+    //   - O_EXCL semantics under the hood
+    let mut scratch = tempfile_builder_secret()
+        .suffix(".env")
+        .prefix("yoink-secrets-")
+        .tempfile()
+        .context("create scratch file")?;
+    {
+        use std::io::Write as _;
+        scratch
+            .as_file_mut()
+            .write_all(initial.as_bytes())
+            .with_context(|| format!("write {}", scratch.path().display()))?;
+    }
 
     let status = std::process::Command::new(program)
         .args(&editor_args)
-        .arg(&path)
+        .arg(scratch.path())
         .status()
         .with_context(|| format!("launch editor {editor:?}"))?;
     if !status.success() {
-        let _ = std::fs::remove_file(&path);
         return Err(anyhow::anyhow!(
             "editor {editor:?} exited with {status} — aborting"
         ));
     }
 
-    let edited = std::fs::read_to_string(&path)
-        .with_context(|| format!("read edited file {}", path.display()))?;
-    let _ = std::fs::remove_file(&path);
+    let edited = std::fs::read_to_string(scratch.path())
+        .with_context(|| format!("read edited file {}", scratch.path().display()))?;
+    // Drop runs unlink(2); explicit `close()` would let us surface a
+    // cleanup error but we'd rather not fail the seal on a tmpfs hiccup.
+    drop(scratch);
     Ok(edited)
 }
 
-/// Create the scratch file for the editor flow with mode 0600 from
-/// creation on Unix (no chmod-after-write window). `O_EXCL` rejects
-/// pre-existing files — defends against a symlink-in-/tmp attack
-/// pointing yoink at a privileged path. Stale scratch files from a
-/// crashed previous run are removed first.
-fn write_scratch_file(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    // A previous yoink crash could leave the file around — same PID
-    // collisions are vanishingly unlikely but `create_new` would
-    // refuse, so clear first. Removing a symlink an attacker planted
-    // is fine: the subsequent `create_new` proves we own the inode.
-    let _ = std::fs::remove_file(path);
-
+/// `tempfile::Builder` configured for secrets scratch files: 0600 perms
+/// on Unix from creation. On non-Unix tempfile uses platform-appropriate
+/// defaults (no public-mode hole anyway).
+fn tempfile_builder_secret() -> tempfile::Builder<'static, 'static> {
+    let mut b = tempfile::Builder::new();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("create scratch file {}", path.display()))?;
-        f.write_all(contents)
-            .with_context(|| format!("write {}", path.display()))?;
-        Ok(())
+        use std::os::unix::fs::PermissionsExt as _;
+        b.permissions(std::fs::Permissions::from_mode(0o600));
     }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
-        Ok(())
-    }
+    b
 }
 
 fn mask_value(s: &str) -> String {

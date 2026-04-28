@@ -48,15 +48,17 @@ Two providers, selected by the `provider:` tag.
 
 ### `provider: age` (default, batteries-included)
 
-A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env, for CI), `YOINK_AGE_KEY_FILE` (path, for laptop dev — typically a gitignored `age.key` next to `yoink.yaml`), or `~/.config/yoink/age.key` (fallback, never written to by yoink itself — multi-project safety).
+A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with the operator's age **identity** (private half) resolved from `YOINK_AGE_KEY` (env, for CI), `YOINK_AGE_KEY_FILE` (path, for laptop dev — typically a gitignored `age.key` next to `yoink.yaml`), or `~/.config/yoink/age.key` (fallback, never written to by yoink itself — multi-project safety).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `provider` | string | required | `age` |
-| `recipients` | list of string | `[]` | Public age recipients (`age1...`) used when sealing/editing. Decryption only needs one matching identity. |
-| `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. |
+| `recipients` | list of string | `[]` | Public age **recipients** (`age1...`), one per principal that needs to decrypt. New writes are sealed against every entry; decryption only needs *one* matching identity. Validates non-empty at config-load. |
+| `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. `..` and absolute paths are rejected. |
 
-Bootstrap: `yoink secrets key generate` prints a fresh identity to stdout (operator decides where to route the secret — into a GitHub Actions secret, a 1Password item, AWS Secrets Manager, …); `--out PATH` writes it to a file at mode 0600 instead. `yoink secrets key public` re-derives the public recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
+The recipient/identity split is the asymmetric-keypair mental model — see [Two halves of one key](/docs/recipes/sealed-secrets#two-halves-of-one-key) in the recipe for the full explanation.
+
+Bootstrap: `yoink secrets key generate` prints a fresh **keypair** to stdout — both the identity (`AGE-SECRET-KEY-1…`, private; route into your manager) and the matching recipient (`age1…`, public; paste into `recipients:` above). `--out PATH` writes the identity to a file at mode 0600 instead of stdout. `yoink secrets key public` re-derives the recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
 
 ### `provider: command` (bring-your-own-tool)
 
