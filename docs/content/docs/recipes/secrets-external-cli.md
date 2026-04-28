@@ -181,14 +181,14 @@ Later lines override earlier ones (the dotenv parser is last-write-wins per key)
 
 ## Where yoink's own age key goes
 
-The `yoink secrets key generate` private key is itself a secret. Route it through whatever store you trust:
+The `yoink secrets key generate` private key is itself a secret. By default it's saved to `~/.config/yoink/keys/<recipient>.key` and yoink discovers it automatically. For CI / external stores, pass `--print` so the secret goes to stdout (the recipient and follow-up notes go to stderr, so the pipe stays clean):
 
 ```sh
 # Generate, route into your manager
-yoink secrets key generate | gh secret set YOINK_AGE_KEY
-yoink secrets key generate | op item create --category=password --title='yoink: prod' --vault=Engineering password=-
-yoink secrets key generate | aws secretsmanager create-secret --name yoink/prod --secret-string file:///dev/stdin
-yoink secrets key generate | vault kv put secret/yoink/prod private=-
+yoink secrets key generate --print | gh secret set YOINK_AGE_KEY
+yoink secrets key generate --print | op item create --category=password --title='yoink: prod' --vault=Engineering password=-
+yoink secrets key generate --print | aws secretsmanager create-secret --name yoink/prod --secret-string file:///dev/stdin
+yoink secrets key generate --print | vault kv put secret/yoink/prod private=-
 ```
 
 Then surface it as `YOINK_AGE_KEY` at deploy time:

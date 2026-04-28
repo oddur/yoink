@@ -2949,20 +2949,24 @@ fn cmd_secrets_key_generate(
 
     if print {
         // Explicit stdout mode — operator pipes / pastes themselves.
-        println!("New age identity. Save the secret somewhere — yoink won't.");
-        println!();
-        println!("Secret (private — never commit):");
-        println!();
+        // Discipline: only the *secret itself* goes to stdout, so a
+        // pipe like `... --print | gh secret set YOINK_AGE_KEY`
+        // captures exactly the key bytes. Everything else (header,
+        // recipient, follow-up instructions) goes to stderr where the
+        // operator reads it without contaminating the pipe.
+        eprintln!("New age identity. Save the secret somewhere — yoink won't.");
+        eprintln!();
+        eprintln!("Secret (private — never commit) — piped to stdout:");
         println!("{secret}");
-        println!();
-        println!("Public recipient (add to yoink.yaml):");
-        println!();
-        println!("{recipient_block}");
-        println!();
-        println!("Suggested next steps:");
-        println!("  • Paste into a CI secret named YOINK_AGE_KEY, or save the");
-        println!("    secret to a file referenced by YOINK_AGE_KEY_FILE.");
-        println!("  • Clear your terminal scrollback when done.");
+        eprintln!();
+        eprintln!("Public recipient (add to yoink.yaml):");
+        eprintln!();
+        eprintln!("{recipient_block}");
+        eprintln!();
+        eprintln!("Suggested next steps:");
+        eprintln!("  • Pipe into a CI secret: `yoink secrets key generate --print | gh secret set YOINK_AGE_KEY`");
+        eprintln!("  • Or pipe into a password manager (`op item create … password=-`).");
+        eprintln!("  • Clear your terminal scrollback when done.");
         return Ok(());
     }
 

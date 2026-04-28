@@ -13,26 +13,26 @@ You've already set up sealed secrets locally — see [Sealed secrets (age)](/doc
 
 - `secrets.age` is committed to the repo (encrypted)
 - `yoink.yaml` has a `secrets.recipients:` list with at least your laptop's recipient
-- Your laptop's identity is saved somewhere readable to you (typically a gitignored `age.key` next to the project's `yoink.yaml`)
+- Your laptop's identity is saved somewhere readable to you (default: `~/.config/yoink/keys/<recipient>.key`, written by `yoink secrets key generate`)
 
 ## 1. Generate a CI-only identity
 
 Each principal who needs to decrypt — your laptop, CI, a teammate's laptop — gets its own age keypair. **Don't reuse the laptop pair for CI**; if a CI runner is compromised you want to revoke its identity without disturbing operators' day-to-day workflow.
 
-Generate a fresh one:
+Generate a fresh one and pipe it straight into GitHub:
 
 ```sh
-yoink secrets key generate
+yoink secrets key generate --print | gh secret set YOINK_AGE_KEY --repo you/your-repo
 ```
 
-Default `key generate` prints the secret straight to stdout (it does **not** save to disk by default), which is exactly what you want for CI: paste the printed secret into a GitHub Actions secret and clear your scrollback. Output looks like:
+`--print` sends only the secret to stdout (instead of the default keys-dir save). The header, public recipient, and follow-up notes all go to **stderr**, so the pipe captures exactly the key bytes — `gh secret set` stores a clean key, and you still see the recipient on your terminal to copy into `yoink.yaml`.
+
+Output looks like:
 
 ```
 New age identity. Save the secret somewhere — yoink won't.
 
-Secret (private — never commit; gitignore the file you save it to):
-
-AGE-SECRET-KEY-1KLY239F...
+Secret (private — never commit) — piped to stdout:
 
 Public recipient (add to yoink.yaml):
 
@@ -40,15 +40,12 @@ Public recipient (add to yoink.yaml):
     provider: age
     recipients:
       - age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45
-
-Suggested next steps:
-  • Save the secret to ./age.key (gitignored), then:
-      export YOINK_AGE_KEY_FILE=$(pwd)/age.key
-  • Or paste it into a CI secret named YOINK_AGE_KEY.
-  • Clear your terminal scrollback when done.
+…
 ```
 
-Don't save the **identity** to disk — paste it directly into the GitHub secret. The scrollback is the only copy. The **recipient** is fine to copy around freely; we add it to `yoink.yaml` next.
+(The `AGE-SECRET-KEY-1…` line is invisible above because it went to stdout — straight into the GitHub secret. Exactly what you want.)
+
+The **recipient** is fine to copy around freely; we add it to `yoink.yaml` next.
 
 ## 2. Add the CI recipient to `yoink.yaml`
 
@@ -113,10 +110,11 @@ That's the whole integration. Yoink finds `YOINK_AGE_KEY` in the env, decrypts `
 Resolution order (same code path locally and in CI):
 
 1. `YOINK_AGE_KEY` env var — raw key (the CI path)
-2. `YOINK_AGE_KEY_FILE` env var — path to a key file (the laptop path: `export YOINK_AGE_KEY_FILE=$(pwd)/age.key`)
-3. `~/.config/yoink/age.key` — fallback if you've manually placed a key there. Yoink doesn't write to this path itself.
+2. `YOINK_AGE_KEY_FILE` env var — explicit path to a key file (override)
+3. `~/.config/yoink/keys/<recipient>.key` — the default save location for `yoink secrets key generate`. yoink scans the dir and picks whichever key's public half matches one of `secrets.recipients:`. This is the laptop path.
+4. `~/.config/yoink/age.key` — legacy single-key fallback (pre-multi-identity); still loaded so existing setups don't break on upgrade.
 
-Stop at the first one set. If none are set, yoink errors with a pointer to `yoink secrets key generate`.
+Stop at the first match. If none match, yoink errors with a pointer to `yoink secrets key generate`.
 
 ## Rotating the CI key
 

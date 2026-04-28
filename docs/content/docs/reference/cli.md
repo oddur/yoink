@@ -110,16 +110,22 @@ yoink lock                               inspect / release the per-host deploy l
                                          after a crashed deploy left a sentinel container)
 yoink completions <shell>                generate shell completions (bash/zsh/fish/...)
 
-yoink secrets key generate               generate an age keypair. Prints both
-                                         the IDENTITY (private, AGE-SECRET-KEY-1…)
-                                         and matching RECIPIENT (public, age1…) —
-                                         identity goes in your secret manager,
-                                         recipient gets committed to yoink.yaml.
+yoink secrets key generate               generate an age keypair. By default the
+                                         IDENTITY (private) is saved to
+                                         ~/.config/yoink/keys/<recipient>.key
+                                         (mode 0600) and yoink finds it
+                                         automatically next time. The matching
+                                         RECIPIENT (public, age1…) is printed
+                                         for adding to yoink.yaml.
   --out <PATH>                           write the identity to PATH (mode 0600)
-                                         instead of stdout. Make sure PATH is
-                                         gitignored. The recipient still prints
-                                         to stdout.
-  --force                                overwrite an existing identity at --out
+                                         instead of the default keys dir.
+  --print                                print the secret to stdout (for piping
+                                         into a CI secret store, e.g.
+                                         `… --print | gh secret set YOINK_AGE_KEY`).
+                                         Recipient/header/notes go to stderr so
+                                         the pipe captures only the key bytes.
+  --force                                overwrite an existing identity at the
+                                         destination
 yoink secrets key public                 re-derive the recipient from whichever
                                          identity yoink would use right now
                                          (sanity-check vs yoink.yaml)

@@ -48,7 +48,7 @@ Two providers, selected by the `provider:` tag.
 
 ### `provider: age` (default, batteries-included)
 
-A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with the operator's age **identity** (private half) resolved from `YOINK_AGE_KEY` (env, for CI), `YOINK_AGE_KEY_FILE` (path, for laptop dev — typically a gitignored `age.key` next to `yoink.yaml`), or `~/.config/yoink/age.key` (fallback, never written to by yoink itself — multi-project safety).
+A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with the operator's age **identity** (private half) resolved in this order: `YOINK_AGE_KEY` (env, for CI) → `YOINK_AGE_KEY_FILE` (explicit path override) → `~/.config/yoink/keys/<recipient>.key` (the dir scanned for a key whose public matches one of `recipients:` below; this is where `yoink secrets key generate` saves by default — multiple projects with distinct identities coexist here without env-var dance) → `~/.config/yoink/age.key` (legacy single-key fallback, still loaded so existing setups don't break on upgrade).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -58,7 +58,7 @@ A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deplo
 
 The recipient/identity split is the asymmetric-keypair mental model — see [Two halves of one key](/docs/recipes/sealed-secrets#two-halves-of-one-key) in the recipe for the full explanation.
 
-Bootstrap: `yoink secrets key generate` prints a fresh **keypair** to stdout — both the identity (`AGE-SECRET-KEY-1…`, private; route into your manager) and the matching recipient (`age1…`, public; paste into `recipients:` above). `--out PATH` writes the identity to a file at mode 0600 instead of stdout. `yoink secrets key public` re-derives the recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
+Bootstrap: `yoink secrets key generate` writes a fresh **identity** to `~/.config/yoink/keys/<recipient>.key` (mode 0600) by default and prints the matching **recipient** (`age1…`, public; paste into `recipients:` above). `--out PATH` writes to a specific file at mode 0600 instead. `--print` sends the secret to stdout for piping into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`). `yoink secrets key public` re-derives the recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
 
 ### `provider: command` (bring-your-own-tool)
 
