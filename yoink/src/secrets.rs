@@ -504,13 +504,14 @@ fn parse_json_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
 fn parse_dotenv_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let raw_line = lines[i];
+    // Iterator-based: each `iter.next()` advances exactly once, so we
+    // can't accidentally fail to advance and spin (the previous
+    // index-mutation shape had four explicit `i += 1` sites and any
+    // missing one was an infinite loop).
+    let mut iter = text.lines().enumerate();
+    while let Some((line_idx, raw_line)) = iter.next() {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            i += 1;
             continue;
         }
         let after_export = trimmed
@@ -518,55 +519,62 @@ fn parse_dotenv_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
             .unwrap_or(trimmed)
             .trim_start();
         let (key, first_value) = after_export.split_once('=').ok_or_else(|| {
-            format!("line {}: expected `KEY=VALUE`, got {raw_line:?}", i + 1)
+            format!(
+                "line {}: expected `KEY=VALUE`, got {raw_line:?}",
+                line_idx + 1
+            )
         })?;
         let key = key.trim();
         if key.is_empty() {
-            return Err(format!("line {}: empty key", i + 1));
+            return Err(format!("line {}: empty key", line_idx + 1));
         }
 
         let value_start = first_value.trim_start();
         let value = if let Some(quote) = opening_unmatched_quote(value_start) {
-            // Multi-line quoted value: keep consuming lines until
-            // we find the closing quote on its own. The opening
-            // line contributes everything *after* the quote char.
-            let mut acc = String::from(&value_start[1..]);
-            let start_line = i;
-            i += 1;
-            let mut closed = false;
-            while i < lines.len() {
-                acc.push('\n');
-                let l = lines[i];
-                if let Some(idx) = l.find(quote) {
-                    acc.push_str(&l[..idx]);
-                    if !l[idx + 1..].trim().is_empty() {
-                        return Err(format!(
-                            "line {}: trailing content after closing {quote} in multi-line value for {key:?}",
-                            i + 1
-                        ));
-                    }
-                    closed = true;
-                    i += 1;
-                    break;
-                }
-                acc.push_str(l);
-                i += 1;
-            }
-            if !closed {
-                return Err(format!(
-                    "line {}: unterminated {quote}-quoted value for {key:?}",
-                    start_line + 1
-                ));
-            }
-            acc
+            consume_multiline_value(quote, value_start, key, line_idx, &mut iter)?
         } else {
-            i += 1;
             strip_quotes(value_start.trim_end())
         };
 
         out.insert(key.to_string(), value);
     }
     Ok(SecretsBundle::new(out))
+}
+
+/// Pulled out of `parse_dotenv_bundle` to keep the main loop one
+/// page tall. Consumes lines from `iter` until we see the closing
+/// `quote`; returns the accumulated value (without surrounding
+/// quotes). The opening line `value_start` contributes everything
+/// after its leading quote char.
+fn consume_multiline_value<'a, I>(
+    quote: char,
+    value_start: &str,
+    key: &str,
+    start_line_idx: usize,
+    iter: &mut I,
+) -> Result<String, String>
+where
+    I: Iterator<Item = (usize, &'a str)>,
+{
+    let mut acc = String::from(&value_start[1..]);
+    for (line_idx, l) in iter.by_ref() {
+        acc.push('\n');
+        if let Some(idx) = l.find(quote) {
+            acc.push_str(&l[..idx]);
+            if !l[idx + 1..].trim().is_empty() {
+                return Err(format!(
+                    "line {}: trailing content after closing {quote} in multi-line value for {key:?}",
+                    line_idx + 1
+                ));
+            }
+            return Ok(acc);
+        }
+        acc.push_str(l);
+    }
+    Err(format!(
+        "line {}: unterminated {quote}-quoted value for {key:?}",
+        start_line_idx + 1
+    ))
 }
 
 /// If `s` starts with `'` or `"` but the matching closing quote
@@ -670,6 +678,21 @@ mod tests {
         let bytes = b"CERT='-----BEGIN CERT-----\nMIIE\nMIIE\n";
         let err = parse_dotenv_bundle(bytes).unwrap_err();
         assert!(err.contains("unterminated"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_dotenv_bundle_double_quoted_multiline() {
+        let bytes = b"KEY=\"line one\nline two\nline three\"\nNEXT=ok\n";
+        let bundle = parse_dotenv_bundle(bytes).unwrap();
+        assert_eq!(bundle.get("KEY"), Some("line one\nline two\nline three"));
+        assert_eq!(bundle.get("NEXT"), Some("ok"));
+    }
+
+    #[test]
+    fn parse_dotenv_bundle_rejects_trailing_after_close() {
+        let bytes = b"CERT='-----BEGIN-----\nbody\n-----END-----' something_else\nNEXT=ok\n";
+        let err = parse_dotenv_bundle(bytes).unwrap_err();
+        assert!(err.contains("trailing content"), "got: {err}");
     }
 
     #[test]
