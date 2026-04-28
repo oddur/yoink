@@ -83,6 +83,8 @@ Containers are named in upstream entries (not IPs), so a container restart with 
 
 ### `proxy.xcaddy:` block — caddy plugins without a registry
 
+> Task-oriented walkthrough with debugging tips, common-plugin recipes, and operational notes lives at [Caddy plugins (xcaddy, no registry)](/docs/recipes/caddy-plugins). What follows is the schema reference.
+
 Want rate-limit, redis-storage, the L4 module, or a non-bundled DNS provider? Just list them and yoink builds caddy on each host the proxy runs on:
 
 ```yaml

@@ -52,7 +52,7 @@ services:
 Browsers can't speak native gRPC — they need [gRPC-Web](https://github.com/grpc/grpc-web), which uses HTTP/1.1 or HTTP/2 (no h2c required) plus a translation layer. Two options:
 
 - **Translation in your backend**: Tonic has [`tonic-web`](https://docs.rs/tonic-web/), grpc-go has [improbable-eng/grpc-web](https://github.com/improbable-eng/grpc-web/tree/master/go/grpcwebproxy). Backend speaks both gRPC and gRPC-Web on the same port. `upstream_h2c: true` on yoink covers both because gRPC-Web traffic is regular HTTP/1.1 over h2c.
-- **Caddy plugin**: there's a `caddy-grpc-web` plugin that translates at the proxy layer. Requires an [`xcaddy`](https://github.com/caddyserver/xcaddy)-built image; set `proxy.image:` to your build.
+- **Caddy plugin**: there's a `caddy-grpc-web` plugin that translates at the proxy layer. Add it via [`proxy.xcaddy:`](/docs/recipes/caddy-plugins) — yoink builds a custom caddy with the module on each proxy host.
 
 ## Reflection / grpcurl
 
