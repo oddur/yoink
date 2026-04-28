@@ -164,5 +164,6 @@ The cert + key live in `secrets.age` (one copy in the repo). Every host's proxy 
 ## See also
 
 - [Reverse proxy guide](/docs/guide/proxy) — full schema reference.
+- [Defense-in-depth web serving](/docs/recipes/defense-in-depth) — Origin Certs are the bottom layer; this recipe stacks CrowdSec + Coraza on top.
 - [Multi-host LE with Redis storage](/docs/recipes/multi-host-redis-storage) — for the Let's Encrypt path when you don't want to use Cloudflare.
 - [Cloudflare Origin CA docs](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/) — Cloudflare's side of the setup.

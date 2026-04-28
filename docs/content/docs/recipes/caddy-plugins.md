@@ -289,6 +289,7 @@ xcaddy errors are surfaced verbatim through the deploy error chain. Common shape
 
 - [Reverse proxy guide](/docs/guide/proxy) — full schema reference for the routing primitives yoink models, including the `proxy.xcaddy:` field table.
 - [Caddy snippets cookbook](/docs/recipes/caddy-snippets) — JSON shapes for `caddy_extra_json:` (the path you need when your snippet uses plugin directives).
+- [Defense-in-depth web serving](/docs/recipes/defense-in-depth) — composing the security plugins above into a Cloudflare + CrowdSec + Coraza stack.
 - [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage) — the canonical "I need a plugin" worked example.
 - [xcaddy on GitHub](https://github.com/caddyserver/xcaddy) — upstream tool docs.
 - [caddy-dns providers](https://github.com/caddy-dns) — directory of DNS-provider plugins for DNS-01 / wildcard certs.
