@@ -584,15 +584,18 @@ fn parse_dotenv_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
 
 /// Single-line value: strip surrounding quotes if cleanly bracketed.
 ///
-/// Rejects the unambiguous footgun pattern `KEY='val' garbage` —
-/// a quote pair that closes mid-line and is followed by content
-/// that doesn't itself contain another matching quote (so it's
-/// definitely operator junk, not a value with embedded `\"` escapes
-/// nor a shell-style adjacent-quoted-string concat). Strings where
-/// the heuristic is ambiguous (e.g. `"hello \"world\""` from
-/// Doppler) fall through to `strip_quotes`, preserving the
-/// pre-existing "verbatim with backslashes" behavior — operators
-/// using providers that emit shell-escaped values still get them.
+/// Rejects the most common footgun: `KEY='val' garbage` where the
+/// closing quote is mid-line and what follows contains no further
+/// matching quote at all. Cases where another matching quote
+/// appears later (`"hello \"world\""` from Doppler-style escapes,
+/// or `'val' 'more'` shell-concat-shaped input) fall through to
+/// `strip_quotes`, preserving the "verbatim with surrounding
+/// quotes stripped if first==last, else verbatim" behavior of the
+/// pre-existing parser. The heuristic is intentionally narrow —
+/// false-rejecting a Doppler value would be worse than under-
+/// rejecting an operator typo, since the typo case isn't
+/// security-relevant (the parser is operator-facing, not a trust
+/// boundary).
 fn parse_single_line_value(
     value_start: &str,
     key: &str,
