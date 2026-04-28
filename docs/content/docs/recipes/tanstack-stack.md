@@ -188,7 +188,12 @@ The keys are the accessory's suggestion — neutral, conventional. If your app r
 
 ## Step 5: wire the app to the accessories
 
-Paste the two `connect another service to …` blocks into your app's `services[]` entry. Then add `domain:` and the `build:` block. The whole file ends up looking like:
+Paste the two `connect another service to …` blocks into your app's `services[]` entry. Two things to clean up after the paste:
+
+- Each block prints its own `depends_on: [...]`. Merge them into one list (`depends_on: [postgres, redis]`).
+- The keys are conventional but not magic — drop any your app doesn't read (the demo `db.server.ts` ignores `POSTGRES_PORT` / `REDIS_PORT` since both are hard-coded).
+
+Then add `domain:`, a real `proxy.email:` (Let's Encrypt sends expiry warnings there — `yoink doctor` flags the placeholder), and the `build:` block. The whole file ends up looking like:
 
 ```yaml
 hosts:
@@ -196,9 +201,9 @@ hosts:
 
 # Bundled Caddy fronts every `domain:`-tagged service with HTTPS.
 # `email:` is sent to Let's Encrypt for ACME registration / expiry
-# warnings — change before going live.
+# warnings — use a real address you actually read.
 proxy:
-  email: you@example.com
+  email: you@example.com           # ← REPLACE BEFORE DEPLOY
 
 secrets:
   provider: age
@@ -220,8 +225,8 @@ services:
     depends_on: [postgres, redis]
     env:
       POSTGRES_HOST: postgres
-      POSTGRES_USER: app
       POSTGRES_DB: app
+      POSTGRES_USER: app
       REDIS_HOST: redis
     env_from_secrets:
       POSTGRES_PASSWORD: POSTGRES_PASSWORD
@@ -232,6 +237,8 @@ services:
 include:
   - "services/*.yaml"
 ```
+
+Run `yoink validate` to confirm the config parses, then `yoink doctor` for a deploy-readiness check. Doctor surfaces unreachable hosts, unresolved domains, and placeholder emails before you spend time on a deploy that would fail.
 
 The `domain:` line opts the app into yoink's bundled Caddy. Caddy will request a Let's Encrypt cert on first deploy — if your DNS isn't pointed at the host yet, you'll get a self-signed fallback and can re-deploy after fixing the record.
 
