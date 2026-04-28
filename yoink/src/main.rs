@@ -107,19 +107,18 @@ impl ColorChoice {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a starter `yoink.yaml` for the current repo with
-    /// best-practices defaults. Detects cwd / Dockerfile / git remote /
-    /// `~/.ssh/config` and writes a complete validated config with
-    /// zero prompts in the happy path. Pass HOST as a positional arg
-    /// when ssh config can't infer one. `--interactive` engages a
-    /// stdio prompt fallback.
+    /// Generate a starter `yoink.yaml` for the current repo, plus an
+    /// age identity for sealed secrets. Detects cwd / Dockerfile /
+    /// git remote / `~/.ssh/config` and writes a validated config with
+    /// zero prompts in the happy path; the identity lands at
+    /// `~/.config/yoink/keys/<recipient>.key` (mode 0600) and yoink
+    /// finds it automatically next time. Back up the printed key —
+    /// it's the only thing that decrypts what you'll seal.
     ///
-    /// Also generates an age identity (saved to
-    /// `~/.config/yoink/keys/<recipient>.key`, mode 0600) and renders
-    /// the matching `secrets:` block into the new yoink.yaml — the
-    /// project is ready for `yoink secrets edit` and `yoink add`
-    /// immediately. Pass `--no-secrets` to skip. Back up the printed
-    /// key (it decrypts everything sealed in the repo).
+    /// Pass HOST as a positional arg when ssh config can't infer one.
+    /// `--interactive` for stdio prompts. `--no-secrets` to skip the
+    /// identity generation (e.g. you'll bring your own key, or use
+    /// `provider: command` for secrets).
     Init {
         /// Ssh target (e.g. `deploy@prod-eu-1` or just `prod-eu-1`).
         /// Optional when `~/.ssh/config` has a non-wildcard Host

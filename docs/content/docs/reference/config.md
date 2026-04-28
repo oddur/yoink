@@ -48,7 +48,14 @@ Two providers, selected by the `provider:` tag.
 
 ### `provider: age` (default, batteries-included)
 
-A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with the operator's age **identity** (private half) resolved in this order: `YOINK_AGE_KEY` (env, for CI) → `YOINK_AGE_KEY_FILE` (explicit path override) → `~/.config/yoink/keys/<recipient>.key` (the dir scanned for a key whose public matches one of `recipients:` below; this is where `yoink secrets key generate` saves by default — multiple projects with distinct identities coexist here without env-var dance) → `~/.config/yoink/age.key` (legacy single-key fallback, still loaded so existing setups don't break on upgrade).
+A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with the operator's age **identity** (private half) resolved in priority order:
+
+1. `YOINK_AGE_KEY` env (raw key) — CI / managed-env contexts
+2. `YOINK_AGE_KEY_FILE` env (path) — explicit override
+3. `~/.config/yoink/keys/*.key` — laptop default; yoink scans the dir and picks whichever key's public half matches one of `recipients:` below
+4. `~/.config/yoink/age.key` — legacy single-key fallback
+
+The keys-dir scan (#3) is what makes `yoink secrets key generate` work without per-project env-var setup — multiple projects with distinct identities coexist there, picked by recipient match.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|

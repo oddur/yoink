@@ -62,7 +62,7 @@ inferred:
 
 The summary tells you exactly what was inferred and where each value came from. Edit the line in `yoink.yaml` if anything's off.
 
-**About the age key**: `init` also generates an age identity for sealed secrets and saves it to `~/.config/yoink/keys/<recipient>.key`. yoink finds it automatically next time you run `yoink secrets edit` or `yoink up`. **The backup notice is the most important line in this output** — that key is the only thing that decrypts your sealed secrets, so paste it into your password manager before you forget. (If you don't want sealed secrets — e.g. you're using `provider: command` — pass `--no-secrets` to `init`.)
+`init` also generated an age identity for sealed secrets — that's the backup notice. **Paste the contents of that key file into a password manager now**; it's the only thing that can decrypt your sealed values, and yoink doesn't keep a copy. (Pass `--no-secrets` to `init` if you'd rather bring your own key or use `provider: command`.)
 
 For this walkthrough we'll change one thing: edit `image:` to a bare name (no registry prefix) so we can use **standalone mode** — build locally, ship directly to the host, no registry involved:
 

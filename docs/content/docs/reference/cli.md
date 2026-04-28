@@ -17,15 +17,14 @@ Every subcommand accepts:
 ## Subcommand reference
 
 ```
-yoink init [HOST]                        generate a starter yoink.yaml in cwd, plus a
-                                         fresh age identity at
-                                         ~/.config/yoink/keys/<recipient>.key (mode 0600)
-                                         and a matching `secrets:` block in the yaml.
-                                         Detects
-                                         Dockerfile (EXPOSE/USER/HEALTHCHECK) + git remote
-                                         + ~/.ssh/config and writes a validated config
-                                         with zero prompts. HOST optional when ssh config
-                                         supplies a non-wildcard Host entry.
+yoink init [HOST]                        generate yoink.yaml + an age identity for sealed
+                                         secrets. Detects Dockerfile / git remote /
+                                         ~/.ssh/config and writes a validated config with
+                                         zero prompts. The identity lands at
+                                         ~/.config/yoink/keys/<recipient>.key (mode 0600);
+                                         a matching `secrets:` block goes into the yaml.
+                                         HOST optional when ssh config has a non-wildcard
+                                         entry.
   --force                                overwrite an existing yoink.yaml
   --interactive                          prompt for every field instead of inferring
                                          (defaults match the inferences)

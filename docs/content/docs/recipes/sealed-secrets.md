@@ -41,49 +41,65 @@ What it does **not** cover:
 
 ## One-time setup
 
-1. **Generate a keypair.**
+If you ran `yoink init`, you can skip this section — `init` already generated an identity, saved it to `~/.config/yoink/keys/<recipient>.key`, added a `secrets:` block to your `yoink.yaml`, and printed a backup notice. Skip ahead to [Sealing values](#sealing-values).
 
-   ```sh
-   yoink secrets key generate
-   ```
+Otherwise, the manual flow is two steps.
 
-   By default this saves the identity to `~/.config/yoink/keys/<recipient>.key` (mode 0600) and prints the public recipient (`age1…`) for adding to `yoink.yaml`. Filename = recipient means multiple projects with distinct identities coexist in one dir without collisions, and yoink discovers the right one for each `yoink.yaml` automatically — no `YOINK_AGE_KEY_FILE` to set, no per-project `.gitignore` to maintain.
+### 1. Generate a keypair
 
-   **For CI**, pass `--print` to send the secret to stdout instead, and pipe it straight into your secret manager:
+```sh
+yoink secrets key generate
+```
 
-   ```sh
-   # GitHub Actions
-   yoink secrets key generate --print | gh secret set YOINK_AGE_KEY --repo you/your-repo
+This writes a fresh identity to `~/.config/yoink/keys/<recipient>.key` (mode 0600) and prints the matching **recipient** (the `age1…` public half) for the next step. yoink discovers the key automatically every time you seal or unseal — no env var to set, no per-project gitignore to maintain. Multiple projects with different identities coexist in the dir; the filename is the recipient, so yoink picks the right one for each `yoink.yaml`.
 
-   # 1Password
-   yoink secrets key generate --print | op item create --category=password \
-     --title='yoink: your-repo' --vault=Engineering password=-
+**Back the key up.** It's the only thing that can decrypt your sealed values; lose it and the values in this repo are unrecoverable. Pick at least one:
 
-   # AWS Secrets Manager
-   yoink secrets key generate --print | aws secretsmanager create-secret \
-     --name yoink/your-repo --secret-string file:///dev/stdin
+- Password manager: `cat ~/.config/yoink/keys/<recipient>.key` and paste into 1Password / Bitwarden / Keychain.
+- Encrypted backup volume: `cp ~/.config/yoink/keys/<recipient>.key ~/Backups/`.
+- Teammate handoff: add their `age1…` recipient to `yoink.yaml` (see [multi-recipient](#two-halves-of-one-key)) — defence in depth so the file survives losing your laptop.
 
-   # macOS Keychain
-   yoink secrets key generate --print | security add-generic-password \
-     -s yoink-your-repo -a $USER -w
-   ```
+### 2. Add the recipient to `yoink.yaml`
 
-   `--out PATH` writes to a specific file (mode 0600) when you want a project-local keyfile instead of the default keys dir.
+```yaml
+secrets:
+  provider: age
+  recipients:
+    - age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45
+```
 
-   > **Avoid the shell-history hazard with `--print`.** Pipe directly into your manager. Don't run it bare and copy-paste from the terminal: many shells log stdout to scrollback / iTerm shared sessions / tmux capture-pane history, and `key generate --print | tee` leaves the identity in the running shell's history. If you must inspect it, prefix the command with a space (zsh `HISTORY_IGNORE_SPACE` / bash `HISTCONTROL=ignorespace`) and `clear` afterwards. The default (no `--print`) avoids this entirely — the secret is written straight to `~/.config/yoink/keys/`, never to your terminal.
+The recipient is the public half — safe to commit. (`yoink secrets key public` re-derives it from your current identity if you didn't save the printed string.)
 
-   Either way, the **recipient** (public half) goes into `yoink.yaml` in step 2. See `docs/recipes/secrets-*` for per-tool deploy-time wiring (`gh actions`, `op read`, `aws secretsmanager get-secret-value`, etc.) that surfaces the identity as `YOINK_AGE_KEY` for the `yoink up` step.
+That's setup done — [Sealing values](#sealing-values) below creates `secrets.age` and you commit it normally.
 
-2. **Add the recipient (public half) to `yoink.yaml`** — this is the half that's safe to commit. The `key generate` output prints it alongside the identity; `yoink secrets key public` re-derives it from whichever identity yoink would use right now (run this if you only saved the identity and need the recipient back):
+### Routing the identity to CI / a managed store
 
-   ```yaml
-   secrets:
-     provider: age
-     recipients:
-       - age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45
-   ```
+When you need the identity in a place other than your laptop's keys dir — typically a GitHub Actions secret, but also 1Password, AWS Secrets Manager, macOS Keychain, etc. — pass `--print` to send the secret to **stdout** while everything else (header, recipient, instructions) goes to **stderr**:
 
-3. **Add `secrets.age` to the repo and commit it.** The next step creates it.
+```sh
+# GitHub Actions
+yoink secrets key generate --print | gh secret set YOINK_AGE_KEY --repo you/your-repo
+
+# 1Password
+yoink secrets key generate --print | op item create --category=password \
+  --title='yoink: your-repo' --vault=Engineering password=-
+
+# AWS Secrets Manager
+yoink secrets key generate --print | aws secretsmanager create-secret \
+  --name yoink/your-repo --secret-string file:///dev/stdin
+
+# macOS Keychain
+yoink secrets key generate --print | security add-generic-password \
+  -s yoink-your-repo -a $USER -w
+```
+
+The pipe captures only the `AGE-SECRET-KEY-1…` line. The recipient prints to your terminal (stderr) — copy that into `yoink.yaml`.
+
+> **Don't run `key generate --print` bare and copy-paste.** Many shells log stdout to scrollback, iTerm shared sessions, or tmux capture-pane history, and a bare `key generate --print` leaves the identity in your terminal. The default (no `--print`) is safe — it writes to disk and never touches stdout. Use `--print` only when piping directly into a store.
+
+`--out PATH` writes to a specific file (mode 0600) instead — useful for keeping a project-local keyfile alongside `yoink.yaml`.
+
+For CI runners pulling the identity *out* of a managed store at deploy time, see [`secrets-*`](/docs/recipes/) — each external tool's recipe shows how to surface the identity as `YOINK_AGE_KEY` for the `yoink up` step.
 
 ## Sealing values
 
@@ -174,14 +190,18 @@ The compromised key can decrypt every value sealed against it for as long as the
 
 ## Identity resolution
 
-When yoink needs to decrypt, it looks in this order, stopping at the first match:
+When yoink needs to decrypt, it tries these sources in order and stops at the first match:
 
-1. `YOINK_AGE_KEY` env var — raw key (used in CI / managed-env contexts)
-2. `YOINK_AGE_KEY_FILE` env var — path to a key file
-3. `~/.config/yoink/keys/<recipient>.key` — the default save location for `yoink secrets key generate`. yoink scans this dir and picks whichever key's public half matches one of `yoink.yaml`'s `secrets.recipients:` — that's how multiple projects with different identities coexist in one place.
-4. `~/.config/yoink/age.key` — legacy single-key fallback (pre-multi-identity); still loaded so existing setups don't break on upgrade.
+| Order | Source | When it's used |
+|---|---|---|
+| 1 | `YOINK_AGE_KEY` env (raw key) | CI / managed-env contexts |
+| 2 | `YOINK_AGE_KEY_FILE` env (path) | Explicit override |
+| 3 | `~/.config/yoink/keys/*.key` | Laptop default — yoink scans the dir and picks whichever key's public half matches one of `yoink.yaml`'s `secrets.recipients:` |
+| 4 | `~/.config/yoink/age.key` | Legacy single-key path; still loaded for back-compat |
 
-`yoink secrets key public` prints the recipient (`age1…`) derived from the resolved identity — quick "is the key in my shell the same one yoink.yaml expects?" sanity check.
+The keys-dir scan is what makes multiple projects work without per-project env-var setup. `yoink secrets key generate` writes there by default, and the right project's key gets picked automatically based on the loaded `yoink.yaml`.
+
+Run `yoink secrets key public` from inside any project for a "what key is yoink using here?" sanity check — it prints the recipient derived from whichever identity resolved.
 
 ## Rotating a key
 
