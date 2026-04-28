@@ -1028,7 +1028,48 @@ fn build_run_spec(
         publish: service.run.publish.clone(),
         binds,
         volumes: service.run.volumes.clone(),
+        docker_healthcheck: docker_healthcheck_for(service),
     }
+}
+
+/// Pick a docker-native HEALTHCHECK directive for a service.
+///
+/// Today this only lights up for the synthesized `yoink-proxy`:
+/// the bundled image is `caddy:2`, which doesn't ship a HEALTHCHECK
+/// of its own, and the proxy is the one container yoink puts on
+/// every host whether the operator wrote a yaml entry for it or not.
+/// Best practice is for it to show `(healthy)` in `docker ps` and
+/// in tools like lazydocker / cAdvisor / k8s-style health probes —
+/// the deploy-time gate yoink already runs is invisible there.
+///
+/// User-defined services intentionally inherit whatever HEALTHCHECK
+/// their image's Dockerfile declares (or none); yoink doesn't yet
+/// expose a config knob to override that.
+fn docker_healthcheck_for(service: &ServiceConfig) -> Option<bollard::models::HealthConfig> {
+    use bollard::models::HealthConfig;
+    if service.kind != Some(crate::config::ServiceKind::Proxy) {
+        return None;
+    }
+    // Probe Caddy's admin endpoint on its own loopback. /config/
+    // returns the live config blob and is what yoink itself uses
+    // as the deploy-time gate. BusyBox `wget --spider` exits 0 on
+    // 200, non-zero otherwise — caddy:2 (alpine-based) ships it.
+    Some(HealthConfig {
+        test: Some(vec![
+            "CMD-SHELL".into(),
+            "wget --spider --quiet http://127.0.0.1:2019/config/ || exit 1".into(),
+        ]),
+        // 30 s is enough headroom for Caddy's admin loop without
+        // making `docker ps` lag the actual state.
+        interval: Some(30 * 1_000_000_000),
+        timeout: Some(5 * 1_000_000_000),
+        // Caddy boots in well under a second; keep the start grace
+        // generous so a slow first-load (TLS bootstrap on first run)
+        // doesn't get reported as unhealthy.
+        start_period: Some(10 * 1_000_000_000),
+        retries: Some(3),
+        ..Default::default()
+    })
 }
 
 /// Parse + content-hash every entry in `service.run.files`. Failure to
