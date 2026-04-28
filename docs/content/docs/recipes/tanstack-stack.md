@@ -208,7 +208,7 @@ include:
 yoink up --build
 ```
 
-One command. Yoink pulls postgres from Docker Hub on the host, builds the app image locally, ships the app to the host via [unregistry](https://github.com/psviderski/unregistry) over SSH (no registry account required), starts both containers on the `yoink` network, and runs the app's healthcheck. yoink picks the right path per service from the `build:` block — postgres (no `build:`) gets pulled by the host; the app (with `build:`) gets shipped from your local docker daemon. No flag needed, no 404s on Docker Hub for locally-built images.
+One command. The host pulls postgres from Docker Hub; the app (with its `build:` block) is built locally and shipped to the host via [unregistry](https://github.com/psviderski/unregistry) over SSH — no registry account required for the app. Both containers come up on the `yoink` network, the app's healthcheck gates the swap.
 
 First deploy is the slow one — pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry ships only changed layers.
 
