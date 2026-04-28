@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use bollard::models::{
-    ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig, PortBinding,
-    RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, EndpointSettings, HealthConfig, HostConfig, NetworkingConfig,
+    PortBinding, RestartPolicy, RestartPolicyNameEnum,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -76,6 +76,16 @@ pub struct RunSpec {
     /// docker-cli volume strings, e.g. `"named-volume:/data"`. Concatenated
     /// onto `host_config.binds` (Docker accepts named volumes there too).
     pub volumes: Vec<String>,
+    /// Docker-native HEALTHCHECK directive (`Config.Healthcheck`).
+    /// Distinct from `ServiceRun.healthcheck_path`, which yoink uses
+    /// as its deploy-time HTTP probe gate. When set, this becomes
+    /// the container-image-level healthcheck that `docker ps` /
+    /// `docker inspect` / lazydocker / cAdvisor read — i.e. the
+    /// "is this container running cleanly RIGHT NOW" signal that
+    /// outlives the deploy. Currently populated by yoink only for
+    /// the synthesized `yoink-proxy`; user services inherit whatever
+    /// HEALTHCHECK their image's Dockerfile declares.
+    pub docker_healthcheck: Option<HealthConfig>,
 }
 
 /// Build the typed body for `bollard.create_container`.
@@ -107,6 +117,7 @@ pub fn build_container(spec: &RunSpec) -> Result<ContainerCreateBody, BuildError
         },
         user: spec.options.user.clone(),
         exposed_ports: vec_opt(&exposed_ports),
+        healthcheck: spec.docker_healthcheck.clone(),
         host_config: Some(host_config),
         networking_config: Some(networking_config),
         ..Default::default()
@@ -460,6 +471,33 @@ pub fn compute_spec_hash(spec: &RunSpec) -> String {
     feed_list(&mut h, "publish", &spec.publish);
     feed_list(&mut h, "binds", &spec.binds);
     feed_list(&mut h, "volumes", &spec.volumes);
+    if let Some(hc) = &spec.docker_healthcheck {
+        // Stringify each field independently. test is the load-bearing
+        // bit; interval/timeout/retries/start_period are tuning knobs
+        // that should still trigger a re-roll when changed (e.g.
+        // bumping retries from 3 → 5).
+        feed_opt_list(&mut h, "healthcheck.test", hc.test.as_deref());
+        feed(
+            &mut h,
+            "healthcheck.interval_ns",
+            hc.interval.unwrap_or(0).to_le_bytes().as_slice(),
+        );
+        feed(
+            &mut h,
+            "healthcheck.timeout_ns",
+            hc.timeout.unwrap_or(0).to_le_bytes().as_slice(),
+        );
+        feed(
+            &mut h,
+            "healthcheck.retries",
+            hc.retries.unwrap_or(0).to_le_bytes().as_slice(),
+        );
+        feed(
+            &mut h,
+            "healthcheck.start_period_ns",
+            hc.start_period.unwrap_or(0).to_le_bytes().as_slice(),
+        );
+    }
 
     let opts = &spec.options;
     feed_list(&mut h, "network_aliases", &opts.network_aliases);
@@ -593,6 +631,7 @@ mod tests {
             publish: vec![],
             binds: vec![],
             volumes: vec![],
+            docker_healthcheck: None,
         }
     }
 
@@ -629,6 +668,49 @@ mod tests {
         assert_eq!(host.auto_remove, Some(false));
         let rp = host.restart_policy.unwrap();
         assert_eq!(rp.name, Some(RestartPolicyNameEnum::UNLESS_STOPPED));
+    }
+
+    #[test]
+    fn build_container_emits_docker_healthcheck_when_set() {
+        let mut spec = sample_spec();
+        spec.docker_healthcheck = Some(HealthConfig {
+            test: Some(vec![
+                "CMD-SHELL".into(),
+                "wget --spider --quiet http://127.0.0.1:2019/config/ || exit 1".into(),
+            ]),
+            interval: Some(30 * 1_000_000_000),
+            timeout: Some(5 * 1_000_000_000),
+            retries: Some(3),
+            start_period: Some(10 * 1_000_000_000),
+            ..Default::default()
+        });
+        let body = build_container(&spec).unwrap();
+        let hc = body.healthcheck.expect("healthcheck on body");
+        let test = hc.test.unwrap();
+        assert_eq!(test[0], "CMD-SHELL");
+        assert!(test[1].contains("127.0.0.1:2019/config/"));
+        assert_eq!(hc.interval, Some(30_000_000_000));
+        assert_eq!(hc.retries, Some(3));
+    }
+
+    #[test]
+    fn spec_hash_differs_when_healthcheck_changes() {
+        let base = sample_spec();
+        let baseline = compute_spec_hash(&base);
+        let mut with_hc = base.clone();
+        with_hc.docker_healthcheck = Some(HealthConfig {
+            test: Some(vec!["CMD".into(), "true".into()]),
+            ..Default::default()
+        });
+        let with_hc_hash = compute_spec_hash(&with_hc);
+        assert_ne!(baseline, with_hc_hash, "adding a healthcheck must reroll");
+        let mut tighter = with_hc.clone();
+        tighter.docker_healthcheck.as_mut().unwrap().retries = Some(5);
+        assert_ne!(
+            with_hc_hash,
+            compute_spec_hash(&tighter),
+            "tightening retries must reroll"
+        );
     }
 
     #[test]
