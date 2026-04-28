@@ -297,42 +297,75 @@ async fn inspect_field_diff(
     secrets: Option<&SecretsBundle>,
 ) -> Result<FieldDiff, DockerError> {
     let detail = ops.inspect_container(host, container).await?;
-    let current_env = detail.env_map();
     let desired_env = deploy::build_env(service, secrets);
-    let (env_added, env_removed, env_changed) = diff_kv(&current_env, &desired_env);
-
     let desired_labels = deploy::build_labels(service, tag, desired_hash);
-    let (mut labels_added, mut labels_removed, mut labels_changed) =
-        diff_kv(&detail.labels, &desired_labels);
-    // Suppress the labels yoink itself manages so the operator doesn't
-    // see them in every diff:
-    //   - `yoink.version` / `yoink.spec_hash` are already shown via the
-    //     dedicated tag/spec_hash diff lines.
-    //   - `yoink.deployed-*` are audit labels written at deploy time
-    //     (see `deploy::audit_labels`), kept out of `build_labels` so
-    //     the spec_hash isn't poisoned. Without this filter every
-    //     Update would report them as `removed` since they're in the
-    //     running container but not in `desired_labels`.
-    labels_added.retain(|k| !is_yoink_managed_label(k));
-    labels_removed.retain(|k| !is_yoink_managed_label(k));
-    labels_changed.retain(|k| !is_yoink_managed_label(k));
+    Ok(field_diff_scoped(
+        service,
+        &detail.env_map(),
+        &detail.labels,
+        &desired_env,
+        &desired_labels,
+    ))
+}
 
-    Ok(FieldDiff {
+/// Pure-function part of `inspect_field_diff`: given current vs desired
+/// env+labels (already loaded), produce the operator-facing field diff,
+/// filtered down to keys yoink would actually set.
+///
+/// The scoping matters because the running container's env always
+/// carries image-inherited entries (`PATH`, `SSL_CERT_FILE`, locale
+/// vars, …) and the running container's labels carry image-baked OCI
+/// annotations (`LABEL service=foo` from a Dockerfile, `org.openconta-
+/// iners.image.*`). yoink doesn't manage any of those, so they
+/// shouldn't show as drift — they'd flood the modal with permanent
+/// red `-` lines. The contract is "yoink reports drift on what it
+/// sets": for env that's `service.env` + declared `secrets:` + LHS
+/// of `env_from_secrets:`; for labels that's anything starting with
+/// `yoink.` or anything the operator declared in `service.labels`.
+fn field_diff_scoped(
+    service: &crate::config::ServiceConfig,
+    current_env: &BTreeMap<String, String>,
+    current_labels: &BTreeMap<String, String>,
+    desired_env: &BTreeMap<String, String>,
+    desired_labels: &BTreeMap<String, String>,
+) -> FieldDiff {
+    let managed_env: BTreeSet<String> = service
+        .env
+        .keys()
+        .cloned()
+        .chain(service.secrets.iter().cloned())
+        .chain(service.env_from_secrets.keys().cloned())
+        .collect();
+    let (mut env_added, mut env_removed, mut env_changed) = diff_kv(current_env, desired_env);
+    env_added.retain(|k| managed_env.contains(k));
+    env_removed.retain(|k| managed_env.contains(k));
+    env_changed.retain(|k| managed_env.contains(k));
+
+    let user_labels: BTreeSet<String> = service.labels.keys().cloned().collect();
+    let label_in_scope =
+        |k: &String| (k.starts_with("yoink.") || user_labels.contains(k)) && !is_yoink_internal_label(k);
+    let (mut labels_added, mut labels_removed, mut labels_changed) =
+        diff_kv(current_labels, desired_labels);
+    labels_added.retain(&label_in_scope);
+    labels_removed.retain(&label_in_scope);
+    labels_changed.retain(&label_in_scope);
+
+    FieldDiff {
         env_added,
         env_removed,
         env_changed,
         labels_added,
         labels_removed,
         labels_changed,
-    })
+    }
 }
 
-/// Labels yoink manages on its own and that the field-diff suppresses
-/// from added/removed/changed lists. These are either represented by
-/// other parts of the diff (`yoink.version`, `yoink.spec_hash` ↔ the
-/// tag and `spec_hash` columns) or by design absent from `build_labels`
-/// (`yoink.deployed-*` audit labels — see `deploy::audit_labels`).
-fn is_yoink_managed_label(k: &str) -> bool {
+/// Yoink-internal labels suppressed from the field diff. These are
+/// either represented by other parts of the diff (`yoink.version`,
+/// `yoink.spec_hash` ↔ the tag and `spec_hash` columns) or by design
+/// absent from `build_labels` (`yoink.deployed-*` audit labels — see
+/// `deploy::audit_labels`).
+fn is_yoink_internal_label(k: &str) -> bool {
     matches!(k, "yoink.version" | "yoink.spec_hash") || k.starts_with("yoink.deployed-")
 }
 
@@ -712,16 +745,148 @@ mod tests {
     }
 
     #[test]
-    fn is_yoink_managed_label_recognises_audit_and_spec_keys() {
-        assert!(is_yoink_managed_label("yoink.version"));
-        assert!(is_yoink_managed_label("yoink.spec_hash"));
-        assert!(is_yoink_managed_label("yoink.deployed-by"));
-        assert!(is_yoink_managed_label("yoink.deployed-at"));
+    fn is_yoink_internal_label_recognises_audit_and_spec_keys() {
+        assert!(is_yoink_internal_label("yoink.version"));
+        assert!(is_yoink_internal_label("yoink.spec_hash"));
+        assert!(is_yoink_internal_label("yoink.deployed-by"));
+        assert!(is_yoink_internal_label("yoink.deployed-at"));
         // Other yoink labels (caddy, custom user labels under yoink.*)
         // remain visible in the diff.
-        assert!(!is_yoink_managed_label("yoink.caddy.domain"));
-        assert!(!is_yoink_managed_label("yoink.service"));
-        assert!(!is_yoink_managed_label("org.opencontainers.image.description"));
+        assert!(!is_yoink_internal_label("yoink.caddy.domain"));
+        assert!(!is_yoink_internal_label("yoink.service"));
+        assert!(!is_yoink_internal_label("org.opencontainers.image.description"));
+    }
+
+    fn service_with_managed_keys() -> crate::config::ServiceConfig {
+        let cfg = crate::config::Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/bt-api
+    tag: latest
+    env:
+      LOG_LEVEL: info
+      PORT: "8080"
+    secrets:
+      - DATABASE_URL
+    env_from_secrets:
+      OTEL_HEADERS: GRAFANA_AUTH
+    labels:
+      ops.team: platform
+    run:
+      port: 8080
+      healthcheck_path: /health
+      healthcheck_timeout: 60s
+      drain_timeout: 10s
+      options: { memory: 256Mi }
+"#,
+        )
+        .unwrap();
+        cfg.services[0].clone()
+    }
+
+    #[test]
+    fn field_diff_ignores_image_inherited_env() {
+        // Container has image-baked vars (PATH, SSL_CERT_FILE, NODE_ENV)
+        // alongside the ones yoink set. Desired only carries the
+        // yoink-set ones. The image-inherited shouldn't show as
+        // env_removed.
+        let svc = service_with_managed_keys();
+        let mut current_env = BTreeMap::new();
+        current_env.insert("PATH".into(), "/usr/local/bin:/usr/bin".into());
+        current_env.insert("SSL_CERT_FILE".into(), "/etc/ssl/cert.pem".into());
+        current_env.insert("NODE_ENV".into(), "production".into());
+        current_env.insert("LOG_LEVEL".into(), "info".into());
+        current_env.insert("PORT".into(), "8080".into());
+        current_env.insert("DATABASE_URL".into(), "postgres://…".into());
+        current_env.insert("OTEL_HEADERS".into(), "Bearer …".into());
+        let mut desired_env = current_env.clone();
+        desired_env.remove("PATH");
+        desired_env.remove("SSL_CERT_FILE");
+        desired_env.remove("NODE_ENV");
+        let diff = field_diff_scoped(
+            &svc,
+            &current_env,
+            &BTreeMap::new(),
+            &desired_env,
+            &BTreeMap::new(),
+        );
+        assert!(diff.env_removed.is_empty(), "got: {:?}", diff.env_removed);
+    }
+
+    #[test]
+    fn field_diff_still_reports_dropped_managed_env() {
+        // Operator removes a key from service.env: that IS drift —
+        // make sure the scoping doesn't over-filter and silently
+        // hide it.
+        let svc = service_with_managed_keys();
+        let mut current_env = BTreeMap::new();
+        current_env.insert("LOG_LEVEL".into(), "info".into());
+        current_env.insert("PORT".into(), "8080".into()); // gone in desired
+        current_env.insert("PATH".into(), "/usr/bin".into()); // image, ignored
+        let mut desired_env = BTreeMap::new();
+        desired_env.insert("LOG_LEVEL".into(), "info".into());
+        let diff = field_diff_scoped(
+            &svc,
+            &current_env,
+            &BTreeMap::new(),
+            &desired_env,
+            &BTreeMap::new(),
+        );
+        assert_eq!(diff.env_removed, vec!["PORT".to_string()]);
+    }
+
+    #[test]
+    fn field_diff_ignores_image_baked_labels() {
+        // bt-api's Dockerfile carries `LABEL service=backtrack` plus
+        // OCI image annotations. Those shouldn't show as drift;
+        // operator can't act on them.
+        let svc = service_with_managed_keys();
+        let mut current_labels = BTreeMap::new();
+        current_labels.insert("service".into(), "backtrack".into());
+        current_labels.insert(
+            "org.opencontainers.image.source".into(),
+            "https://example.com".into(),
+        );
+        current_labels.insert("yoink.managed".into(), "true".into());
+        current_labels.insert("yoink.service".into(), "api".into());
+        current_labels.insert("ops.team".into(), "platform".into());
+        let mut desired_labels = current_labels.clone();
+        desired_labels.remove("service");
+        desired_labels.remove("org.opencontainers.image.source");
+        let diff = field_diff_scoped(
+            &svc,
+            &BTreeMap::new(),
+            &current_labels,
+            &BTreeMap::new(),
+            &desired_labels,
+        );
+        assert!(
+            diff.labels_removed.is_empty(),
+            "got: {:?}",
+            diff.labels_removed
+        );
+    }
+
+    #[test]
+    fn field_diff_reports_user_label_change() {
+        // A label declared in service.labels is yoink-managed; an
+        // operator-side change should still show as drift.
+        let svc = service_with_managed_keys();
+        let mut current_labels = BTreeMap::new();
+        current_labels.insert("ops.team".into(), "platform".into());
+        let mut desired_labels = BTreeMap::new();
+        desired_labels.insert("ops.team".into(), "infra".into());
+        let diff = field_diff_scoped(
+            &svc,
+            &BTreeMap::new(),
+            &current_labels,
+            &BTreeMap::new(),
+            &desired_labels,
+        );
+        assert_eq!(diff.labels_changed, vec!["ops.team".to_string()]);
     }
 
     #[test]
