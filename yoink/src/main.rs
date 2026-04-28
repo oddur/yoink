@@ -2670,18 +2670,19 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
 fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
     use yoink::config::SecretsConfig;
     use yoink::sealed;
-    if reveal && std::env::var_os("CI").is_some() {
+    if reveal
+        && let Some(ci_var) = detected_ci_env()
+        && !is_truthy_env("YOINK_ALLOW_REVEAL_IN_CI")
+    {
         // CI runners log stdout into build artifacts that get
         // shared / archived / scraped — `--reveal` printing real
         // values there is almost always a mistake. Force operators
         // to override consciously when they really mean it.
-        if std::env::var_os("YOINK_ALLOW_REVEAL_IN_CI").is_none() {
-            return Err(anyhow::anyhow!(
-                "refusing to print real secret values: $CI is set. \
-                 If this is intentional (you're capturing the bundle into a managed secret store, \
-                 not into build logs), set YOINK_ALLOW_REVEAL_IN_CI=1"
-            ));
-        }
+        return Err(anyhow::anyhow!(
+            "refusing to print real secret values: detected CI environment (${ci_var} is set). \
+             If this is intentional (you're capturing the bundle into a managed secret store, \
+             not into build logs), set YOINK_ALLOW_REVEAL_IN_CI=1"
+        ));
     }
     let SecretsConfig::Age { file, .. } = expect_secrets_provider_age(config)? else {
         unreachable!()
@@ -2891,6 +2892,47 @@ fn mask_value(s: &str) -> String {
     let prefix: String = s.chars().take(visible).collect();
     let masked = "•".repeat(s.chars().count().saturating_sub(visible).min(16));
     format!("{prefix}{masked}")
+}
+
+/// Returns the name of the first CI-environment env var that is set,
+/// or None for an interactive shell. The CI=1 convention is set by
+/// most providers but not all (some only set their own per-product
+/// var); checking the union catches more cases.
+fn detected_ci_env() -> Option<&'static str> {
+    const CI_ENV_VARS: &[&str] = &[
+        "CI",
+        "GITHUB_ACTIONS",
+        "GITLAB_CI",
+        "CIRCLECI",
+        "BUILDKITE",
+        "TRAVIS",
+        "TF_BUILD",          // Azure Pipelines
+        "TEAMCITY_VERSION",
+        "BITBUCKET_BUILD_NUMBER",
+        "DRONE",
+        "JENKINS_URL",
+    ];
+    CI_ENV_VARS
+        .iter()
+        .copied()
+        .find(|name| std::env::var_os(name).is_some())
+}
+
+/// Strict truthy parse for guard-override env vars. `"1"`, `"true"`,
+/// `"yes"`, `"on"` (case-insensitive) flip; everything else — empty
+/// string, `"0"`, `"false"`, `"no"`, `"off"`, unset — does not. Avoids
+/// the trap where a misconfigured workflow sets the override to an
+/// empty value (e.g. `FOO: ${{ secrets.MISSING }}`) and silently
+/// bypasses the guard.
+fn is_truthy_env(name: &str) -> bool {
+    let Some(raw) = std::env::var_os(name) else {
+        return false;
+    };
+    let s = raw.to_string_lossy();
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn chrono_like_now() -> String {

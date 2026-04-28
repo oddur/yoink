@@ -32,6 +32,13 @@ use crate::sealed;
 /// against a buggy or malicious provider that runs away with stdout
 /// and OOMs the deploy / CI runner.
 const COMMAND_OUTPUT_CAP: usize = 10 * 1024 * 1024;
+/// Cap on stderr / parser-detail bytes embedded in error variants.
+/// A misconfigured upstream can echo secret values into its error
+/// output ("failed to read secret 'DB_PASS' = '<value>'"); capping
+/// the slice we surface to the operator (and to any deploy-log
+/// archive) bounds that leak. The tail is kept rather than the
+/// head — error tails are usually more diagnostic.
+const ERROR_DETAIL_CAP: usize = 4096;
 /// Hard wall-clock deadline for a `provider: command` invocation. A
 /// stuck `op read` / `vault kv get` would otherwise hang `yoink up`
 /// indefinitely. Picked to comfortably cover slow KMS round-trips
@@ -51,6 +58,10 @@ const COMMAND_ENV_ALLOWLIST: &[&str] = &[
     "LC_ALL",
     "TERM",
     "TZ",
+    // git, gpg, age, and a number of other CLIs honor XDG_CONFIG_HOME
+    // for config-file resolution. Operators with custom dotfiles
+    // setups otherwise hit subtle "config not found" failures.
+    "XDG_CONFIG_HOME",
     // Per-tool auth tokens commonly needed; passing through is
     // safer than forcing operators to wrap every CLI in a script
     // that re-exports them.
@@ -324,8 +335,15 @@ async fn load_command_bundle(
     // cases) a still-running process blocked on closed pipes.
     let (stdout_buf, stderr_buf, status) = match drain_result {
         Ok((stdout_res, stderr_res)) => {
-            // Drain completed within the timeout. wait() should be
-            // ~immediate since we read both pipes to completion.
+            // If either drain hit the cap, kill the child before
+            // wait()ing — for natural producers (head -c) the
+            // process is exiting on its own, but a slow producer
+            // that drip-feeds bytes after exceeding the cap would
+            // otherwise block our wait() until COMMAND_TIMEOUT.
+            // Symmetric with the timeout branch below.
+            if stdout_res.is_err() || stderr_res.is_err() {
+                let _ = child.start_kill();
+            }
             let status = child
                 .wait()
                 .await
@@ -359,7 +377,10 @@ async fn load_command_bundle(
         return Err(SecretsError::CommandExit {
             command: pretty,
             status: status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&stderr_buf).trim().to_string(),
+            stderr: truncate_for_error(
+                String::from_utf8_lossy(&stderr_buf).trim(),
+                ERROR_DETAIL_CAP,
+            ),
         });
     }
 
@@ -368,7 +389,7 @@ async fn load_command_bundle(
             SecretsError::CommandParse {
                 command: pretty.clone(),
                 format,
-                detail,
+                detail: truncate_for_error(&detail, ERROR_DETAIL_CAP),
             }
         })?;
     if bundle.is_empty() && any_secrets_referenced {
@@ -382,6 +403,23 @@ async fn load_command_bundle(
         return Err(SecretsError::CommandEmpty { command: pretty });
     }
     Ok(bundle)
+}
+
+/// Truncate a string to at most `cap` bytes for inclusion in an
+/// error variant. Keeps the tail (where parser/CLI errors usually
+/// have their useful diagnostic) and prepends a marker when we
+/// had to cut. Char-boundary safe.
+fn truncate_for_error(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    // Walk forward from `s.len() - cap` until we hit a char boundary,
+    // so we never split a multi-byte char.
+    let mut start = s.len().saturating_sub(cap);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…(truncated){}", &s[start..])
 }
 
 fn json_value_kind(v: &serde_json::Value) -> &'static str {
@@ -536,12 +574,53 @@ fn parse_dotenv_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
         let value = if let Some(quote) = opening_unmatched_quote(value_start) {
             consume_multiline_value(quote, value_start, key, line_idx, &mut iter)?
         } else {
-            strip_quotes(value_start.trim_end())
+            parse_single_line_value(value_start, key, line_idx)?
         };
 
         out.insert(key.to_string(), value);
     }
     Ok(SecretsBundle::new(out))
+}
+
+/// Single-line value: strip surrounding quotes if cleanly bracketed.
+///
+/// Rejects the unambiguous footgun pattern `KEY='val' garbage` —
+/// a quote pair that closes mid-line and is followed by content
+/// that doesn't itself contain another matching quote (so it's
+/// definitely operator junk, not a value with embedded `\"` escapes
+/// nor a shell-style adjacent-quoted-string concat). Strings where
+/// the heuristic is ambiguous (e.g. `"hello \"world\""` from
+/// Doppler) fall through to `strip_quotes`, preserving the
+/// pre-existing "verbatim with backslashes" behavior — operators
+/// using providers that emit shell-escaped values still get them.
+fn parse_single_line_value(
+    value_start: &str,
+    key: &str,
+    line_idx: usize,
+) -> Result<String, String> {
+    let trimmed = value_start.trim_end();
+    let bytes = trimmed.as_bytes();
+    if let Some(&first) = bytes.first()
+        && (first == b'\'' || first == b'"')
+        && let Some(close_offset) = trimmed[1..].find(first as char)
+    {
+        let close_idx = close_offset + 1;
+        let after_close = &trimmed[close_idx + 1..];
+        if after_close.is_empty() {
+            return Ok(trimmed[1..close_idx].to_string());
+        }
+        // Heuristic: if there's another matching quote later in the
+        // line, this looks like an escaped-quote or concat case;
+        // preserve verbatim. Otherwise, the trailing chars are junk.
+        if !after_close.contains(first as char) {
+            return Err(format!(
+                "line {}: trailing content after closing {} in value for {key:?}",
+                line_idx + 1,
+                first as char,
+            ));
+        }
+    }
+    Ok(strip_quotes(trimmed))
 }
 
 /// Pulled out of `parse_dotenv_bundle` to keep the main loop one
@@ -696,6 +775,63 @@ mod tests {
         let bytes = b"CERT='-----BEGIN-----\nbody\n-----END-----' something_else\nNEXT=ok\n";
         let err = parse_dotenv_bundle(bytes).unwrap_err();
         assert!(err.contains("trailing content"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_dotenv_bundle_rejects_single_line_trailing_after_close() {
+        // Unambiguous footgun: quote pair followed by junk that
+        // contains no further matching quote. Previously silently
+        // accepted as the literal string with embedded quotes.
+        let bytes = b"KEY='val' garbage\n";
+        let err = parse_dotenv_bundle(bytes).unwrap_err();
+        assert!(err.contains("trailing content"), "got: {err}");
+
+        let bytes = b"KEY='val' # comment-shaped garbage\n";
+        let err = parse_dotenv_bundle(bytes).unwrap_err();
+        assert!(err.contains("trailing content"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_dotenv_bundle_preserves_doppler_style_escaped_quotes() {
+        // Real-world: Doppler / similar emit values containing
+        // literal quotes via `\"` escape. Our parser keeps the
+        // backslashes verbatim (documented limitation), but we
+        // must NOT misclassify this as the trailing-content
+        // footgun above.
+        let bytes = b"K=\"hello \\\"world\\\"\"\n";
+        let bundle = parse_dotenv_bundle(bytes).unwrap();
+        // Either inner-stripped or full-literal is acceptable as
+        // long as we didn't error.
+        assert!(bundle.get("K").is_some());
+    }
+
+    #[test]
+    fn truncate_for_error_keeps_short_input_intact() {
+        assert_eq!(truncate_for_error("hello", 100), "hello");
+        assert_eq!(truncate_for_error("", 100), "");
+    }
+
+    #[test]
+    fn truncate_for_error_marks_truncated_input() {
+        let s = "x".repeat(5000);
+        let out = truncate_for_error(&s, 4096);
+        assert!(out.starts_with("…(truncated)"));
+        // Tail kept: the truncation marker is prepended to the last
+        // ~cap bytes, so total length is cap + marker bytes.
+        assert!(out.len() < s.len());
+        assert!(out.ends_with("xxxxx"));
+    }
+
+    #[test]
+    fn truncate_for_error_respects_char_boundary() {
+        // 3-byte char (•) repeated past the cap. Cap of 100 bytes
+        // doesn't land on a char boundary cleanly; truncate_for_error
+        // must walk forward to the next valid boundary.
+        let s = "•".repeat(2000);
+        let out = truncate_for_error(&s, 100);
+        // Must be a valid str (no panic) and end on a boundary.
+        assert!(out.starts_with("…(truncated)"));
+        assert!(out.is_char_boundary(out.len()));
     }
 
     #[test]
