@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use minijinja::Environment;
 
-use super::manifest::{FileSpec, SecretSpec, TemplateManifest};
+use super::manifest::{ConnectionSpec, FileSpec, SecretSpec, TemplateManifest};
 
 /// One file to write to disk after rendering.
 #[derive(Debug, Clone)]
@@ -33,6 +33,7 @@ pub struct Rendered {
     pub secrets: Vec<RenderedSecret>,
     pub notes: Option<String>,
     pub include_glob: Option<String>,
+    pub connection: Option<ConnectionSpec>,
 }
 
 /// Render every output the manifest declares.
@@ -69,11 +70,47 @@ pub fn render(
         .map(|g| render_string(&env, "<include_glob>", g, &ctx))
         .transpose()?;
 
+    let connection = manifest
+        .connection
+        .as_ref()
+        .map(|c| render_connection(&env, c, &ctx))
+        .transpose()?;
+
     Ok(Rendered {
         files,
         secrets,
         notes,
         include_glob,
+        connection,
+    })
+}
+
+fn render_connection(
+    env: &Environment<'_>,
+    spec: &ConnectionSpec,
+    ctx: &minijinja::Value,
+) -> Result<ConnectionSpec> {
+    let render_map = |label: &str, m: &BTreeMap<String, String>| -> Result<BTreeMap<String, String>> {
+        m.iter()
+            .map(|(k, v)| {
+                let key = render_string(env, &format!("{label}.key({k})"), k, ctx)?;
+                let val = render_string(env, &format!("{label}.value({k})"), v, ctx)?;
+                Ok((key, val))
+            })
+            .collect()
+    };
+
+    let depends_on = spec
+        .depends_on
+        .iter()
+        .enumerate()
+        .map(|(i, s)| render_string(env, &format!("connection.depends_on[{i}]"), s, ctx))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ConnectionSpec {
+        env: render_map("connection.env", &spec.env)?,
+        env_from_secrets: render_map("connection.env_from_secrets", &spec.env_from_secrets)?,
+        depends_on,
     })
 }
 
@@ -220,6 +257,7 @@ mod tests {
             secrets,
             include_glob: None,
             notes: None,
+            connection: None,
         }
     }
 

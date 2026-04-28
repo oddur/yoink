@@ -168,9 +168,27 @@ services/postgres.yaml   # postgres:16-alpine + sealed POSTGRES_PASSWORD
 services/redis.yaml      # redis:7-alpine, secure-by-default options
 ```
 
+After each `add` succeeds, yoink prints a **paste-ready connection block** that uses only fields already in the schema (`depends_on:`, `env:`, `env_from_secrets:`):
+
+```
+connect another service to postgres:
+  # paste under the consuming service in yoink.yaml,
+  # rename keys to whatever your app expects.
+  depends_on: [postgres]
+  env:
+    POSTGRES_DB: app
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_USER: app
+  env_from_secrets:
+    POSTGRES_PASSWORD: POSTGRES_PASSWORD
+```
+
+The keys are the accessory's suggestion — neutral, conventional. If your app reads a different shape (e.g. `DATABASE_URL`, `PG_HOST`), rename them in the paste; yoink doesn't care which env names the consuming service uses, only that they're present.
+
 ## Step 5: wire the app to the accessories
 
-Edit `yoink.yaml`. The `init` output already has the basics; add `domain:`, `depends_on:`, env vars, and the build block. The whole file ends up looking like:
+Paste the two `connect another service to …` blocks into your app's `services[]` entry. Then add `domain:` and the `build:` block. The whole file ends up looking like:
 
 ```yaml
 hosts:

@@ -670,10 +670,12 @@ fn render(plan: &WizardPlan) -> String {
         ImageSource::Registry(s) | ImageSource::Bare(s) => s.clone(),
     };
     out.push_str(&format!("    image: {image}\n"));
-    out.push_str(&format!(
-        "    tag: {}                   # use --tag {}=$(git rev-parse HEAD) at deploy\n",
-        plan.tag, plan.service
-    ));
+    let tag_comment = if is_git_repo() {
+        format!("# use --tag {}=$(git rev-parse HEAD) at deploy", plan.service)
+    } else {
+        "# pin a stable tag before going to production".to_string()
+    };
+    out.push_str(&format!("    tag: {}                   {tag_comment}\n", plan.tag));
     out.push_str("    run:\n");
     if let Some(p) = plan.port {
         out.push_str(&format!("      port: {p}\n"));
@@ -686,6 +688,21 @@ fn render(plan: &WizardPlan) -> String {
         ));
     }
     out
+}
+
+/// True if the current directory is inside a git working tree. Used
+/// to gate the `--tag $(git rev-parse HEAD)` hint so non-git repos
+/// don't see suggestions that would error.
+fn is_git_repo() -> bool {
+    let mut p = std::env::current_dir().unwrap_or_default();
+    loop {
+        if p.join(".git").exists() {
+            return true;
+        }
+        if !p.pop() {
+            return false;
+        }
+    }
 }
 
 fn print_summary(plan: &WizardPlan, path: &Path, line_count: usize) {
@@ -753,11 +770,15 @@ fn print_summary(plan: &WizardPlan, path: &Path, line_count: usize) {
     let _ = writeln!(summary);
     let _ = writeln!(summary, "next:");
     let _ = writeln!(summary, "  yoink validate");
-    let _ = writeln!(
-        summary,
-        "  yoink up --tag {}=$(git rev-parse HEAD)",
-        plan.service
-    );
+    if is_git_repo() {
+        let _ = writeln!(
+            summary,
+            "  yoink up --tag {}=$(git rev-parse HEAD)",
+            plan.service
+        );
+    } else {
+        let _ = writeln!(summary, "  yoink up");
+    }
     let _ = writeln!(summary);
     let _ = writeln!(
         summary,

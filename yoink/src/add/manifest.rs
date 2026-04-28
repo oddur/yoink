@@ -2,6 +2,7 @@
 //! fetching from GitHub. Describes the variables to prompt for, the
 //! files to render, and the secrets to seal.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -64,6 +65,34 @@ pub struct TemplateManifest {
     /// for follow-up instructions ("set `depends_on:` in your app").
     #[serde(default)]
     pub notes: Option<String>,
+    /// Optional structured wiring block. Renders as paste-ready YAML
+    /// after the add — `depends_on:`, `env:`, `env_from_secrets:` —
+    /// using only fields that already exist in `services[]`. Keys are
+    /// the manifest author's choice; the user pastes and renames to
+    /// fit their app.
+    #[serde(default)]
+    pub connection: Option<ConnectionSpec>,
+}
+
+/// Wiring hints printed after `yoink add` succeeds. Pure data —
+/// rendered with the same context as everything else, then surfaced
+/// as a yaml block the operator can paste into their app's service
+/// definition.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionSpec {
+    /// Plain env vars (host, port, db name, user). Keys print in
+    /// sorted order — pick names that read well alphabetically
+    /// (`POSTGRES_DB`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Secret bindings: env var name → sealed-secret name. Same
+    /// shape as `services[].env_from_secrets`.
+    #[serde(default)]
+    pub env_from_secrets: BTreeMap<String, String>,
+    /// Service names the consumer should list under `depends_on:`.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -20,11 +20,12 @@ files:
 
 include_glob: "services/*.yaml"
 
-notes: |
-  Connect from another service:
-    depends_on: [{{ service_name }}]
-    env:
-      REDIS_URL: redis://{{ service_name }}:6379/0
+connection:
+  depends_on: ["{{ service_name }}"]
+  env:
+    REDIS_HOST: "{{ service_name }}"
+    REDIS_PORT: "6379"
 
+notes: |
   No auth is configured. The service is only reachable on the docker
   network — keep it that way unless you know what you're doing.

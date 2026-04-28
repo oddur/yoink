@@ -260,6 +260,7 @@ mod tests {
                 .collect(),
             include_glob: None,
             notes: None,
+            connection: None,
         }
     }
 }

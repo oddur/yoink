@@ -28,13 +28,14 @@ secrets:
 
 include_glob: "services/*.yaml"
 
-notes: |
-  Connect from another service:
-    depends_on: [{{ service_name }}]
-    env:
-      MEILI_URL: http://{{ service_name }}:7700
-    env_from_secrets:
-      MEILI_MASTER_KEY: {{ service_name | upper }}_MASTER_KEY
+connection:
+  depends_on: ["{{ service_name }}"]
+  env:
+    MEILI_HOST: "{{ service_name }}"
+    MEILI_PORT: "7700"
+  env_from_secrets:
+    MEILI_MASTER_KEY: "{{ service_name | upper }}_MASTER_KEY"
 
-  Search dashboard: `yoink shell {{ service_name }}` then
+notes: |
+  Probe the API: `yoink shell {{ service_name }}` then
   `curl -H "Authorization: Bearer $MEILI_MASTER_KEY" http://localhost:7700/keys`

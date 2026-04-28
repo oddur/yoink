@@ -33,12 +33,15 @@ secrets:
 
 include_glob: "services/*.yaml"
 
-notes: |
-  Connect from another service in this config:
-    depends_on: [{{ service_name }}]
-    env:
-      DATABASE_URL: postgres://{{ user }}:$POSTGRES_PASSWORD@{{ service_name }}:5432/{{ database }}
-    env_from_secrets:
-      POSTGRES_PASSWORD: {{ service_name | upper }}_PASSWORD
+connection:
+  depends_on: ["{{ service_name }}"]
+  env:
+    POSTGRES_DB: "{{ database }}"
+    POSTGRES_HOST: "{{ service_name }}"
+    POSTGRES_PORT: "5432"
+    POSTGRES_USER: "{{ user }}"
+  env_from_secrets:
+    POSTGRES_PASSWORD: "{{ service_name | upper }}_PASSWORD"
 
+notes: |
   Backup tip: `yoink exec {{ service_name }} -- pg_dump -U {{ user }} {{ database }}`

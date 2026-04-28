@@ -260,6 +260,18 @@ pub async fn cmd_add(
         }
     }
 
+    if let Some(conn) = rendered.connection.as_ref()
+        && !connection_is_empty(conn)
+    {
+        eprintln!();
+        eprintln!("connect another service to {}:", manifest.name);
+        eprintln!("  # paste under the consuming service in yoink.yaml,");
+        eprintln!("  # rename keys to whatever your app expects.");
+        for line in render_connection_block(conn) {
+            eprintln!("  {line}");
+        }
+    }
+
     if let Some(notes) = &rendered.notes
         && !notes.trim().is_empty()
     {
@@ -300,6 +312,55 @@ fn validate_fragment(text: &str) -> Result<()> {
     use crate::config::ConfigFragment;
     let _: ConfigFragment = yaml_serde::from_str(text)?;
     Ok(())
+}
+
+fn connection_is_empty(c: &manifest::ConnectionSpec) -> bool {
+    c.env.is_empty() && c.env_from_secrets.is_empty() && c.depends_on.is_empty()
+}
+
+/// Format a `ConnectionSpec` as paste-ready yaml lines using the same
+/// fields the consuming service already accepts (`depends_on`, `env`,
+/// `env_from_secrets`). No new schema — neutral keys come from the
+/// manifest, the user pastes and renames as needed.
+fn render_connection_block(c: &manifest::ConnectionSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    if !c.depends_on.is_empty() {
+        let list = c
+            .depends_on
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!("depends_on: [{list}]"));
+    }
+    if !c.env.is_empty() {
+        out.push("env:".into());
+        for (k, v) in &c.env {
+            out.push(format!("  {k}: {}", quote_if_needed(v)));
+        }
+    }
+    if !c.env_from_secrets.is_empty() {
+        out.push("env_from_secrets:".into());
+        for (k, v) in &c.env_from_secrets {
+            out.push(format!("  {k}: {v}"));
+        }
+    }
+    out
+}
+
+/// Quote yaml scalars that look like numbers or contain reserved
+/// characters, so `5432` round-trips as a string and `app:s3://…`
+/// doesn't trip the parser. Conservative — quotes anything that
+/// isn't unambiguously a plain string identifier.
+fn quote_if_needed(v: &str) -> String {
+    let needs_quote = v.is_empty()
+        || v.chars().next().is_some_and(|c| c.is_ascii_digit())
+        || v.contains(|c: char| matches!(c, ':' | '#' | '@' | '\'' | '"' | '\\'));
+    if needs_quote {
+        format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        v.to_string()
+    }
 }
 
 #[derive(Debug)]
