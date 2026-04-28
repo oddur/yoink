@@ -1466,8 +1466,10 @@ impl App {
         if self.secrets_state.confirming_remove() {
             let confirm = matches!(key.code, KeyCode::Char('y') | KeyCode::Enter);
             if confirm {
-                if let Some(key) = self.secrets_state.confirm_remove() {
-                    self.secrets_state.apply_remove(key);
+                if let Some(key) = self.secrets_state.confirm_remove()
+                    && self.secrets_state.apply_remove(key)
+                {
+                    self.spawn_secrets_loader();
                 }
             } else {
                 self.secrets_state.cancel_edit();
@@ -1483,8 +1485,10 @@ impl App {
             match key.code {
                 KeyCode::Esc => self.secrets_state.cancel_edit(),
                 KeyCode::Enter => {
-                    if let Some(commit) = self.secrets_state.commit_input() {
-                        self.secrets_state.apply_commit(commit);
+                    if let Some(commit) = self.secrets_state.commit_input()
+                        && self.secrets_state.apply_commit(commit)
+                    {
+                        self.spawn_secrets_loader();
                     }
                 }
                 KeyCode::Backspace => self.secrets_state.backspace(),
