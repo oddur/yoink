@@ -2814,7 +2814,27 @@ impl App {
         let secrets = self.secrets.clone();
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
-            let bundle = secrets.read().await.clone();
+            // Fresh bundle per modal open. The cached one is loaded
+            // ONCE at startup (spawn_secrets_loader); a long-running
+            // TUI that outlives an Infisical edit / rotation would
+            // otherwise compute desired_hash from stale env and show
+            // bogus drift forever. On refresh failure, fall back to
+            // the cached bundle so the modal still renders something
+            // and surface the staleness via a toast.
+            let bundle = match crate::secrets::load_bundle(&config).await {
+                Ok(Some(fresh)) => {
+                    let arc = std::sync::Arc::new(fresh);
+                    *secrets.write().await = Some(arc.clone());
+                    Some(arc)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    let _ = tx.send(Update::Toast(format!(
+                        "✗ secrets refresh failed: {e} (drift may use stale values)"
+                    )));
+                    secrets.read().await.clone()
+                }
+            };
             let mut overrides = std::collections::BTreeMap::new();
             // For services with no `tag:` in config, fall back to the
             // running replica's tag so the diff isolates the env/label
