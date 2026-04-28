@@ -2839,7 +2839,7 @@ fn open_in_editor(initial: &str) -> Result<String> {
     //   - RAII cleanup, so the plaintext is removed even if a panic
     //     unwinds past the explicit drop below
     //   - O_EXCL semantics under the hood
-    let mut scratch = tempfile_builder_secret()
+    let mut scratch = yoink::sealed::secret_tempfile_builder(Some(0o600))
         .suffix(".env")
         .prefix("yoink-secrets-")
         .tempfile()
@@ -2869,19 +2869,6 @@ fn open_in_editor(initial: &str) -> Result<String> {
     // cleanup error but we'd rather not fail the seal on a tmpfs hiccup.
     drop(scratch);
     Ok(edited)
-}
-
-/// `tempfile::Builder` configured for secrets scratch files: 0600 perms
-/// on Unix from creation. On non-Unix tempfile uses platform-appropriate
-/// defaults (no public-mode hole anyway).
-fn tempfile_builder_secret() -> tempfile::Builder<'static, 'static> {
-    let mut b = tempfile::Builder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        b.permissions(std::fs::Permissions::from_mode(0o600));
-    }
-    b
 }
 
 fn mask_value(s: &str) -> String {

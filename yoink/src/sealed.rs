@@ -354,6 +354,23 @@ fn needs_quoting(s: &str) -> bool {
             .any(|c| c.is_whitespace() || c == '#' || c == '"' || c == '\'')
 }
 
+/// `tempfile::Builder` configured for secrets-bearing scratch files:
+/// 0o600 perms on Unix from creation when `mode` is set, no public
+/// hole even momentarily. Shared between `write_atomically_secret`
+/// and the editor scratch file in the seal/edit CLI flow.
+#[must_use]
+pub fn secret_tempfile_builder(mode: Option<u32>) -> tempfile::Builder<'static, 'static> {
+    let mut b = tempfile::Builder::new();
+    #[cfg(unix)]
+    if let Some(m) = mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        b.permissions(std::fs::Permissions::from_mode(m));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    b
+}
+
 /// Atomic write: write to `<path>.tmp` and rename. Creates parent
 /// directories as needed. Use [`write_atomically_secret`] for files
 /// that must never be world-readable, even briefly.
@@ -387,19 +404,14 @@ fn write_atomically_inner(
     // Random tmp filename in the destination directory: same
     // filesystem (rename(2) atomic) and RAII cleanup if we bail
     // before persist().
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".yoink-").suffix(".tmp");
-    #[cfg(unix)]
-    if let Some(m) = mode {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(m));
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    let mut tmp = builder.tempfile_in(&parent).map_err(|source| SealedError::Write {
-        path: parent.clone(),
-        source,
-    })?;
+    let mut tmp = secret_tempfile_builder(mode)
+        .prefix(".yoink-")
+        .suffix(".tmp")
+        .tempfile_in(&parent)
+        .map_err(|source| SealedError::Write {
+            path: parent.clone(),
+            source,
+        })?;
     tmp.as_file_mut()
         .write_all(bytes)
         .map_err(|source| SealedError::Write {
