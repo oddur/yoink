@@ -2660,30 +2660,14 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
 }
 
 async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
-    use yoink::doctor::{run_doctor, Severity};
+    use yoink::doctor::{run_doctor, tally, Severity};
 
     let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
         std::sync::Arc::new(build_real_ops(config, None).await?);
     let findings = run_doctor(config, ops).await;
 
     if json {
-        let payload: Vec<serde_json::Value> = findings
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "severity": match f.severity {
-                        Severity::Pass => "pass",
-                        Severity::Warn => "warn",
-                        Severity::Error => "error",
-                    },
-                    "category": f.category,
-                    "title": f.title,
-                    "detail": f.detail,
-                    "fix": f.fix,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!("{}", serde_json::to_string_pretty(&findings)?);
     } else {
         for f in &findings {
             let icon = match f.severity {
@@ -2702,25 +2686,12 @@ async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
             }
         }
         eprintln!();
-        let pass = findings
-            .iter()
-            .filter(|f| f.severity == Severity::Pass)
-            .count();
-        let warn = findings
-            .iter()
-            .filter(|f| f.severity == Severity::Warn)
-            .count();
-        let err = findings
-            .iter()
-            .filter(|f| f.severity == Severity::Error)
-            .count();
+        let (pass, warn, err) = tally(&findings);
         eprintln!("summary: {pass} pass, {warn} warn, {err} error");
     }
 
-    let any_error = findings
-        .iter()
-        .any(|f| f.severity == Severity::Error);
-    if any_error {
+    let (_, _, errors) = tally(&findings);
+    if errors > 0 {
         anyhow::bail!("doctor found blocking issues");
     }
     Ok(())

@@ -412,10 +412,10 @@ enum Update {
         result: super::drift::DriftRefresh,
     },
     /// Result of a doctor modal load — the full set of findings from
-    /// `crate::doctor::run_doctor`. `Err` carries a single message
-    /// when the run itself failed (vs returning an Error-severity
-    /// finding, which is normal output).
-    Doctor(Result<Vec<crate::doctor::Finding>, String>),
+    /// `crate::doctor::run_doctor`. The runner always returns a vec
+    /// (errors surface as `Severity::Error` findings, not as a
+    /// run-level failure), so no Result wrapper is needed.
+    Doctor(Vec<crate::doctor::Finding>),
     /// Batch of `(host_address, container_name, stats)` samples produced
     /// by the always-on background stats poller. Each sample is folded
     /// into the per-container `StatsHistory` so that opening a
@@ -2842,10 +2842,7 @@ impl App {
             } => {
                 self.drift.apply(&host, &service, result);
             }
-            Update::Doctor(result) => match result {
-                Ok(findings) => self.doctor.store(findings),
-                Err(msg) => self.doctor.fail(msg),
-            },
+            Update::Doctor(findings) => self.doctor.store(findings),
         }
     }
 
@@ -2860,7 +2857,7 @@ impl App {
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
             let findings = crate::doctor::run_doctor(&config, ops).await;
-            let _ = tx.send(Update::Doctor(Ok(findings)));
+            let _ = tx.send(Update::Doctor(findings));
         });
     }
 

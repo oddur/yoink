@@ -28,7 +28,6 @@ enum Status {
     Closed,
     Loading,
     Loaded(Vec<Finding>),
-    Failed(String),
 }
 
 impl DoctorState {
@@ -52,10 +51,6 @@ impl DoctorState {
         // to bottom") needs no nav. Prior selection rarely makes
         // sense across runs because findings can reorder.
         self.selected.select(if len > 0 { Some(0) } else { None });
-    }
-
-    pub fn fail(&mut self, message: String) {
-        self.status = Status::Failed(message);
     }
 
     pub fn select_next(&mut self) {
@@ -105,11 +100,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut DoctorState) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::ITALIC),
             );
-            frame.render_widget(p, body);
-        }
-        Status::Failed(msg) => {
-            let p = Paragraph::new(format!("doctor failed: {msg}"))
-                .style(Style::default().fg(Color::Red));
             frame.render_widget(p, body);
         }
         Status::Loaded(findings) => {
@@ -170,18 +160,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut DoctorState) {
 
     let summary = match &state.status {
         Status::Loaded(findings) => {
-            let pass = findings
-                .iter()
-                .filter(|f| f.severity == Severity::Pass)
-                .count();
-            let warn = findings
-                .iter()
-                .filter(|f| f.severity == Severity::Warn)
-                .count();
-            let err = findings
-                .iter()
-                .filter(|f| f.severity == Severity::Error)
-                .count();
+            let (pass, warn, err) = crate::doctor::tally(findings);
             format!("{pass} pass, {warn} warn, {err} error  —  ↑↓ navigate, r rerun, Esc close")
         }
         _ => "r rerun, Esc close".to_string(),

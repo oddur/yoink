@@ -20,7 +20,8 @@ use crate::config::{Config, SecretsConfig, ServiceConfig, TlsMode};
 use crate::docker_ops::{DockerOps, Host};
 use crate::sealed;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Check ran and the answer is good. Pass-level findings are
     /// surfaced because absence of evidence is not evidence — the
@@ -36,7 +37,21 @@ pub enum Severity {
     Error,
 }
 
-#[derive(Debug, Clone)]
+/// Pass / Warn / Error counts in a single pass.
+#[must_use]
+pub fn tally(findings: &[Finding]) -> (usize, usize, usize) {
+    let mut t = (0, 0, 0);
+    for f in findings {
+        match f.severity {
+            Severity::Pass => t.0 += 1,
+            Severity::Warn => t.1 += 1,
+            Severity::Error => t.2 += 1,
+        }
+    }
+    t
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Finding {
     pub severity: Severity,
     /// Short categorical label — `host`, `config`, `secrets`, `dns`,
@@ -45,8 +60,10 @@ pub struct Finding {
     /// One-line summary suitable for a list view.
     pub title: String,
     /// Optional follow-up — error text, observed values, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Optional remediation hint — the actionable bit.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
 }
 
@@ -99,8 +116,36 @@ impl Finding {
 /// completes — no individual check failure aborts the whole run; each
 /// surfaces as its own `Error`-severity Finding.
 pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding> {
-    let mut findings: Vec<Finding> = Vec::new();
+    // Fan out the slow / shared I/O up front in one round-trip so
+    // every downstream check reads from cached data:
+    //   - `ops.version` per host (was: called twice per host, once
+    //     in check_hosts + once in check_arch_alignment).
+    //   - bundle load (was: called twice, in check_tls_cert_secrets
+    //     and check_secret_references — two age decrypts / two
+    //     `provider: command` spawns).
+    //   - DNS lookups for `domain:` services (independent of the
+    //     above; concurrent with the version probes).
+    let local_host = Host::local();
+    let host_version_futs = config.hosts.iter().map(|h| {
+        let host = Host::from(h);
+        let ops = ops.clone();
+        async move { (host.clone(), ops.version(&host).await) }
+    });
+    let local_version_fut = ops.version(&local_host);
+    let bundle_fut = crate::secrets::load_bundle(config);
+    let dns_fut = check_dns_for_domains(config);
 
+    let (host_versions, local_version, bundle_result, dns_findings) = tokio::join!(
+        futures_util::future::join_all(host_version_futs),
+        local_version_fut,
+        bundle_fut,
+        dns_fut,
+    );
+    let bundle = bundle_result.ok().flatten();
+    let bundle_ref = bundle.as_ref();
+
+    // Every other check is sync (config walk + cached lookups).
+    let mut findings: Vec<Finding> = Vec::new();
     findings.extend(check_secrets(config));
     findings.extend(check_sealed_file_exists(config));
     findings.extend(check_provider_command(config));
@@ -108,11 +153,15 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
     findings.extend(check_build_blocks(config));
     findings.extend(check_dockerfile_paths(config));
     findings.extend(check_proxied_services(config));
-    findings.extend(check_tls_cert_secrets(config).await);
-    findings.extend(check_secret_references(config).await);
-    findings.extend(check_hosts(config, ops.clone()).await);
-    findings.extend(check_arch_alignment(config, ops.clone()).await);
-    findings.extend(check_dns_for_domains(config).await);
+    findings.extend(check_tls_cert_secrets(config, bundle_ref));
+    findings.extend(check_secret_references(config, bundle_ref));
+    findings.extend(check_hosts_from_versions(&host_versions));
+    findings.extend(check_arch_alignment_from_versions(
+        config,
+        local_version.as_ref().ok(),
+        &host_versions,
+    ));
+    findings.extend(dns_findings);
 
     findings
 }
@@ -273,11 +322,12 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
 
 // ---------- hosts ----------
 
-async fn check_hosts(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding> {
+fn check_hosts_from_versions(
+    versions: &[(Host, Result<crate::docker_ops::DockerVersion, crate::docker_ops::DockerError>)],
+) -> Vec<Finding> {
     let mut out = Vec::new();
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
-        match ops.version(&host).await {
+    for (host, result) in versions {
+        match result {
             Ok(v) => {
                 out.push(
                     Finding::pass("host", format!("{}: docker reachable", host.address))
@@ -310,7 +360,11 @@ async fn check_hosts(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding> {
 
 // ---------- arch alignment (local vs hosts) ----------
 
-async fn check_arch_alignment(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding> {
+fn check_arch_alignment_from_versions(
+    config: &Config,
+    local_version: Option<&crate::docker_ops::DockerVersion>,
+    versions: &[(Host, Result<crate::docker_ops::DockerVersion, crate::docker_ops::DockerError>)],
+) -> Vec<Finding> {
     let any_local_build = config.services.iter().any(|s| s.build.is_some());
     if !any_local_build {
         return vec![Finding::pass(
@@ -318,38 +372,21 @@ async fn check_arch_alignment(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<F
             "arch-alignment check skipped (no services have `build:` blocks)",
         )];
     }
-
-    // We need both local docker (for the build) and each remote
-    // host's arch (for the run target). If either fails, bail with
-    // a single Finding rather than spamming.
-    let local_host = Host {
-        user: String::new(),
-        address: Host::LOCAL_ADDRESS.to_string(),
-    };
-    let local = match ops.version(&local_host).await {
-        Ok(v) => v,
-        Err(e) => {
-            return vec![
-                Finding::warn(
-                    "build",
-                    "couldn't query local docker arch — skipping cross-build check",
-                )
-                .with_detail(e.to_string()),
-            ];
-        }
+    let Some(local) = local_version else {
+        return vec![Finding::warn(
+            "build",
+            "couldn't query local docker arch — skipping cross-build check",
+        )];
     };
     let local_arch = local.arch.as_deref().unwrap_or("");
 
     let mut out = Vec::new();
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
+    for (host, result) in versions {
         if host.is_local() {
             continue;
         }
-        // Skip silently — `check_hosts` already surfaced the failure.
-        let Ok(remote) = ops.version(&host).await else {
-            continue;
-        };
+        // Skip silently — check_hosts already surfaced the failure.
+        let Ok(remote) = result else { continue };
         let remote_arch = remote.arch.as_deref().unwrap_or("");
         if local_arch.is_empty() || remote_arch.is_empty() {
             continue;
@@ -406,7 +443,6 @@ fn canonical_platform(arch: &str) -> &'static str {
 async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
     use tokio::net::lookup_host;
 
-    let mut out = Vec::new();
     let any_domain = config.services.iter().any(|s| s.domain.is_some());
     if !any_domain {
         return vec![Finding::pass(
@@ -414,54 +450,50 @@ async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
             "DNS check skipped (no services have `domain:` set)",
         )];
     }
-    for svc in &config.services {
-        let Some(domain) = &svc.domain else { continue };
-        for host in domain.as_list() {
-            // `lookup_host` wants `host:port`; we don't care about the
-            // port, just whether the name resolves to A/AAAA records.
-            let probe = format!("{host}:443");
-            match lookup_host(&probe).await {
+    // Flatten every (service, host) into one list so they all
+    // resolve concurrently via join_all instead of awaiting each
+    // lookup serially.
+    let domains: Vec<String> = config
+        .services
+        .iter()
+        .filter_map(|s| s.domain.as_ref())
+        .flat_map(crate::config::DomainSpec::as_list)
+        .collect();
+    let lookups = domains.into_iter().map(|host| async move {
+        // `lookup_host` wants `host:port`; we don't care about the
+        // port, just whether the name resolves to A/AAAA records.
+        let probe = format!("{host}:443");
+        let result = lookup_host(probe).await;
+        (host, result)
+    });
+    futures_util::future::join_all(lookups)
+        .await
+        .into_iter()
+        .map(|(host, result)| {
+            match result {
                 Ok(addrs) => {
-                    let ips: Vec<String> =
-                        addrs.map(|a| a.ip().to_string()).collect();
+                    let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
                     if ips.is_empty() {
-                        out.push(
-                            Finding::error(
-                                "dns",
-                                format!("`{host}` doesn't resolve"),
-                            )
-                            .with_fix(format!(
+                        Finding::error("dns", format!("`{host}` doesn't resolve")).with_fix(
+                            format!(
                                 "add an A/AAAA record for `{host}` \
                                  pointing at the host's public IP — \
                                  Let's Encrypt validates by HTTP-01"
-                            )),
-                        );
+                            ),
+                        )
                     } else {
-                        out.push(
-                            Finding::pass(
-                                "dns",
-                                format!("`{host}` resolves"),
-                            )
-                            .with_detail(format!("→ {}", ips.join(", "))),
-                        );
+                        Finding::pass("dns", format!("`{host}` resolves"))
+                            .with_detail(format!("→ {}", ips.join(", ")))
                     }
                 }
-                Err(e) => {
-                    out.push(
-                        Finding::error(
-                            "dns",
-                            format!("`{host}` lookup failed"),
-                        )
-                        .with_detail(e.to_string())
-                        .with_fix(format!(
-                            "add an A/AAAA record for `{host}` and wait for propagation"
-                        )),
-                    );
-                }
+                Err(e) => Finding::error("dns", format!("`{host}` lookup failed"))
+                    .with_detail(e.to_string())
+                    .with_fix(format!(
+                        "add an A/AAAA record for `{host}` and wait for propagation"
+                    )),
             }
-        }
-    }
-    out
+        })
+        .collect()
 }
 
 // ---------- sealed.age existence ----------
@@ -489,9 +521,8 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
             "sealed file check skipped (no services reference secrets)",
         )];
     }
-    let path = match sealed::resolve_sealed_path(config, file.as_deref()) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
+    let Ok(path) = sealed::resolve_sealed_path(config, file.as_deref()) else {
+        return Vec::new();
     };
     if path.exists() {
         return vec![Finding::pass(
@@ -675,7 +706,10 @@ fn check_dockerfile_paths(config: &Config) -> Vec<Finding> {
 
 // ---------- TLS cert mode requires bundle entries ----------
 
-async fn check_tls_cert_secrets(config: &Config) -> Vec<Finding> {
+fn check_tls_cert_secrets(
+    config: &Config,
+    bundle: Option<&crate::secrets::SecretsBundle>,
+) -> Vec<Finding> {
     let proxy_default_cert = config
         .proxy
         .as_ref()
@@ -697,11 +731,10 @@ async fn check_tls_cert_secrets(config: &Config) -> Vec<Finding> {
             "TLS cert-mode check skipped (no services use `tls: cert`)",
         )];
     }
-    let bundle = match crate::secrets::load_bundle(config).await {
-        Ok(Some(b)) => b,
-        // If we can't load the bundle, `check_secret_references` will
-        // already have surfaced that — don't double-report.
-        _ => return Vec::new(),
+    // If the bundle isn't loaded, `check_secret_references` will have
+    // already surfaced that — don't double-report.
+    let Some(bundle) = bundle else {
+        return Vec::new();
     };
 
     let mut out = Vec::new();
@@ -758,31 +791,28 @@ async fn check_tls_cert_secrets(config: &Config) -> Vec<Finding> {
 
 // ---------- env_from_secrets / secrets references match the bundle ----------
 
-async fn check_secret_references(config: &Config) -> Vec<Finding> {
+fn check_secret_references(
+    config: &Config,
+    bundle: Option<&crate::secrets::SecretsBundle>,
+) -> Vec<Finding> {
     let any_refs = config
         .services
         .iter()
         .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty());
     if !any_refs {
-        return Vec::new();
+        return vec![Finding::pass(
+            "secrets",
+            "secret-reference check skipped (no services reference secrets)",
+        )];
     }
-    let bundle = match crate::secrets::load_bundle(config).await {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            return vec![
-                Finding::error(
-                    "secrets",
-                    "services reference secrets but no bundle is configured",
-                )
-                .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)"),
-            ];
-        }
-        Err(e) => {
-            return vec![
-                Finding::error("secrets", "couldn't load secrets bundle for cross-check")
-                    .with_detail(e.to_string()),
-            ];
-        }
+    let Some(bundle) = bundle else {
+        return vec![
+            Finding::error(
+                "secrets",
+                "services reference secrets but no bundle is configured / loadable",
+            )
+            .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)"),
+        ];
     };
 
     let mut out = Vec::new();
