@@ -155,6 +155,41 @@ enum Command {
         #[arg(long)]
         no_secrets: bool,
     },
+    /// Drop a vetted template into your repo — accessory (postgres,
+    /// redis, …) or full app (openclaw, …). Fetches from GitHub,
+    /// runs a wizard for variable substitution, seals any generated
+    /// secrets, extends `yoink.yaml`'s `include:` list. Use a bare
+    /// name (`postgres`) for the bundled set, `gh:owner/repo/path`
+    /// for arbitrary 3rd-party templates.
+    Add {
+        /// Template ref. Bare (`postgres`), pinned (`postgres@<sha>`),
+        /// or `gh:owner/repo[@ref]/path` for an external source.
+        /// Mutually exclusive with `--from-path`. Omit both to open
+        /// the interactive picker (or pipe `yoink add` for a
+        /// scriptable list dump).
+        r#ref: Option<String>,
+        /// Use a local directory as the template source instead of
+        /// fetching from GitHub. For template authors iterating on a
+        /// manifest without push-pull cycles. The path must contain
+        /// a `template.yaml`.
+        #[arg(long, value_name = "PATH", conflicts_with = "ref")]
+        from_path: Option<PathBuf>,
+        /// Skip every confirmation prompt (use defaults). Required in
+        /// non-interactive contexts (CI).
+        #[arg(long)]
+        yes: bool,
+        /// Run `yoink up` immediately after the fragment is in place.
+        /// `kind: app` templates default to yes when interactive.
+        #[arg(long)]
+        up: bool,
+        /// Re-resolve a branch/tag ref to the latest SHA, bypassing the
+        /// local cache mapping. Pinned-SHA refs are unaffected.
+        #[arg(long)]
+        refresh: bool,
+        /// Set a manifest variable. Repeatable: `--var name=db --var version=17`.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        var: Vec<String>,
+    },
     /// Verify Docker is reachable on each configured host.
     Preflight,
     /// Reconcile every service in the config to its desired spec.
@@ -897,10 +932,71 @@ async fn run(cli: Cli) -> Result<()> {
         return result;
     }
 
-    let config = Config::load_from_path(&cli.config)
-        .with_context(|| format!("loading {}", cli.config.display()))?;
+    // `yoink add` may be the very command that fixes a dangling
+    // reference (e.g. `depends_on: [postgres]` written before
+    // `yoink add postgres` ran), so it loads through the relaxed
+    // path that skips cross-service validation. Every other command
+    // assumes a deployable config.
+    let config = if matches!(cli.command, Command::Add { .. }) {
+        Config::load_from_path_relaxed(&cli.config)
+    } else {
+        Config::load_from_path(&cli.config)
+    }
+    .with_context(|| format!("loading {}", cli.config.display()))?;
 
     match cli.command {
+        Command::Add {
+            r#ref,
+            from_path,
+            yes,
+            up,
+            refresh,
+            var,
+        } => {
+            let outcome = yoink::add::cmd_add(
+                &config,
+                &cli.config,
+                yoink::add::AddOpts {
+                    r#ref,
+                    from_path,
+                    yes,
+                    up,
+                    refresh,
+                    vars: var,
+                },
+            )
+            .await?;
+            if outcome.deploy_requested {
+                // include: edits + new fragment files mean the in-memory
+                // config we loaded above is now stale. Reload before
+                // running up so the freshly-added service is included.
+                let reloaded = Config::load_from_path(&cli.config)
+                    .with_context(|| format!("reloading {}", cli.config.display()))?;
+                let no_services: Vec<String> = Vec::new();
+                let no_tags: Vec<String> = Vec::new();
+                cmd_up(
+                    &reloaded,
+                    UpOptions {
+                        services: &no_services,
+                        tag_args: &no_tags,
+                        allow_dirty: false,
+                        dry_run: false,
+                        format: DryRunFormat::Text,
+                        no_registry: false,
+                        transport: TransportMode::Auto.into(),
+                        build: false,
+                        force: false,
+                        here: false,
+                        plan: false,
+                        watch: false,
+                        config_path: &cli.config,
+                    },
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        }
         Command::Preflight => cmd_preflight(&config).await,
         Command::Up {
             services,
@@ -1222,10 +1318,26 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // separately. Push is intentionally not auto-engaged — kamal-style
     // flows still go through the explicit `yoink build --push` step.
     if build {
-        for svc in config.selected_services(services_filter) {
-            if svc.build.is_none() {
-                continue;
-            }
+        let buildable: Vec<&yoink::config::ServiceConfig> = config
+            .selected_services(services_filter)
+            .filter(|s| s.build.is_some())
+            .collect();
+        if buildable.is_empty() {
+            // Silent no-op was the worst UX — operator passes --build,
+            // assumes building happened, deploys an unchanged image.
+            // Loud-fail with the diagnosis.
+            let selected: Vec<&str> = config
+                .selected_services(services_filter)
+                .map(|s| s.name.as_str())
+                .collect();
+            anyhow::bail!(
+                "--build was set but no selected service has a `build:` block. \
+                 Selected: [{}]. Add `build: {{ context: . }}` to a service, \
+                 or drop --build for an image-only deploy.",
+                selected.join(", ")
+            );
+        }
+        for svc in buildable {
             let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
             yoink::build::build_service(config, svc, &tag, false, false)
                 .await
@@ -1290,6 +1402,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             &tag_overrides,
             services_filter,
             bundle.as_ref(),
+            no_registry,
             prefetch_cb,
         )
         .await
@@ -3417,7 +3530,7 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
     let parsed = sealed::parse_dotenv(&edited)?;
     let canonical = sealed::render_dotenv(&parsed);
     let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
-    sealed::write_atomically(&path, &sealed_bytes)?;
+    sealed::write_atomically_secret(&path, &sealed_bytes)?;
     println!("sealed {} key(s) to {}", parsed.len(), path.display());
     Ok(())
 }
@@ -3503,7 +3616,7 @@ fn cmd_secrets_seal(config: &Config, input: Option<&Path>, out: Option<PathBuf>)
         Some(p) => p,
         None => sealed::resolve_sealed_path(config, file_override.as_deref())?,
     };
-    sealed::write_atomically(&target, &sealed_bytes)?;
+    sealed::write_atomically_secret(&target, &sealed_bytes)?;
     println!("sealed {} key(s) to {}", parsed.len(), target.display());
     Ok(())
 }
@@ -3537,7 +3650,7 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
         next.push(new_public.clone());
     }
     let resealed = sealed::seal(canonical.as_bytes(), &next)?;
-    sealed::write_atomically(&path, &resealed)?;
+    sealed::write_atomically_secret(&path, &resealed)?;
 
     println!(
         "re-sealed {} key(s) to {} ({} recipients)",

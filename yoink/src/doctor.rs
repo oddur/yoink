@@ -288,15 +288,24 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
         )];
     }
 
-    if config.proxy.as_ref().and_then(|p| p.email.as_deref()).is_none() {
+    let email = config.proxy.as_ref().and_then(|p| p.email.as_deref());
+    if email.is_none() {
         out.push(
             Finding::warn(
                 "config",
                 "`proxy.email:` is unset; Let's Encrypt registration uses a placeholder",
             )
             .with_fix(
-                "set `proxy: { email: you@example.com }` so ACME expiry warnings reach you",
+                "set `proxy: { email: <your real email> }` so ACME expiry warnings reach you",
             ),
+        );
+    } else if email.is_some_and(is_placeholder_email) {
+        out.push(
+            Finding::warn(
+                "config",
+                "`proxy.email:` is still the placeholder; ACME expiry warnings won't reach a real address",
+            )
+            .with_fix("replace `proxy.email:` with an address you actually read"),
         );
     }
 
@@ -318,6 +327,22 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// Catch the placeholders the docs and recipe templates ship with —
+/// users who copy-paste forget to swap them for a real address, which
+/// silently breaks ACME expiry warnings.
+fn is_placeholder_email(email: &str) -> bool {
+    let lower = email.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "you@example.com"
+            | "user@example.com"
+            | "admin@example.com"
+            | "me@example.com"
+            | "your-email@example.com"
+    ) || lower.ends_with("@example.com")
+        || lower.ends_with("@example.org")
 }
 
 // ---------- hosts ----------

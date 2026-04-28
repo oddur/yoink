@@ -1,0 +1,31 @@
+services:
+  - name: {{ service_name }}
+    image: getmeili/meilisearch
+    tag: "{{ version }}"
+    env:
+      MEILI_ENV: {{ env_label }}
+      MEILI_NO_ANALYTICS: "true"
+    env_from_secrets:
+      MEILI_MASTER_KEY: {{ service_name | upper }}_MASTER_KEY
+    run:
+      port: 7700
+      healthcheck_path: /health
+      volumes:
+        - meili-{{ service_name }}-data:/meili_data
+      options:
+        memory: {{ memory }}
+        # Stable DNS name for in-network clients. Without this, yoink
+        # only registers `{{ service_name }}-<spec_hash>` as the alias,
+        # so `http://{{ service_name }}:7700` wouldn't resolve.
+        network_aliases: [{{ service_name }}]
+        # The meilisearch image's default USER is `meili`, but the
+        # /meili_data volume mount is owned by root — and with yoink's
+        # default cap_drop=ALL, the container can't chown it. Run as
+        # root so the index directory is writable; meili itself
+        # doesn't drop privileges, so this is the simplest path.
+        user: "0:0"
+        # Meili writes payload-receive buffers to its working directory
+        # during ingest, which lands on the rootfs (the volume only
+        # covers /meili_data). yoink defaults to read_only=true; flip
+        # it for meili.
+        read_only: false

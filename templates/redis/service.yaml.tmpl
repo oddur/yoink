@@ -1,0 +1,24 @@
+services:
+  - name: {{ service_name }}
+    image: redis
+    tag: 7-alpine
+    run:
+      cmd:
+        - redis-server
+        - --maxmemory
+        - "{{ maxmemory }}"
+        - --maxmemory-policy
+        - allkeys-lru
+        - --save
+        - ""
+        - --appendonly
+        - "no"
+      options:
+        memory: {{ memory }}
+        # Stable DNS name for in-network clients. Without this, yoink
+        # only registers `{{ service_name }}-<spec_hash>` as the alias,
+        # so `host: {{ service_name }}` in the connecting service's
+        # config wouldn't resolve.
+        network_aliases: [{{ service_name }}]
+        tmpfs:
+          /data: size=32m,mode=1777

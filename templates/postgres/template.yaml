@@ -1,0 +1,47 @@
+name: postgres
+kind: accessory
+description: PostgreSQL with sealed credentials and a named volume for data.
+
+variables:
+  - name: service_name
+    prompt: Service name
+    default: postgres
+    pattern: "^[a-z][a-z0-9-]*$"
+  - name: version
+    prompt: Postgres major version
+    default: "16"
+    choices: ["15", "16", "17"]
+  - name: database
+    prompt: Default database name
+    default: app
+    pattern: "^[a-zA-Z_][a-zA-Z0-9_]*$"
+  - name: user
+    prompt: Database user
+    default: app
+    pattern: "^[a-zA-Z_][a-zA-Z0-9_]*$"
+  - name: memory
+    prompt: Memory limit
+    default: 512m
+
+files:
+  - dest: "services/{{ service_name }}.yaml"
+    template: service.yaml.tmpl
+
+secrets:
+  - name: "{{ service_name | upper }}_PASSWORD"
+    generate: "random:32"
+
+include_glob: "services/*.yaml"
+
+connection:
+  depends_on: ["{{ service_name }}"]
+  env:
+    POSTGRES_DB: "{{ database }}"
+    POSTGRES_HOST: "{{ service_name }}"
+    POSTGRES_PORT: "5432"
+    POSTGRES_USER: "{{ user }}"
+  env_from_secrets:
+    POSTGRES_PASSWORD: "{{ service_name | upper }}_PASSWORD"
+
+notes: |
+  Backup tip: `yoink exec {{ service_name }} -- pg_dump -U {{ user }} {{ database }}`

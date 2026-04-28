@@ -1,0 +1,47 @@
+name: openclaw
+kind: app
+description: Placeholder web-app template (rename to suit). Deploys a single
+  containerised app behind yoink's bundled Caddy with HTTPS.
+
+variables:
+  - name: service_name
+    prompt: Service name
+    default: openclaw
+    pattern: "^[a-z][a-z0-9-]*$"
+  - name: image
+    prompt: Container image
+    default: ghcr.io/example/openclaw
+  - name: tag
+    prompt: Image tag
+    default: latest
+  - name: domain
+    prompt: Public domain (e.g. claw.example.com)
+    default: ""
+  - name: port
+    prompt: Container HTTP port
+    default: "8080"
+    pattern: "^[0-9]+$"
+  - name: memory
+    prompt: Memory limit
+    default: 512m
+
+files:
+  - dest: "services/{{ service_name }}.yaml"
+    template: service.yaml.tmpl
+
+secrets:
+  - name: "{{ service_name | upper }}_SECRET_KEY"
+    generate: "random:32"
+
+include_glob: "services/*.yaml"
+
+notes: |
+  This is a placeholder app template — rename it, point `image:` at
+  your real container, and adjust env/secrets in
+  services/{{ service_name }}.yaml.
+
+  HTTPS is wired automatically because `domain:` is set; yoink's
+  bundled Caddy will request a Let's Encrypt cert on first deploy.
+
+  Deploy: `yoink up`
+  Tail logs: `yoink logs {{ service_name }} -f`

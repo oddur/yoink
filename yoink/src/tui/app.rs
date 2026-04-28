@@ -3923,6 +3923,7 @@ async fn reconcile_all(
         &overrides,
         None,
         secrets_ref,
+        false, // TUI deploys go through registries; locally-built path is CLI-only
         prefetch_cb,
     )
     .await

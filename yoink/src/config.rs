@@ -970,6 +970,34 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Like [`load_from_path`] but skips the final `validate()` pass —
+    /// returns even when the loaded config has dangling `depends_on`
+    /// or other cross-service references.
+    ///
+    /// Used by `yoink add`: the operator may have referenced a service
+    /// that doesn't exist yet (e.g. `depends_on: [postgres]` in the
+    /// app, before `yoink add postgres` ran). Hard-rejecting at load
+    /// time would lock them out of the very command that fixes the
+    /// reference. The add flow validates each *rendered fragment* on
+    /// its own (`Config::parse_str` inside the orchestrator), and the
+    /// post-add reload (when the operator opts into `--up`) goes
+    /// through the strict path.
+    pub fn load_from_path_relaxed(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let mut cfg: Self = yaml_serde::from_str(&text)?;
+        cfg.config_dir = path.parent().map(std::path::Path::to_path_buf);
+        cfg.merge_includes()?;
+        cfg.normalize_image_references()?;
+        // Skip inject_implicit_proxy + validate + topo_sort — those
+        // are what reject incomplete configs. The add flow only reads
+        // `secrets`, `services`, and `include`; an un-injected proxy
+        // is fine because we're not deploying.
+        Ok(cfg)
+    }
+
     pub fn parse_str(text: &str) -> Result<Self, ConfigError> {
         let mut config: Self = yaml_serde::from_str(text)?;
         config.normalize_image_references()?;

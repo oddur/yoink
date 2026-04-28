@@ -1,0 +1,41 @@
+name: meilisearch
+kind: accessory
+description: Meilisearch with sealed master key and a named volume for the index.
+
+variables:
+  - name: service_name
+    prompt: Service name
+    default: meili
+    pattern: "^[a-z][a-z0-9-]*$"
+  - name: version
+    prompt: Meilisearch version
+    default: v1.10
+  - name: env_label
+    prompt: MEILI_ENV
+    default: production
+    choices: [production, development]
+  - name: memory
+    prompt: Memory limit
+    default: 512m
+
+files:
+  - dest: "services/{{ service_name }}.yaml"
+    template: service.yaml.tmpl
+
+secrets:
+  - name: "{{ service_name | upper }}_MASTER_KEY"
+    generate: "random:48"
+
+include_glob: "services/*.yaml"
+
+connection:
+  depends_on: ["{{ service_name }}"]
+  env:
+    MEILI_HOST: "{{ service_name }}"
+    MEILI_PORT: "7700"
+  env_from_secrets:
+    MEILI_MASTER_KEY: "{{ service_name | upper }}_MASTER_KEY"
+
+notes: |
+  Probe the API: `yoink shell {{ service_name }}` then
+  `curl -H "Authorization: Bearer $MEILI_MASTER_KEY" http://localhost:7700/keys`

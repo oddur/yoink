@@ -1,0 +1,31 @@
+name: redis
+kind: accessory
+description: Redis 7 with secure-by-default options and a tunable memory cap.
+
+variables:
+  - name: service_name
+    prompt: Service name
+    default: redis
+    pattern: "^[a-z][a-z0-9-]*$"
+  - name: maxmemory
+    prompt: Maxmemory cap (redis --maxmemory)
+    default: 256mb
+  - name: memory
+    prompt: Container memory limit
+    default: 300m
+
+files:
+  - dest: "services/{{ service_name }}.yaml"
+    template: service.yaml.tmpl
+
+include_glob: "services/*.yaml"
+
+connection:
+  depends_on: ["{{ service_name }}"]
+  env:
+    REDIS_HOST: "{{ service_name }}"
+    REDIS_PORT: "6379"
+
+notes: |
+  No auth is configured. The service is only reachable on the docker
+  network — keep it that way unless you know what you're doing.
