@@ -28,7 +28,7 @@ Single-host PaaS tools are wonderful for "one app, one host" but creak the momen
 - **Drift detection.** Every effective spec (image, env, networks, mounts, options, file content) hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
 - **Build where it makes sense, ship how it makes sense.** Yoink treats build origin and distribution as independent choices. Build on a developer laptop OR in CI (both first-class — same `yoink up`). Ship from a real container registry OR push the locally-built image straight to each host with no registry in between. **Incremental layer push works on both paths**: a real registry dedupes natively, and the registry-less path (`--no-registry`) uses an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar to get the same layer-level dedup over SSH. Pick whichever combination fits — drop the `build:` block for CI-built infra, keep it for app code, mix freely.
 - **Secure by default.** Containers run as a non-root uid (65534) with cap_drop=ALL, no-new-privileges, read-only rootfs, init=tini, tmpfs noexec, binds default :ro. Override per service when an image genuinely needs root or specific file ownership.
-- **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI) or `YOINK_AGE_KEY_FILE` (a gitignored `age.key` next to your `yoink.yaml`). No remote vault required. Infisical stays available as an opt-in for teams already running it.
+- **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI) or `YOINK_AGE_KEY_FILE` (a gitignored `age.key` next to your `yoink.yaml`). No remote vault required. For teams that prefer a managed store, `provider: command` shells out to whatever CLI you already use (Doppler, 1Password, Vault, AWS Secrets Manager, the Infisical CLI, …) — no first-party SDK to vendor.
 - **Bundled reverse proxy.** Set `domain:` on a service and yoink's bundled Caddy fronts it with HTTPS — automatic Let's Encrypt or sealed Cloudflare origin certs (with optional origin-pull mTLS). h2c for gRPC, HSTS, compression, multi-host canonical redirects — all one-line opt-ins.
 - **CLI + YAML, no GUI.** The entire control surface is the `yoink` binary plus `yoink.yaml`. No web dashboard to click, no API to script. The same workflow that you run by hand drives CI runners and AI coding agents identically — yoink is happy to be driven by Claude Code, Cursor, or a GitHub Actions job.
 - **k9s-style TUI.** A `ratatui` dashboard with one-key reconcile, prune, kill, shell-into, debug-sidecar, log filter, deploy history with one-press rollback. Keyboard-only.
@@ -39,13 +39,14 @@ Yoink picks "batteries included" over "framework" for the boring-but-important p
 
 Where the in-the-box default isn't the right answer for a team, yoink extends rather than blocks. **Secrets** is the canonical example:
 
-| | Default (`provider: age`) | Opt-in (`provider: infisical`) |
+| | Default (`provider: age`) | Opt-in (`provider: command`) |
 |---|---|---|
-| Where the values live | committed `secrets.age` in the repo | external Infisical instance |
-| Setup | `yoink secrets keygen` | machine identity, project, env config |
-| When it's the right choice | small team, single environment, trust the repo as the source of truth | already running Infisical, want a UI for non-engineers, need centralized audit |
+| Where the values live | committed `secrets.age` in the repo | wherever your secret manager already keeps them |
+| Setup | `yoink secrets key generate` | configure the manager's CLI as usual; point yoink at it |
+| When it's the right choice | small team, single environment, trust the repo as the source of truth | shared rotation across many repos, audit trail, fine-grained ACLs, can't commit secrets at all |
+| Examples | `secrets.age` + `YOINK_AGE_KEY` | `["doppler","secrets","download","--no-file","--format","env"]`, `["op","inject","-i","secrets.tpl"]`, `["vault","kv","get","-format=json","..."]`, … |
 
-The schema is an enum (`SecretsConfig::Age` / `SecretsConfig::Infisical`), so future providers (Vault, AWS Secrets Manager, …) plug in as additional variants without changing the per-service `secrets:` surface. Existing configs keep working as new providers land.
+The `command` path means yoink doesn't need first-party integrations for every secret manager — any CLI that emits dotenv or JSON on stdout works. See [external secrets via CLI](/docs/recipes/secrets-external-cli) for per-tool recipes.
 
 The same shape applies elsewhere: registry credentials, CI integrations, host-level networking. Yoink's job is to make the obvious choice work without configuration, and to stay out of the way when the operator needs to swap a piece for something specific.
 

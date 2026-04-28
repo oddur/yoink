@@ -463,26 +463,15 @@ enum Command {
 /// Subcommands for `yoink secrets`.
 #[derive(clap::Subcommand)]
 enum SecretsAction {
-    /// Generate a fresh age identity. By default the secret key is
-    /// printed to stdout — operator decides where to save it
-    /// (typically a gitignored `age.key` next to the project's
-    /// `yoink.yaml`, OR pasted into a CI secret). The public
-    /// recipient is also printed for committing to `yoink.yaml`
-    /// under `secrets.recipients:`. Pass `--out PATH` to write the
-    /// secret to a specific file with mode 0o600 instead.
-    ///
-    /// Yoink intentionally does NOT default to a global location
-    /// like `~/.config/yoink/age.key` — multiple projects with
-    /// distinct identities would collide there.
-    Keygen {
-        /// Write the secret key to PATH (mode 0o600) instead of
-        /// printing it to stdout. Refuses to overwrite an existing
-        /// file unless `--force`. Make sure PATH is gitignored.
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// Overwrite an existing identity at `--out`.
-        #[arg(long)]
-        force: bool,
+    /// Manage the age identity used to (un)seal `secrets.age`. The
+    /// identity is just an X25519 keypair; the public half lands in
+    /// `secrets.recipients:` of `yoink.yaml`, and the private half
+    /// gets routed through whatever secret manager you already use
+    /// (GitHub Actions secret, 1Password, AWS Secrets Manager, …).
+    /// See `docs/recipes/secrets-*` for per-tool wiring.
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
     },
     /// Decrypt the sealed file into `$EDITOR`, then re-seal on save.
     /// Creates the file if it doesn't exist yet.
@@ -513,6 +502,36 @@ enum SecretsAction {
     /// old recipient and run `yoink secrets edit` (just save without
     /// changes) to re-seal under the new recipients only.
     Rotate,
+}
+
+#[derive(clap::Subcommand)]
+enum KeyAction {
+    /// Generate a fresh age identity. By default the secret key is
+    /// printed to stdout — operator decides where to route it
+    /// (gitignored file, GitHub Actions secret, 1Password item, …).
+    /// The public recipient is also printed for adding to
+    /// `secrets.recipients:` in `yoink.yaml`. Pass `--out PATH` to
+    /// write the secret to a specific file with mode 0o600 instead.
+    ///
+    /// Yoink intentionally does NOT default to a global location
+    /// like `~/.config/yoink/age.key` — multiple projects with
+    /// distinct identities would collide there.
+    Generate {
+        /// Write the secret key to PATH (mode 0o600) instead of
+        /// printing it to stdout. Refuses to overwrite an existing
+        /// file unless `--force`. Make sure PATH is gitignored.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Overwrite an existing identity at `--out`.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the public recipient (`age1…`) derived from the
+    /// currently-resolved identity. Useful for "is the key in my
+    /// shell the same one yoink.yaml expects?" sanity checks.
+    /// Identity resolution: `YOINK_AGE_KEY` (raw) →
+    /// `YOINK_AGE_KEY_FILE` (path) → `~/.config/yoink/age.key`.
+    Public,
 }
 
 /// Subcommands for `yoink lock`.
@@ -2275,7 +2294,7 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
             "registry_server": config.registry.as_ref().map(|r| r.server.clone()),
             "secrets_provider": config.secrets.as_ref().map(|s| match s {
                 yoink::config::SecretsConfig::Age { .. } => "age",
-                yoink::config::SecretsConfig::Infisical { .. } => "infisical",
+                yoink::config::SecretsConfig::Command { .. } => "command",
             }),
         },
         "hosts": hosts_json,
@@ -2530,8 +2549,10 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             Some(Ok(()))
         }
         Command::Secrets {
-            action: SecretsAction::Keygen { out, force },
-        } => Some(cmd_secrets_keygen(out.clone(), *force)),
+            action: SecretsAction::Key {
+                action: KeyAction::Generate { out, force },
+            },
+        } => Some(cmd_secrets_key_generate(out.clone(), *force)),
         Command::Init {
             host,
             force,
@@ -2555,7 +2576,10 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
 
 fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     match action {
-        SecretsAction::Keygen { out, force } => cmd_secrets_keygen(out, force),
+        SecretsAction::Key { action } => match action {
+            KeyAction::Generate { out, force } => cmd_secrets_key_generate(out, force),
+            KeyAction::Public => cmd_secrets_key_public(),
+        },
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
         SecretsAction::Seal { r#in, out } => cmd_secrets_seal(config, r#in.as_deref(), out),
@@ -2563,7 +2587,15 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     }
 }
 
-fn cmd_secrets_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
+fn cmd_secrets_key_public() -> Result<()> {
+    use yoink::sealed;
+    let identity = sealed::load_identity()
+        .with_context(|| "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, or place one at ~/.config/yoink/age.key")?;
+    println!("{}", identity.to_public());
+    Ok(())
+}
+
+fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool) -> Result<()> {
     use yoink::sealed;
     let (secret, public) = sealed::keygen();
     let recipient_block =
@@ -2740,11 +2772,12 @@ fn expect_secrets_provider_age(config: &Config) -> Result<&yoink::config::Secret
     use yoink::config::SecretsConfig;
     match config.secrets.as_ref() {
         Some(s @ SecretsConfig::Age { .. }) => Ok(s),
-        Some(SecretsConfig::Infisical { .. }) => Err(anyhow::anyhow!(
-            "yoink.yaml configures `provider: infisical` — `yoink secrets` only manages age-sealed files"
+        Some(SecretsConfig::Command { .. }) => Err(anyhow::anyhow!(
+            "yoink.yaml configures `provider: command` — `yoink secrets` only manages age-sealed files. \
+             To rotate values in your external secret store, use that store's CLI directly."
         )),
         None => Err(anyhow::anyhow!(
-            "no `secrets:` block in yoink.yaml — add `secrets: {{ provider: age, recipients: [...] }}` first (see `yoink secrets keygen`)"
+            "no `secrets:` block in yoink.yaml — add `secrets: {{ provider: age, recipients: [...] }}` first (see `yoink secrets key generate`)"
         )),
     }
 }

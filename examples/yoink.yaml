@@ -14,9 +14,21 @@ hosts:
     user: deploy
 
 secrets:
-  provider: infisical
-  project_id: PROJECT_ID
-  environment: prod
+  # Default: a sealed `secrets.age` file in the repo, decrypted at
+  # deploy time with one age identity sourced from
+  # `YOINK_AGE_KEY` / `YOINK_AGE_KEY_FILE` / `~/.config/yoink/age.key`.
+  # See `docs/recipes/sealed-secrets.md` for the full flow.
+  provider: age
+  recipients:
+    - age1examplepublickeyreplacewithyourown000000000000000000000000
+
+  # Alternative: bring-your-own-tool. yoink invokes the command and
+  # parses the resulting bundle from stdout (auto-detects dotenv vs
+  # JSON). Recipes for 1Password, Doppler, Vault, AWS Secrets
+  # Manager, Infisical CLI, etc. live under `docs/recipes/secrets-…`.
+  #
+  # provider: command
+  # command: ["doppler", "secrets", "download", "--no-file", "--format", "env"]
 
 # ─── pre-deploy hooks ────────────────────────────────────────────────
 # Run before any service deploys. One-shot containers; must exit 0

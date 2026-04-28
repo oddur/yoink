@@ -56,21 +56,25 @@ A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deplo
 | `recipients` | list of string | `[]` | Public age recipients (`age1...`) used when sealing/editing. Decryption only needs one matching identity. |
 | `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. |
 
-Bootstrap: `yoink secrets keygen` prints a fresh identity to stdout (operator decides where to save the secret); `--out PATH` writes it to a file at mode 0600. See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
+Bootstrap: `yoink secrets key generate` prints a fresh identity to stdout (operator decides where to route the secret — into a GitHub Actions secret, a 1Password item, AWS Secrets Manager, …); `--out PATH` writes it to a file at mode 0600 instead. `yoink secrets key public` re-derives the public recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
 
-### `provider: infisical` (opt-in)
+### `provider: command` (bring-your-own-tool)
 
-Talks to Infisical's REST API directly — for teams already running an Infisical instance.
+Yoink invokes the configured command and reads a secrets bundle from stdout. Format auto-detects between dotenv and JSON. Lets operators wire any external manager (Doppler, 1Password, HashiCorp Vault, AWS Secrets Manager, the Infisical CLI, Bitwarden, …) without yoink growing first-party integrations for each.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `provider` | string | required | `infisical` |
-| `project_id` | string | required | Infisical project UUID. |
-| `environment` | string | required | Infisical environment slug (e.g. `prod`, `staging`). |
-| `path` | string | `/` | Secret folder path within the environment. |
-| `domain` | string | `https://app.infisical.com` | Self-hosted instance URL. |
+| `provider` | string | required | `command` |
+| `command` | list of string | required | Argv to spawn. First element is the binary, the rest are arguments. No shell interpretation — wrap in `["sh", "-c", "..."]` if you need pipes. |
+| `format` | string | `auto` | `auto` inspects the first non-whitespace byte (`{` → JSON, else dotenv). `dotenv` / `json` force the parser. |
 
-Auth: `INFISICAL_CLIENT_ID` + `INFISICAL_CLIENT_SECRET` env vars (machine identity). See [Infisical auth recipe](/docs/recipes/infisical-auth).
+```yaml
+secrets:
+  provider: command
+  command: ["doppler", "secrets", "download", "--no-file", "--format", "env"]
+```
+
+See the [external-secrets recipe](/docs/recipes/secrets-external-cli) for per-tool wiring.
 
 ## Registry
 

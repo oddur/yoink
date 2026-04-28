@@ -33,7 +33,6 @@ futures-util = "0.3"
 glob = "0.3"
 humantime-serde = "1"
 indicatif = "0.18"
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

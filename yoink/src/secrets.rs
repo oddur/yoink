@@ -1,88 +1,33 @@
-//! Secrets handling. Two providers, dispatched by the
-//! `secrets.provider` tag in `yoink.yaml`:
+//! Secrets handling. Two providers, dispatched by `secrets.provider`
+//! in `yoink.yaml`:
 //!
 //!   - **`age`** (the batteries-included default) — a single sealed
 //!     dotenv file committed to the repo, decrypted at deploy time
-//!     with one key resolved from `YOINK_AGE_KEY` (raw),
-//!     `YOINK_AGE_KEY_FILE` (path), or
-//!     `~/.config/yoink/age.key`. Encrypt-side helpers live in
-//!     `crate::sealed`.
-//!   - **`infisical`** — original provider; talks to Infisical's
-//!     REST API directly (no `infisical` CLI required at deploy
-//!     time). Three auth modes, tried in order:
-//!       1. Universal Auth (machine identity) — `INFISICAL_CLIENT_ID`
-//!          + `INFISICAL_CLIENT_SECRET` env vars. Recommended for CI.
-//!       2. Raw bearer token — `INFISICAL_TOKEN` env var.
-//!       3. Cached browser-flow login — read from
-//!          `~/.infisical/infisical-config.json` + the OS keyring.
-//!
-//! Tokens must never appear in logs or error messages. The `Debug`
-//! and `Display` impls on `InfisicalToken` mask all but the first 4
-//! chars.
+//!     with one identity resolved from `YOINK_AGE_KEY` (raw),
+//!     `YOINK_AGE_KEY_FILE` (path), or `~/.config/yoink/age.key`.
+//!     Encrypt-side helpers live in [`crate::sealed`]; key-management
+//!     CLI is `yoink secrets key …`.
+//!   - **`command`** — yoink invokes the configured command and reads
+//!     a secrets bundle from its stdout. Auto-detects between dotenv
+//!     and JSON. Lets operators wire any external manager (1Password
+//!     `op inject`, Doppler `doppler secrets download --format env`,
+//!     Vault, AWS Secrets Manager, the Infisical CLI, …) without
+//!     yoink growing first-party integrations for each.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
-use base64::Engine;
-use serde::Deserialize;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
-use crate::config::{Config, SecretsConfig};
+use crate::config::{Config, SecretsConfig, SecretsFormat};
 use crate::sealed;
-
-pub const INFISICAL_TOKEN_ENV: &str = "INFISICAL_TOKEN";
-pub const INFISICAL_CLIENT_ID_ENV: &str = "INFISICAL_CLIENT_ID";
-pub const INFISICAL_CLIENT_SECRET_ENV: &str = "INFISICAL_CLIENT_SECRET";
-
-const DEFAULT_BASE_URL: &str = "https://app.infisical.com";
-const KEYRING_SERVICE: &str = "infisical-cli";
 
 #[derive(Debug, Error)]
 pub enum SecretsError {
-    #[error(
-        "no Infisical credentials available — set {INFISICAL_CLIENT_ID_ENV}+{INFISICAL_CLIENT_SECRET_ENV}, set {INFISICAL_TOKEN_ENV}, or run `infisical login`"
-    )]
-    NoAuth,
-    #[error("{INFISICAL_TOKEN_ENV} env var is empty")]
-    EmptyToken,
-    #[error("failed to read infisical config at {path}: {source}")]
-    ConfigRead {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to parse infisical config at {path}: {source}")]
-    ConfigParse {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("infisical config at {0} has no `loggedInUserEmail` — run `infisical login`")]
-    NoLoggedInUser(PathBuf),
-    #[error("OS keyring lookup failed for `{KEYRING_SERVICE}`/{email}: {source}")]
-    Keyring {
-        email: String,
-        #[source]
-        source: keyring::Error,
-    },
-    #[error("cached infisical session for {0} not found — run `infisical login`")]
-    KeyringNotFound(String),
-    #[error("cached infisical session for {email} is malformed: {source}")]
-    KeyringParse {
-        email: String,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("cached infisical session for {0} has no JWT — run `infisical login`")]
-    KeyringNoToken(String),
-    #[error("HTTP request to Infisical failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("Infisical API returned {status}: {body}")]
-    Api { status: u16, body: String },
-    #[error("`HOME` env var not set — cannot locate `~/.infisical/infisical-config.json`")]
-    NoHome,
     #[error("read sealed secrets file {path}: {source}")]
     SealedRead {
         path: PathBuf,
@@ -103,45 +48,30 @@ pub enum SecretsError {
     },
     #[error("locate age identity for sealed secrets: {0}")]
     NoAgeIdentity(#[source] sealed::SealedError),
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct InfisicalToken(String);
-
-impl InfisicalToken {
-    /// Read the token from the operator's environment.
-    pub fn from_env() -> Result<Self, SecretsError> {
-        let raw = env::var(INFISICAL_TOKEN_ENV).map_err(|_| SecretsError::NoAuth)?;
-        Self::new(raw)
-    }
-
-    /// Construct directly. Whitespace-trimmed input must be non-empty.
-    pub fn new(raw: impl Into<String>) -> Result<Self, SecretsError> {
-        let raw = raw.into();
-        if raw.trim().is_empty() {
-            return Err(SecretsError::EmptyToken);
-        }
-        Ok(Self(raw))
-    }
-
-    /// The unmasked value — only call when handing it to a child process
-    /// (e.g. as a `docker run --env` value). Never log or print it.
-    #[must_use]
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-
-    /// First 4 chars + `…(masked)` for safe display in logs.
-    #[must_use]
-    pub fn masked(&self) -> String {
-        let prefix: String = self.0.chars().take(4).collect();
-        format!("{prefix}…(masked)")
-    }
+    #[error("`secrets.command:` is empty — needs at least the binary name")]
+    CommandMissing,
+    #[error("spawn `{command}`: {source}")]
+    CommandSpawn {
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("`{command}` exited with status {status}: {stderr}")]
+    CommandExit {
+        command: String,
+        status: i32,
+        stderr: String,
+    },
+    #[error("parse secrets bundle from `{command}` (treated as {format}): {detail}")]
+    CommandParse {
+        command: String,
+        format: &'static str,
+        detail: String,
+    },
 }
 
 /// In-memory map of resolved secret keys → values. Built once at the
-/// start of a reconcile. Each service then picks the keys it needs out
-/// of the bundle.
+/// start of a reconcile. Each service then picks the keys it needs.
 #[derive(Clone, Default)]
 pub struct SecretsBundle {
     values: BTreeMap<String, String>,
@@ -182,9 +112,8 @@ impl fmt::Debug for SecretsBundle {
     }
 }
 
-/// Convenience wrapper for the common "load whatever the operator
-/// configured" path. Returns `Ok(None)` when no `[secrets]` block is
-/// declared (services that don't need secrets).
+/// Load whatever the operator configured. `Ok(None)` when no
+/// `[secrets]` block is declared (services that don't need secrets).
 pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, SecretsError> {
     let Some(cfg) = &config.secrets else {
         return Ok(None);
@@ -194,25 +123,13 @@ pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, Secre
             let path = sealed::resolve_sealed_path(config, file.as_deref());
             load_age_bundle(&path)?
         }
-        SecretsConfig::Infisical {
-            project_id,
-            environment,
-            path,
-            domain,
-        } => {
-            fetch_infisical_secrets(
-                project_id,
-                environment,
-                path.as_deref(),
-                domain.as_deref(),
-            )
-            .await?
+        SecretsConfig::Command { command, format } => {
+            load_command_bundle(command, *format).await?
         }
     };
     Ok(Some(bundle))
 }
 
-/// Load + decrypt + parse the sealed dotenv at `path`.
 fn load_age_bundle(path: &Path) -> Result<SecretsBundle, SecretsError> {
     let bytes = std::fs::read(path).map_err(|source| SecretsError::SealedRead {
         path: path.to_path_buf(),
@@ -231,367 +148,247 @@ fn load_age_bundle(path: &Path) -> Result<SecretsBundle, SecretsError> {
     Ok(SecretsBundle::new(map))
 }
 
-/// Fetch every secret in an Infisical project + environment + path.
-pub async fn fetch_infisical_secrets(
-    project_id: &str,
-    environment: &str,
-    path: Option<&str>,
-    domain_override: Option<&str>,
+async fn load_command_bundle(
+    command: &[String],
+    format: SecretsFormat,
 ) -> Result<SecretsBundle, SecretsError> {
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("yoink/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    let Some((bin, args)) = command.split_first() else {
+        return Err(SecretsError::CommandMissing);
+    };
+    let pretty = command.join(" ");
 
-    let (base_url, bearer) = resolve_auth(&http, domain_override).await?;
-
-    let path = path.unwrap_or("/");
-    let url = format!("{base_url}/api/v3/secrets/raw");
-    let resp = http
-        .get(&url)
-        .bearer_auth(&bearer)
-        .query(&[
-            ("workspaceId", project_id),
-            ("environment", environment),
-            ("secretPath", path),
-        ])
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(SecretsError::Api {
-            status: status.as_u16(),
-            body,
-        });
-    }
-    let parsed: RawSecretsResponse = resp.json().await?;
-    let map = parsed
-        .secrets
-        .into_iter()
-        .map(|s| (s.secret_key, s.secret_value))
-        .collect();
-    Ok(SecretsBundle::new(map))
-}
-
-#[derive(Deserialize)]
-struct RawSecretsResponse {
-    secrets: Vec<RawSecret>,
-}
-
-#[derive(Deserialize)]
-struct RawSecret {
-    #[serde(rename = "secretKey")]
-    secret_key: String,
-    #[serde(rename = "secretValue")]
-    secret_value: String,
-}
-
-/// Resolve `(base_url, bearer_token)` using the auth-mode priority
-/// documented at the top of this file.
-async fn resolve_auth(
-    http: &reqwest::Client,
-    domain_override: Option<&str>,
-) -> Result<(String, String), SecretsError> {
-    if let (Ok(client_id), Ok(client_secret)) = (
-        env::var(INFISICAL_CLIENT_ID_ENV),
-        env::var(INFISICAL_CLIENT_SECRET_ENV),
-    ) && !client_id.trim().is_empty()
-        && !client_secret.trim().is_empty()
-    {
-        let base = normalize_base(domain_override.unwrap_or(DEFAULT_BASE_URL));
-        let token =
-            universal_auth_login(http, &base, client_id.trim(), client_secret.trim()).await?;
-        return Ok((base, token));
-    }
-
-    if let Ok(raw) = env::var(INFISICAL_TOKEN_ENV) {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err(SecretsError::EmptyToken);
-        }
-        let base = normalize_base(domain_override.unwrap_or(DEFAULT_BASE_URL));
-        return Ok((base, trimmed.to_string()));
-    }
-
-    let cached = load_cached_session()?;
-    let base = normalize_base(
-        domain_override
-            .or(cached.domain.as_deref())
-            .unwrap_or(DEFAULT_BASE_URL),
-    );
-    Ok((base, cached.jwt))
-}
-
-#[derive(Deserialize)]
-struct UniversalAuthResponse {
-    #[serde(rename = "accessToken")]
-    access_token: String,
-}
-
-async fn universal_auth_login(
-    http: &reqwest::Client,
-    base: &str,
-    client_id: &str,
-    client_secret: &str,
-) -> Result<String, SecretsError> {
-    let url = format!("{base}/api/v1/auth/universal-auth/login");
-    let resp = http
-        .post(&url)
-        .json(&serde_json::json!({
-            "clientId": client_id,
-            "clientSecret": client_secret,
-        }))
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(SecretsError::Api {
-            status: status.as_u16(),
-            body,
-        });
-    }
-    Ok(resp.json::<UniversalAuthResponse>().await?.access_token)
-}
-
-struct CachedSession {
-    jwt: String,
-    /// Whatever the CLI stored in `LoggedInUserDomain` — may include a
-    /// trailing `/api`. `normalize_base` strips it.
-    domain: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct InfisicalConfigFile {
-    #[serde(default, rename = "loggedInUserEmail")]
-    logged_in_user_email: String,
-    #[serde(default, rename = "LoggedInUserDomain")]
-    logged_in_user_domain: String,
-}
-
-#[derive(Deserialize)]
-struct CachedUserCreds {
-    /// Yes, the upstream CLI stores this as `JTWToken` (a typo of JWT).
-    /// We follow the typo so deserialization matches the on-disk shape.
-    #[serde(default, rename = "JTWToken")]
-    jwt_token: String,
-}
-
-fn load_cached_session() -> Result<CachedSession, SecretsError> {
-    let home = env::var("HOME").map_err(|_| SecretsError::NoHome)?;
-    let path = PathBuf::from(home).join(".infisical/infisical-config.json");
-    let raw = std::fs::read_to_string(&path).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            SecretsError::NoAuth
-        } else {
-            SecretsError::ConfigRead {
-                path: path.clone(),
-                source,
-            }
-        }
-    })?;
-    let cfg: InfisicalConfigFile =
-        serde_json::from_str(&raw).map_err(|source| SecretsError::ConfigParse {
-            path: path.clone(),
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| SecretsError::CommandSpawn {
+            command: pretty.clone(),
             source,
         })?;
-    if cfg.logged_in_user_email.is_empty() {
-        return Err(SecretsError::NoLoggedInUser(path));
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_end(&mut stdout_buf).await.ok();
     }
-    let entry =
-        keyring::Entry::new(KEYRING_SERVICE, &cfg.logged_in_user_email).map_err(|source| {
-            SecretsError::Keyring {
-                email: cfg.logged_in_user_email.clone(),
-                source,
-            }
-        })?;
-    let stored = match entry.get_password() {
-        Ok(s) => s,
-        Err(keyring::Error::NoEntry) => {
-            return Err(SecretsError::KeyringNotFound(cfg.logged_in_user_email));
-        }
-        Err(source) => {
-            return Err(SecretsError::Keyring {
-                email: cfg.logged_in_user_email,
-                source,
-            });
-        }
-    };
-    let json = decode_go_keyring_value(&stored).map_err(|source| SecretsError::KeyringParse {
-        email: cfg.logged_in_user_email.clone(),
-        source,
-    })?;
-    let creds: CachedUserCreds =
-        serde_json::from_str(&json).map_err(|source| SecretsError::KeyringParse {
-            email: cfg.logged_in_user_email.clone(),
+    if let Some(mut err) = child.stderr.take() {
+        err.read_to_end(&mut stderr_buf).await.ok();
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|source| SecretsError::CommandSpawn {
+            command: pretty.clone(),
             source,
         })?;
-    if creds.jwt_token.trim().is_empty() {
-        return Err(SecretsError::KeyringNoToken(cfg.logged_in_user_email));
+    if !status.success() {
+        return Err(SecretsError::CommandExit {
+            command: pretty,
+            status: status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&stderr_buf).trim().to_string(),
+        });
     }
-    let domain = if cfg.logged_in_user_domain.is_empty() {
-        None
-    } else {
-        Some(cfg.logged_in_user_domain)
-    };
-    Ok(CachedSession {
-        jwt: creds.jwt_token,
-        domain,
+
+    parse_bundle_bytes(&stdout_buf, format).map_err(|(format, detail)| {
+        SecretsError::CommandParse {
+            command: pretty,
+            format,
+            detail,
+        }
     })
 }
 
-/// `go-keyring` (used by the infisical CLI) wraps stored values with one
-/// of two prefixes before handing them to the OS keychain — the macOS
-/// keychain mangles non-ASCII bytes, so the Go library encodes
-/// everything. We unwrap both prefixes so callers see the original
-/// JSON regardless of which the CLI version chose.
-fn decode_go_keyring_value(raw: &str) -> Result<String, serde_json::Error> {
-    if let Some(rest) = raw.strip_prefix("go-keyring-base64:") {
-        return base64::engine::general_purpose::STANDARD
-            .decode(rest)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .ok_or_else(|| serde::de::Error::custom("malformed go-keyring-base64 value"));
-    }
-    if let Some(rest) = raw.strip_prefix("go-keyring-encoded:") {
-        return decode_hex(rest)
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .ok_or_else(|| serde::de::Error::custom("malformed go-keyring-encoded value"));
-    }
-    Ok(raw.to_string())
-}
-
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
-/// Strip a trailing `/api` so callers can append `/api/...` paths
-/// uniformly. The CLI's cached `LoggedInUserDomain` includes `/api`;
-/// the bare `domain` setting in `yoink.yaml` does not.
-fn normalize_base(s: &str) -> String {
-    let trimmed = s.trim_end_matches('/');
-    trimmed
-        .strip_suffix("/api")
-        .unwrap_or(trimmed)
-        .trim_end_matches('/')
-        .to_string()
-}
-
-impl fmt::Debug for InfisicalToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "InfisicalToken({})", self.masked())
+/// Pick a parser for `bytes`: `auto` looks at the first non-whitespace
+/// byte (`{` → JSON, anything else → dotenv); `dotenv` / `json` force
+/// the parser. Returns `(format_label, detail)` on parse failure so
+/// the caller can build an error.
+fn parse_bundle_bytes(
+    bytes: &[u8],
+    format: SecretsFormat,
+) -> Result<SecretsBundle, (&'static str, String)> {
+    let chosen = match format {
+        SecretsFormat::Json => SecretsFormat::Json,
+        SecretsFormat::Dotenv => SecretsFormat::Dotenv,
+        SecretsFormat::Auto => {
+            if bytes
+                .iter()
+                .find(|b| !b.is_ascii_whitespace())
+                .is_some_and(|b| *b == b'{')
+            {
+                SecretsFormat::Json
+            } else {
+                SecretsFormat::Dotenv
+            }
+        }
+    };
+    match chosen {
+        SecretsFormat::Json => parse_json_bundle(bytes).map_err(|d| ("json", d)),
+        SecretsFormat::Dotenv | SecretsFormat::Auto => {
+            parse_dotenv_bundle(bytes).map_err(|d| ("dotenv", d))
+        }
     }
 }
 
-impl fmt::Display for InfisicalToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.masked())
+fn parse_json_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
+    let raw: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj = raw.as_object().ok_or_else(|| {
+        "expected a top-level JSON object of \"KEY\":\"VALUE\" pairs".to_string()
+    })?;
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in obj {
+        let value = match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => continue,
+            other => other.to_string(),
+        };
+        out.insert(k.clone(), value);
     }
+    Ok(SecretsBundle::new(out))
+}
+
+/// Minimal dotenv parser — same shape `crate::sealed::parse_dotenv`
+/// uses on the age plaintext. Comments (`#…`) and blank lines are
+/// dropped; values may be wrapped in single or double quotes; surrounding
+/// whitespace is trimmed; an unrecognised line is a parse error
+/// (better to fail loudly than silently drop a malformed export).
+fn parse_dotenv_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (i, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Strip an optional leading `export ` (dotenv tools sometimes
+        // emit it for shell-source ergonomics).
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            format!("line {}: expected `KEY=VALUE`, got {raw_line:?}", i + 1)
+        })?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(format!("line {}: empty key", i + 1));
+        }
+        let value = strip_quotes(value.trim());
+        out.insert(key.to_string(), value);
+    }
+    Ok(SecretsBundle::new(out))
+}
+
+fn strip_quotes(raw: &str) -> String {
+    if raw.len() >= 2
+        && let (Some(first), Some(last)) = (raw.chars().next(), raw.chars().last())
+        && first == last
+        && (first == '"' || first == '\'')
+    {
+        return raw[1..raw.len() - 1].to_string();
+    }
+    raw.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
 
     #[test]
-    fn rejects_empty_token() {
-        assert!(matches!(
-            InfisicalToken::new(""),
-            Err(SecretsError::EmptyToken)
-        ));
-        assert!(matches!(
-            InfisicalToken::new("   "),
-            Err(SecretsError::EmptyToken)
-        ));
+    fn parse_json_bundle_basic() {
+        let bytes = br#"{"FOO":"1","BAR":"two words"}"#;
+        let bundle = parse_json_bundle(bytes).unwrap();
+        assert_eq!(bundle.get("FOO"), Some("1"));
+        assert_eq!(bundle.get("BAR"), Some("two words"));
     }
 
     #[test]
-    fn accepts_non_empty_token() {
-        let tok = InfisicalToken::new("st_test_super_secret_value_xyz123").unwrap();
-        assert_eq!(tok.expose(), "st_test_super_secret_value_xyz123");
+    fn parse_json_bundle_drops_nulls_and_stringifies_numbers() {
+        let bytes = br#"{"PORT":8080,"NIL":null,"NAME":"x"}"#;
+        let bundle = parse_json_bundle(bytes).unwrap();
+        assert_eq!(bundle.get("PORT"), Some("8080"));
+        assert_eq!(bundle.get("NIL"), None);
+        assert_eq!(bundle.get("NAME"), Some("x"));
     }
 
     #[test]
-    fn debug_impl_masks_value() {
-        let tok = InfisicalToken::new("st_test_super_secret_value_xyz123").unwrap();
-        let debug = format!("{tok:?}");
-        assert!(!debug.contains("super_secret"));
-        assert!(debug.starts_with("InfisicalToken("));
-        assert!(debug.contains("st_t"));
+    fn parse_json_bundle_rejects_top_level_array() {
+        let bytes = br#"[{"K":"V"}]"#;
+        assert!(parse_json_bundle(bytes).is_err());
     }
 
     #[test]
-    fn display_impl_masks_value() {
-        let tok = InfisicalToken::new("st_test_super_secret_value_xyz123").unwrap();
-        let display = format!("{tok}");
-        assert!(!display.contains("super_secret"));
-        assert!(display.contains("st_t"));
+    fn parse_dotenv_bundle_basic() {
+        let bytes = b"FOO=1\n# comment\nBAR=\"hello\"\nexport BAZ='spaced value'\n";
+        let bundle = parse_dotenv_bundle(bytes).unwrap();
+        assert_eq!(bundle.get("FOO"), Some("1"));
+        assert_eq!(bundle.get("BAR"), Some("hello"));
+        assert_eq!(bundle.get("BAZ"), Some("spaced value"));
     }
 
     #[test]
-    fn debug_impl_masks_short_value() {
-        let tok = InfisicalToken::new("ab").unwrap();
-        let debug = format!("{tok:?}");
-        assert!(!debug.contains("InfisicalToken(ab)"));
-        assert!(debug.contains("ab"));
+    fn parse_dotenv_bundle_rejects_malformed_lines() {
+        let bytes = b"VALID=1\nthisisnotanassignment\n";
+        let err = parse_dotenv_bundle(bytes).unwrap_err();
+        assert!(err.contains("expected `KEY=VALUE`"), "got: {err}");
     }
 
     #[test]
-    fn secrets_bundle_get_returns_str() {
-        let mut m = BTreeMap::new();
-        m.insert("A".into(), "1".into());
-        let b = SecretsBundle::new(m);
-        assert_eq!(b.get("A"), Some("1"));
-        assert_eq!(b.get("missing"), None);
-        assert_eq!(b.len(), 1);
+    fn auto_detect_picks_json_for_brace_prefix() {
+        let bytes = br#"  {"K":"V"}"#;
+        let bundle = parse_bundle_bytes(bytes, SecretsFormat::Auto).unwrap();
+        assert_eq!(bundle.get("K"), Some("V"));
     }
 
     #[test]
-    fn token_equality_is_value_based() {
-        let a = InfisicalToken::new("aaaa1111").unwrap();
-        let b = InfisicalToken::new("aaaa1111").unwrap();
-        let c = InfisicalToken::new("bbbb2222").unwrap();
-        assert_eq!(a, b);
-        assert_ne!(a, c);
+    fn auto_detect_falls_back_to_dotenv() {
+        let bytes = b"# header\nFOO=bar\n";
+        let bundle = parse_bundle_bytes(bytes, SecretsFormat::Auto).unwrap();
+        assert_eq!(bundle.get("FOO"), Some("bar"));
     }
 
     #[test]
-    fn decode_go_keyring_value_handles_all_prefixes() {
-        assert_eq!(decode_go_keyring_value("plain").unwrap(), "plain");
-        // base64 of `{"a":1}`
-        assert_eq!(
-            decode_go_keyring_value("go-keyring-base64:eyJhIjoxfQ==").unwrap(),
-            r#"{"a":1}"#
-        );
-        // hex of `{"a":1}`
-        assert_eq!(
-            decode_go_keyring_value("go-keyring-encoded:7b2261223a317d").unwrap(),
-            r#"{"a":1}"#
-        );
-        assert!(decode_go_keyring_value("go-keyring-base64:!!!not-base64!!!").is_err());
+    fn explicit_dotenv_overrides_brace_prefix_value() {
+        // A dotenv value that legitimately starts with `{` (e.g. JSON
+        // payload as an env value) — operator should set
+        // `format: dotenv` to disambiguate. Verifies the explicit
+        // setting wins over the auto-detect heuristic.
+        let bytes = b"PAYLOAD={\"k\":1}\n";
+        let bundle = parse_bundle_bytes(bytes, SecretsFormat::Dotenv).unwrap();
+        assert_eq!(bundle.get("PAYLOAD"), Some(r#"{"k":1}"#));
     }
 
-    #[test]
-    fn normalize_base_strips_trailing_api() {
-        assert_eq!(normalize_base("https://example.com"), "https://example.com");
-        assert_eq!(
-            normalize_base("https://example.com/"),
-            "https://example.com"
-        );
-        assert_eq!(
-            normalize_base("https://example.com/api"),
-            "https://example.com"
-        );
-        assert_eq!(
-            normalize_base("https://example.com/api/"),
-            "https://example.com"
-        );
+    #[tokio::test]
+    async fn load_command_bundle_runs_command_and_parses_dotenv() {
+        let bundle = load_command_bundle(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'A=1\\nB=two\\n'".into(),
+            ],
+            SecretsFormat::Auto,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bundle.get("A"), Some("1"));
+        assert_eq!(bundle.get("B"), Some("two"));
+    }
+
+    #[tokio::test]
+    async fn load_command_bundle_surfaces_nonzero_exit() {
+        let err = load_command_bundle(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo oh no >&2; exit 7".into(),
+            ],
+            SecretsFormat::Auto,
+        )
+        .await
+        .unwrap_err();
+        let SecretsError::CommandExit { status, stderr, .. } = err else {
+            panic!("expected CommandExit, got: {err:?}");
+        };
+        assert_eq!(status, 7);
+        assert!(stderr.contains("oh no"), "stderr: {stderr}");
     }
 }

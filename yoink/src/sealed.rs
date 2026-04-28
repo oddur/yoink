@@ -3,8 +3,8 @@
 //! Operators commit a single `secrets.age` file alongside `yoink.yaml`.
 //! Format inside the seal: dotenv (`KEY=value\n`). At deploy time
 //! yoink decrypts with one identity, parses the dotenv, and feeds the
-//! resulting `KEY -> VALUE` map to the same `SecretsBundle` machinery
-//! the Infisical path uses.
+//! resulting `KEY -> VALUE` map to the `SecretsBundle` machinery shared
+//! with the `provider: command` path.
 //!
 //! Identity resolution order (same code path locally and in CI):
 //!   1. `YOINK_AGE_KEY` env var — raw `AGE-SECRET-KEY-1...`

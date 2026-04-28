@@ -85,17 +85,14 @@ Where it matters: the `pre_deploy` hooks for a service run *before* that service
 
 ## Secrets resolution
 
-When `secrets.provider: infisical` is set, yoink resolves a bearer token in this order — first match wins, failures cascade:
+Two providers, dispatched by `secrets.provider:`:
 
-1. **Universal Auth env vars** — `INFISICAL_CLIENT_ID` + `INFISICAL_CLIENT_SECRET`. Yoink calls `/api/v1/auth/universal-auth/login` to exchange the pair for a short-lived bearer.
-2. **Raw bearer** — `INFISICAL_TOKEN`. Used directly.
-3. **Cached browser-flow login** — yoink reads the session that the `infisical` CLI persisted in your OS keyring (macOS Keychain / libsecret / Windows Credential Manager). The CLI's session metadata lives in `~/.infisical/infisical-config.json`; the actual token is in the keyring under service=`infisical-cli`, account=your email.
+- **`age`** (default, batteries-included) — yoink decrypts a sealed `secrets.age` file at deploy time using one X25519 identity sourced from `YOINK_AGE_KEY` (raw key) → `YOINK_AGE_KEY_FILE` (path) → `~/.config/yoink/age.key` (fallback). The key itself is operator-managed; route the `yoink secrets key generate` output through whatever secret store you already use (GitHub Actions secret, 1Password, AWS Secrets Manager, …) and surface it as `YOINK_AGE_KEY` at deploy time.
+- **`command`** — yoink invokes the configured command, captures stdout, and parses it as a secrets bundle. Format is auto-detected: stdout starting with `{` is JSON, anything else is dotenv (`KEY=value\n`). One spawn per `yoink up` (and once on TUI startup). Stderr is captured and surfaced when the command exits non-zero.
 
-The CLI binary itself is **never invoked at deploy time** — yoink only reads its persisted session. You can `brew uninstall infisical` after `infisical login` and yoink will keep working until the cached session expires.
+There's no first-party integration with any specific manager. Operators wire their tool of choice via its standard CLI: `doppler secrets download --format env`, `infisical export --format=dotenv`, `vault kv get -format=json`, `aws secretsmanager get-secret-value`, etc. See [external secrets via CLI](/docs/recipes/secrets-external-cli) for per-tool recipes.
 
-Once authenticated, yoink calls `/api/v3/secrets/raw` once per `up` to pull every secret the project exposes for the configured environment + path. Every service that lists `secrets:` (or `env_from_secrets:`) gets its values picked out of that bundle and injected as env vars on the container — which means the values feed into `spec_hash`, which is why a rotated secret triggers a redeploy.
-
-See [Authenticate to Infisical](/docs/recipes/infisical-auth) for the operator-facing setup.
+Both providers feed the same `SecretsBundle`. Every service that lists `secrets:` (or `env_from_secrets:`) gets its values picked out of that bundle and injected as env vars on the container — which means the values feed into `spec_hash`, which is why a rotated secret triggers a redeploy.
 
 ## Prune semantics
 

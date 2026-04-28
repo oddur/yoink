@@ -62,7 +62,7 @@ Kamal is the closest neighbor — both are "ship a Rust/Ruby binary, ssh into ho
 | Pre-merge dry-run / diff | ✓ (`yoink up --dry-run --format=markdown` → sticky PR comment) | ✗ |
 | TUI dashboard | ✓ (k9s-style) | ✗ (CLI only) |
 | Service deploy history + one-press rollback | ✓ (TUI `H` then `r`) | ✓ (CLI `kamal rollback <version>`) |
-| Secrets store | age-sealed `secrets.age` in the repo (default, no external service); Infisical (REST API, no CLI dep) as opt-in | 1Password / Bitwarden / LastPass / generic shell command |
+| Secrets store | age-sealed `secrets.age` in the repo (default, no external service); `provider: command` shells out to any CLI (1Password `op`, Doppler, Vault, AWS Secrets Manager, Infisical CLI, Bitwarden) | 1Password / Bitwarden / LastPass / generic shell command |
 | Accessory containers (postgres, redis, …) | Same shape as services | First-class `accessories:` block |
 | Resource limits | k8s-style (`"500m"`, `"2Gi"`) | docker-style (`cpus: 2`, `memory: 1g`) |
 | Per-service `pids_limit` | ✓ | ✗ |
@@ -181,7 +181,7 @@ Compose is a YAML schema for declaring a stack on a single host. yoink is a depl
 | Bundled reverse proxy with HTTPS | ✓ (Caddy + ACME / sealed certs) | ✗ (BYO) |
 | Secure-by-default container options | ✓ | ✗ (compose's defaults are dev-friendly: full caps, writable rootfs, no pids cap) |
 | Pre-deploy hooks (migrations etc.) | ✓ (`hooks.pre_deploy`) | partial (`depends_on` + healthcheck dance) |
-| Secrets store | ✓ (age-sealed `secrets.age` in the repo by default, Infisical as opt-in) | ✗ (env file or external) |
+| Secrets store | ✓ (age-sealed `secrets.age` in the repo by default, `provider: command` for any external CLI) | ✗ (env file or external) |
 | TUI / drift dashboard | ✓ | ✗ |
 | Driven by AI agents / CI scripts | ✓ | ✓ |
 | Single binary, no Python/Compose runtime | ✓ | ✗ (Compose v2 ships with docker, but still a separate runtime) |
@@ -204,7 +204,7 @@ Different leagues. Yoink is for people who don't want a control plane.
 | Replicas + healthcheck-gated rolling swap | ✓ | ✓ (Deployments) |
 | Per-tier network isolation | ✓ (named docker networks) | ✓ (NetworkPolicy + CNI) |
 | Resource limits (cpu/memory) | ✓ | ✓ |
-| Secrets management | ✓ (age-sealed in-repo by default, Infisical opt-in) | ✓ (Secrets / external store) |
+| Secrets management | ✓ (age-sealed in-repo by default, `provider: command` to any external CLI) | ✓ (Secrets / external store) |
 | Driven by AI agents / CI scripts | ✓ (CLI + one YAML file) | ✓ (kubectl + many YAML files) |
 | Imperative deploy command | `yoink up` | `kubectl apply -f` |
 

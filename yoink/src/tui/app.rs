@@ -762,9 +762,9 @@ pub struct App {
     job_rx: UnboundedReceiver<JobUpdate>,
     /// Cached secrets bundle for drift detection in the Dashboard
     /// pane. Populated lazily by a background task at startup so the
-    /// TUI doesn't block on the Infisical fetch (which can take 1–3 s).
-    /// `None` means "not loaded yet" — drift cells render as `?`
-    /// until the loader finishes.
+    /// TUI doesn't block on a slow `provider: command` fetch (an
+    /// external CLI can take 1–3 s). `None` means "not loaded yet" —
+    /// drift cells render as `?` until the loader finishes.
     secrets: Arc<tokio::sync::RwLock<Option<Arc<crate::secrets::SecretsBundle>>>>,
     /// Ring of recent docker-event toasts: `(deadline, line)`. The
     /// most-recent line displaces the right-side host/service count
@@ -1166,11 +1166,12 @@ impl App {
         }
     }
 
-    /// Kick off the Infisical secrets fetch in the background. The Dashboard
-    /// drift column needs the bundle to compute `spec_hashes` that
-    /// match what `yoink up` would produce. We don't block startup
-    /// on it — the column shows `?` for the few seconds the loader
-    /// takes, then resolves to ✓/⚠ once the bundle lands.
+    /// Kick off the secrets bundle fetch in the background. The
+    /// Dashboard drift column needs the bundle to compute the
+    /// `spec_hash` that matches what `yoink up` would produce. We
+    /// don't block startup on it — the column shows `?` for the few
+    /// seconds the loader takes, then resolves to ✓/⚠ once the
+    /// bundle lands.
     fn spawn_secrets_loader(&self) {
         let config = self.config.clone();
         let slot = self.secrets.clone();

@@ -287,9 +287,20 @@ pub struct RegistryConfig {
 /// Secrets provider config. The default, batteries-included shape is
 /// `age` — a single sealed file (`secrets.age` next to `yoink.yaml`)
 /// committed to the repo, decrypted at deploy time with one key
-/// resolved from `YOINK_AGE_KEY` (env, for CI) or
-/// `~/.config/yoink/age.key` (for laptop dev). `infisical` is the
-/// opt-in remote-provider path.
+/// `age` is the batteries-included path: a single `secrets.age` file
+/// in the repo, decrypted with one identity sourced from
+/// `YOINK_AGE_KEY` / `YOINK_AGE_KEY_FILE` / `~/.config/yoink/age.key`
+/// (the operator typically pipes the private key into a third-party
+/// secret store and exposes it as an env var at deploy time).
+///
+/// `command` is the bring-your-own-tool path: yoink runs the
+/// configured command and reads the resulting bundle from stdout.
+/// Auto-detects between dotenv (`KEY=value\n`) and JSON
+/// (`{"K":"V"}`) based on the first non-whitespace byte. Lets
+/// operators wire up 1Password (`op inject`), Doppler (`doppler
+/// secrets download --format env`), `HashiCorp` Vault (`vault kv
+/// get -format=json`), AWS Secrets Manager, the Infisical CLI, etc.
+/// without yoink growing first-party integrations for each.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase", deny_unknown_fields)]
 pub enum SecretsConfig {
@@ -305,19 +316,33 @@ pub enum SecretsConfig {
         #[serde(default)]
         recipients: Vec<String>,
     },
-    /// Infisical (self-hosted or cloud). The original provider — kept
-    /// as an opt-in for teams already running an Infisical instance.
-    Infisical {
-        project_id: String,
-        environment: String,
-        /// Optional path within the project (Infisical "folder").
+    /// External CLI provider. yoink invokes `command`, captures
+    /// stdout, and parses it as a secrets bundle. Format is
+    /// auto-detected unless explicitly set.
+    Command {
+        /// Argv to spawn. First element is the binary, the rest are
+        /// arguments. Spawned without a shell, so users can't (and
+        /// shouldn't) embed pipes or env-var expansion in a string —
+        /// quote-and-split is on the operator.
+        command: Vec<String>,
+        /// Override the bundle format. `auto` (default) inspects the
+        /// first non-whitespace byte: `{` → JSON, anything else →
+        /// dotenv. Set explicitly when the auto-detect could trip on
+        /// values that legitimately start with `{`.
         #[serde(default)]
-        path: Option<String>,
-        /// Self-hosted Infisical instance URL. When unset, the cloud
-        /// `SaaS` at `app.infisical.com` is used.
-        #[serde(default)]
-        domain: Option<String>,
+        format: SecretsFormat,
     },
+}
+
+/// On-the-wire bundle shape from a `provider: command`. `Auto` (the
+/// default) inspects the first non-whitespace byte of stdout.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretsFormat {
+    #[default]
+    Auto,
+    Dotenv,
+    Json,
 }
 
 /// Local build instructions for a service. Powers `yoink build`
@@ -441,8 +466,8 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub secrets: Vec<String>,
     /// Inject a secret under a *different* env var name. Map of
-    /// `env_var_name -> secret_key`. Useful when the secret in
-    /// Infisical is stored under one name (e.g. `AUTH_DATABASE_MIGRATE_URL`)
+    /// `env_var_name -> secret_key`. Useful when the upstream secret
+    /// store names a value one way (e.g. `AUTH_DATABASE_MIGRATE_URL`)
     /// but the running container expects another (e.g. `AUTH_DATABASE_URL`).
     #[serde(default)]
     pub env_from_secrets: BTreeMap<String, String>,

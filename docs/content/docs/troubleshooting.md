@@ -50,15 +50,23 @@ Add the key with `ssh-add ~/.ssh/id_ed25519` (or whichever) and re-run.
 
 `yoink preflight` is the canonical "why can't I reach the host" diagnostic — it does an explicit `ssh -o BatchMode=yes user@host true` first and translates common stderr patterns. The classifier covers Tailscale auth, permission denied, connection timeout, host key changes, DNS / hostname resolution, and connection refused.
 
-## `Authenticate to Infisical: dial tcp ... i/o timeout`
+## `` `<command>` exited with status N: <stderr> ``
 
-The Infisical instance is on the tailnet. Join it.
+`provider: command` ran your secrets binary and it failed. The captured stderr is included in the error — start there.
 
-```sh
-tailscale up
-```
+Common causes:
 
-If you're using a self-hosted Infisical at a private domain, set `secrets.domain` in the config.
+- The CLI needs a session/token env var that isn't set on this runner (e.g. `DOPPLER_TOKEN`, `OP_SERVICE_ACCOUNT_TOKEN`, `VAULT_TOKEN`). Run the same command manually to confirm.
+- The CLI is missing on the deploy runner (operator's laptop has it via Homebrew; CI doesn't). Install it in the workflow before `yoink up`.
+- The configured project / vault / secret name has changed. Re-check the argv against your secret manager's UI.
+
+## `parse secrets bundle from \`<command>\` (treated as <format>)`
+
+The command exited 0 but yoink couldn't parse stdout. Either:
+
+- The output was empty (the CLI silently filtered to zero secrets — usually a permissions issue at the source).
+- A value legitimately starts with `{`, tripping the `auto` JSON heuristic. Set `format: dotenv` (or `format: json`) explicitly in `yoink.yaml`.
+- The dotenv stream contains a malformed line (no `=`). Yoink fails loud rather than silently dropping malformed lines; the error names the line number.
 
 ## `image_present=false; pull failed: 404 not found`
 

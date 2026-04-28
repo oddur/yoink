@@ -104,7 +104,7 @@ proxy:
       trust_pool_secret: CF_ORIGIN_PULL_CA
 ```
 
-This is the Cloudflare-style "every route is an origin behind Cloudflare's edge with mTLS proving the request came from Cloudflare" pattern. No host-filesystem cert state — everything lives in `secrets.age` (or Infisical), encrypted at rest.
+This is the Cloudflare-style "every route is an origin behind Cloudflare's edge with mTLS proving the request came from Cloudflare" pattern. No host-filesystem cert state — everything lives in `secrets.age` or via `provider: command`, encrypted at rest.
 
 That's the full surface. Five service-level fields, four proxy-level fields. Anything beyond that is `caddy_extra_json:` or a custom proxy image.
 
