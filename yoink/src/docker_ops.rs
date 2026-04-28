@@ -369,6 +369,21 @@ pub struct ContainerDetail {
     pub read_only: bool,
 }
 
+impl ContainerDetail {
+    /// Parse `env: Vec<"KEY=VALUE">` into a key/value map. Lines
+    /// without `=` (rare but legal in docker) are dropped — the
+    /// callers (TUI redaction, dry-run diff) only care about keyed
+    /// values. Cheap; recompute at call sites rather than caching.
+    #[must_use]
+    pub fn env_map(&self) -> BTreeMap<String, String> {
+        self.env
+            .iter()
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+}
+
 /// One docker network as the dashboard / `yoink networks` show it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct NetworkInfo {

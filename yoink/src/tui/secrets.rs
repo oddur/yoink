@@ -377,15 +377,20 @@ impl SecretsState {
         self.flash = Some((Instant::now(), msg.into()));
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    pub fn render(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         let layout = pane_layout(area);
 
-        let header = Paragraph::new(self.header_text()).style(bold());
+        let header = Paragraph::new(self.header_text(throbber)).style(bold());
         frame.render_widget(header, layout[0]);
 
         match &self.bundle {
             LoadStatus::NotLoaded => {
-                let p = Paragraph::new("(loading…)")
+                let p = Paragraph::new(super::ui::loading_line(throbber))
                     .block(Block::default().borders(Borders::ALL).title("secrets"));
                 frame.render_widget(p, layout[1]);
             }
@@ -431,9 +436,9 @@ impl SecretsState {
         parts.join(" · ")
     }
 
-    fn header_text(&self) -> String {
+    fn header_text(&self, _throbber: &throbber_widgets_tui::ThrobberState) -> String {
         match &self.bundle {
-            LoadStatus::NotLoaded => "yoink secrets · (loading…)".into(),
+            LoadStatus::NotLoaded => "yoink secrets · loading…".into(),
             LoadStatus::Failed(_) => "yoink secrets · (error)".into(),
             LoadStatus::Loaded(b) => {
                 let n = b.values.len();

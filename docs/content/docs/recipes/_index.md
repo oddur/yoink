@@ -20,4 +20,5 @@ Task-oriented how-tos. Each recipe stands alone — pick the one that matches wh
   {{< card link="/docs/recipes/secrets-external-cli" title="External secrets via CLI" subtitle="Per-tool wiring for Doppler, 1Password, Vault, AWS Secrets Manager, Infisical CLI, Bitwarden — anything that emits dotenv or JSON." icon="key" >}}
   {{< card link="/docs/recipes/pr-comment-dry-run" title="Pre-merge dry-run on every PR" subtitle="Sticky GitHub PR comment showing what `yoink up` would change before the merge." icon="annotation" >}}
   {{< card link="/docs/recipes/multi-host-distribution" title="Multi-host distribution" subtitle="`replicas` + `services[].hosts` patterns: scale-out, singletons, region-pinned, stateful + stateless." icon="server" >}}
+  {{< card link="/docs/recipes/watch-mode" title="Edit-save-deploy with --watch" subtitle="`yoink up --watch --build --no-registry` polls the config and redeploys on save. Hot-reload for prod-like dev without CI." icon="refresh" >}}
 {{< /cards >}}

@@ -56,6 +56,7 @@ Heavily inspired by [k9s](https://k9scli.io/) and [lazydocker](https://github.co
 | `!` | shell into container (`bash` then fallback to `sh`) |
 | `D` | debug sidecar (alpine in target's pid+net ns — for distroless / shell-less images) |
 | `H` | service deploy history; on a stopped row press `r` to roll back |
+| `~` | show drift detail for the focused service (image / tag / spec_hash / env keys / label keys) |
 | `x` | toggle eXited containers visible in the table |
 | `r` | refresh |
 | `/` | filter substring (Esc clears) |
@@ -89,6 +90,28 @@ Plus, at the bottom of the pane, a rolling tail of the container's logs.
 | `esc` | back to host detail |
 
 If your image is distroless or otherwise has no shell, `!` will fail. **Fall back to `D`** — the debug sidecar attaches an alpine container sharing the target's PID and network namespaces, so you can run `ps`, `ss`, `cat /proc/<pid>/...` against the target without modifying the production image. The sidecar auto-removes when you `exit` / Ctrl-D.
+
+## Drift detail (`~`)
+
+When the dashboard / host detail / service detail / container detail view shows ⚠ on a row, press **`~`** to open a modal that explains *what* drifted — the same per-field diff `yoink up --plan` produces on the CLI side:
+
+```
+ drift: api on host-a (esc to close) 
+   image  ghcr.io/me/api  (unchanged)
+   spec   a1b2c3d → e5f6a7b
+    tag   v1.2.4
+env:
+  + DATABASE_POOL_SIZE
+  ~ LOG_LEVEL
+labels:
+  - yoink.caddy.tls
+```
+
+Color-coded so the markers read at a glance: `+` green (added in desired), `-` red (removed from running), `~` yellow (changed). The hash and image columns highlight the running → desired transition in cyan when they differ; the line dims to `(unchanged)` when they match.
+
+The fetch reuses `diff::compute` under the hood, so the modal's content is identical to `yoink up --plan --service <name>` against the same host. For services without a `tag:` pinned in config (typical for `image: ghcr.io/you/api` where CI provides the tag), the modal falls back to the running replica's tag so the diff isolates the env/label change instead of erroring on a missing tag — useful for "what changed since deploy?" without leaving the TUI.
+
+`Esc` closes the modal. The underlying view stays put.
 
 ## Hosts pane (`h`)
 

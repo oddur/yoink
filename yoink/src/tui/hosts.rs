@@ -117,7 +117,13 @@ impl HostsState {
             .collect()
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, _config: &Config) {
+    pub fn render(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        _config: &Config,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         let layout = pane_layout(area);
 
         let header = Paragraph::new("yoink hosts · ↑↓ select · enter for detail").style(bold());
@@ -126,7 +132,7 @@ impl HostsState {
         let visible = self.visible_indices();
         clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from("(loading…)")])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
         } else if visible.is_empty() && !self.rows.is_empty() {
             vec![Row::new(vec![Cell::from("(no hosts match filter)")])]
         } else if self.rows.is_empty() {

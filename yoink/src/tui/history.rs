@@ -140,7 +140,12 @@ impl HistoryState {
         Some((svc.clone(), row.version.clone()))
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    pub fn render(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         let layout = pane_layout(area);
         let title = match &self.service {
             Some(svc) => format!("yoink history · {svc} · ↑↓ select · r rollback · esc back"),
@@ -158,7 +163,7 @@ impl HistoryState {
             Constraint::Min(12),    // deployed-by
         ];
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from("(loading…)")])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
         } else if self.rows.is_empty() && !self.errors.is_empty() {
             // All hosts errored — make that obvious instead of
             // implying the service has no history.

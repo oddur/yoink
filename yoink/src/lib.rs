@@ -1,4 +1,5 @@
 pub mod build;
+pub mod completion;
 pub mod config;
 pub mod deploy;
 pub mod diff;

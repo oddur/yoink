@@ -164,6 +164,18 @@ pub fn build_labels(
     spec_hash: &str,
 ) -> BTreeMap<String, String> {
     let mut labels: BTreeMap<String, String> = service.labels.clone();
+    // Use the OCI standard key so the TUI's single lookup works for
+    // both yoink-deployed and 3rd-party OCI containers.
+    if let Some(desc) = service
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        labels
+            .entry("org.opencontainers.image.description".into())
+            .or_insert_with(|| desc.to_string());
+    }
     labels.insert("yoink.managed".into(), "true".into());
     labels.insert("yoink.service".into(), service.name.clone());
     labels.insert("yoink.version".into(), tag.into());
@@ -1641,6 +1653,44 @@ services:
         assert_eq!(
             labels.get("yoink.spec_hash"),
             Some(&"0123456789abcdef".into())
+        );
+    }
+
+    #[test]
+    fn build_labels_emits_oci_description_when_set() {
+        let mut cfg = config_one_service();
+        cfg.services[0].description = Some("API gateway".into());
+        let labels = build_labels(&cfg.services[0], "abc1234", "0123456789abcdef");
+        assert_eq!(
+            labels.get("org.opencontainers.image.description"),
+            Some(&"API gateway".into())
+        );
+    }
+
+    #[test]
+    fn build_labels_omits_oci_description_when_unset_or_blank() {
+        let cfg = config_one_service();
+        let labels = build_labels(&cfg.services[0], "abc1234", "0123456789abcdef");
+        assert!(!labels.contains_key("org.opencontainers.image.description"));
+
+        let mut blank = config_one_service();
+        blank.services[0].description = Some("   ".into());
+        let labels = build_labels(&blank.services[0], "abc1234", "0123456789abcdef");
+        assert!(!labels.contains_key("org.opencontainers.image.description"));
+    }
+
+    #[test]
+    fn build_labels_user_override_wins_over_description_field() {
+        let mut cfg = config_one_service();
+        cfg.services[0].description = Some("from convenience field".into());
+        cfg.services[0].labels.insert(
+            "org.opencontainers.image.description".into(),
+            "explicit user override".into(),
+        );
+        let labels = build_labels(&cfg.services[0], "abc1234", "0123456789abcdef");
+        assert_eq!(
+            labels.get("org.opencontainers.image.description"),
+            Some(&"explicit user override".into())
         );
     }
 

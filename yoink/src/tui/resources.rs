@@ -324,7 +324,13 @@ impl ResourcesState {
         clamp_selection(&mut self.networks_table, networks_visible);
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect, _config: &Config) {
+    pub fn render(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        _config: &Config,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         let layout = pane_layout(area);
         let header = layout[0];
         let body = layout[1];
@@ -349,9 +355,9 @@ impl ResourcesState {
         frame.render_widget(tabs, header);
 
         match self.current_tab() {
-            ResourceTab::Images => self.render_images(frame, body),
-            ResourceTab::Volumes => self.render_volumes(frame, body),
-            ResourceTab::Networks => self.render_networks(frame, body),
+            ResourceTab::Images => self.render_images(frame, body, throbber),
+            ResourceTab::Volumes => self.render_volumes(frame, body, throbber),
+            ResourceTab::Networks => self.render_networks(frame, body, throbber),
         }
 
         // Footer: filter line + per-tab help on the right.
@@ -383,7 +389,12 @@ impl ResourcesState {
         }
     }
 
-    fn render_images(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_images(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         let widths = [
             Constraint::Length(16), // host
             Constraint::Length(14), // id
@@ -398,7 +409,7 @@ impl ResourcesState {
         let dangling_count = self.images.iter().filter(|i| i.dangling).count();
 
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from("(loading…)")])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
         } else if self.images.is_empty() {
             vec![Row::new(vec![Cell::from("(no images cached on any host)")])]
         } else if visible.is_empty() {
@@ -457,7 +468,12 @@ impl ResourcesState {
         frame.render_stateful_widget(table, area, &mut self.images_table);
     }
 
-    fn render_volumes(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_volumes(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         let widths = [
             Constraint::Length(16), // host
             Constraint::Length(28), // name
@@ -468,7 +484,7 @@ impl ResourcesState {
         clamp_selection(&mut self.volumes_table, visible.len());
 
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from("(loading…)")])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
         } else if self.volumes.is_empty() {
             vec![Row::new(vec![Cell::from("(no volumes on any host)")])]
         } else if visible.is_empty() {
@@ -504,7 +520,12 @@ impl ResourcesState {
         frame.render_stateful_widget(table, area, &mut self.volumes_table);
     }
 
-    fn render_networks(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_networks(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         let widths = [
             Constraint::Length(16), // host
             Constraint::Length(28), // name
@@ -516,7 +537,7 @@ impl ResourcesState {
         clamp_selection(&mut self.networks_table, visible.len());
 
         let rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from("(loading…)")])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
         } else if self.networks.is_empty() {
             vec![Row::new(vec![Cell::from("(no networks)")])]
         } else if visible.is_empty() {

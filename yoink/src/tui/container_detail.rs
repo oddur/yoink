@@ -238,6 +238,13 @@ impl ContainerDetailState {
         self.top_loading || self.top.is_some()
     }
 
+    /// Last-known inspect for the focused container, if loaded.
+    /// Used by `App::drift_focus` to resolve the service name from
+    /// the running container's `yoink.service` label.
+    pub fn inspect(&self) -> Option<&ContainerDetail> {
+        self.inspect.as_ref()
+    }
+
     pub fn target(&self) -> Option<&(Host, String)> {
         self.target.as_ref()
     }
@@ -258,7 +265,13 @@ impl ContainerDetailState {
         }
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect, history: Option<&StatsHistory>) {
+    pub fn render(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        history: Option<&StatsHistory>,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         if let Some(err) = &self.last_error {
             let block = Block::default().borders(Borders::ALL).title(" container ");
             frame.render_widget(
@@ -271,17 +284,20 @@ impl ContainerDetailState {
         }
 
         let Some(inspect) = &self.inspect else {
-            let msg = if self.loaded {
-                "(container not found — may have been removed)"
+            let block = Block::default().borders(Borders::ALL).title(" container ");
+            if self.loaded {
+                frame.render_widget(
+                    Paragraph::new("(container not found — may have been removed)")
+                        .style(Style::default().fg(Color::DarkGray))
+                        .block(block),
+                    area,
+                );
             } else {
-                "(loading…)"
-            };
-            frame.render_widget(
-                Paragraph::new(msg)
-                    .style(Style::default().fg(Color::DarkGray))
-                    .block(Block::default().borders(Borders::ALL).title(" container ")),
-                area,
-            );
+                frame.render_widget(
+                    Paragraph::new(super::ui::loading_line(throbber)).block(block),
+                    area,
+                );
+            }
             return;
         };
 
@@ -307,7 +323,7 @@ impl ContainerDetailState {
         Self::render_env_labels(frame, cols[1], inspect);
 
         if self.top_visible() {
-            self.render_top_modal(frame);
+            self.render_top_modal(frame, throbber);
         }
     }
 
@@ -526,7 +542,11 @@ impl ContainerDetailState {
 
     /// Centre-modal overlay listing `docker top` rows. Same dimensions
     /// as the help/error modals so the visual language stays consistent.
-    fn render_top_modal(&self, frame: &mut Frame<'_>) {
+    fn render_top_modal(
+        &self,
+        frame: &mut Frame<'_>,
+        throbber: &throbber_widgets_tui::ThrobberState,
+    ) {
         use ratatui::widgets::Clear;
         let area = frame.area();
         let modal_width = (area.width.saturating_sub(4)).clamp(60, 140);
@@ -546,9 +566,7 @@ impl ContainerDetailState {
         frame.render_widget(Clear, modal_area);
 
         if self.top_loading && self.top.is_none() {
-            let body = Paragraph::new("(loading…)")
-                .style(Style::default().fg(Color::DarkGray))
-                .block(block);
+            let body = Paragraph::new(super::ui::loading_line(throbber)).block(block);
             frame.render_widget(body, modal_area);
             return;
         }
@@ -635,6 +653,14 @@ impl ContainerDetailState {
         if let Some(h) = health {
             left_lines.push(kv_styled("health", h, health_style(h)));
         }
+        if let Some(desc) = inspect
+            .labels
+            .get("org.opencontainers.image.description")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            left_lines.push(kv("description", desc));
+        }
         if let Some(cmd) = &inspect.command {
             left_lines.push(kv("command", cmd));
         }
@@ -716,20 +742,102 @@ impl ContainerDetailState {
     }
 
     fn render_runtime(frame: &mut Frame<'_>, area: Rect, inspect: &ContainerDetail) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(20), // ports
-                Constraint::Percentage(30), // mounts
-                Constraint::Percentage(20), // networks
-                Constraint::Percentage(30), // security & limits
-            ])
-            .split(area);
+        // Skip the proxy section for non-routed containers (3rd-party
+        // images, or services without `domain:`) so their layout stays
+        // 4-section.
+        let has_proxy = inspect.labels.contains_key("yoink.caddy.domain");
+        let chunks = if has_proxy {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(18), // proxy
+                    Constraint::Percentage(15), // ports
+                    Constraint::Percentage(25), // mounts
+                    Constraint::Percentage(15), // networks
+                    Constraint::Percentage(27), // security & limits
+                ])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(20), // ports
+                    Constraint::Percentage(30), // mounts
+                    Constraint::Percentage(20), // networks
+                    Constraint::Percentage(30), // security & limits
+                ])
+                .split(area)
+        };
 
-        Self::render_list(frame, chunks[0], " ports ", &inspect.ports);
-        Self::render_list(frame, chunks[1], " mounts ", &inspect.mounts);
-        Self::render_list(frame, chunks[2], " networks ", &inspect.networks);
-        Self::render_security(frame, chunks[3], inspect);
+        let mut idx = 0;
+        if has_proxy {
+            Self::render_proxy(frame, chunks[idx], inspect);
+            idx += 1;
+        }
+        Self::render_list(frame, chunks[idx], " ports ", &inspect.ports);
+        Self::render_list(frame, chunks[idx + 1], " mounts ", &inspect.mounts);
+        Self::render_list(frame, chunks[idx + 2], " networks ", &inspect.networks);
+        Self::render_security(frame, chunks[idx + 3], inspect);
+    }
+
+    /// Public URL + TLS + extra-rules indicator, sourced from
+    /// `yoink.caddy.*` labels written by `deploy::build_labels`.
+    /// The labels are the source of truth here — they flow through
+    /// the `spec_hash` so any routing change has already been
+    /// redeployed by the time this renders.
+    fn render_proxy(frame: &mut Frame<'_>, area: Rect, inspect: &ContainerDetail) {
+        let block = Block::default().borders(Borders::ALL).title(" proxy ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(domain_csv) = inspect.labels.get("yoink.caddy.domain") else {
+            return;
+        };
+        let domains: Vec<&str> = domain_csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let primary = domains.first().copied().unwrap_or("?");
+        let extra_count = domains.len().saturating_sub(1);
+
+        let tls = inspect
+            .labels
+            .get("yoink.caddy.tls")
+            .map_or("auto", String::as_str);
+        let scheme = if tls == "off" { "http" } else { "https" };
+        let url = format!("{scheme}://{primary}");
+
+        let tls_text = match tls {
+            "off" => "off (HTTP only)".to_string(),
+            "cert" => {
+                let secret = inspect
+                    .labels
+                    .get("yoink.caddy.cert_secret")
+                    .map_or("?", String::as_str);
+                format!("custom cert ({secret})")
+            }
+            _ => "auto (Let's Encrypt)".to_string(),
+        };
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut url_spans = vec![
+            Span::styled("url ", dim),
+            Span::styled(url, Style::default().fg(Color::Cyan)),
+        ];
+        if extra_count > 0 {
+            url_spans.push(Span::styled(format!("  (+{extra_count} more)"), dim));
+        }
+        let mut lines: Vec<Line<'static>> = vec![Line::from(url_spans), kv("tls", &tls_text)];
+
+        if extra_count > 0 {
+            lines.push(kv("aliases", &domains[1..].join(", ")));
+        }
+        if let Some(hash) = inspect.labels.get("yoink.caddy.extra_hash") {
+            lines.push(kv("extra rules", &format!("present ({hash})")));
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     /// Surface the secure-by-default profile + any override the

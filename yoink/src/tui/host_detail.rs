@@ -148,7 +148,7 @@ impl HostDetailState {
         self.host.as_ref()
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         frame: &mut Frame<'_>,
@@ -157,6 +157,7 @@ impl HostDetailState {
         secrets: Option<&SecretsBundle>,
         events: &[String],
         history: &HashMap<(String, String), StatsHistory>,
+        throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         // 5-section layout: header · summary · containers (Min) · events (Length 8 when present) · footer.
         // The event panel collapses to 0 when no events are recorded yet.
@@ -187,7 +188,7 @@ impl HostDetailState {
         let header = Paragraph::new(header_text).style(bold());
         frame.render_widget(header, header_area);
 
-        self.render_summary(frame, summary_area, history);
+        self.render_summary(frame, summary_area, history, throbber);
 
         let widths = [
             Constraint::Length(14), // service
@@ -204,7 +205,7 @@ impl HostDetailState {
         let visible = self.visible_indices();
         clamp_selection(&mut self.table, visible.len());
         let rows: Vec<Row<'_>> = if !self.loaded && self.last_error.is_none() {
-            vec![Row::new(vec![Cell::from("(loading…)")])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
         } else if visible.is_empty() && !self.containers.is_empty() {
             vec![Row::new(vec![Cell::from("(no containers match filter)")])]
         } else if self.containers.is_empty() {
@@ -320,6 +321,7 @@ impl HostDetailState {
         frame: &mut Frame<'_>,
         area: ratatui::layout::Rect,
         history: &HashMap<(String, String), StatsHistory>,
+        throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -396,21 +398,28 @@ impl HostDetailState {
 
         // Third row: kernel + OS + container counts. Dim so it sits
         // quietly under the gauges.
-        let info_text = match &self.host_info {
+        match &self.host_info {
             Some(i) => {
                 let os = i.operating_system.as_deref().unwrap_or("?");
                 let kernel = i.kernel.as_deref().unwrap_or("?");
                 let running = i.containers_running.unwrap_or(0);
                 let total = i.containers.unwrap_or(0);
                 let images = i.images.unwrap_or(0);
-                format!("{os} · {kernel} · {running}/{total} containers · {images} images")
+                let info_text = format!(
+                    "{os} · {kernel} · {running}/{total} containers · {images} images"
+                );
+                frame.render_widget(
+                    Paragraph::new(info_text).style(Style::default().fg(Color::DarkGray)),
+                    chunks[2],
+                );
             }
-            None => "(host info loading…)".into(),
-        };
-        frame.render_widget(
-            Paragraph::new(info_text).style(Style::default().fg(Color::DarkGray)),
-            chunks[2],
-        );
+            None => {
+                frame.render_widget(
+                    Paragraph::new(super::ui::throbber_with_label(throbber, " host info…")),
+                    chunks[2],
+                );
+            }
+        }
     }
 }
 
