@@ -7,13 +7,13 @@ Error messages you might see, what they mean, and how to fix them.
 
 ## `docker save exited with status 1`
 
-You're in standalone mode (`--no-registry`) but the image isn't built locally yet.
+A service has a `build:` block (so yoink wants to ship it from local) but the image isn't built locally yet.
 
 ```sh
-yoink up --build --no-registry        # build first, then ship
+yoink up --build        # build first, then ship
 ```
 
-Or build in a separate step: `yoink build` then `yoink up --no-registry`.
+Or build in a separate step: `yoink build` then `yoink up`.
 
 ## `lock heartbeat exec failed: container not found`
 
@@ -74,7 +74,7 @@ Your CI hasn't built and pushed this SHA yet. Either:
 
 - Wait for the build workflow to finish, or
 - Pass a different `--tag <service>=<sha>` that exists, or
-- Use standalone mode (`--build --no-registry`) to ship the local image directly.
+- Add a `build:` block to the service and pass `--build` so yoink ships the local image directly instead of pulling.
 
 ## `secrets.NAME not allowed in step-level if:` (GitHub Actions)
 

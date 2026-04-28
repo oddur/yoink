@@ -53,8 +53,13 @@ yoink up                                 reconcile every service to its desired 
   --watch                                re-reconcile whenever the config file (or include
                                          fragment) changes on disk; polls every 2s. Ctrl-C
                                          exits. Cannot combine with --plan/--dry-run.
-  --no-registry                          stream local image to host (no docker pull);
-                                         pair with --build for the indie one-shot
+  --no-registry                          force local-only mode: ship every selected service's
+                                         image from the operator's docker daemon to each host,
+                                         skipping all registry pulls. Usually unnecessary —
+                                         services with a `build:` block are shipped from local
+                                         automatically; this widens the path to non-build
+                                         services too (offline / airgapped / locally-modified
+                                         public image)
   --build                                docker build any service with a `build:` block first
   --force                                redeploy even when at-spec; recovery gesture for
                                          drifted proxy state. Pair with --service to scope.
@@ -207,10 +212,10 @@ Tradeoff: for multi-replica services the prep phase removes the old replicas bef
 
 ## Watch mode (`--watch`)
 
-`yoink up --watch` runs an initial reconcile, then keeps polling the config file every 2 seconds and re-reconciles on every change. Pairs with `--build --no-registry` for the edit-save-deploy inner loop:
+`yoink up --watch` runs an initial reconcile, then keeps polling the config file every 2 seconds and re-reconciles on every change. Pairs with `--build` for the edit-save-deploy inner loop:
 
 ```sh
-yoink up --watch --build --no-registry --service my-tool
+yoink up --watch --build --service my-tool
 # edit Dockerfile / yoink.yaml → save → yoink rebuilds and ships
 # Ctrl-C to exit
 ```
@@ -224,7 +229,7 @@ yoink uses three deliberately distinct shapes for boolean flags:
 | Shape | Meaning | Examples |
 |---|---|---|
 | `--<verb>` | Enable an additive behavior. Off by default. | `--build`, `--watch`, `--push`, `--json`, `--force` |
-| `--no-<thing>` | Suppress a default-on behavior. | `--no-registry` (skip the registry pull), `--no-port` (skip port/healthcheck inference), `--no-secrets` (skip identity bootstrap), `--no-cache` (skip docker build cache) |
+| `--no-<thing>` | Suppress a default-on behavior. | `--no-registry` (force local-only mode — ship every service's image from local instead of pulling), `--no-port` (skip port/healthcheck inference), `--no-secrets` (skip identity bootstrap), `--no-cache` (skip docker build cache) |
 | `--allow-<safety>` | Override a safety guard. The default refuses; `--allow-X` opts in. | `--allow-dirty` (deploy with a dirty git tree) |
 
 Same rules for new flags: `--allow-X` only when there's a guard to bypass; `--no-X` only when the default is on; otherwise plain `--<verb>`. Avoid `--skip-X` / `--without-X` — they overlap with `--no-X`.

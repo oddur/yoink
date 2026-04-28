@@ -69,7 +69,7 @@ Kamal is the closest neighbor — both are "ship a Rust/Ruby binary, ssh into ho
 | Per-service `pids_limit` | ✓ | ✗ |
 | Secure-by-default RunOptions | ✓ (cap_drop=ALL, no-new-privileges, read_only=true, pids_limit=1024, init=tini, tmpfs noexec, binds default :ro) | ✗ (docker defaults) |
 | Port-forward to non-published services | ✓ (`yoink pf <svc>`, auto-spawns socat sidecar so the locked-down "no `publish:`" default doesn't make debugging awkward) | ✗ (operator BYO `ssh -L`) |
-| No-registry deploy | ✓ (`yoink up --build --no-registry` runs an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar on the host and pushes only the missing layers via SSH; tarball fallback) | ✗ (registry required) |
+| No-registry deploy | ✓ (`yoink up --build` ships any service with a `build:` block via an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar — only the missing layers cross the SSH wire; no registry account needed for those services; tarball fallback) | ✗ (registry required) |
 | Driven by AI agents / CI scripts | ✓ (CLI + YAML, identical local & remote) | ✓ (CLI + YAML) |
 | Maturity | New (born 2026) | Mature (born 2023, used at 37signals scale) |
 | Ecosystem | Rust-built, opinionated for "I run a few heterogeneous services" | Ruby/Rails ecosystem, `rails new` → `kamal init` is the canonical Rails deploy story today |

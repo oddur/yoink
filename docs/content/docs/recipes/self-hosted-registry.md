@@ -3,7 +3,7 @@ title: Self-hosted registry on a yoink host
 weight: 11
 ---
 
-The middle ground between "real remote registry" (ghcr.io, etc.) and "no registry at all" (`--no-registry` save/load): run a `registry:2` container as a yoink-managed service on one of your hosts, expose it via tailscale, and point `image:` at the tailnet hostname.
+The middle ground between "real remote registry" (ghcr.io, etc.) and "no registry at all" (services with a `build:` block, shipped from your local docker daemon by plain `yoink up`): run a `registry:2` container as a yoink-managed service on one of your hosts, expose it via tailscale, and point `image:` at the tailnet hostname.
 
 Best for "I want a registry but I don't want to pay for one and I don't want to run it on a separate machine."
 
@@ -63,5 +63,5 @@ yoink up --service api          # docker pull from the tailnet registry on each 
 
 ## See also
 
-- [Three deploy modes](/docs/guide/deploy-modes) — when registry vs. registry-less (`--no-registry` / unregistry) makes sense.
+- [Three deploy modes](/docs/guide/deploy-modes) — when registry vs. registry-less (`build:` blocks shipped via unregistry over SSH) makes sense.
 - [Multi-host distribution](/docs/recipes/multi-host-distribution) — pinning services to specific hosts when you've split images across registries.

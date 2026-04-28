@@ -205,10 +205,10 @@ include:
 ## Step 6: deploy
 
 ```sh
-yoink up --build --no-registry
+yoink up --build
 ```
 
-One command. Yoink pulls postgres from Docker Hub, builds the app image locally, ships the app to the host via [unregistry](https://github.com/psviderski/unregistry) over SSH (no registry account required), starts both containers on the `yoink` network, and runs the app's healthcheck. The image-prefetch phase auto-skips services with a `build:` block when `--no-registry` is set, so locally-built services don't 404 on Docker Hub.
+One command. Yoink pulls postgres from Docker Hub on the host, builds the app image locally, ships the app to the host via [unregistry](https://github.com/psviderski/unregistry) over SSH (no registry account required), starts both containers on the `yoink` network, and runs the app's healthcheck. yoink picks the right path per service from the `build:` block — postgres (no `build:`) gets pulled by the host; the app (with `build:`) gets shipped from your local docker daemon. No flag needed, no 404s on Docker Hub for locally-built images.
 
 First deploy is the slow one — pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry ships only changed layers.
 
@@ -229,7 +229,7 @@ The page should render JSON with `ok: true` and a postgres version string.
 ## Re-deploys
 
 ```sh
-yoink up --build --no-registry --service my-app
+yoink up --build --service my-app
 ```
 
 ~15 seconds for a typical code change. unregistry's layer dedup means only the rebuilt application layer ships over SSH.
@@ -237,7 +237,7 @@ yoink up --build --no-registry --service my-app
 For tag-stamped deploys (so `yoink history` shows commits, not `latest`s):
 
 ```sh
-yoink up --build --no-registry --here --service my-app
+yoink up --build --here --service my-app
 ```
 
 `--here` substitutes `git rev-parse --short HEAD` for the tag.

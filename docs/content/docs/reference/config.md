@@ -13,7 +13,7 @@ Full schema for `yoink.yaml`. Canonical source: [`yoink/src/config.rs`](https://
 | `hosts` | list of [Host](#host) | required | One or more deploy targets. |
 | `deploy` | [Deploy](#deploy) | `{}` | Cross-service defaults (networks, etc.). |
 | `secrets` | [Secrets](#secrets) | unset | Secret provider config. Required if any service uses `secrets:` / `env_from_secrets:`. |
-| `registry` | [Registry](#registry) | unset | Image-pull credentials. Skip for `--no-registry` or public images. |
+| `registry` | [Registry](#registry) | unset | Image-pull credentials. Skip when every service is locally-built (yoink ships build artifacts from your docker daemon, no auth needed) or when pulling exclusively from public registries. |
 | `services` | list of [Service](#service) | `[]` | Services to deploy. Can be defined inline or split via `include:`. |
 | `include` | list of glob | `[]` | Glob paths (relative to the config file) merged into `services`. |
 
