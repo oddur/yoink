@@ -11,6 +11,8 @@ variables:
         s3:https://fsn1.your-objectstorage.com/MY-BUCKET   (Hetzner)
         s3:https://s3.eu-central-003.backblazeb2.com/MY-BUCKET  (B2)
         s3:http://rustfs-vault.tailnet:9000/backups        (self-hosted)
+    default: "s3:https://CHANGE-ME.example.com/CHANGE-ME"
+    pattern: "^s3:.+"
   - name: schedule
     prompt: go-cron schedule (6 fields incl. seconds)
     default: "0 30 3 * * *"
@@ -22,24 +24,26 @@ files:
   - dest: "services/backups.yaml"
     template: service.yaml.tmpl
 
-secrets:
-  - name: RESTIC_PASSWORD
-    generate: "random:48"
-
 include_glob: "services/*.yaml"
 
 notes: |
-  RESTIC_PASSWORD has been auto-generated and sealed.
-  **Save a copy somewhere durable.** Without it you cannot decrypt
-  these backups. Print it via:
-    yoink secrets get RESTIC_PASSWORD
+  Three operator-supplied secrets need to be sealed manually before
+  the next deploy — the template doesn't auto-generate them because
+  the S3 keys come from your storage provider, and tying the
+  RESTIC_PASSWORD to the provider keys keeps "all backup credentials"
+  in one place under your control:
 
-  You also need to seal two operator-supplied secrets manually — the
-  S3 keys for the bucket at the configured `repository` URL:
     yoink secrets edit
     # add:
+    #   RESTIC_PASSWORD=…    (e.g. `openssl rand -base64 48`)
     #   S3_ACCESS_KEY_ID=…
     #   S3_SECRET_ACCESS_KEY=…
+
+  **Save a copy of RESTIC_PASSWORD somewhere durable.** Without it you
+  cannot decrypt these backups.
+
+  If `repository` is still the placeholder, edit services/backups.yaml
+  to point it at your real bucket before deploying.
 
   Edit services/backups.yaml to list the docker volumes you want to back
   up — one read-only bind under `run.volumes:` per volume:

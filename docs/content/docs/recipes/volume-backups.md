@@ -63,48 +63,55 @@ yoink secrets edit
 #  S3_SECRET_ACCESS_KEY <- paste from `yoink secrets show RUSTFS_SECRET_KEY --reveal`
 ```
 
-`yoink up`, watch dedup do its thing on the second backup. See [pairing with Tailscale](/docs/guide/pairing) for tailnet hostname conventions.
+Two one-time setup steps on the host before the first deploy:
 
-## What the templates render
-
-If you want to see the shape directly (or you'd rather drop the YAML in by hand), the rendered `services/backups.yaml` looks like this:
-
-```yaml
-services:
-  - name: backups
-    image: mazzolino/restic
-    tag: "1.8.2"
-    env:
-      RESTIC_REPOSITORY: "s3:https://s3.example.com/MY-BUCKET"
-      BACKUP_CRON: "0 30 3 * * *"
-      RESTIC_BACKUP_SOURCES: /data
-      RESTIC_FORGET_ARGS: "--keep-daily 7 --keep-weekly 4 --keep-monthly 6"
-    env_from_secrets:
-      AWS_ACCESS_KEY_ID:     S3_ACCESS_KEY_ID
-      AWS_SECRET_ACCESS_KEY: S3_SECRET_ACCESS_KEY
-    secrets:
-      - RESTIC_PASSWORD
-    run:
-      drain_timeout: 60s
-      volumes:
-        - resticker-cache:/root/.cache
-        # Add one read-only bind per docker volume:
-        - postgres-data:/data/postgres-data:ro
-        - api-uploads:/data/api-uploads:ro
-      options:
-        user: "0:0"             # mazzolino/restic expects root
-        init: false             # image's entrypoint already wraps with tini
-        read_only: true
-        restart: unless-stopped
-        tmpfs:
-          /tmp: "size=128m"
+```sh
+# 1. RustFS runs as uid 10001; chown its data volume so the daemon
+#    can write to it.
+ssh root@<vault-host> '
+  docker volume create rustfs-rustfs-data
+  chown -R 10001:10001 /var/lib/docker/volumes/rustfs-rustfs-data/_data
+'
 ```
 
-Things worth knowing:
+```sh
+# 2. Create the bucket. restic doesn't auto-create S3 buckets, only
+#    the repo metadata inside one. After the first `yoink up rustfs`,
+#    use any S3 client against the running RustFS:
+ssh root@<vault-host> "docker run --rm --network=<your-network> \
+  -e AWS_ACCESS_KEY_ID='$(yoink secrets show RUSTFS_ACCESS_KEY --reveal | cut -d= -f2-)' \
+  -e AWS_SECRET_ACCESS_KEY='$(yoink secrets show RUSTFS_SECRET_KEY --reveal | cut -d= -f2-)' \
+  -e AWS_REGION=us-east-1 \
+  amazon/aws-cli --endpoint-url=http://rustfs:9000 s3 mb s3://backups"
+```
 
-- **No `build:` block** → image is pulled directly by the host from Docker Hub. No registry account, no `yoink build`, no unregistry handoff. Plain `yoink up` reconciles.
-- **No healthcheck** → cron worker; nothing to probe. `port` / `healthcheck_path` correctly unset.
-- **Read-only sources** → the `:ro` suffix on each `/data/<name>` bind is load-bearing. restic doesn't write to its sources, but enforcing it at the bind keeps you honest if a future ransomware-disguised-as-backup container ever tries.
+Then `yoink up` deploys the backups service, watches dedup do its thing on the second backup. See [pairing with Tailscale](/docs/guide/pairing) for tailnet hostname conventions.
+
+### Bonus: serve a bucket as public HTTPS via yoink's Caddy
+
+RustFS is S3-compatible, so a bucket policy can flip a single bucket to anonymous-read and yoink's bundled Caddy can front it as a public asset endpoint. One-time bucket setup:
+
+```sh
+# Make the `public-assets` bucket world-readable (objects only, not the
+# bucket-level listing). Run from any host on the same docker network.
+POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::public-assets/*"}]}'
+docker run --rm --network=<your-network> \
+  -e AWS_ACCESS_KEY_ID="$(yoink secrets show RUSTFS_ACCESS_KEY --reveal | cut -d= -f2-)" \
+  -e AWS_SECRET_ACCESS_KEY="$(yoink secrets show RUSTFS_SECRET_KEY --reveal | cut -d= -f2-)" \
+  -e AWS_REGION=us-east-1 \
+  amazon/aws-cli --endpoint-url=http://rustfs:9000 s3api put-bucket-policy \
+    --bucket public-assets --policy "$POLICY"
+```
+
+Then add `domain:` and a one-line Caddy rewrite to `services/rustfs.yaml`. The rewrite injects the bucket prefix so `/foo.png` at the public domain maps to `/public-assets/foo.png` against RustFS; yoink's auto-generated `reverse_proxy rustfs:9000` (emitted because `domain:` is set) handles the actual proxying with the rewritten path:
+
+```yaml
+domain: assets.example.com
+caddy_extra_caddyfile: |
+  rewrite * /public-assets{path}
+```
+
+After `yoink up`, `https://assets.example.com/foo.png` serves the object from the `public-assets` bucket — TLS via Let's Encrypt by default (or sealed origin certs — see [Cloudflare origin certs](/docs/recipes/cloudflare-origin-certs)). The path-rewrite scopes the public endpoint to one bucket so the rest of your S3 endpoint (other buckets, the admin API) stays internal-only — but use this only for genuinely public assets, since the bucket policy is the sole access control on objects under `public-assets/*`. Add a method matcher (`@get method GET HEAD` + `respond 405` for everything else) if you want defense-in-depth against rogue PUT attempts.
 
 ## Verify
 
@@ -128,51 +135,15 @@ docker run --rm \
 
 ## Restore
 
-```sh
-docker run --rm \
-  -v $PWD/restore-out:/restore \
-  -e RESTIC_REPOSITORY="s3:https://s3.example.com/MY-BUCKET" \
-  -e RESTIC_PASSWORD="$(yoink secrets show RESTIC_PASSWORD --reveal)" \
-  -e AWS_ACCESS_KEY_ID="$(yoink secrets show S3_ACCESS_KEY_ID --reveal)" \
-  -e AWS_SECRET_ACCESS_KEY="$(yoink secrets show S3_SECRET_ACCESS_KEY --reveal)" \
-  mazzolino/restic:1.8.2 \
-  restic restore <snapshot-id> --target /restore
-```
-
-For **interactive browsing** of a backup as a filesystem, restic's FUSE mount needs `/dev/fuse` exposed and `cap_add: [SYS_ADMIN]`. Run it as a one-off outside yoink — long-lived FUSE in a deploy reconcile loop is a weird shape:
-
-```sh
-docker run --rm -it \
-  --device /dev/fuse --cap-add SYS_ADMIN \
-  -v $PWD/restore-out:/restore \
-  -e RESTIC_REPOSITORY="s3:https://s3.example.com/MY-BUCKET" \
-  -e RESTIC_PASSWORD="$(yoink secrets show RESTIC_PASSWORD --reveal)" \
-  -e AWS_ACCESS_KEY_ID="$(yoink secrets show S3_ACCESS_KEY_ID --reveal)" \
-  -e AWS_SECRET_ACCESS_KEY="$(yoink secrets show S3_SECRET_ACCESS_KEY --reveal)" \
-  mazzolino/restic:1.8.2 \
-  restic mount /restore
-```
-
-(yoink does support `devices:` and `cap_add` if you want a persistent restore-mount as a service — see the [hardware passthrough recipe](/docs/recipes/hardware-passthrough#fuse-eg-juicefs-sshfs-restic-mount). The one-off `docker run` is the right shape for "I want to grep through last Tuesday's backup.")
+`restic restore` and `restic mount` (FUSE browsing) run as one-off `docker run` invocations against the same `mazzolino/restic` image — pass the same env vars as the verify step above, plus `--device /dev/fuse --cap-add SYS_ADMIN` for the mount case. Full restore syntax lives in the [restic docs](https://restic.readthedocs.io/en/stable/050_restore.html); a long-lived FUSE service in a deploy reconcile loop is the wrong shape, but if you genuinely want one, [hardware passthrough](/docs/recipes/hardware-passthrough#fuse-eg-juicefs-sshfs-restic-mount) covers the `devices:` + `cap_add:` config.
 
 ## Troubleshooting
 
 **`Fatal: unable to open repository at s3:…`**
-The repo doesn't exist yet. The first `restic backup` initializes it automatically — wait for the first cron tick or set `RUN_ON_STARTUP=true`. If it still fails, double-check `RESTIC_REPOSITORY` (the `s3:` prefix and trailing `/<bucket>` matter) and that the S3 keys have read+write to the bucket.
-
-**`The Access Key Id you provided does not exist in our records.`**
-Wrong `S3_ACCESS_KEY_ID`, wrong endpoint, or wrong region. Each provider's keys only work against their own endpoint — Hetzner's `*.your-objectstorage.com`, B2's `s3.*.backblazeb2.com`, AWS's `s3.amazonaws.com`, etc.
+The repo doesn't exist yet. The first `restic backup` initializes it automatically — wait for the first cron tick or set `RUN_ON_STARTUP=true`. If it still fails, the `RESTIC_REPOSITORY` URL is wrong or the S3 keys don't have read+write on the bucket.
 
 **`restic` panics with `signal: terminated` during a redeploy.**
-`drain_timeout` (60s here) wasn't enough for an in-flight backup to abort cleanly. Either bump `drain_timeout` or schedule deploys outside the backup window.
-
-**Backup includes `node_modules` / `.cache` / build artifacts.**
-Add inline exclusions in the env block of the rendered `services/backups.yaml`:
-
-```yaml
-env:
-  RESTIC_BACKUP_ARGS: "--exclude-caches --exclude '*.tmp' --exclude 'node_modules'"
-```
+`drain_timeout` (60s by default) wasn't enough for an in-flight backup to abort cleanly. Bump `drain_timeout` in the rendered service, or schedule deploys outside the backup window.
 
 ## See also
 

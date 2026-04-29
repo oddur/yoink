@@ -33,3 +33,9 @@ services:
         restart: unless-stopped
         tmpfs:
           /tmp: "size=128m"
+          # resticker's go-cron writes /run/lock/backup.lock to prevent
+          # overlapping backup runs; with read_only rootfs this dir
+          # needs explicit tmpfs (mounting `/run` alone leaves the
+          # `/lock` subdir nonexistent on a fresh tmpfs — mount the
+          # leaf path directly).
+          /run/lock: "size=16m"

@@ -21,6 +21,9 @@ services:
         # rustfs/rustfs ships uid 10001 baked in.
         user: "10001:10001"
         memory: {{ memory }}
-        # The data volume is writable; rootfs stays immutable per
-        # yoink's hardened default.
+        # rustfs writes operational logs to /logs at startup. Rootfs
+        # stays read_only=true (yoink default); /logs gets a tmpfs so
+        # the writes succeed without a persistent volume.
+        tmpfs:
+          /logs: "size=64m"
         network_aliases: [{{ service_name }}]

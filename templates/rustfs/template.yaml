@@ -23,7 +23,7 @@ variables:
   - name: console_enable
     prompt: Enable RustFS admin console on :9001?
     default: "false"
-    choices: ["true", "false"]
+    pattern: "^(true|false)$"
   - name: memory
     prompt: Memory limit
     default: 1g
@@ -67,3 +67,16 @@ notes: |
     so RustFS only deploys on the off-site host.
   - On the workload host, `yoink add restic-backups` and set the
     repository URL to the vault host's tailnet hostname.
+
+  Public assets via yoink's Caddy:
+  RustFS supports `s3api put-bucket-policy` with `Principal: "*"`,
+  so any single bucket can be flipped to anonymous-read and fronted
+  by the bundled Caddy as a public HTTPS endpoint. Add to
+  services/{{ service_name }}.yaml:
+    domain: assets.example.com
+    caddy_extra_caddyfile: |
+      rewrite * /<public-bucket>{path}
+  The path-rewrite scopes the public endpoint to one bucket; the
+  admin API and other buckets stay internal-only. See the
+  /docs/recipes/volume-backups recipe for the matching bucket-policy
+  one-liner.
