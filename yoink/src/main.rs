@@ -171,6 +171,12 @@ enum Command {
         /// subsequent `yoink hosts add` calls just work.
         #[arg(long, value_name = "NAME", conflicts_with = "no_secrets")]
         create_ssh_key: Option<String>,
+        /// Pre-fill `proxy.email:` in the rendered yoink.yaml. Required
+        /// at `yoink up` time when any service uses `tls: auto` (the
+        /// default for ACME); pass it here to avoid an after-the-fact
+        /// hand-edit.
+        #[arg(long, value_name = "EMAIL")]
+        proxy_email: Option<String>,
     },
     /// Drop a vetted template into your repo — accessory (postgres,
     /// redis, …) or full app (openclaw, …). Fetches from GitHub,
@@ -1288,6 +1294,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn cmd_preflight(config: &Config, wait: Option<Duration>) -> Result<()> {
+    config.require_hosts()?;
     let ops = build_real_ops(config, None).await?;
     let mut had_error = false;
     for host_cfg in &config.hosts {
@@ -1390,6 +1397,8 @@ struct UpOptions<'a> {
 }
 
 async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
+    config.require_hosts()?;
+    config.require_services()?;
     let dry_run = up.dry_run || up.plan;
 
     do_up_once(config, &up, dry_run).await?;
@@ -3671,6 +3680,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             image,
             no_secrets,
             create_ssh_key,
+            proxy_email,
         } => Some(yoink::init::cmd_init(yoink::init::InitOpts {
             host: host.clone(),
             force: *force,
@@ -3681,6 +3691,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             image: image.clone(),
             no_secrets: *no_secrets,
             create_ssh_key: create_ssh_key.clone(),
+            proxy_email: proxy_email.clone(),
         })),
         _ => None,
     }
