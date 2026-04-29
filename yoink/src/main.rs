@@ -772,6 +772,50 @@ enum SecretsAction {
     /// old recipient and run `yoink secrets edit` (just save without
     /// changes) to re-seal under the new recipients only.
     Rotate,
+    /// Manage SSH keypairs used by yoink itself (e.g. host
+    /// `ssh_key_secret:` references). Subcommands operate on
+    /// already-sealed bundles, so the private half never touches disk
+    /// in plaintext.
+    SshKey {
+        #[command(subcommand)]
+        action: SshKeyAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum SshKeyAction {
+    /// Generate a fresh ed25519 SSH keypair, seal the private half
+    /// into the configured `secrets.age` under `--seal-as <NAME>`, and
+    /// print the OpenSSH-format public key to stdout (one line, ready
+    /// to pipe into `hcloud ssh-key create --public-key-from-file -`,
+    /// `gh ssh-key add`, your provider's SSH-key form, etc.).
+    ///
+    /// The private half is generated in memory and committed straight
+    /// into the sealed bundle — no plaintext PEM ever lands in /tmp,
+    /// no `shred` cleanup needed. Existing keys in the bundle are
+    /// preserved (same merge logic as `yoink secrets edit`).
+    Generate {
+        /// Name to seal the private key under. Becomes the secret key
+        /// referenced by `hosts[].ssh_key_secret:` (or any other yoink
+        /// surface that resolves a sealed value by name).
+        #[arg(long = "seal-as", value_name = "NAME")]
+        seal_as: String,
+        /// Optional comment baked into the OpenSSH key header. Mirrors
+        /// `ssh-keygen -C`. Default: empty.
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
+    },
+    /// Print the OpenSSH-format public key derived from a sealed SSH
+    /// private key, one line on stdout. Useful for piping into provider
+    /// SSH-key-upload commands without re-extracting the public half:
+    ///
+    ///   hcloud ssh-key create --name yoink-scratch \
+    ///     --public-key-from-file <(yoink secrets ssh-key public --name DEPLOY_SSH_KEY)
+    Public {
+        /// Name of the sealed SSH private key to derive the public from.
+        #[arg(long, value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -3590,7 +3634,123 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
             out,
         } => cmd_secrets_seal(config, r#in.as_deref(), &as_pairs, out),
         SecretsAction::Rotate => cmd_secrets_rotate(config),
+        SecretsAction::SshKey { action } => match action {
+            SshKeyAction::Generate { seal_as, comment } => {
+                cmd_secrets_ssh_key_generate(config, &seal_as, comment.as_deref())
+            }
+            SshKeyAction::Public { name } => cmd_secrets_ssh_key_public(config, &name),
+        },
     }
+}
+
+fn cmd_secrets_ssh_key_generate(
+    config: &Config,
+    seal_as: &str,
+    comment: Option<&str>,
+) -> Result<()> {
+    use ssh_key::{Algorithm, LineEnding, PrivateKey, rand_core::OsRng};
+    use yoink::sealed;
+
+    if seal_as.is_empty()
+        || seal_as
+            .bytes()
+            .next()
+            .is_none_or(|b| !(b.is_ascii_alphabetic() || b == b'_'))
+        || !seal_as
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(anyhow::anyhow!(
+            "--seal-as {seal_as:?} is not a valid secret name (must match [A-Za-z_][A-Za-z0-9_]*)"
+        ));
+    }
+
+    let (file_override, recipients) = expect_age_block(config)?;
+    let target = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+
+    // ed25519 keypair, in memory only.
+    let mut rng = OsRng;
+    let key =
+        PrivateKey::random(&mut rng, Algorithm::Ed25519).context("generate ed25519 keypair")?;
+    let key = if let Some(c) = comment {
+        let mut k = key;
+        k.set_comment(c);
+        k
+    } else {
+        key
+    };
+    let priv_pem = key
+        .to_openssh(LineEnding::LF)
+        .context("encode private key as OpenSSH PEM")?;
+    let pub_openssh = key
+        .public_key()
+        .to_openssh()
+        .context("encode public key as OpenSSH")?;
+
+    // Merge into the existing bundle (if any) so we don't clobber
+    // unrelated keys. Same shape as `yoink secrets edit` on save.
+    let mut bundle = if target.exists() {
+        let identity = sealed::load_identity(recipients)?;
+        let ciphertext =
+            std::fs::read(&target).with_context(|| format!("read {}", target.display()))?;
+        let plaintext = sealed::unseal(&ciphertext, &identity)?;
+        sealed::parse_dotenv(&plaintext)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    if bundle.contains_key(seal_as) {
+        return Err(anyhow::anyhow!(
+            "{seal_as:?} already exists in the sealed bundle. Pick a different --seal-as name, \
+             or run `yoink secrets edit` to remove the existing entry first."
+        ));
+    }
+    bundle.insert(seal_as.to_string(), (*priv_pem).clone());
+
+    let canonical = sealed::render_dotenv(&bundle);
+    let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
+    sealed::write_atomically_secret(&target, &sealed_bytes)?;
+
+    eprintln!(
+        "✓ sealed new ed25519 SSH private key as {seal_as:?} into {}",
+        target.display()
+    );
+    // stdout: just the public key, one line, ready to pipe.
+    println!("{pub_openssh}");
+    Ok(())
+}
+
+fn cmd_secrets_ssh_key_public(config: &Config, name: &str) -> Result<()> {
+    use ssh_key::PrivateKey;
+    use yoink::sealed;
+
+    let (file_override, recipients) = expect_age_block(config)?;
+    let target = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+    if !target.exists() {
+        return Err(anyhow::anyhow!(
+            "no sealed bundle at {}; nothing to derive {name:?} from",
+            target.display()
+        ));
+    }
+    let identity = sealed::load_identity(recipients)?;
+    let ciphertext =
+        std::fs::read(&target).with_context(|| format!("read {}", target.display()))?;
+    let plaintext = sealed::unseal(&ciphertext, &identity)?;
+    let bundle = sealed::parse_dotenv(&plaintext)?;
+    let pem = bundle.get(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{name:?} not found in the sealed bundle at {}",
+            target.display()
+        )
+    })?;
+    let key = PrivateKey::from_openssh(pem.as_bytes())
+        .with_context(|| format!("{name:?} is not a valid OpenSSH-format private key"))?;
+    let pub_openssh = key
+        .public_key()
+        .to_openssh()
+        .context("encode public key as OpenSSH")?;
+    // stdout: just the public key, one line, ready to pipe.
+    println!("{pub_openssh}");
+    Ok(())
 }
 
 fn cmd_secrets_key_public(config: &Config) -> Result<()> {
