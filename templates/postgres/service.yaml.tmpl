@@ -1,15 +1,41 @@
 services:
   - name: {{ service_name }}
     image: postgres
-    tag: "{{ version }}-alpine"
+    tag: "18-alpine"
     env:
       POSTGRES_DB: {{ database }}
       POSTGRES_USER: {{ user }}
     env_from_secrets:
       POSTGRES_PASSWORD: {{ service_name | upper }}_PASSWORD
+      {%- if wal_archiving == "true" %}
+      AWS_ACCESS_KEY_ID: S3_ACCESS_KEY_ID
+      AWS_SECRET_ACCESS_KEY: S3_SECRET_ACCESS_KEY
+      {%- endif %}
     run:
+      {%- if wal_archiving == "true" %}
+      # WAL archiving wrapper. Installs aws-cli on first start, then
+      # hands off to the stock postgres entrypoint with archive_mode
+      # flags. The archive_command runs as the postgres user, so the
+      # aws binary needs to be on $PATH for that user too — apk's
+      # default install to /usr/bin satisfies that.
+      entrypoint: ["/bin/sh", "-c"]
+      cmd:
+        - |
+          set -e
+          if ! command -v aws >/dev/null; then
+            apk add --no-cache aws-cli >/dev/null
+          fi
+          exec docker-entrypoint.sh postgres \
+            -c archive_mode=on \
+            -c wal_level=replica \
+            -c wal_compression=zstd \
+            -c archive_timeout=300 \
+            -c "archive_command=gzip -c %p | aws s3 cp{% if wal_endpoint %} --endpoint-url={{ wal_endpoint }}{% endif %} - {{ wal_repository }}/%f.gz"
+      {%- endif %}
       volumes:
-        - pgdata-{{ service_name }}:/var/lib/postgresql/data
+        # postgres 18+ stores data at /var/lib/postgresql/<major>/docker
+        # (per pg_ctlcluster's layout); mount the parent dir, not /data.
+        - pgdata-{{ service_name }}:/var/lib/postgresql
       options:
         memory: {{ memory }}
         # Stable DNS name for in-network clients. Without this, yoink

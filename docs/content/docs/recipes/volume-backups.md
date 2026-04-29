@@ -113,6 +113,44 @@ caddy_extra_caddyfile: |
 
 After `yoink up`, `https://assets.example.com/foo.png` serves the object from the `public-assets` bucket — TLS via Let's Encrypt by default (or sealed origin certs — see [Cloudflare origin certs](/docs/recipes/cloudflare-origin-certs)). The path-rewrite scopes the public endpoint to one bucket so the rest of your S3 endpoint (other buckets, the admin API) stays internal-only — but use this only for genuinely public assets, since the bucket policy is the sole access control on objects under `public-assets/*`. Add a method matcher (`@get method GET HEAD` + `respond 405` for everything else) if you want defense-in-depth against rogue PUT attempts.
 
+## PostgreSQL: point-in-time recovery via WAL archiving
+
+A nightly restic snapshot of `pgdata-*` is fine for "yesterday's data", but a crash at 14:30 with the last snapshot at 03:30 loses 11 hours. PostgreSQL's continuous WAL archiving closes that gap: every committed transaction's write-ahead log segment ships to S3 as it's filled, and `restore_command` replays them on top of any base backup. The `postgres` template renders this wiring when `wal_archiving=true`:
+
+```sh
+# 1. Provision a WAL bucket (RustFS or any S3-compatible provider; bucket
+#    must exist before postgres starts archiving).
+# 2. Seal the same S3 keys you used for restic-backups (re-used here, since
+#    WAL upload is just `aws s3 cp`):
+yoink secrets edit
+#   S3_ACCESS_KEY_ID=…
+#   S3_SECRET_ACCESS_KEY=…
+# 3. Render postgres with WAL archiving on:
+yoink add postgres \
+  --var wal_archiving=true \
+  --var wal_repository=s3://wal-archive \
+  --var wal_endpoint=http://rustfs:9000   # omit for AWS S3
+```
+
+This emits a service that wraps the stock postgres entrypoint with a one-line `apk add aws-cli` and starts postgres with `archive_mode=on`, `wal_compression=zstd` (full-page images compressed inside WAL records), and an `archive_command` that pipes each segment through `gzip -c` before upload — so the on-disk WAL is denser before it ships, and the segment files in S3 are gzip-compressed `.gz` blobs (idle-database segments compress from 16 MiB to a few KiB; busy ones to ~3-6 MiB). `archive_timeout=300` forces a flush every 5 min so an idle database still ships its tail.
+
+Pair with restic-backups against the data volume to get the base backup half of PITR:
+
+```yaml
+# services/backups.yaml — bind the postgres data volume read-only
+- pgdata-postgres:/data/pgdata-postgres:ro
+```
+
+Restoring to a specific point in time is a one-shot manual procedure (out of scope for the deploy reconcile loop — there's no "auto-restore" mode here):
+
+1. `restic restore` the latest pre-incident snapshot of `pgdata-postgres` to a fresh volume.
+2. Add a `recovery.signal` file + `restore_command = 'aws s3 cp s3://wal-archive/%f.gz - | gunzip -c > %p'` to the recovered data dir (the `.gz` suffix and `gunzip` mirror the archive-side compression).
+3. Set `recovery_target_time` to the desired moment, start postgres, wait for replay to complete.
+
+Full PITR mechanics live in the [PostgreSQL continuous archiving docs](https://www.postgresql.org/docs/current/continuous-archiving.html). The yoink piece is just the upload half — `archive_command` is the only contract postgres has with the storage backend.
+
+**WAL archive retention** is currently a manual concern: `aws s3 rm` (or RustFS lifecycle rules) older than your restic retention window. A future iteration of this recipe may bundle `pg_archivecleanup` as a sidecar; for now keep WAL retention ≥ your oldest restic snapshot.
+
 ## Verify
 
 ```sh
