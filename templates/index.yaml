@@ -18,3 +18,9 @@ templates:
   - name: openclaw
     kind: app
     summary: Placeholder web-app template — rename + repoint `image:` to suit.
+  - name: rustfs
+    kind: accessory
+    summary: Self-hosted S3-compatible object storage (RustFS). Pairs with `restic-backups` for sovereign off-site backups.
+  - name: restic-backups
+    kind: accessory
+    summary: Nightly volume backups via restic to any S3-compatible storage. Bring your bucket + keys.

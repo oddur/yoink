@@ -1,0 +1,26 @@
+services:
+  - name: {{ service_name }}
+    image: rustfs/rustfs
+    tag: "{{ tag }}"
+    {% if console_enable == "true" %}env:
+      RUSTFS_CONSOLE_ENABLE: "true"
+    {% endif %}env_from_secrets:
+      RUSTFS_ACCESS_KEY: {{ service_name | upper }}_ACCESS_KEY
+      RUSTFS_SECRET_KEY: {{ service_name | upper }}_SECRET_KEY
+    run:
+      cmd: ["/data"]
+      port: 9000
+      publish:
+        - "{{ bind_address }}:9000:9000"
+        {%- if console_enable == "true" %}
+        - "{{ bind_address }}:9001:9001"
+        {%- endif %}
+      volumes:
+        - rustfs-{{ service_name }}-data:/data
+      options:
+        # rustfs/rustfs ships uid 10001 baked in.
+        user: "10001:10001"
+        memory: {{ memory }}
+        # The data volume is writable; rootfs stays immutable per
+        # yoink's hardened default.
+        network_aliases: [{{ service_name }}]

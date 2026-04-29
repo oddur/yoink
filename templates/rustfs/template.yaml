@@ -1,0 +1,69 @@
+name: rustfs
+kind: accessory
+description: Self-hosted S3-compatible object storage (RustFS, Apache 2.0).
+  Deploys as a yoink-managed service on a single host — typically a
+  tailnet-reachable off-site box used as the sovereign backup destination
+  for `yoink add restic-backups`.
+
+variables:
+  - name: service_name
+    prompt: Service name
+    default: rustfs
+    pattern: "^[a-z][a-z0-9-]*$"
+  - name: tag
+    prompt: RustFS image tag
+    default: latest
+  - name: bind_address
+    prompt: |
+      Host address to bind the S3 endpoint on. Defaults to 127.0.0.1
+      (loopback only). For cross-host access via Tailscale, set this to
+      the host's tailnet IP (e.g. "100.64.1.5"). For docker-network-only
+      access, leave default.
+    default: "127.0.0.1"
+  - name: console_enable
+    prompt: Enable RustFS admin console on :9001?
+    default: "false"
+    choices: ["true", "false"]
+  - name: memory
+    prompt: Memory limit
+    default: 1g
+
+files:
+  - dest: "services/{{ service_name }}.yaml"
+    template: service.yaml.tmpl
+
+secrets:
+  - name: "{{ service_name | upper }}_ACCESS_KEY"
+    generate: "random:24"
+  - name: "{{ service_name | upper }}_SECRET_KEY"
+    generate: "random:48"
+
+include_glob: "services/*.yaml"
+
+notes: |
+  Two secrets sealed: {{ service_name | upper }}_ACCESS_KEY and
+  {{ service_name | upper }}_SECRET_KEY. These are the S3 root credentials
+  for this RustFS instance — anything that talks to the S3 endpoint at
+  http://{{ bind_address }}:9000 needs them.
+
+  Deploy: `yoink up`
+  Reach the S3 endpoint at: http://{{ bind_address }}:9000
+  {%- if console_enable == "true" %}
+  Admin console at: http://{{ bind_address }}:9001
+  {%- endif %}
+
+  To pair with the restic-backups template, run:
+    yoink add restic-backups \
+      --vars repository=s3:http://{{ bind_address }}:9000/<bucket-name>
+  and reuse `{{ service_name | upper }}_ACCESS_KEY` /
+  `{{ service_name | upper }}_SECRET_KEY` as the `S3_ACCESS_KEY_ID` /
+  `S3_SECRET_ACCESS_KEY` sealed secrets it expects (copy via
+  `yoink secrets edit`).
+
+  Cross-host setup notes:
+  - Set `bind_address` to a tailnet IP (e.g. "100.x.y.z") so only
+    tailnet peers can reach the S3 endpoint.
+  - Add `hosts: [<vault-host-address>]` to services/{{ service_name }}.yaml
+    so RustFS only deploys on the off-site host.
+  - On the workload host, `yoink add restic-backups` and set the
+    repository URL to the vault host's tailnet hostname.
