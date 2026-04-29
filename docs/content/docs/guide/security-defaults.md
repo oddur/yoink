@@ -17,6 +17,7 @@ Compose's defaults are dev-friendly, not prod-friendly: every container runs wit
 | `pids_limit` | `1024` | bounds the fork-bomb class of exploits | `pids_limit: null` (unlimited), or any positive int |
 | `cpus` | `null` (uncapped) | — | set to `"2"`, `"500m"`, `"1.5"`, etc. — k8s style |
 | `memory` | `null` (uncapped) | — | set to `"512Mi"`, `"1Gi"`, `"512m"`, `"1g"` — k8s + docker styles both accepted |
+| `devices` | `[]` | only the kernel-whitelisted set is visible; host hardware (GPUs, USB hubs, `/dev/fuse`, …) is unreachable | list explicit `--device`-style entries — see [hardware passthrough recipe](/docs/recipes/hardware-passthrough). Narrower than `--privileged` (which yoink doesn't expose at all). |
 
 ## Surgical opt-outs in practice
 
@@ -24,26 +25,38 @@ Compose's defaults are dev-friendly, not prod-friendly: every container runs wit
 # caddy needs to bind :80/:443 — re-add NET_BIND_SERVICE only.
 - name: caddy
   run:
-    cap_drop: [ALL]
-    cap_add:  [NET_BIND_SERVICE]
-    cpus: "0.5"
-    memory: "64Mi"
+    options:
+      cap_drop: [ALL]
+      cap_add:  [NET_BIND_SERVICE]
+      cpus: "0.5"
+      memory: "64Mi"
 
 # pgadmin's image scribbles all over its rootfs at startup — back out
 # of read_only, keep the rest of the hardened defaults.
 - name: pgadmin
   run:
-    read_only: false
-    cpus: "1"
-    memory: "256Mi"
+    options:
+      read_only: false
+      cpus: "1"
+      memory: "256Mi"
 
 # Image with stubborn legacy code that needs root + writable /etc.
 - name: legacy-thing
   run:
-    user: "0:0"
-    read_only: false
-    cap_drop: []
-    security_opt: []
+    options:
+      user: "0:0"
+      read_only: false
+      cap_drop: []
+      security_opt: []
+
+# Hardware passthrough — opt into specific device nodes only,
+# not the whole privileged blast radius. See the recipe for more.
+- name: jellyfin
+  run:
+    options:
+      user: "0:0"        # most media images need root for HW access
+      devices:
+        - /dev/dri       # Intel/AMD VAAPI — read+write+mknod default
 ```
 
 ## Non-root in practice
@@ -65,10 +78,11 @@ The app still needs *somewhere* to write — `/tmp`, sometimes `/run`, occasiona
 
 ```yaml
 run:
-  read_only: true
-  tmpfs:
-    /tmp: "size=64m,mode=1777"
-    /var/cache/app: "size=128m,mode=0755"
+  options:
+    read_only: true
+    tmpfs:
+      /tmp: "size=64m,mode=1777"
+      /var/cache/app: "size=128m,mode=0755"
 ```
 
 ## No host port binds by default — and `yoink pf` keeps that practical
