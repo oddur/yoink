@@ -1,6 +1,6 @@
 ---
 title: Driving yoink from an AI agent
-weight: 17
+weight: 8
 ---
 
 Yoink is unusually well-suited to being driven by AI coding agents (Claude Code, Cursor, Aider, OpenAI Codex, GitHub Copilot Workspace, Devin, …) because **its entire control surface is a CLI binary plus YAML files in your repo** — no web dashboard, no REST API to learn, no interactive prompts to navigate. Anything an agent can do at a terminal, it can do with yoink.
@@ -60,7 +60,7 @@ The agent edits the file, runs the dry-run, you skim the diff, the agent applies
 
 ## CI is just an agent that doesn't talk back
 
-The GitHub Actions workflows yoink documents (see [PR-comment dry-run](/docs/recipes/pr-comment-dry-run)) are the same shape: an automated runner edits / reads `yoink.yaml`, calls `yoink up --dry-run`, posts the diff back to the PR, and on merge calls `yoink up` for real. Anything an AI agent does locally, you can graduate to CI by copying the same commands into a workflow file.
+The GitHub Actions workflows yoink documents (see [Pre-merge dry-run on every PR](/docs/recipes/pr-comment-dry-run)) are the same shape: an automated runner edits / reads `yoink.yaml`, calls `yoink up --dry-run`, posts the diff back to the PR, and on merge calls `yoink up` for real. Anything an AI agent does locally, you can graduate to CI by copying the same commands into a workflow file.
 
 ## What doesn't work yet
 

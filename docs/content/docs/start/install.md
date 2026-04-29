@@ -63,7 +63,7 @@ Yoink doesn't bootstrap docker; it expects:
 - **SSH access from the operator's machine to each host** — yoink uses `ssh://user@host` to reach the docker daemon, no docker socket exposed over TCP
 - **For local-build workflows**: docker on the operator's machine too (`yoink build` shells out to `docker build`)
 
-[Tailscale](https://tailscale.com) pairs especially cleanly with the SSH transport — see [Pairing](/docs/guide/pairing).
+[Tailscale](https://tailscale.com) pairs especially cleanly with the SSH transport — see [Pairing](/docs/guide/networking).
 
 ## Next: your first deploy
 

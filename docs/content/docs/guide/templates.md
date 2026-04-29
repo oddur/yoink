@@ -1,13 +1,105 @@
 ---
-title: Authoring templates for `yoink add`
-weight: 4
+title: Templates (`yoink add`)
+weight: 7
 ---
+
+`yoink add <name>` is the "poor man's helm" for accessories and full apps: fetch a vetted template from GitHub, fill in a few variables, get a sealed secret + a working service fragment, optionally deploy. Same code path serves bundled templates and arbitrary 3rd-party repos.
+
+This guide is in two halves:
+
+1. **[Using templates](#using-templates)** — operator side. Run `yoink add postgres`, get a working postgres.
+2. **[Authoring templates](#authoring-templates)** — author side. Publish your own that anyone can `yoink add gh:you/repo/yourname`.
+
+## Using templates
+
+```sh
+yoink add postgres            # accessory: postgres on a named volume
+yoink add redis               # accessory: redis with secure defaults
+yoink add meilisearch         # accessory: full-text search w/ sealed master key
+yoink add rustfs              # accessory: self-hosted S3-compatible object storage
+yoink add restic-backups      # accessory: nightly volume backups to any S3
+yoink add openclaw --up       # app: render fragment + run `yoink up`
+```
+
+### What it does
+
+1. Fetches `templates/<name>/` from `oddur/yoink@main` over GitHub (or any repo you point it at — see below).
+2. Reads the template's `template.yaml` manifest.
+3. Asks for any variables that don't have a default (or, with `--yes`, uses every default — useful in CI).
+4. Renders the template files with [minijinja](https://github.com/mitsuhiko/minijinja).
+5. Generates and **seals** any declared secrets straight into your `secrets.age` (the random bytes never leave the local process).
+6. Adds the fragment glob to your `yoink.yaml` `include:` list if it isn't already covered.
+7. Prints the manifest's notes — usually a one-liner showing how to wire the new service into your existing app.
+
+Every step gates on a confirmation diff in interactive mode. `--yes` skips all prompts and is required in CI.
+
+### Bundled templates
+
+| Template | Kind | What you get |
+|---|---|---|
+| `postgres` | accessory | Postgres 18 + named volume + `<NAME>_PASSWORD` sealed; opt-in WAL archiving for PITR |
+| `redis` | accessory | Redis 7 with secure-by-default options |
+| `meilisearch` | accessory | Meilisearch + volume + sealed master key |
+| `rustfs` | accessory | Apache-2.0 S3-compatible object storage; sealed root credentials |
+| `restic-backups` | accessory | Nightly volume snapshots via resticker (restic + go-cron) to any S3-compatible bucket |
+| `openclaw` | app | Placeholder app template (rename + repoint `image:` to suit) |
+
+The full set lives at <https://github.com/oddur/yoink/tree/main/templates>.
+
+### Pinning to a specific version
+
+By default, `yoink add postgres` resolves the bundled template at `oddur/yoink@main`. To pin to a tag or commit:
+
+```sh
+yoink add postgres@v0.12.0
+yoink add postgres@a1b2c3d
+```
+
+The cache is content-addressed by the resolved commit SHA, so re-running with the same pin is a no-op (no network).
+
+To bypass the `main → SHA` mapping cache (e.g. when a branch was just updated and you want the latest):
+
+```sh
+yoink add postgres --refresh
+```
+
+### 3rd-party templates
+
+Anyone can author templates and publish them in any GitHub repo. Use the `gh:` prefix to point at one:
+
+```sh
+yoink add gh:acme/yoink-templates/clickhouse
+yoink add gh:acme/yoink-templates@v1.0.0/clickhouse
+yoink add gh:acme/yoink-templates@a1b2c3d/clickhouse
+```
+
+The same diff/confirm flow applies to 3rd-party sources — even bundled templates are run through it. The confirmation header shows the resolved short SHA so you know exactly what version you're applying.
+
+### CI / non-interactive
+
+Every variable can be set via `--var key=value`, and `--yes` skips confirmations:
+
+```sh
+yoink add postgres --yes \
+  --var service_name=db \
+  --var memory=1g
+```
+
+Variables without a default fail fast in non-interactive mode, so typos surface as clear errors instead of silently using empty values.
+
+### Troubleshooting
+
+- **"variable X has no default"**: pass `--var X=value` or run interactively.
+- **"couldn't resolve …@main"**: GitHub API unreachable; if you've added this template before with the same ref, `yoink add` falls back to the cached SHA. Otherwise pass a pinned `@<sha>`.
+- **"rendered file failed yoink validation"**: bug in the template; please report it (or open a PR if it's one of the bundled ones).
+
+---
+
+## Authoring templates
 
 A template is a directory in any GitHub repo with a small manifest plus one or more rendered files. Users run `yoink add gh:you/your-repo/your-template` and yoink fetches it, runs a wizard, generates secrets, and drops the rendered fragments into their project. Same code path as the bundled set in `oddur/yoink/templates/`, so anything you can do for yourself you can publish for others.
 
-This is the author-side guide. For the consumer side ("how do I use someone else's template"), see [Drop-in templates with `yoink add`](/docs/recipes/add-templates).
-
-## A complete example
+### A complete example
 
 Concrete first. This is a real working `clickhouse` template — paste into a fresh repo, push, and `yoink add gh:you/yourrepo/clickhouse` works against it.
 
@@ -81,7 +173,7 @@ services:
 
 That's the whole shape: a manifest declaring variables and outputs, plus one or more files rendered through [minijinja](https://github.com/mitsuhiko/minijinja).
 
-## Manifest reference
+### Manifest reference
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
@@ -95,7 +187,7 @@ That's the whole shape: a manifest declaring variables and outputs, plus one or 
 | `include_glob` | string | no | If set, yoink offers to add this glob to the operator's `yoink.yaml` `include:` list when the rendered fragments aren't already covered. |
 | `notes` | string | no | Markdown-ish blob shown after a successful `add`. Rendered through minijinja so you can interpolate variables. |
 
-## Variables
+### Variables
 
 ```yaml
 variables:
@@ -112,11 +204,11 @@ variables:
 - **`prompt`** is what the wizard shows. Falls back to `name` if absent. Keep it short.
 - **`default`** is what the wizard pre-fills, and what `yoink add --yes` uses without further input. **Always provide a default** — non-interactive runs fail loud when a variable has neither a default nor a `--var` override.
 - **`choices`** restricts the answer set. Wizard renders a numbered picker; CLI overrides via `--var name=X` validate against the list.
-- **`pattern`** is a small anchored regex (yoink ships a tiny matcher; supports literals, `.`, character classes like `[a-z0-9-]`, `*`, `+`). Mismatches re-prompt in the wizard, error out in `--yes` mode.
+- **`pattern`** is a small anchored regex (yoink ships a tiny matcher; supports literals, `.`, character classes like `[a-z0-9-]`, `*`, `+`, top-level alternation like `^(true|false)$`). Mismatches re-prompt in the wizard, error out in `--yes` mode.
 
 Variable values are passed through to minijinja. Common filters: `{{ name | upper }}`, `{{ name | lower }}`, `{{ name | default("fallback") }}`. Conditionals: `{% if domain %}domain: {{ domain }}{% endif %}`.
 
-## Files
+### Files
 
 ```yaml
 files:
@@ -131,7 +223,7 @@ files:
 
 The rendered file must parse as a yoink [`ConfigFragment`](/docs/reference/config) — yoink validates each one before writing, so a bad template fails closed instead of producing a broken config.
 
-## Secrets
+### Secrets
 
 ```yaml
 secrets:
@@ -147,7 +239,7 @@ The **name** is rendered through minijinja, so secrets-per-instance work — add
 
 If the operator hasn't configured `secrets:` in their `yoink.yaml`, `yoink add` offers to bootstrap age — you don't need to handle that case in the template.
 
-## Hardening overrides — what bites in practice
+### Hardening overrides — what bites in practice
 
 yoink's container defaults are deliberately strict:
 
@@ -170,15 +262,17 @@ For most templates these are right. Some popular images need overrides — usual
 | `Read-only file system (os error 30)` mid-request | App writes to rootfs (logs, pidfiles, payload buffers) | `read_only: false` |
 | `Permission denied` writing to a volume | Volume owned by root, container running as nobody | `user: "0:0"` (image's entrypoint usually drops privileges itself) |
 
-The bundled `postgres` and `meilisearch` templates each carry a 3–4 line block of overrides for exactly these reasons — read them before authoring a similar template:
+The bundled `postgres`, `meilisearch`, `rustfs`, and `restic-backups` templates each carry a few lines of overrides for exactly these reasons — read them before authoring a similar template:
 
 - [`templates/postgres/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/postgres/service.yaml.tmpl) — root entrypoint, gosu privilege drop, initdb chown.
 - [`templates/meilisearch/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/meilisearch/service.yaml.tmpl) — root + writable rootfs for ingest payload buffers.
 - [`templates/redis/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/redis/service.yaml.tmpl) — secure-by-default works as-is, with a tmpfs for `/data`.
+- [`templates/rustfs/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/rustfs/service.yaml.tmpl) — uid 10001 baked into the image; `/logs` tmpfs because the daemon writes operational logs there with `read_only: true`.
+- [`templates/restic-backups/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/restic-backups/service.yaml.tmpl) — go-cron writes a lockfile to `/run/lock`; tmpfs at the leaf path because mounting `/run` alone leaves `/lock` nonexistent.
 
 **Test on a real host before declaring a template done.** First-deploy permission failures don't show up in the manifest validator or the rendered-YAML linter; they only surface when the container actually starts. The pattern when you hit one: `docker logs <container>` for the error string, then check the table above.
 
-## Local development loop
+### Local development loop
 
 Templates are fetched from a GitHub commit, so iterating means committing and pushing. The cycle:
 
@@ -199,7 +293,7 @@ yoink up --service clickhouse
 
 The cache lives at `~/.cache/yoink/templates/<owner>__<repo>__<sha>/`. Wipe it (`rm -rf ~/.cache/yoink/templates`) if anything looks weirdly stuck — content-addressed by SHA, so re-fetching is harmless.
 
-## Versioning and pinning
+### Versioning and pinning
 
 - **Branch refs** (`@main`, `@feat/foo`) get re-resolved on `--refresh`. Without `--refresh`, the cached `branch → SHA` mapping wins.
 - **Tag refs** (`@v1.0.0`) work the same way — they're resolved to a SHA once and cached.
@@ -209,7 +303,7 @@ For published templates, document the recommended pin in your README. Most opera
 
 If your template starts requiring a yoink feature added after some version, set `yoink_min_version: "X.Y.Z"` in the manifest. yoink hard-fails with a clear "upgrade or pin to an older template" message — better than the template silently rendering garbage on an older binary.
 
-## Publishing patterns
+### Publishing patterns
 
 Any GitHub repo works. Common shapes:
 
@@ -219,9 +313,9 @@ Any GitHub repo works. Common shapes:
 
 Templates are fetched as gzipped tarballs via `https://codeload.github.com/...`. yoink caps the download at 50 MB and the unpacked size at 200 MB — large-monorepo templates work fine, multi-GB ones don't. (If you hit the cap, the template repo probably wants to be split out.)
 
-## Submitting to the bundled set
+### Submitting to the bundled set
 
-The four bundled templates (`postgres`, `redis`, `meilisearch`, `openclaw`) live in this repo at [`/templates/`](https://github.com/oddur/yoink/tree/main/templates) and are what `yoink add postgres` resolves to without a `gh:` prefix. PRs adding new bundled templates are welcome — the bar is "common enough that yoink shipping it directly saves real users from re-deriving the hardening overrides."
+The six bundled templates (`postgres`, `redis`, `meilisearch`, `rustfs`, `restic-backups`, `openclaw`) live in this repo at [`/templates/`](https://github.com/oddur/yoink/tree/main/templates) and are what `yoink add postgres` resolves to without a `gh:` prefix. PRs adding new bundled templates are welcome — the bar is "common enough that yoink shipping it directly saves real users from re-deriving the hardening overrides."
 
 Acceptance criteria for a PR:
 
@@ -232,7 +326,7 @@ Acceptance criteria for a PR:
 
 For 3rd-party templates published in your own repo, none of these are required — but they're still good practice.
 
-## Schema reference
+### Schema reference
 
 For the manifest:
 
@@ -265,5 +359,7 @@ For the rendered service fragment, see [Config reference](/docs/reference/config
 
 ## See also
 
-- [Drop-in templates with `yoink add`](/docs/recipes/add-templates) — operator-side reference for `yoink add`.
 - [Configuration reference](/docs/reference/config) — schema for the rendered service fragment.
+- [TanStack Start + postgres from scratch](/docs/recipes/tanstack-stack) — `yoink add` in an end-to-end recipe.
+- [Volume backups](/docs/recipes/volume-backups) — recipe pairing the `restic-backups` and `rustfs` templates.
+- [Secrets](/docs/guide/secrets) — how the secrets that templates seal get decrypted at deploy time.

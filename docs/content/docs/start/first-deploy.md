@@ -27,7 +27,7 @@ Edit a line of code, run `yoink up --build` again — yoink rebuilds, ships only
 That's it. Yoink uses your operating system's SSH client, so anything you've set up (`~/.ssh/config`, `ssh-agent`, hardware keys, jump hosts) just works.
 
 {{< callout type="info" >}}
-**No Tailscale required.** Plain SSH to the host's IP or DNS name is the simplest path. Tailscale becomes useful when you have multiple hosts behind NAT or want stable hostnames — see [Pairing](/docs/guide/pairing).
+**No Tailscale required.** Plain SSH to the host's IP or DNS name is the simplest path. Tailscale becomes useful when you have multiple hosts behind NAT or want stable hostnames — see [Pairing](/docs/guide/networking).
 {{< /callout >}}
 
 ## Walkthrough
@@ -158,7 +158,7 @@ hosts:
 
 ### Ship the deploy key with the repo
 
-For team setups where you don't want every operator to manage the host's key in their personal `ssh-agent`. Drop the key in [sealed secrets](/docs/recipes/sealed-secrets) and reference from the host:
+For team setups where you don't want every operator to manage the host's key in their personal `ssh-agent`. Drop the key in [sealed secrets](/docs/guide/secrets) and reference from the host:
 
 ```yaml
 secrets:
@@ -174,7 +174,7 @@ hosts:
 
 ### Tailscale (opt-in)
 
-If you're on Tailscale, point `address:` at the tailnet hostname. See [Pairing](/docs/guide/pairing).
+If you're on Tailscale, point `address:` at the tailnet hostname. See [Pairing](/docs/guide/networking).
 
 ## What's next
 
@@ -186,4 +186,4 @@ If you're on Tailscale, point `address:` at the tailnet hostname. See [Pairing](
 | Deploy from CI instead of locally | [Deploy modes](/docs/guide/deploy-modes) |
 | Understand the rolling deploy + drift detection | [Architecture](/docs/guide/architecture) |
 | See every CLI flag and config field | [CLI](/docs/reference/cli) and [Configuration](/docs/reference/config) |
-| See what hardened defaults yoink applies | [Secure by default](/docs/guide/security-defaults) |
+| See what hardened defaults yoink applies | [Secure by default](/docs/guide/security) |

@@ -5,7 +5,7 @@ weight: 2
 
 A TanStack Start app deploying alongside a managed postgres, built locally and shipped without a registry. Five files, three commands, working stack on the host in about ten minutes. Adding more accessories (redis, meilisearch, …) is the same shape — `yoink add <name>`, paste the connection block.
 
-This is the "indie one-shot" pattern — single laptop, single host, no CI, no Docker Hub account, no Vault. Public exposure (HTTPS, domains) is intentionally out of scope here; the [port-forward recipe](/docs/recipes/port-forward) covers reaching the deployed stack from your laptop.
+This is the "indie one-shot" pattern — single laptop, single host, no CI, no Docker Hub account, no Vault. Public exposure (HTTPS, domains) is intentionally out of scope here; the [port-forward recipe](/docs/guide/networking#port-forward) covers reaching the deployed stack from your laptop.
 
 ## What you need
 
@@ -14,7 +14,11 @@ This is the "indie one-shot" pattern — single laptop, single host, no CI, no D
 
 > **Local-only iteration?** yoink is a remote-deploy tool by design — destructive commands target ssh hosts, not your laptop's docker daemon (read-only commands like `yoink tui` / `yoink status` do work locally). For pure local development loops, reach for Docker Compose; come back to yoink when you have a host to ship to. If you genuinely want yoink against a "local" VM, expose its docker daemon over SSH (Colima, OrbStack) and treat it as a remote host — no special syntax.
 
-## Step 1: scaffold the app
+## Walkthrough
+
+{{% steps %}}
+
+### Scaffold the app
 
 ```sh
 npm create @tanstack/start@latest my-app
@@ -78,7 +82,7 @@ function App() {
 }
 ```
 
-## Step 2: Dockerfile
+### Dockerfile
 
 Multi-stage build. Nitro bundles all server-side deps into `.output/server/_libs/`, so the runtime image needs no `node_modules`:
 
@@ -110,7 +114,7 @@ yoink.yaml
 services/
 ```
 
-## Step 3: yoink init
+### Run `yoink init`
 
 ```sh
 yoink init root@your-host
@@ -131,9 +135,9 @@ inferred:
   identity: ~/.config/yoink/keys/age1….key
 ```
 
-**Back up the key now** (paste into a password manager) — see [Sealed secrets](/docs/recipes/sealed-secrets) for backup options. Lose it and the sealed values in this repo are gone.
+**Back up the key now** (paste into a password manager) — see [Sealed secrets](/docs/guide/secrets) for backup options. Lose it and the sealed values in this repo are gone.
 
-## Step 4: drop in postgres
+### Drop in postgres
 
 ```sh
 yoink add postgres
@@ -161,7 +165,7 @@ The keys are the accessory's suggestion — neutral, conventional. If your app r
 
 > **Need redis, meilisearch, …?** Same shape: `yoink add redis` (or `yoink add meilisearch`) prints its own connection block. Paste alongside this one, merging the `depends_on:` lists.
 
-## Step 5: wire the app to the accessory
+### Wire the app to the accessory
 
 Paste the `connect another service to …` block into your app's `services[]` entry. The keys are conventional but not magic — drop any your app doesn't read (the demo `db.server.ts` ignores `POSTGRES_PORT` since the port is hard-coded).
 
@@ -202,7 +206,7 @@ include:
 
 `yoink validate` confirms the config parses; `yoink doctor` checks deploy-readiness (unreachable host, missing identity, etc.).
 
-## Step 6: deploy
+### Deploy
 
 ```sh
 yoink up --build
@@ -212,7 +216,7 @@ One command. The host pulls postgres from Docker Hub; the app (with its `build:`
 
 First deploy is the slow one — pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry ships only changed layers.
 
-## Verify
+### Verify
 
 The app is reachable on the host's docker network at `my-app:3000` but isn't bound to a host port — that's the secure default. To open it on your laptop:
 
@@ -220,9 +224,11 @@ The app is reachable on the host's docker network at `my-app:3000` but isn't bou
 yoink pf my-app -o
 ```
 
-`yoink pf` opens a tunnel to the container even though no host port is published, and `-o` opens the printed URL in your browser. See the [port-forward recipe](/docs/recipes/port-forward) for how it works.
+`yoink pf` opens a tunnel to the container even though no host port is published, and `-o` opens the printed URL in your browser. See the [port-forward recipe](/docs/guide/networking#port-forward) for how it works.
 
 The page should render JSON with `ok: true` and a postgres version string.
+
+{{% /steps %}}
 
 ## Re-deploys
 
@@ -244,7 +250,7 @@ yoink up --build --here --service my-app
 
 Five files (`Dockerfile`, `.dockerignore`, `src/lib/db.server.ts`, `src/routes/index.tsx`, `yoink.yaml`) plus three yoink commands (`init`, `add`, `up`) brought up two containers on a private docker network with a sealed-on-commit Postgres password and drift detection on every container.
 
-- [Sealed secrets](/docs/recipes/sealed-secrets) — how the `POSTGRES_PASSWORD` is generated and decrypted at deploy.
+- [Sealed secrets](/docs/guide/secrets) — how the `POSTGRES_PASSWORD` is generated and decrypted at deploy.
 - [Architecture](/docs/guide/architecture) — drift detection, healthcheck-gated swap.
 - [CLI reference](/docs/reference/cli) — every `yoink up` flag.
 
@@ -298,7 +304,7 @@ Coordination cost: every project's CI runner needs the host config's age identit
 
 ## See also
 
-- [Drop-in templates with `yoink add`](/docs/recipes/add-templates) — adding redis / meilisearch alongside postgres.
-- [Port-forward to any service](/docs/recipes/port-forward) — full background on the `yoink pf` verify step.
-- [Sealed secrets (age)](/docs/recipes/sealed-secrets) — what `yoink init` set up, and how to back up the key.
+- [Drop-in templates with `yoink add`](/docs/guide/templates) — adding redis / meilisearch alongside postgres.
+- [Port-forward to any service](/docs/guide/networking#port-forward) — full background on the `yoink pf` verify step.
+- [Sealed secrets (age)](/docs/guide/secrets) — what `yoink init` set up, and how to back up the key.
 - [Edit-save-deploy with `--watch`](/docs/recipes/watch-mode) — turn the redeploy command into a save-triggered loop.

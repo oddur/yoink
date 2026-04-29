@@ -13,7 +13,17 @@ yoink history api         # who deployed what, when
 yoink rollback api        # roll back to the previous version
 ```
 
-A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts. **Low ceremony**: drop a `yoink.yaml` next to your code describing where the app should go, run `yoink up`. **Batteries and best practices included** — the boring-but-important pieces (sealed secrets, hardened container defaults, healthcheck-gated rolling swaps, drift detection, dependency-ordered waves, a bundled Caddy reverse proxy) are all on by default with no plugins to install. **CLI + YAML, no GUI** — everything is a subcommand or a config field, identical from your laptop, CI, or an AI coding agent.
+A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts.
+
+- **Low ceremony.** Drop a `yoink.yaml` next to your code describing where the app should go, run `yoink up`.
+- **Batteries and best practices included**, all on by default with no plugins to install:
+  - Sealed secrets
+  - Hardened container defaults
+  - Healthcheck-gated rolling swaps
+  - Drift detection
+  - Dependency-ordered waves
+  - Bundled Caddy reverse proxy
+- **CLI + YAML, no GUI.** Everything is a subcommand or a config field, identical from your laptop, CI, or an AI coding agent.
 
 ## Why it exists
 
@@ -28,7 +38,7 @@ Single-host PaaS tools are wonderful for "one app, one host" but creak the momen
 - **Drift detection.** Every effective spec (image, env, networks, mounts, options, file content) hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
 - **Build where it makes sense, ship how it makes sense.** Build on a laptop OR in CI; ship via a registry OR straight to each host. Yoink picks the right path per service automatically from the `build:` block, with layer-level dedup either way — drop `build:` for CI-built infra, keep it for app code, mix freely in one `yoink up`. See [deploy modes](/docs/guide/deploy-modes).
 - **Secure by default.** Containers run as a non-root uid (65534) with cap_drop=ALL, no-new-privileges, read-only rootfs, init=tini, tmpfs noexec, binds default :ro. Override per service when an image genuinely needs root or specific file ownership.
-- **Port-forward without weakening the deploy posture.** `yoink pf <service>` opens a kubectl-style tunnel to any container — published or not — so the locked-down "no `publish:` for backends" default stops fighting with the on-call's need to point a browser at something. Same one-key UX in the TUI. See [port-forward recipe](/docs/recipes/port-forward).
+- **Port-forward without weakening the deploy posture.** `yoink pf <service>` opens a kubectl-style tunnel to any container — published or not — so the locked-down "no `publish:` for backends" default stops fighting with the on-call's need to point a browser at something. Same one-key UX in the TUI. See [port-forward recipe](/docs/guide/networking#port-forward).
 - **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI) or — on a laptop — auto-discovered from `~/.config/yoink/keys/<recipient>.key` (where `yoink secrets key generate` saves by default; one identity per project, no env var to set). No remote vault required. For teams that prefer a managed store, `provider: command` shells out to whatever CLI you already use (Doppler, 1Password, Vault, AWS Secrets Manager, the Infisical CLI, …) — no first-party SDK to vendor.
 - **Bundled reverse proxy.** Set `domain:` on a service and yoink's bundled Caddy fronts it with HTTPS — automatic Let's Encrypt or sealed Cloudflare origin certs (with optional origin-pull mTLS). h2c for gRPC, HSTS, compression, multi-host canonical redirects — all one-line opt-ins.
 - **CLI + YAML, no GUI.** The entire control surface is the `yoink` binary plus `yoink.yaml`. No web dashboard to click, no API to script. The same workflow that you run by hand drives CI runners and AI coding agents identically — yoink is happy to be driven by Claude Code, Cursor, or a GitHub Actions job.
@@ -47,7 +57,7 @@ Where the in-the-box default isn't the right answer for a team, yoink extends ra
 | When it's the right choice | small team, single environment, trust the repo as the source of truth | shared rotation across many repos, audit trail, fine-grained ACLs, can't commit secrets at all |
 | Examples | `secrets.age` + `YOINK_AGE_KEY` | `["doppler","secrets","download","--no-file","--format","env"]`, `["op","inject","-i","secrets.tpl"]`, `["vault","kv","get","-format=json","..."]`, … |
 
-The `command` path means yoink doesn't need first-party integrations for every secret manager — any CLI that emits dotenv or JSON on stdout works. See [external secrets via CLI](/docs/recipes/secrets-external-cli) for per-tool recipes.
+The `command` path means yoink doesn't need first-party integrations for every secret manager — any CLI that emits dotenv or JSON on stdout works. See [external secrets via CLI](/docs/guide/secrets) for per-tool recipes.
 
 The same shape applies elsewhere: registry credentials, CI integrations, host-level networking. Yoink's job is to make the obvious choice work without configuration, and to stay out of the way when the operator needs to swap a piece for something specific.
 
@@ -58,4 +68,4 @@ The same shape applies elsewhere: registry credentials, CI integrations, host-le
 - **No scheduling or auto-scaling.** Yoink deploys to a fixed set of hosts you declare; capacity decisions stay with you.
 - **No web dashboard or REST API.** Everything happens through the CLI and YAML. The TUI is a keyboard-driven inspector, not a control plane.
 - **No multi-cluster, HA failover, or geo-distribution.** One operator, one config, one deploy at a time. For multi-region, run separate yoink configs per region.
-- **No load balancer or geo-routing.** Yoink ships a [bundled Caddy reverse proxy](/docs/guide/proxy) for HTTPS + per-host routing, but it does not coordinate traffic across hosts. [Tailscale](/docs/guide/pairing) is a clean way to bridge several hosts into one network.
+- **No load balancer or geo-routing.** Yoink ships a [bundled Caddy reverse proxy](/docs/guide/proxy) for HTTPS + per-host routing, but it does not coordinate traffic across hosts. [Tailscale](/docs/guide/networking) is a clean way to bridge several hosts into one network.

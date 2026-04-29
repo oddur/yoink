@@ -28,7 +28,7 @@ That's it. ~15 seconds for a small image. The `build:` block tells yoink the ima
 
 ## What yoink does for you (without you asking)
 
-Even at this minimum size your container inherits yoink's hardened defaults — read-only rootfs, no Linux caps, no setuid escalation, fork-bomb bound, tini as PID 1, healthcheck-gated swap. See [secure by default](/docs/guide/security-defaults) for the full list and per-field rationale.
+Even at this minimum size your container inherits yoink's hardened defaults — read-only rootfs, no Linux caps, no setuid escalation, fork-bomb bound, tini as PID 1, healthcheck-gated swap. See [secure by default](/docs/guide/security) for the full list and per-field rationale.
 
 If your `my-tool` actually needs to write somewhere, give it a tmpfs:
 

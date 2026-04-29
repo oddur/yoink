@@ -1,11 +1,165 @@
 ---
-title: Port-forward to any service
-weight: 12
+title: Networking
+weight: 5
 ---
+
+How yoink reaches your hosts, how services reach each other across them, and how you debug a service without weakening the security posture. Three layers:
+
+1. **Operator → host**: SSH, paired with Tailscale for hostname + auth + ACLs.
+2. **Service → service**: docker networks per `yoink up` host, plus `services[].hosts` to pin which boxes run what.
+3. **Operator → service (debugging)**: `yoink pf <service>` tunnels to any container without publishing host ports.
+
+## Connectivity layer (Tailscale + SSH)
+
+Yoink's transport is `ssh://user@host` — it opens an SSH tunnel and speaks the Docker Engine API over the remote daemon's Unix socket. Yoink doesn't try to solve "how do I reach my hosts" — it expects you to bring an off-the-shelf SSH connectivity layer.
+
+Pairing this with **Tailscale SSH** is what we recommend, and what every example in these docs assumes:
+
+- **Hostnames work everywhere.** MagicDNS gives every host a stable name (`my-server`) reachable from your laptop, CI runner, anywhere on the tailnet. No `ssh_config` to maintain, no jump hosts, no bastion.
+- **Auth without keys.** Tailscale SSH issues short-lived certs based on tailnet membership and ACLs. Onboard a new operator: invite to the tailnet, grant ACL access to the `tag:server` group. Done. Off-board: revoke from tailnet. Their key is gone everywhere, immediately.
+- **CI authentication is the same flow.** A GH Actions runner with `tailscale/github-action` joins the tailnet under `tag:ci`; ACL grants `tag:ci → tag:server` SSH; yoink connects without ever touching `~/.ssh/`.
+- **No port forwarding.** The Docker daemon never listens on a TCP port. The SSH transport handles auth + transport in one hop. Surface area: `:22` accessible only from the tailnet.
+
+The deploy user on each host is in the `docker` group (functionally root, scope your tailnet ACLs accordingly).
+
+## What yoink owns vs leaves to the connectivity layer
+
+| concern | tool |
+|---|---|
+| **container lifecycle** (pull, start, healthcheck, drain, replace) | yoink |
+| **dep-ordered deploys** (redis before api before caddy) | yoink |
+| **per-tier network isolation** | yoink |
+| **HTTPS / hostname routing / cert issuance** | yoink (bundled Caddy — see [proxy guide](/docs/guide/proxy)) |
+| **operator → host connectivity** | Tailscale (or your SSH config) |
+| **CI → host connectivity** | Tailscale (or your SSH config) |
+| **stateful services** (postgres, etc.) | yoink (with a named volume) or docker compose on the host |
+| **secrets** | yoink (age-sealed) or any external CLI via `provider: command` — see [secrets guide](/docs/guide/secrets) |
+
+## Multi-host distribution
+
+How services spread across hosts when you scale beyond one box. Two knobs: `replicas` (per host) and `services[].hosts` (which hosts run a service).
+
+### Default: every service on every host
+
+By default a service runs on **every** host in `hosts:`, with `replicas` copies per host. So:
+
+```yaml
+hosts:
+  - { address: prod-eu-1, user: deploy }
+  - { address: prod-eu-2, user: deploy }
+
+services:
+  - name: api
+    image: ghcr.io/you/api
+    run:
+      port: 8080
+      replicas: 2
+```
+
+…gives you **4 api containers total**: 2 on `prod-eu-1`, 2 on `prod-eu-2`. Rolling swap is per host — yoink keeps `replicas - 1` alive on each host during the swap.
+
+### Pinning a service to specific hosts
+
+`services[].hosts:` whitelists which hosts run that service. Strings match `hosts[].address`.
+
+```yaml
+hosts:
+  - { address: prod-eu-1, user: deploy }
+  - { address: prod-eu-2, user: deploy }
+  - { address: prod-db-1, user: deploy }      # beefier box, dedicated to stateful
+
+services:
+  - name: api
+    image: ghcr.io/you/api
+    domain: api.example.com                    # bundled Caddy auto-injects on every host that runs api
+    hosts: [prod-eu-1, prod-eu-2]              # public-facing tier; redis stays internal
+    run: { port: 8080, replicas: 2 }
+
+  - name: redis
+    image: redis
+    tag: 7-alpine
+    hosts: [prod-db-1]                         # pin to the db host only
+    run: { port: 6379 }
+```
+
+### Common shapes
+
+**Stateless app, scale horizontally:**
+
+```yaml
+hosts: [prod-eu-1, prod-eu-2, prod-eu-3]
+services:
+  - name: api
+    run: { replicas: 2 }     # 6 total — 2 per host
+```
+
+**Singleton (cron, queue worker):**
+
+```yaml
+services:
+  - name: scheduler
+    hosts: [prod-eu-1]       # one host
+    run: { replicas: 1 }     # one container — singleton
+```
+
+**Stateful pinned + stateless replicated:**
+
+```yaml
+services:
+  - name: redis
+    hosts: [prod-db-1]
+    run: { replicas: 1 }
+
+  - name: api
+    hosts: [prod-eu-1, prod-eu-2]
+    networks: [api, redis]   # api dials redis cross-host via the redis network
+    run: { replicas: 2 }
+```
+
+For cross-host network reach, the `redis` network must be an **overlay** network (or you use a tailnet sidecar). Yoink creates bridge networks by default; switch by declaring it ahead of time on the host or extending `deploy.networks` once overlay support lands.
+
+**Region-pinned:**
+
+```yaml
+hosts:
+  - { address: prod-eu-1, user: deploy }
+  - { address: prod-us-1, user: deploy }
+
+services:
+  - name: api-eu
+    image: ghcr.io/you/api
+    hosts: [prod-eu-1]
+    env: { REGION: eu }
+    run: { port: 8080, replicas: 2 }
+
+  - name: api-us
+    image: ghcr.io/you/api
+    hosts: [prod-us-1]
+    env: { REGION: us }
+    run: { port: 8080, replicas: 2 }
+```
+
+Two services, same image, different env — region-aware deploys without conditionals in the config.
+
+### How `yoink up` schedules across hosts
+
+For each service, yoink computes its host set (`services[].hosts` ∩ `hosts[]`, defaulting to all hosts when unset) and runs the reconcile in parallel across those hosts. Within a host, the rolling swap is sequential per replica (start new → healthcheck → swap → drain old).
+
+Wave ordering (`depends_on`) is global — `redis` finishes its host fan-out before `api` starts, regardless of which hosts each lands on.
+
+### Pre-deploy hooks
+
+`pre_deploy` hooks run **once per `up`**, on the first host that has the service. Don't multiply by replica count or host count — migrations run once, full stop.
+
+### Pruning
+
+`yoink prune` walks every host independently, removing containers and images that don't match any current service definition. A service that used to run on `prod-eu-2` but is now pinned to `prod-eu-1` gets cleaned up on `prod-eu-2` automatically.
+
+## Port-forward
 
 `yoink pf <service>` opens a tunnel from your laptop to a container port — the same shape `kubectl port-forward` gives you, reusing the SSH connection yoink already has to the host. Works whether or not the service publishes a host port; **you don't need to publish anything to debug a service**. Open URL, `Ctrl-C` to close.
 
-## Why this matters — make the secure default the easy one
+### Why this matters — make the secure default the easy one
 
 The biggest production-security win on a single-host docker deploy is *not publishing host ports*. Specifically:
 
@@ -29,7 +183,7 @@ The standard objection: **"but how do I debug api / poke a database / hit an int
 
 In other words: the security posture and the debugging posture stop fighting. The right default for production *is* the right default for everything; `pf` papers over the awkwardness that used to make operators reach for `publish:` as a workaround.
 
-## What it works on
+### What it works on
 
 Anything yoink runs:
 
@@ -38,7 +192,7 @@ Anything yoink runs:
 - Services on a single network or multi-network.
 - Replicated services. See [Replicas](#replicas) below for routing caveats.
 
-## CLI
+### CLI
 
 ```sh
 # Auto-mode: published if available, sidecar otherwise.
@@ -62,14 +216,14 @@ curl -s http://localhost:$LOCAL/health
 
 The process holds the tunnel until you Ctrl-C; on exit the SSH child dies, the sidecar (if any) is force-removed, and the local port is freed.
 
-### Errors you'll see
+#### Errors you'll see
 
 - **`service "x" has no \`publish:\` block and \`--mode published\` was forced`** — drop the flag (auto mode falls back to a sidecar) or pass `--mode sidecar` explicitly.
 - **`service "x" declares no \`networks:\``** — sidecar mode needs a docker network to join. Add a `networks:` entry to the service or to `deploy.networks:`.
 - **`service "x" has no \`publish:\` and no \`run.port:\``** — when no port arg is given, yoink defaults to `run.port`. Set one or pass the container port explicitly.
 - **`ssh probe to <host> failed: …`** — the same probe `yoink up` uses. Tailnet, key, host-key acceptance — fix once and `yoink pf` works for everything.
 
-## TUI
+### TUI
 
 Three keys plus a visual indicator on every row whose service has a tunnel open:
 
@@ -100,7 +254,7 @@ While any tunnel is open, a one-line footer band stays visible across every pane
 
 The band is hard to miss on purpose — open tunnels are the kind of thing operators forget about and accidentally leave running between sessions. Quitting the TUI closes every tunnel cleanly.
 
-## Replicas
+### Replicas
 
 For services with `replicas: > 1`, the tunnel may land on any healthy replica per connection. Pin the routing with one of:
 
@@ -110,7 +264,7 @@ For services with `replicas: > 1`, the tunnel may land on any healthy replica pe
 
 The TUI's `↦` marker shows which replica row was selected when you pressed `f`. Treat it as "this is the tunnel I opened" — not a routing guarantee.
 
-## What's guaranteed
+### What's guaranteed
 
 - **Same auth path as everything else.** If `yoink up` works against the host, `yoink pf` works.
 - **No image dependencies on the target.** Whether the target is `FROM scratch`, distroless, or full Debian, `pf` reaches it.
@@ -119,6 +273,10 @@ The TUI's `↦` marker shows which replica row was selected when you pressed `f`
 
 ## See also
 
-- [Secure by default](/docs/guide/security-defaults) — why `publish:` should be the exception, not the rule.
+- [Security](/docs/guide/security) — why `publish:` should be the exception, not the rule.
+- [Reverse proxy](/docs/guide/proxy) — HTTPS / hostname routing for services with `domain:`.
+- [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage) — proxy-side coordination when more than one host fronts the same domain.
+- [Run staging alongside prod](/docs/recipes/staging-alongside-prod) — same primitives, separate `yoink.yaml` per environment.
 - [TanStack Start + postgres](/docs/recipes/tanstack-stack) — end-to-end recipe that uses `yoink pf` to verify the deploy.
 - [CLI reference: pf](/docs/reference/cli) — full flag surface.
+- [Configuration reference](/docs/reference/config) — full `hosts:` / `replicas:` / `pin:` schema.

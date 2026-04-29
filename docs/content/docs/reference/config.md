@@ -64,9 +64,9 @@ The keys-dir scan (#3) is what makes `yoink secrets key generate` work without p
 | `recipients` | list of string | `[]` | Public age **recipients** (`age1...`), one per principal that needs to decrypt. New writes are sealed against every entry; decryption only needs *one* matching identity. Validates non-empty at config-load. |
 | `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. `..` and absolute paths are rejected. |
 
-The recipient/identity split is the asymmetric-keypair mental model — see [Two halves of one key](/docs/recipes/sealed-secrets#two-halves-of-one-key) in the recipe for the full explanation.
+The recipient/identity split is the asymmetric-keypair mental model — see [Sealed secrets (age) — the default](/docs/guide/secrets#sealed-secrets-age--the-default) in the secrets guide for the full explanation.
 
-Bootstrap: `yoink secrets key generate` writes a fresh **identity** to `~/.config/yoink/keys/<recipient>.key` (mode 0600) by default and prints the matching **recipient** (`age1…`, public; paste into `recipients:` above). `--out PATH` writes to a specific file at mode 0600 instead. `--print` sends the secret to stdout for piping into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`). `yoink secrets key public` re-derives the recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [sealed-secrets recipe](/docs/recipes/sealed-secrets).
+Bootstrap: `yoink secrets key generate` writes a fresh **identity** to `~/.config/yoink/keys/<recipient>.key` (mode 0600) by default and prints the matching **recipient** (`age1…`, public; paste into `recipients:` above). `--out PATH` writes to a specific file at mode 0600 instead. `--print` sends the secret to stdout for piping into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`). `yoink secrets key public` re-derives the recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [secrets guide](/docs/guide/secrets).
 
 ### `provider: command` (bring-your-own-tool)
 
@@ -84,7 +84,7 @@ secrets:
   command: ["doppler", "secrets", "download", "--no-file", "--format", "env"]
 ```
 
-See the [external-secrets recipe](/docs/recipes/secrets-external-cli) for per-tool wiring.
+See the [external-secrets recipe](/docs/guide/secrets) for per-tool wiring.
 
 ## Registry
 
@@ -161,7 +161,7 @@ The hardened defaults make new containers prod-safe out of the box. Override per
 | `network_aliases` | list of string | `[name]` | Extra DNS names on the attached networks. |
 | `devices` | list of string | `[]` | Host devices to expose. Each entry is `<host-path>[:<container-path>[:<perms>]]` (docker's `--device` syntax). `<perms>` is some combination of `r`, `w`, `m`; defaults to `rwm`. Both bind-mounts the device file and adds it to the cgroup `devices.allow` list. Narrower than `--privileged` — only the listed devices become accessible. Common uses: `/dev/nvidia*` (GPU), `/dev/dri` (Intel/AMD VAAPI), `/dev/ttyUSB*` (USB serial), `/dev/fuse` (with `cap_add: [SYS_ADMIN]`), `/dev/snd` (audio). |
 
-See [Security defaults](/docs/guide/security-defaults) for the full picture.
+See [Security defaults](/docs/guide/security) for the full picture.
 
 ## Hook
 

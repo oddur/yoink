@@ -5,17 +5,21 @@ weight: 5
 
 How to use age-sealed secrets from a CI workflow. The whole integration is one env var.
 
-> **One-paragraph refresher.** age uses an asymmetric keypair. The **recipient** (`age1…`, public) goes in `yoink.yaml` and seals new values. The **identity** (`AGE-SECRET-KEY-1…`, private) goes in your secret manager and unseals at deploy time. CI gets its own pair: a fresh identity it owns and never shares, plus the matching recipient added alongside the laptop recipient(s) in `yoink.yaml` so either can decrypt. See [Two halves of one key](/docs/recipes/sealed-secrets#two-halves-of-one-key) for the full mental model.
+> **One-paragraph refresher.** age uses an asymmetric keypair. The **recipient** (`age1…`, public) goes in `yoink.yaml` and seals new values. The **identity** (`AGE-SECRET-KEY-1…`, private) goes in your secret manager and unseals at deploy time. CI gets its own pair: a fresh identity it owns and never shares, plus the matching recipient added alongside the laptop recipient(s) in `yoink.yaml` so either can decrypt. See the [secrets guide](/docs/guide/secrets#sealed-secrets-age--the-default) for the full mental model.
 
 ## Prerequisites
 
-You've already set up sealed secrets locally — see [Sealed secrets (age)](/docs/recipes/sealed-secrets) if not. Specifically:
+You've already set up sealed secrets locally — see [Sealed secrets (age)](/docs/guide/secrets) if not. Specifically:
 
 - `secrets.age` is committed to the repo (encrypted)
 - `yoink.yaml` has a `secrets.recipients:` list with at least your laptop's recipient
 - Your laptop's identity is saved somewhere readable to you (default: `~/.config/yoink/keys/<recipient>.key`, written by `yoink secrets key generate`)
 
-## 1. Generate a CI-only identity and ship it to GitHub
+## Setup
+
+{{% steps %}}
+
+### Generate a CI-only identity and ship it to GitHub
 
 Each principal that needs to decrypt — your laptop, CI, a teammate's laptop — gets its own age keypair. **Don't reuse the laptop pair for CI**; if a CI runner is ever compromised you want to revoke its identity without disturbing day-to-day operator workflow.
 
@@ -25,11 +29,11 @@ One command does the generate + ship:
 yoink secrets key generate --print | gh secret set YOINK_AGE_KEY --repo you/your-repo
 ```
 
-`--print` sends the secret to **stdout**; the header, recipient, and follow-up notes go to **stderr**. The pipe captures only the `AGE-SECRET-KEY-1…` line — `gh secret set` gets a clean key, and you still see the recipient (`age1…`) on your terminal so you can copy it into `yoink.yaml` in step 2.
+`--print` sends the secret to **stdout**; the header, recipient, and follow-up notes go to **stderr**. The pipe captures only the `AGE-SECRET-KEY-1…` line — `gh secret set` gets a clean key, and you still see the recipient (`age1…`) on your terminal so you can copy it into `yoink.yaml` in the next step.
 
 If you'd rather paste manually: run without the pipe, copy the secret out, then `Repo Settings → Secrets and variables → Actions → New repository secret` named `YOINK_AGE_KEY`. Clear your scrollback (`reset`) when done — bare `key generate --print` leaves the identity in your terminal.
 
-## 2. Add the CI recipient to `yoink.yaml`
+### Add the CI recipient to `yoink.yaml`
 
 `recipients:` is a list. Add the new CI recipient *alongside* the existing laptop recipient — don't replace it, or you'll lock yourself out of the file you just sealed. Either identity decrypts the same `secrets.age`; that's the whole reason `recipients` is a list.
 
@@ -50,7 +54,7 @@ git commit -m "chore: add CI to age recipients"
 git push
 ```
 
-## 3. Wire it into the workflow
+### Wire it into the workflow
 
 ```yaml
 # .github/workflows/deploy.yml
@@ -76,7 +80,9 @@ jobs:
           YOINK_AGE_KEY: ${{ secrets.YOINK_AGE_KEY }}
 ```
 
-That's the whole integration. Yoink finds `YOINK_AGE_KEY` in the env, decrypts `secrets.age` on the runner, and uses the values exactly like a laptop deploy would.
+Yoink finds `YOINK_AGE_KEY` in the env, decrypts `secrets.age` on the runner, and uses the values exactly like a laptop deploy would.
+
+{{% /steps %}}
 
 ## How yoink finds the key
 
@@ -93,17 +99,38 @@ If none match, yoink errors with a pointer to `yoink secrets key generate`.
 
 ## Rotating the CI key
 
-When you want to roll the CI identity (left the company, suspected leak, periodic hygiene):
+When you want to roll the CI identity (left the company, suspected leak, periodic hygiene), `yoink secrets rotate` generates a new identity, re-seals `secrets.age` against [old recipients + new recipient], and prints the new secret + public key.
+
+{{% steps %}}
+
+### Run the rotation
 
 ```sh
 yoink secrets rotate
 ```
 
-This generates a new identity, re-seals `secrets.age` against [old recipients + new recipient], prints the new secret + public key, and tells you what to do next:
+### Add the new recipient to `yoink.yaml` and re-seal
 
-1. Add the new recipient to `yoink.yaml`
-2. Update the `YOINK_AGE_KEY` GitHub secret to the new value
-3. Once CI is decrypting fine with the new key, remove the old recipient from `yoink.yaml` and run `yoink secrets edit` (save without changes) to drop it.
+```yaml
+secrets:
+  recipients:
+    - age1...old
+    - age1...new
+```
+
+```sh
+yoink secrets edit  # save without changes
+```
+
+### Update the `YOINK_AGE_KEY` GitHub secret
+
+To the new value the rotate command printed.
+
+### Drop the old recipient
+
+Once CI is decrypting fine with the new key, remove the old recipient from `yoink.yaml` and run `yoink secrets edit` (save without changes) to drop it.
+
+{{% /steps %}}
 
 The transitional state where both keys can decrypt prevents a deploy outage during the swap.
 
@@ -132,6 +159,5 @@ Recipients (who can decrypt) and values (what's stored) are independent — an i
 
 ## See also
 
-- [Sealed secrets (age)](/docs/recipes/sealed-secrets) — full mental model for the keypair shape.
-- [External secrets via CLI](/docs/recipes/secrets-external-cli) — when GitHub Secrets isn't where your secrets live.
+- [Secrets guide](/docs/guide/secrets) — full mental model for the keypair shape and the `provider: command` escape hatch when GitHub Secrets isn't where your secrets live.
 - [Pre-merge dry-run on every PR](/docs/recipes/pr-comment-dry-run) — same `YOINK_AGE_KEY` setup, applied to PR-time validation.

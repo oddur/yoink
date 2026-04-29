@@ -105,4 +105,4 @@ jobs:
 ## See also
 
 - [AGE secrets in GitHub Actions](/docs/recipes/age-in-github-actions) — wiring `YOINK_AGE_KEY` into the runner so dry-run can decrypt.
-- [Driving yoink from an AI agent](/docs/recipes/ai-agents) — how the dry-run output reads to a reviewer (human or otherwise).
+- [Driving yoink from an AI agent](/docs/guide/ai-agents) — how the dry-run output reads to a reviewer (human or otherwise).

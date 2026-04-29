@@ -28,7 +28,11 @@ flowchart LR
 
 The single Redis is a small SPOF, but a tractable one (it's only used for cert issuance/renewal, not request-path traffic). Backups via tailnet-replicated snapshots if you need it.
 
-## Bake the plugin into caddy
+## Setup
+
+{{% steps %}}
+
+### Bake the plugin into caddy
 
 `caddy-storage-redis` isn't in the base `caddy:2` image. The plugin part is straightforward — `proxy.xcaddy:` does the build on every proxy host:
 
@@ -44,7 +48,7 @@ That gets the storage *module* compiled into the caddy binary on each host. Wiri
 
 See [Caddy plugins (xcaddy, no registry)](/docs/recipes/caddy-plugins) for the full xcaddy story (build cost, idempotency, debugging).
 
-## Run Redis as a yoink service
+### Run Redis as a yoink service
 
 Pin Redis to one host and publish only on the tailnet IP:
 
@@ -72,7 +76,7 @@ services:
 
 The published port on Tailscale's IP makes Redis reachable from `prod-2` and `prod-3` over the tailnet, but **not** from the public internet (Hetzner / your hosting provider's external interface).
 
-## Wire caddy's storage backend
+### Wire caddy's storage backend
 
 `proxy.xcaddy:` compiles the plugin in. `proxy.config_extra:` hands caddy the top-level `storage` block that tells it to *use* Redis instead of the local `/data` volume:
 
@@ -95,9 +99,11 @@ Yoink deep-merges that JSON into the rendered Caddy config before `/load`-ing it
 
 Every proxy host now reads ACME state from the shared Redis instead of its local `/data` volume. The `yoink_caddy_data` named volume becomes empty — but you can leave it; it does no harm.
 
-## Tailscale on every host
+### Tailscale on every host
 
-For the proxies on `prod-2` and `prod-3` to reach `redis:6379` on `prod-1`'s tailnet IP, every host needs to be on the tailnet. See [Pairing with Tailscale](/docs/guide/pairing) for the setup.
+For the proxies on `prod-2` and `prod-3` to reach `redis:6379` on `prod-1`'s tailnet IP, every host needs to be on the tailnet. See the [networking guide](/docs/guide/networking) for the setup.
+
+{{% /steps %}}
 
 ## See also
 
