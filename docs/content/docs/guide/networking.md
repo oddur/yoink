@@ -102,7 +102,7 @@ services:
     run: { replicas: 1 }     # one container — singleton
 ```
 
-**Stateful pinned + stateless replicated:**
+**Stateful pinned + stateless replicated** (single-host shape — see caveat below for multi-host):
 
 ```yaml
 services:
@@ -111,12 +111,12 @@ services:
     run: { replicas: 1 }
 
   - name: api
-    hosts: [prod-eu-1, prod-eu-2]
-    networks: [api, redis]   # api dials redis cross-host via the redis network
+    hosts: [prod-db-1]
+    networks: [redis]
     run: { replicas: 2 }
 ```
 
-For cross-host network reach, the `redis` network must be an **overlay** network (or you use a tailnet sidecar). Yoink creates bridge networks by default; switch by declaring it ahead of time on the host or extending `deploy.networks` once overlay support lands.
+> **Cross-host service-to-service traffic is not yet first-class.** Docker bridge networks (yoink's default) are per-host, so an api on `prod-eu-1` cannot dial `redis:6379` on `prod-db-1` over the docker network alone. Today's working patterns: pin the dialing service to the same host as its dependency (above), or expose the stateful service on a tailnet IP via `publish:` and have the consumer dial that tailnet hostname. Docker overlay networks would solve this generically; first-class support is on the roadmap.
 
 **Region-pinned:**
 

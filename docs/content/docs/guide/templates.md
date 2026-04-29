@@ -262,7 +262,7 @@ For most templates these are right. Some popular images need overrides — usual
 | `Read-only file system (os error 30)` mid-request | App writes to rootfs (logs, pidfiles, payload buffers) | `read_only: false` |
 | `Permission denied` writing to a volume | Volume owned by root, container running as nobody | `user: "0:0"` (image's entrypoint usually drops privileges itself) |
 
-The bundled `postgres`, `meilisearch`, `rustfs`, and `restic-backups` templates each carry a few lines of overrides for exactly these reasons — read them before authoring a similar template:
+Most bundled templates carry a few lines of overrides for exactly these reasons — read them before authoring a similar template:
 
 - [`templates/postgres/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/postgres/service.yaml.tmpl) — root entrypoint, gosu privilege drop, initdb chown.
 - [`templates/meilisearch/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/meilisearch/service.yaml.tmpl) — root + writable rootfs for ingest payload buffers.

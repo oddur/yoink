@@ -66,8 +66,7 @@ services:
     networks: [yoink-ingress]      # so the proxies can reach it by name from inside the network
     run:
       port: 6379
-      healthcheck_path: /          # Redis doesn't speak HTTP; skip and let yoink TCP-probe
-      healthcheck_path: null
+      healthcheck_path: null       # Redis doesn't speak HTTP; skip and let yoink TCP-probe
       publish:
         - "100.10.0.1:6379:6379"   # tailnet IP only — adjust to your tailscale assignment
       volumes:

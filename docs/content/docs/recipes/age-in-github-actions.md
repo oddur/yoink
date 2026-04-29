@@ -99,36 +99,29 @@ If none match, yoink errors with a pointer to `yoink secrets key generate`.
 
 ## Rotating the CI key
 
-When you want to roll the CI identity (left the company, suspected leak, periodic hygiene), `yoink secrets rotate` generates a new identity, re-seals `secrets.age` against [old recipients + new recipient], and prints the new secret + public key.
+When you want to roll the CI identity (left the company, suspected leak, periodic hygiene):
 
 {{% steps %}}
 
-### Run the rotation
+### Run `yoink secrets rotate`
+
+Generates a new identity, re-seals `secrets.age` against `[old recipients + new recipient]`, and prints the new private + public key. After this step `yoink.yaml` and `secrets.age` are already updated locally — commit them.
 
 ```sh
 yoink secrets rotate
 ```
 
-### Add the new recipient to `yoink.yaml` and re-seal
-
-```yaml
-secrets:
-  recipients:
-    - age1...old
-    - age1...new
-```
-
-```sh
-yoink secrets edit  # save without changes
-```
-
 ### Update the `YOINK_AGE_KEY` GitHub secret
 
-To the new value the rotate command printed.
+To the new private key the rotate command printed.
+
+### Verify CI decrypts with the new key
+
+Push and watch a deploy run. The transitional state has both identities able to decrypt, so a stale runner doesn't break the deploy during the swap.
 
 ### Drop the old recipient
 
-Once CI is decrypting fine with the new key, remove the old recipient from `yoink.yaml` and run `yoink secrets edit` (save without changes) to drop it.
+Once CI is decrypting fine, remove the old recipient from `yoink.yaml` and run `yoink secrets edit` (save without changes) to re-seal against the new recipient only.
 
 {{% /steps %}}
 

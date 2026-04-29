@@ -198,7 +198,7 @@ Operational notes:
 - **Each host needs egress to `proxy.golang.org`** (xcaddy fetches Go modules during the build). Air-gapped hosts will fail at build time.
 - **First `up` is slow** on each fresh host (~2-5 min for the compile). Subsequent ones are no-ops until plugin set changes.
 - **Plugin rotation leaves stale images.** When you change plugins the new build is tagged `yoink-caddy:<new-hash>` and the old `yoink-caddy:<old-hash>` lingers. Run `docker image prune -a` on the host (or use the TUI's image-prune gesture) to reclaim. Stale builds are labelled `yoink.caddy.xcaddy_hash=...` for human inspection.
-- **Caddyfile snippets and plugin directives don't mix.** `caddy_extra_caddyfile:` adapts via the bundled `caddy:2` adapter on the operator's machine, which doesn't know plugin-provided directives like `rate_limit { ... }`. If your snippet uses one, write it as `caddy_extra_json:` instead. See [recipes/caddy-snippets](../recipes/caddy-snippets).
+- **Caddyfile snippets and plugin directives don't mix.** `caddy_extra_caddyfile:` adapts via the bundled `caddy:2` adapter on the operator's machine, which doesn't know plugin-provided directives like `rate_limit { ... }`. If your snippet uses one, write it as `caddy_extra_json:` instead. See the [snippets cookbook](#snippets-cookbook) below for the JSON shapes.
 - **`yoink validate` skips the docker-spawn check** when `xcaddy:` is set (the image only exists on hosts). The pure rendering path still runs and surfaces schema errors; Caddy refuses bad configs at `/load` time on the host.
 - **Debug:** `yoink proxy-dockerfile` prints the synthesized two-stage Dockerfile without running docker. Useful for code review or pinning a Dockerfile in CI.
 
