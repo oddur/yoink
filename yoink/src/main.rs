@@ -23,6 +23,8 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::Level;
@@ -191,7 +193,15 @@ enum Command {
         var: Vec<String>,
     },
     /// Verify Docker is reachable on each configured host.
-    Preflight,
+    Preflight {
+        /// Wait up to DURATION for each host's docker daemon to become
+        /// reachable, polling every 3s with backoff. Useful right after
+        /// provisioning a fresh host whose cloud-init is still installing
+        /// Docker. Without this flag the check fires once and exits on
+        /// first failure. Examples: `--wait 90s`, `--wait 2m`.
+        #[arg(long, value_name = "DURATION", value_parser = parse_humantime)]
+        wait: Option<Duration>,
+    },
     /// Reconcile every service in the config to its desired spec.
     /// Drifted containers (image, env, mounts, options) are swapped
     /// via the healthcheck-gated loop.
@@ -1023,7 +1033,7 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Command::Preflight => cmd_preflight(&config).await,
+        Command::Preflight { wait } => cmd_preflight(&config, wait).await,
         Command::Up {
             services,
             tag,
@@ -1159,12 +1169,12 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-async fn cmd_preflight(config: &Config) -> Result<()> {
+async fn cmd_preflight(config: &Config, wait: Option<Duration>) -> Result<()> {
     let ops = build_real_ops(config, None).await?;
     let mut had_error = false;
     for host_cfg in &config.hosts {
         let host = Host::from(host_cfg);
-        match ops.version(&host).await {
+        match probe_host_with_wait(&ops, &host, wait).await {
             Ok(v) => eprintln!(
                 "✓ {}: docker {} (api {}) on {}/{}",
                 host.address,
@@ -1183,6 +1193,53 @@ async fn cmd_preflight(config: &Config) -> Result<()> {
         anyhow::bail!("preflight failed for one or more hosts");
     }
     Ok(())
+}
+
+/// Poll `ops.version(host)` until it returns Ok or the deadline lapses.
+/// `wait = None` is one-shot. Returns the last error on timeout so the
+/// caller can surface what kept the host unreachable.
+async fn probe_host_with_wait(
+    ops: &dyn DockerOps,
+    host: &Host,
+    wait: Option<Duration>,
+) -> Result<yoink::docker_ops::DockerVersion> {
+    let Some(budget) = wait else {
+        return ops.version(host).await.map_err(anyhow::Error::from);
+    };
+    let deadline = std::time::Instant::now() + budget;
+    let mut delay = Duration::from_secs(2);
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match ops.version(host).await {
+            Ok(v) => {
+                if attempt > 1 {
+                    eprintln!(
+                        "… {}: docker reachable after {attempt} attempt(s)",
+                        host.address
+                    );
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "host {} unreachable after {attempt} attempt(s) within {budget:?}",
+                        host.address
+                    )));
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                let sleep_for = delay.min(remaining);
+                eprintln!(
+                    "… {}: not reachable yet (attempt {attempt}); retrying in {sleep_for:?}",
+                    host.address
+                );
+                tokio::time::sleep(sleep_for).await;
+                delay = (delay * 2).min(Duration::from_secs(15));
+            }
+        }
+    }
 }
 
 // Each bool is a discrete CLI flag; collapsing them would just hide
@@ -2198,6 +2255,10 @@ async fn cmd_pf(
     Ok(())
 }
 
+fn parse_humantime(s: &str) -> Result<Duration, String> {
+    humantime::parse_duration(s).map_err(|e| format!("invalid duration {s:?}: {e}"))
+}
+
 /// Parse `LOCAL:CONTAINER` or just `CONTAINER`. Empty / non-numeric
 /// segments reject with a stable message for shell-completion friendliness.
 fn parse_pf_port_arg(arg: &str) -> Result<(Option<u16>, u16)> {
@@ -3145,7 +3206,7 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
         validate_proxy_render(config).await?;
     }
     if check_hosts {
-        cmd_preflight(config).await?;
+        cmd_preflight(config, None).await?;
     }
     Ok(())
 }

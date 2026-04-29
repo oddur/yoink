@@ -4875,6 +4875,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "glob",
+ "humantime",
  "humantime-serde",
  "indicatif",
  "insta",

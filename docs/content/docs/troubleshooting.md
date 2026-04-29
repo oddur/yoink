@@ -50,6 +50,8 @@ Add the key with `ssh-add ~/.ssh/id_ed25519` (or whichever) and re-run.
 
 `yoink preflight` is the canonical "why can't I reach the host" diagnostic — it does an explicit `ssh -o BatchMode=yes user@host true` first and translates common stderr patterns. The classifier covers Tailscale auth, permission denied, connection timeout, host key changes, DNS / hostname resolution, and connection refused.
 
+For the "host is provisioning right now and Docker isn't installed yet" race (common on `cloud-init`-driven first boots), `yoink preflight --wait 90s` polls each host on backoff (2s → 15s capped) until Docker responds or the budget lapses. Saves writing your own `until ssh … cloud-init status --wait` loop before the first `yoink up`.
+
 ## `` `<command>` exited with status N: <stderr> ``
 
 `provider: command` ran your secrets binary and it failed. The captured stderr is included in the error — start there.

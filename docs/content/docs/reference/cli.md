@@ -66,6 +66,9 @@ yoink add [REF]                          drop a vetted template into your repo: 
   --yes                                  skip every confirmation prompt; required in CI
 
 yoink preflight                          verify Docker is reachable on each configured host
+  --wait <DURATION>                      poll until each host's docker daemon responds
+                                         (or the budget lapses); useful right after
+                                         provisioning a fresh host. e.g. `--wait 90s`
 
 yoink up                                 reconcile every service to its desired spec
   --service <NAME>                       restrict to a subset (repeatable)
