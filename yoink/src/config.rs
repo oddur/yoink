@@ -35,6 +35,12 @@ pub enum ConfigError {
         #[source]
         source: glob::GlobError,
     },
+    #[error("env var ${{{name}}} referenced in config is not set")]
+    EnvVarUnset { name: String },
+    #[error(
+        "malformed env var reference near {context:?} — expected `${{NAME}}` with NAME = [A-Za-z_][A-Za-z0-9_]*"
+    )]
+    EnvVarSyntax { context: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1138,6 +1144,72 @@ fn local_socket_exists() -> bool {
     false
 }
 
+/// Substitute `${NAME}` references in `text` against process env vars.
+/// Applied to YAML text *before* deserialization, so any string field
+/// in the config (host addresses, service domains, env values, …) can
+/// reference an env var. Only the `${NAME}` form is recognized — bare
+/// `$NAME`, `$$`, etc. pass through unchanged so YAML strings that
+/// happen to contain a literal dollar are unaffected.
+///
+/// Errors:
+/// - `EnvVarUnset` if `${NAME}` references a var not present in the
+///   environment. (No silent empty substitution — a missing var almost
+///   always indicates a misconfigured deploy, and a quietly-empty
+///   `address:` produces baffling failures downstream.)
+/// - `EnvVarSyntax` if a `${...}` block contains characters outside
+///   `[A-Za-z_][A-Za-z0-9_]*` or is unterminated.
+fn expand_env_vars(text: &str) -> Result<String, ConfigError> {
+    expand_env_vars_with(text, |name| std::env::var(name).ok())
+}
+
+fn expand_env_vars_with<F>(text: &str, lookup: F) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Short-circuit the common case (no `$` anywhere in the YAML) so
+    // load_from_path doesn't pay an allocation on every invocation.
+    if !text.contains('$') {
+        return Ok(text.to_string());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(dollar) = rest.find('$') {
+        out.push_str(&rest[..dollar]);
+        let after_dollar = &rest[dollar + 1..];
+        if !after_dollar.starts_with('{') {
+            out.push('$');
+            rest = after_dollar;
+            continue;
+        }
+        let name_and_tail = &after_dollar[1..];
+        let Some(close) = name_and_tail.find('}') else {
+            let snippet_end = (dollar + 16).min(rest.len());
+            return Err(ConfigError::EnvVarSyntax {
+                context: rest[dollar..snippet_end].to_string(),
+            });
+        };
+        let name = &name_and_tail[..close];
+        let valid_name = !name.is_empty()
+            && name
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !valid_name {
+            return Err(ConfigError::EnvVarSyntax {
+                context: rest[dollar..=dollar + 2 + close].to_string(),
+            });
+        }
+        let value = lookup(name).ok_or_else(|| ConfigError::EnvVarUnset {
+            name: name.to_string(),
+        })?;
+        out.push_str(&value);
+        rest = &name_and_tail[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 impl Config {
     /// Walk `self.services` filtered by an optional name list. `None`
     /// returns every service in topo order; `Some(&[…])` keeps only
@@ -1199,6 +1271,7 @@ impl Config {
             path: path.display().to_string(),
             source,
         })?;
+        let text = expand_env_vars(&text)?;
         // Parse the main file *without* validation — fragments contribute
         // services + hooks, so duplicate / dangling-reference checks only
         // make sense after the merge.
@@ -1229,6 +1302,7 @@ impl Config {
             path: path.display().to_string(),
             source,
         })?;
+        let text = expand_env_vars(&text)?;
         let mut cfg: Self = yaml_serde::from_str(&text)?;
         cfg.config_dir = path.parent().map(std::path::Path::to_path_buf);
         cfg.merge_includes()?;
@@ -1345,6 +1419,7 @@ impl Config {
                 path: path.display().to_string(),
                 source,
             })?;
+            let text = expand_env_vars(&text)?;
             let fragment: ConfigFragment = yaml_serde::from_str(&text)?;
             self.services.extend(fragment.services);
             self.hooks.pre_deploy.extend(fragment.hooks.pre_deploy);
@@ -1727,6 +1802,70 @@ fn validate_service_name(name: &str) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs.iter().find_map(|(k, v)| {
+                if *k == name {
+                    Some((*v).to_string())
+                } else {
+                    None
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn env_expansion_substitutes_braced_var() {
+        let out =
+            expand_env_vars_with("address: ${HOST_IP}", lookup(&[("HOST_IP", "1.2.3.4")])).unwrap();
+        assert_eq!(out, "address: 1.2.3.4");
+    }
+
+    #[test]
+    fn env_expansion_handles_multiple_and_concatenation() {
+        let out = expand_env_vars_with(
+            "  - ${HOST_IP}.nip.io\n  - ${OTHER}",
+            lookup(&[("HOST_IP", "9.9.9.9"), ("OTHER", "x")]),
+        )
+        .unwrap();
+        assert_eq!(out, "  - 9.9.9.9.nip.io\n  - x");
+    }
+
+    #[test]
+    fn env_expansion_passes_through_bare_dollar_and_no_braces() {
+        // `$HOST_IP` (no braces) and `$$` are left alone — only the
+        // unambiguous `${NAME}` form expands.
+        let out =
+            expand_env_vars_with("price: $5; raw: $HOST_IP", lookup(&[("HOST_IP", "x")])).unwrap();
+        assert_eq!(out, "price: $5; raw: $HOST_IP");
+    }
+
+    #[test]
+    fn env_expansion_unset_var_errors() {
+        let err = expand_env_vars_with("addr: ${NOPE}", lookup(&[])).unwrap_err();
+        assert!(matches!(err, ConfigError::EnvVarUnset { ref name } if name == "NOPE"));
+    }
+
+    #[test]
+    fn env_expansion_unterminated_brace_errors() {
+        let err = expand_env_vars_with("addr: ${HOST", lookup(&[])).unwrap_err();
+        assert!(matches!(err, ConfigError::EnvVarSyntax { .. }));
+    }
+
+    #[test]
+    fn env_expansion_invalid_name_errors() {
+        let err = expand_env_vars_with("x: ${1BAD}", lookup(&[("1BAD", "v")])).unwrap_err();
+        assert!(matches!(err, ConfigError::EnvVarSyntax { .. }));
+        let err = expand_env_vars_with("x: ${HOST-IP}", lookup(&[])).unwrap_err();
+        assert!(matches!(err, ConfigError::EnvVarSyntax { .. }));
+    }
+
+    #[test]
+    fn env_expansion_preserves_utf8() {
+        let out = expand_env_vars_with("# tëst — ${V}", lookup(&[("V", "✓")])).unwrap();
+        assert_eq!(out, "# tëst — ✓");
+    }
 
     fn minimal() -> &'static str {
         r#"

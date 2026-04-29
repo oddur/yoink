@@ -283,3 +283,26 @@ services:
     image: ghcr.io/you/api
     # ...
 ```
+
+## Environment-variable substitution
+
+Any `${VAR}` reference in `yoink.yaml` (or in a fragment loaded via `include:`) is substituted against the process environment at config-load time, before YAML parsing.
+
+```yaml
+hosts:
+  - address: ${HOST_IP}
+    user: root
+services:
+  - name: hello
+    domain:
+      - ${HOST_IP}.nip.io
+```
+
+Run with `HOST_IP=1.2.3.4 yoink up …`. Useful for throwaway-host recipes, ephemeral preview environments, and any other case where one of the values isn't known until invocation time.
+
+Rules:
+
+- Only the unambiguous `${NAME}` form is recognized. Bare `$NAME` and lone `$` characters pass through unchanged so values containing literal dollar signs are unaffected.
+- `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`. Anything else (including `${HOST-IP}`, `${1BAD}`, or unterminated `${`) errors with a snippet pointing at the bad reference.
+- Missing variables are a hard error rather than silent empty substitution — a quietly-empty `address:` produces baffling failures further down the deploy.
+- For long-lived secrets, prefer `secrets:` (sealed or `provider: command`) over passing values via env. The substitution path is intended for routing parameters (host IPs, hostnames, port numbers), not credentials.
