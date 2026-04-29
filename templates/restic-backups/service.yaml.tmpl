@@ -1,0 +1,41 @@
+services:
+  - name: backups
+    image: mazzolino/restic
+    tag: "1.8.2"
+    env:
+      RESTIC_REPOSITORY: "{{ repository }}"
+      BACKUP_CRON: "{{ schedule }}"
+      RESTIC_BACKUP_SOURCES: /data
+      RESTIC_FORGET_ARGS: "{{ retention }}"
+      # Set to "true" to run a backup at container start in addition to
+      # cron. Useful for first-deploy verification; flip back when done.
+      # RUN_ON_STARTUP: "true"
+      # Optional inline excludes:
+      # RESTIC_BACKUP_ARGS: "--exclude-caches --exclude '*.tmp'"
+    env_from_secrets:
+      AWS_ACCESS_KEY_ID:     S3_ACCESS_KEY_ID
+      AWS_SECRET_ACCESS_KEY: S3_SECRET_ACCESS_KEY
+    secrets:
+      - RESTIC_PASSWORD
+    run:
+      drain_timeout: 60s
+      volumes:
+        # Persistent restic cache (speeds up repeat backups).
+        - resticker-cache:/root/.cache
+        # ---- EDIT: add one read-only bind per docker volume to back up ----
+        # Each becomes /data/<name> inside the container; restic walks /data.
+        # - postgres-data:/data/postgres-data:ro
+        # - api-uploads:/data/api-uploads:ro
+      options:
+        user: "0:0"             # mazzolino/restic expects root
+        init: false             # image's entrypoint already wraps with tini
+        read_only: true
+        restart: unless-stopped
+        tmpfs:
+          /tmp: "size=128m"
+          # resticker's go-cron writes /run/lock/backup.lock to prevent
+          # overlapping backup runs; with read_only rootfs this dir
+          # needs explicit tmpfs (mounting `/run` alone leaves the
+          # `/lock` subdir nonexistent on a fresh tmpfs — mount the
+          # leaf path directly).
+          /run/lock: "size=16m"

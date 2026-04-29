@@ -214,27 +214,101 @@ fn check_relative_path(p: &str, field: &str) -> Result<(), ManifestError> {
 }
 
 /// Match a string against a manifest pattern. Same semantics as
-/// `^pattern$` — anchored on both ends. Without a `regex` dep we
-/// implement a tiny subset: `^…$` plus `[a-z0-9-]` character classes,
-/// `+`, `*`. Sufficient for service-name validation; richer patterns
-/// can move to a real regex crate later.
+/// `^pattern$` — anchored on both ends regardless of whether the
+/// caller wrote the anchors. Without a `regex` dep we implement a
+/// tiny subset: literal chars, `.`, `[a-z0-9-]` character classes
+/// (with `^` negation), `+`, `*`, top-level `|` alternation, and
+/// outermost `(...)` grouping. Sufficient for service-name and
+/// boolean-choice validation; richer patterns can move to a real
+/// regex crate later.
 pub fn regex_match(pat: &str, value: &str) -> bool {
-    let stripped = pat
-        .strip_prefix('^')
-        .unwrap_or(pat)
-        .strip_suffix('$')
-        .unwrap_or(pat);
+    // Strip optional anchors. Rebind through a `let` between strips
+    // — the previous `unwrap_or(pat)` form fell back to the original
+    // `pat` (with `^` still attached) when only the prefix was
+    // present, defeating the strip.
+    let no_prefix = pat.strip_prefix('^').unwrap_or(pat);
+    let stripped = no_prefix.strip_suffix('$').unwrap_or(no_prefix);
     tiny_regex::matches(stripped, value)
 }
 
 mod tiny_regex {
     /// Minimal anchored matcher. Supports literal chars, `.`,
-    /// `[a-zA-Z0-9-_]` character classes, `+`, `*`. Anything else
+    /// `[a-zA-Z0-9-_]` character classes, `+`, `*`, top-level `|`
+    /// alternation, and outermost `(...)` grouping. Anything else
     /// is treated as a literal — keep manifest patterns simple.
+    ///
+    /// Alternation is top-level only by design: nested groups like
+    /// `^a(b|c)d$` would need a real parser, and the manifest patterns
+    /// we want to support (service names, simple boolean choices,
+    /// version strings) don't need them. The `(...)` strip lets
+    /// operators write the canonical `^(true|false)$` even though
+    /// the parens are semantically redundant after the strip.
     pub fn matches(pat: &str, s: &str) -> bool {
+        let pat = strip_redundant_outer_parens(pat);
+        // `s` doesn't change across alternatives; vectorize it once.
+        let s_chars: Vec<char> = s.chars().collect();
+        split_top_level_alternatives(pat)
+            .into_iter()
+            .any(|alt| match_anchored(alt, &s_chars))
+    }
+
+    fn match_anchored(pat: &str, s: &[char]) -> bool {
         let pat: Vec<char> = pat.chars().collect();
-        let s: Vec<char> = s.chars().collect();
-        match_at(&pat, 0, &s, 0)
+        match_at(&pat, 0, s, 0)
+    }
+
+    /// Strip `(X)` → `X` only when the parens fully wrap the pattern
+    /// (close matches at the very end). Avoids stripping in `(a)(b)`.
+    fn strip_redundant_outer_parens(pat: &str) -> &str {
+        let bytes = pat.as_bytes();
+        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+            return pat;
+        }
+        let mut depth: i32 = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 && i < bytes.len() - 1 {
+                        // First `)` closed before end → outer parens
+                        // don't wrap; e.g. `(a)(b)`.
+                        return pat;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            &pat[1..pat.len() - 1]
+        } else {
+            pat
+        }
+    }
+
+    /// Split on `|` at the top level only — not inside `[...]` or
+    /// `(...)`. Inside a class, `|` is just a literal char.
+    fn split_top_level_alternatives(pat: &str) -> Vec<&str> {
+        let bytes = pat.as_bytes();
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut bracket: i32 = 0;
+        let mut paren: i32 = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'[' => bracket += 1,
+                b']' => bracket = (bracket - 1).max(0),
+                b'(' => paren += 1,
+                b')' => paren = (paren - 1).max(0),
+                b'|' if bracket == 0 && paren == 0 => {
+                    out.push(&pat[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&pat[start..]);
+        out
     }
 
     fn match_at(pat: &[char], pi: usize, s: &[char], si: usize) -> bool {
@@ -403,6 +477,50 @@ secrets:
         assert!(!regex_match("^[a-z][a-z0-9-]*$", "Bad"));
         assert!(regex_match("^v[0-9]+$", "v17"));
         assert!(!regex_match("^v[0-9]+$", "v"));
+    }
+
+    #[test]
+    fn regex_match_prefix_anchor_only() {
+        // Earlier strip-fallback bug: `^X` (no `$`) fell back to the
+        // unstripped pattern, so the literal `^` got matched against
+        // the value's first char and never matched anything starting
+        // with a non-`^`.
+        assert!(regex_match("^s3:.+", "s3:foo"));
+        assert!(regex_match("^s3:.+", "s3:https://example.com/bucket"));
+        assert!(!regex_match("^s3:.+", "noprefix"));
+        assert!(!regex_match("^s3:.+", "s3:")); // `.+` needs ≥1 char
+    }
+
+    #[test]
+    fn regex_match_suffix_anchor_only() {
+        assert!(regex_match("foo$", "foo"));
+        assert!(!regex_match("foo$", "barfoo")); // matcher is fully anchored
+    }
+
+    #[test]
+    fn regex_match_alternation() {
+        assert!(regex_match("^(true|false)$", "true"));
+        assert!(regex_match("^(true|false)$", "false"));
+        assert!(!regex_match("^(true|false)$", "maybe"));
+        // No parens — top-level `|` still works.
+        assert!(regex_match("^yes|no$", "yes"));
+        assert!(regex_match("^yes|no$", "no"));
+        assert!(!regex_match("^yes|no$", "yep"));
+        // Three-way + character class on one side.
+        assert!(regex_match("^(a|b|[0-9]+)$", "a"));
+        assert!(regex_match("^(a|b|[0-9]+)$", "b"));
+        assert!(regex_match("^(a|b|[0-9]+)$", "42"));
+        assert!(!regex_match("^(a|b|[0-9]+)$", "c"));
+    }
+
+    #[test]
+    fn regex_match_pipe_inside_class_is_literal() {
+        // `[a|b]` matches `a`, `|`, or `b` — the `|` is a literal char
+        // because it's inside `[...]`, NOT an alternation marker.
+        assert!(regex_match("^[a|b]$", "a"));
+        assert!(regex_match("^[a|b]$", "|"));
+        assert!(regex_match("^[a|b]$", "b"));
+        assert!(!regex_match("^[a|b]$", "c"));
     }
 
     #[test]

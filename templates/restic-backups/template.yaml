@@ -1,0 +1,61 @@
+name: restic-backups
+kind: accessory
+description: Nightly off-host backups of named docker volumes via restic.
+  Bring a bucket and S3 keys for any S3-compatible storage — Hetzner,
+  B2, AWS, MinIO, Wasabi, or a self-hosted RustFS via `yoink add rustfs`.
+
+variables:
+  - name: repository
+    prompt: |
+      restic repository URL — `s3:<endpoint>/<bucket>`. Examples:
+        s3:https://fsn1.your-objectstorage.com/MY-BUCKET   (Hetzner)
+        s3:https://s3.eu-central-003.backblazeb2.com/MY-BUCKET  (B2)
+        s3:http://rustfs-vault.tailnet:9000/backups        (self-hosted)
+    default: "s3:https://CHANGE-ME.example.com/CHANGE-ME"
+    pattern: "^s3:.+"
+  - name: schedule
+    prompt: go-cron schedule (6 fields incl. seconds)
+    default: "0 30 3 * * *"
+  - name: retention
+    prompt: restic forget args
+    default: "--keep-daily 7 --keep-weekly 4 --keep-monthly 6"
+
+files:
+  - dest: "services/backups.yaml"
+    template: service.yaml.tmpl
+
+include_glob: "services/*.yaml"
+
+notes: |
+  Three operator-supplied secrets need to be sealed manually before
+  the next deploy — the template doesn't auto-generate them because
+  the S3 keys come from your storage provider, and tying the
+  RESTIC_PASSWORD to the provider keys keeps "all backup credentials"
+  in one place under your control:
+
+    yoink secrets edit
+    # add:
+    #   RESTIC_PASSWORD=…    (e.g. `openssl rand -base64 48`)
+    #   S3_ACCESS_KEY_ID=…
+    #   S3_SECRET_ACCESS_KEY=…
+
+  **Save a copy of RESTIC_PASSWORD somewhere durable.** Without it you
+  cannot decrypt these backups.
+
+  If `repository` is still the placeholder, edit services/backups.yaml
+  to point it at your real bucket before deploying.
+
+  Edit services/backups.yaml to list the docker volumes you want to back
+  up — one read-only bind under `run.volumes:` per volume:
+    - postgres-data:/data/postgres-data:ro
+    - api-uploads:/data/api-uploads:ro
+
+  Deploy:        yoink up
+  First snapshot: wait for the next cron tick, or temporarily set
+                  RUN_ON_STARTUP=true under `env:`.
+  Restore:       see /docs/recipes/volume-backups for the docker run shape.
+
+  Layered with `yoink add rustfs` for full sovereignty: deploy RustFS
+  on a tailnet-reachable off-site host, point this template's
+  `repository` URL at it, reuse the rustfs access/secret keys as the
+  S3 keys here.

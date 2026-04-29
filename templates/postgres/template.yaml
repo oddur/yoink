@@ -7,10 +7,6 @@ variables:
     prompt: Service name
     default: postgres
     pattern: "^[a-z][a-z0-9-]*$"
-  - name: version
-    prompt: Postgres major version
-    default: "18"
-    choices: ["16", "17", "18"]
   - name: database
     prompt: Default database name
     default: app
@@ -22,6 +18,26 @@ variables:
   - name: memory
     prompt: Memory limit
     default: 512m
+  - name: wal_archiving
+    prompt: |
+      Enable continuous WAL archiving to S3-compatible storage? Pairs with
+      a volume-level base backup (e.g. `yoink add restic-backups`) for
+      point-in-time recovery. Set to "true" to render the archive_command
+      wiring into the service.
+    default: "false"
+    pattern: "^(true|false)$"
+  - name: wal_repository
+    prompt: |
+      S3 URI prefix for WAL segments (e.g. `s3://my-wal-bucket` or
+      `s3://wal-archive` against a self-hosted RustFS). Ignored when
+      wal_archiving=false.
+    default: "s3://wal-archive"
+  - name: wal_endpoint
+    prompt: |
+      Custom S3 endpoint URL for non-AWS providers (e.g. `http://rustfs:9000`
+      for in-network RustFS, or `https://s3.eu-central-003.backblazeb2.com`
+      for B2). Leave empty for AWS S3. Ignored when wal_archiving=false.
+    default: ""
 
 files:
   - dest: "services/{{ service_name }}.yaml"
@@ -44,4 +60,20 @@ connection:
     POSTGRES_PASSWORD: "{{ service_name | upper }}_PASSWORD"
 
 notes: |
+  {%- if wal_archiving == "true" %}
+  WAL archiving is enabled. Two operator-supplied secrets must be sealed
+  before `yoink up`:
+    yoink secrets edit
+    #  S3_ACCESS_KEY_ID=…
+    #  S3_SECRET_ACCESS_KEY=…
+  WAL segments ship to {{ wal_repository }}{% if wal_endpoint %} via
+  endpoint {{ wal_endpoint }}{% endif %}. The bucket must exist before
+  postgres starts archiving — restic-style auto-init does not apply here.
+
+  Pair with a base backup of the data volume for point-in-time recovery:
+    yoink add restic-backups
+  Then in services/backups.yaml, bind `pgdata-{{ service_name }}` read-only
+  into /data. WAL segments + restic snapshot = PITR.
+  {%- else %}
   Backup tip: `yoink exec {{ service_name }} -- pg_dump -U {{ user }} {{ database }}`
+  {%- endif %}
