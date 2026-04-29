@@ -8,6 +8,7 @@ sidebar:
 Outcome-oriented how-tos. Each recipe is a series of steps that take you from "I want X" to "X is running in production." Pick the one that matches what you're trying to accomplish — for the deeper "how does this work" content, see the [Guide](/docs/guide).
 
 {{< cards cols="2" >}}
+  {{< card link="/docs/recipes/hetzner-quickstart" title="Hetzner cx23 quickstart with HTTPS" subtitle="Empty Hetzner project → live HTTPS endpoint in ~90 seconds. €3.99/mo cx23, AGE-sealed deploy key, real Let's Encrypt cert via `<ip>.nip.io`." icon="lightning-bolt" >}}
   {{< card link="/docs/recipes/tanstack-stack" title="TanStack Start + postgres from scratch" subtitle="End-to-end: scaffold the app, add postgres via `yoink add`, deploy, verify with `yoink pf`." icon="lightning-bolt" >}}
   {{< card link="/docs/recipes/volume-backups" title="Volume backups + postgres PITR" subtitle="Nightly restic snapshots to any S3 (or self-hosted RustFS over Tailscale) plus postgres WAL archiving for point-in-time recovery." icon="archive" >}}
   {{< card link="/docs/recipes/cloudflare-origin-certs" title="Cloudflare Origin Certificates" subtitle="Skip Let's Encrypt — 15-year cert + origin-pull mTLS that locks your origin to Cloudflare's edge." icon="cloud" >}}
