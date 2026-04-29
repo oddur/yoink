@@ -745,13 +745,21 @@ enum SecretsAction {
         #[arg(long)]
         reveal: bool,
     },
-    /// One-shot: read a plaintext dotenv from `--in` (or stdin),
+    /// One-shot: read a plaintext dotenv from `--in` (or stdin) OR
+    /// individual `--as KEY=...` pairs, merge into a single bundle,
     /// seal against the recipients in `yoink.yaml`, write to
     /// `secrets.age` (or `--out`).
     Seal {
         /// Plaintext dotenv input. `-` (or unset) reads from stdin.
-        #[arg(long, value_name = "PATH")]
+        /// Mutually exclusive with `--as`.
+        #[arg(long, value_name = "PATH", conflicts_with = "as_pairs")]
         r#in: Option<PathBuf>,
+        /// Set a single key directly: `--as KEY=value` for a literal,
+        /// or `--as KEY=@PATH` to read the value from a file (useful
+        /// for multi-line PEMs / SSH keys without the dotenv-quoting
+        /// dance). Repeatable. Mutually exclusive with `--in`.
+        #[arg(long = "as", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+        as_pairs: Vec<String>,
         /// Output path. Defaults to the configured `secrets.file:`
         /// (or `secrets.age` next to `yoink.yaml`).
         #[arg(long)]
@@ -3576,7 +3584,11 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
         },
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
-        SecretsAction::Seal { r#in, out } => cmd_secrets_seal(config, r#in.as_deref(), out),
+        SecretsAction::Seal {
+            r#in,
+            as_pairs,
+            out,
+        } => cmd_secrets_seal(config, r#in.as_deref(), &as_pairs, out),
         SecretsAction::Rotate => cmd_secrets_rotate(config),
     }
 }
@@ -3730,45 +3742,54 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_secrets_seal(config: &Config, input: Option<&Path>, out: Option<PathBuf>) -> Result<()> {
+fn cmd_secrets_seal(
+    config: &Config,
+    input: Option<&Path>,
+    as_pairs: &[String],
+    out: Option<PathBuf>,
+) -> Result<()> {
     use yoink::sealed;
     let (file_override, recipients) = expect_age_block(config)?;
     // Cap input at 10 MiB regardless of source — protects against
     // a wrong-file paste (a 5GB image) just as much as an unbounded
     // stdin stream. Real secrets bundles are kilobytes.
     const SEAL_INPUT_CAP: u64 = 10 * 1024 * 1024;
-    let plaintext = match input {
-        Some(p) if p.as_os_str() != "-" => {
-            use std::io::Read;
-            let f =
-                std::fs::File::open(p).with_context(|| format!("open input {}", p.display()))?;
-            let mut buf = String::new();
-            f.take(SEAL_INPUT_CAP + 1)
-                .read_to_string(&mut buf)
-                .with_context(|| format!("read input {}", p.display()))?;
-            if buf.len() as u64 > SEAL_INPUT_CAP {
-                return Err(anyhow::anyhow!(
-                    "input file {} is larger than {SEAL_INPUT_CAP} bytes — refusing to seal an oversized bundle",
-                    p.display()
-                ));
+    let parsed = if !as_pairs.is_empty() {
+        parse_as_pairs(as_pairs, SEAL_INPUT_CAP)?
+    } else {
+        let plaintext = match input {
+            Some(p) if p.as_os_str() != "-" => {
+                use std::io::Read;
+                let f = std::fs::File::open(p)
+                    .with_context(|| format!("open input {}", p.display()))?;
+                let mut buf = String::new();
+                f.take(SEAL_INPUT_CAP + 1)
+                    .read_to_string(&mut buf)
+                    .with_context(|| format!("read input {}", p.display()))?;
+                if buf.len() as u64 > SEAL_INPUT_CAP {
+                    return Err(anyhow::anyhow!(
+                        "input file {} is larger than {SEAL_INPUT_CAP} bytes — refusing to seal an oversized bundle",
+                        p.display()
+                    ));
+                }
+                buf
             }
-            buf
-        }
-        _ => {
-            use std::io::Read;
-            let mut buf = String::new();
-            io::stdin()
-                .take(SEAL_INPUT_CAP + 1)
-                .read_to_string(&mut buf)?;
-            if buf.len() as u64 > SEAL_INPUT_CAP {
-                return Err(anyhow::anyhow!(
-                    "stdin produced more than {SEAL_INPUT_CAP} bytes — refusing to seal an oversized bundle"
-                ));
+            _ => {
+                use std::io::Read;
+                let mut buf = String::new();
+                io::stdin()
+                    .take(SEAL_INPUT_CAP + 1)
+                    .read_to_string(&mut buf)?;
+                if buf.len() as u64 > SEAL_INPUT_CAP {
+                    return Err(anyhow::anyhow!(
+                        "stdin produced more than {SEAL_INPUT_CAP} bytes — refusing to seal an oversized bundle"
+                    ));
+                }
+                buf
             }
-            buf
-        }
+        };
+        sealed::parse_dotenv(&plaintext)?
     };
-    let parsed = sealed::parse_dotenv(&plaintext)?;
     let canonical = sealed::render_dotenv(&parsed);
     let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
     let target = match out {
@@ -3778,6 +3799,54 @@ fn cmd_secrets_seal(config: &Config, input: Option<&Path>, out: Option<PathBuf>)
     sealed::write_atomically_secret(&target, &sealed_bytes)?;
     println!("sealed {} key(s) to {}", parsed.len(), target.display());
     Ok(())
+}
+
+/// Parse `--as KEY=value` and `--as KEY=@PATH` pairs into a sealable
+/// map. Each entry is verified at parse time so a typo at the front of
+/// the list doesn't get a partial seal — either every pair is valid or
+/// the whole call errors.
+fn parse_as_pairs(
+    as_pairs: &[String],
+    cap_bytes: u64,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for raw in as_pairs {
+        let (key, rhs) = raw.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!(
+                "--as expects `KEY=value` or `KEY=@PATH`, got {raw:?} (no `=` separator)"
+            )
+        })?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(anyhow::anyhow!(
+                "--as got an empty KEY in {raw:?}; expected `KEY=value` or `KEY=@PATH`"
+            ));
+        }
+        let value = if let Some(path_str) = rhs.strip_prefix('@') {
+            use std::io::Read;
+            let path = Path::new(path_str);
+            let f = std::fs::File::open(path)
+                .with_context(|| format!("--as {key}=@{path_str}: open"))?;
+            let mut buf = String::new();
+            f.take(cap_bytes + 1)
+                .read_to_string(&mut buf)
+                .with_context(|| format!("--as {key}=@{path_str}: read"))?;
+            if buf.len() as u64 > cap_bytes {
+                return Err(anyhow::anyhow!(
+                    "--as {key}=@{path_str}: file is larger than {cap_bytes} bytes"
+                ));
+            }
+            buf
+        } else {
+            rhs.to_string()
+        };
+        if out.insert(key.to_string(), value).is_some() {
+            return Err(anyhow::anyhow!(
+                "--as {key}=… given more than once; pass each KEY at most once"
+            ));
+        }
+    }
+    Ok(out)
 }
 
 fn cmd_secrets_rotate(config: &Config) -> Result<()> {
@@ -3971,4 +4040,59 @@ fn chrono_like_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or_default();
     format!("unix={secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_as_pairs;
+
+    #[test]
+    fn as_pair_literal_value() {
+        let m = parse_as_pairs(&["FOO=bar".into()], 1024).unwrap();
+        assert_eq!(m.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    #[test]
+    fn as_pair_value_can_contain_equals_and_at() {
+        let m = parse_as_pairs(&["URL=http://x.example.com/a=1".into()], 1024).unwrap();
+        assert_eq!(m.get("URL"), Some(&"http://x.example.com/a=1".to_string()));
+    }
+
+    #[test]
+    fn as_pair_at_path_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body");
+        std::fs::write(&path, "multi\nline\nvalue").unwrap();
+        let arg = format!("KEY=@{}", path.display());
+        let m = parse_as_pairs(&[arg], 1024).unwrap();
+        assert_eq!(m.get("KEY"), Some(&"multi\nline\nvalue".to_string()));
+    }
+
+    #[test]
+    fn as_pair_missing_separator_errors() {
+        let err = parse_as_pairs(&["NO_EQUALS".into()], 1024).unwrap_err();
+        assert!(format!("{err:#}").contains("--as expects"));
+    }
+
+    #[test]
+    fn as_pair_empty_key_errors() {
+        let err = parse_as_pairs(&["=value".into()], 1024).unwrap_err();
+        assert!(format!("{err:#}").contains("empty KEY"));
+    }
+
+    #[test]
+    fn as_pair_duplicate_key_errors() {
+        let err = parse_as_pairs(&["K=a".into(), "K=b".into()], 1024).unwrap_err();
+        assert!(format!("{err:#}").contains("more than once"));
+    }
+
+    #[test]
+    fn as_pair_at_path_respects_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        std::fs::write(&path, vec![b'x'; 100]).unwrap();
+        let arg = format!("KEY=@{}", path.display());
+        let err = parse_as_pairs(&[arg], 50).unwrap_err();
+        assert!(format!("{err:#}").contains("larger than"));
+    }
 }
