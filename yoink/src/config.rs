@@ -1188,7 +1188,16 @@ where
                 context: rest[dollar..snippet_end].to_string(),
             });
         };
-        let name = &name_and_tail[..close];
+        let inner = &name_and_tail[..close];
+        // `${NAME}` or `${NAME:-default}`. The default form mirrors POSIX
+        // shell `:-` (substitute when the var is unset). Useful for
+        // commands that don't actually need the value but still parse
+        // the full config (e.g. `yoink secrets seal` against a config
+        // whose hosts/domains reference `${HOST_IP}`).
+        let (name, default_value) = match inner.split_once(":-") {
+            Some((n, d)) => (n, Some(d)),
+            None => (inner, None),
+        };
         let valid_name = !name.is_empty()
             && name
                 .bytes()
@@ -1200,9 +1209,15 @@ where
                 context: rest[dollar..=dollar + 2 + close].to_string(),
             });
         }
-        let value = lookup(name).ok_or_else(|| ConfigError::EnvVarUnset {
-            name: name.to_string(),
-        })?;
+        let value = match (lookup(name), default_value) {
+            (Some(v), _) => v,
+            (None, Some(d)) => d.to_string(),
+            (None, None) => {
+                return Err(ConfigError::EnvVarUnset {
+                    name: name.to_string(),
+                });
+            }
+        };
         out.push_str(&value);
         rest = &name_and_tail[close + 1..];
     }
@@ -1845,6 +1860,39 @@ mod tests {
     fn env_expansion_unset_var_errors() {
         let err = expand_env_vars_with("addr: ${NOPE}", lookup(&[])).unwrap_err();
         assert!(matches!(err, ConfigError::EnvVarUnset { ref name } if name == "NOPE"));
+    }
+
+    #[test]
+    fn env_expansion_default_used_when_var_unset() {
+        let out = expand_env_vars_with("addr: ${NOPE:-fallback}", lookup(&[])).unwrap();
+        assert_eq!(out, "addr: fallback");
+    }
+
+    #[test]
+    fn env_expansion_default_ignored_when_var_set() {
+        let out = expand_env_vars_with(
+            "addr: ${HOST_IP:-fallback}",
+            lookup(&[("HOST_IP", "1.2.3.4")]),
+        )
+        .unwrap();
+        assert_eq!(out, "addr: 1.2.3.4");
+    }
+
+    #[test]
+    fn env_expansion_default_can_be_empty() {
+        // POSIX shell `${VAR:-}` substitutes empty when unset.
+        let out = expand_env_vars_with("addr: ${NOPE:-}", lookup(&[])).unwrap();
+        assert_eq!(out, "addr: ");
+    }
+
+    #[test]
+    fn env_expansion_default_value_is_taken_verbatim() {
+        // Default values can contain colons, slashes, dots — anything
+        // shell-shaped except the closing `}`. Operators use this for
+        // hostnames like `${HOST:-localhost:8080}`.
+        let out = expand_env_vars_with("url: ${BASE_URL:-http://localhost:8080/api}", lookup(&[]))
+            .unwrap();
+        assert_eq!(out, "url: http://localhost:8080/api");
     }
 
     #[test]
