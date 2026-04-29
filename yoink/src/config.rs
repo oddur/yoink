@@ -1233,7 +1233,37 @@ where
     Ok(out)
 }
 
+/// Hint surfaced when an operator runs a host-using command on an
+/// empty fleet. Centralized so the wording stays in lock-step with
+/// `yoink hosts add --help`.
+const NO_HOSTS_HINT: &str = "no hosts configured. Run `yoink hosts add --address <ADDR> --user <USER>` to register one \
+     (see `yoink hosts add --help`).";
+
+/// Hint surfaced when `yoink up` runs on an empty service set.
+const NO_SERVICES_HINT: &str = "no services configured. Render one via a template (`yoink add <name>`) or add a fragment \
+     under `include:` (e.g. `services/<name>.yaml`).";
+
 impl Config {
+    /// Bail with a clear error when no hosts are configured. Load-time
+    /// `validate` accepts an empty fleet so operators can bootstrap
+    /// projects (init → provision → `yoink hosts add`) without yoink
+    /// load failures in between; this method is the boundary for
+    /// commands that genuinely need a host.
+    pub fn require_hosts(&self) -> Result<(), ConfigError> {
+        if self.hosts.is_empty() {
+            return Err(ConfigError::Invalid(NO_HOSTS_HINT.into()));
+        }
+        Ok(())
+    }
+
+    /// Symmetric to [`require_hosts`] for `services:`.
+    pub fn require_services(&self) -> Result<(), ConfigError> {
+        if self.services.is_empty() {
+            return Err(ConfigError::Invalid(NO_SERVICES_HINT.into()));
+        }
+        Ok(())
+    }
+
     /// Walk `self.services` filtered by an optional name list. `None`
     /// returns every service in topo order; `Some(&[…])` keeps only
     /// the named ones (in topo order, not in the order the operator
@@ -1458,11 +1488,11 @@ impl Config {
                 "deploy.networks must declare at least one network".into(),
             ));
         }
-        if self.hosts.is_empty() {
-            return Err(ConfigError::Invalid(
-                "at least one entry under `hosts:` required".into(),
-            ));
-        }
+        // Empty hosts is permitted at load time — operators may
+        // bootstrap a project (e.g. `yoink init --create-ssh-key` then
+        // provision + `yoink hosts add`) where the fleet is genuinely
+        // empty for a moment. Commands that need a host call
+        // `Config::require_hosts` at their own boundary.
         for (i, host) in self.hosts.iter().enumerate() {
             if host.address.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
@@ -1516,11 +1546,11 @@ impl Config {
             ));
         }
 
-        if self.services.is_empty() {
-            return Err(ConfigError::Invalid(
-                "at least one entry under `services:` required".into(),
-            ));
-        }
+        // Empty services is permitted at load time — operators may
+        // bootstrap a project (e.g. `yoink init --create-ssh-key`)
+        // and add services later via fragments under `include:`.
+        // Commands that need a service call `Config::require_services`
+        // at their own boundary.
         let mut seen_names = std::collections::HashSet::new();
         for service in &self.services {
             validate_service_name(&service.name)?;
@@ -2248,20 +2278,33 @@ services:
     }
 
     #[test]
-    fn rejects_zero_services() {
-        let s = "hosts:\n  - { address: h, user: u }\n";
-        let err = Config::parse_str(s).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("services")));
+    fn empty_services_is_valid_at_load_time() {
+        // Symmetric to `empty_hosts_is_valid_at_load_time`. Operators
+        // bootstrapping a project may have an empty service list briefly.
+        let s = "hosts:\n  - { address: h, user: u }\nservices: []\n";
+        let cfg = Config::parse_str(s).expect("empty services should parse cleanly");
+        assert!(cfg.services.is_empty());
+        let err = cfg.require_services().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("no services configured"), "got: {msg}");
     }
 
     #[test]
-    fn rejects_zero_hosts() {
+    fn empty_hosts_is_valid_at_load_time() {
+        // Operators may have a config without hosts during bootstrap
+        // (init → provision → `yoink hosts add`). Load-time validation
+        // accepts the empty fleet; commands that need a host call
+        // `Config::require_hosts` themselves.
         let s = r#"
+hosts: []
 services:
   - { name: x, image: i, tag: v1, run: { port: 1 } }
 "#;
-        let err = Config::parse_str(s).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("hosts")));
+        let cfg = Config::parse_str(s).expect("empty hosts should parse cleanly");
+        assert!(cfg.hosts.is_empty());
+        let err = cfg.require_hosts().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("no hosts configured"), "got: {msg}");
     }
 
     #[test]

@@ -59,6 +59,10 @@ pub struct InitOpts {
     /// `hosts/*.yaml` so subsequent `yoink hosts add` calls compose.
     /// Mutually exclusive with `no_secrets`.
     pub create_ssh_key: Option<String>,
+    /// Pre-fill `proxy.email:` in the rendered yoink.yaml. Required at
+    /// `yoink up` time when any service uses `tls: auto` (the default
+    /// for ACME); pass it here to avoid an after-the-fact hand-edit.
+    pub proxy_email: Option<String>,
 }
 
 pub fn cmd_init(opts: InitOpts) -> Result<()> {
@@ -377,6 +381,9 @@ struct WizardPlan {
     /// for the host. Render adds `ssh_key_secret: <name>` to the host
     /// entry and widens `include:` to pick up `hosts/*.yaml`.
     ssh_key_secret: Option<String>,
+    /// `Some(email)` renders a `proxy.email:` block, satisfying the
+    /// ACME-account-email requirement for any service using `tls: auto`.
+    proxy_email: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -452,6 +459,7 @@ fn infer_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
         },
         age_recipient: None,
         ssh_key_secret: None,
+        proxy_email: opts.proxy_email.clone(),
     })
 }
 
@@ -514,6 +522,7 @@ fn fallback_plan(detection: &Detection) -> Result<WizardPlan> {
         sources: InferredSources::default(),
         age_recipient: None,
         ssh_key_secret: None,
+        proxy_email: None,
     })
 }
 
@@ -566,6 +575,26 @@ fn resolve_host(
     opts: &InitOpts,
     detection: &Detection,
 ) -> Result<(String, String, HostUserOrigin, &'static str)> {
+    // `--create-ssh-key` without an explicit host means the operator
+    // is bootstrapping a project where the host doesn't exist yet
+    // (the typical "provision a fresh box, then point yoink at it"
+    // recipe). Render `hosts: []` and let `yoink hosts add` populate
+    // it after provisioning. Empty fleets are valid at load time;
+    // commands that need a host bail at their own boundary via
+    // `Config::require_hosts`.
+    if opts.host.is_none()
+        && opts
+            .create_ssh_key
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+    {
+        return Ok((
+            String::new(),
+            DEFAULT_SSH_USER.into(),
+            HostUserOrigin::Default,
+            "deferred to `yoink hosts add`",
+        ));
+    }
     if let Some(host) = opts.host.as_deref() {
         let (user, addr) = match host.split_once('@') {
             Some((u, a)) => (u.to_string(), a.to_string()),
@@ -704,12 +733,17 @@ fn render(plan: &WizardPlan) -> String {
         env!("CARGO_PKG_VERSION")
     ));
     out.push_str("# https://oddur.github.io/yoink/docs/reference/config\n\n");
-    out.push_str("hosts:\n");
-    if let Some(name) = &plan.ssh_key_secret {
+    if plan.host_address.is_empty() {
+        // Hostless bootstrap (`--create-ssh-key` without a host arg).
+        // `yoink hosts add` populates the fleet later.
+        out.push_str("hosts: []  # populated by `yoink hosts add` after provisioning\n\n");
+    } else if let Some(name) = &plan.ssh_key_secret {
+        out.push_str("hosts:\n");
         out.push_str(&format!("  - address: {}\n", plan.host_address));
         out.push_str(&format!("    user: {}\n", plan.host_user));
         out.push_str(&format!("    ssh_key_secret: {name}\n\n"));
     } else {
+        out.push_str("hosts:\n");
         out.push_str(&format!(
             "  - {{ address: {}, user: {} }}\n\n",
             plan.host_address, plan.host_user
@@ -721,6 +755,25 @@ fn render(plan: &WizardPlan) -> String {
         out.push_str("  recipients:\n");
         out.push_str(&format!("    - {public}\n"));
         out.push('\n');
+    }
+    if let Some(email) = &plan.proxy_email {
+        out.push_str("# Let's Encrypt account contact (expiry warnings, ToS notices).\n");
+        out.push_str("proxy:\n");
+        out.push_str(&format!("  email: {email}\n\n"));
+    }
+    let scaffold_mode = plan.host_address.is_empty() && plan.ssh_key_secret.is_some();
+    if scaffold_mode {
+        out.push_str(
+            "# `yoink hosts add` writes per-host fragments here; service\n# fragments under services/ get picked up the same way.\n",
+        );
+        out.push_str("include:\n");
+        out.push_str("  - hosts/*.yaml\n");
+        out.push_str("  - services/*.yaml\n\n");
+        // No inferred service in scaffold mode — the operator's about
+        // to bring their own via `yoink add <template>` or hand-written
+        // fragments under `services/`.
+        out.push_str("services: []  # populated by `yoink add` / `services/*.yaml` fragments\n");
+        return out;
     }
     if plan.ssh_key_secret.is_some() {
         out.push_str("# `yoink hosts add` writes per-host fragments here.\n");
@@ -808,7 +861,11 @@ fn print_summary(plan: &WizardPlan, path: &Path, line_count: usize) {
         "  image     {:<32}({})",
         image_str, plan.sources.image
     );
-    let host_target = format!("{}@{}", plan.host_user, plan.host_address);
+    let host_target = if plan.host_address.is_empty() {
+        "(none — populate via `yoink hosts add`)".to_string()
+    } else {
+        format!("{}@{}", plan.host_user, plan.host_address)
+    };
     let _ = writeln!(
         summary,
         "  host      {:<32}({})",
@@ -990,6 +1047,7 @@ mod tests {
             sources: InferredSources::default(),
             age_recipient: None,
             ssh_key_secret: None,
+            proxy_email: None,
         };
         let yaml = render(&plan);
         // `parse_str` validates internally, so a clean parse implies
@@ -1011,6 +1069,7 @@ mod tests {
             sources: InferredSources::default(),
             age_recipient: None,
             ssh_key_secret: None,
+            proxy_email: None,
         };
         let yaml = render(&plan);
         // `parse_str` validates internally, so a clean parse implies
@@ -1104,6 +1163,7 @@ mod tests {
                 "age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45".into(),
             ),
             ssh_key_secret: None,
+            proxy_email: None,
         };
         let yaml = render(&plan);
         assert!(yaml.contains("secrets:\n  provider: age\n"));

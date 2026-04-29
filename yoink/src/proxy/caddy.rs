@@ -162,8 +162,9 @@ where
             .and_then(|p| p.email.as_ref())
             .ok_or_else(|| {
                 anyhow!(
-                    "rendering ACME policy requires `proxy.email:` — should have been \
-                     caught by inject_implicit_proxy validation"
+                    "at least one service uses `tls: auto` (Let's Encrypt) but `proxy.email:` \
+                     is unset — Let's Encrypt requires a registration email (or set \
+                     `proxy.tls.cert_secret` for an inline cert instead)"
                 )
             })?;
         config["apps"]["tls"] = json!({

@@ -196,23 +196,12 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         }
     }
 
-    // ACME requires an email address — fail loudly if any service uses
-    // `tls: auto` (the default) and we'd actually run ACME (no
-    // proxy-level inline cert overrides it) and `proxy.email` isn't
-    // set.
-    let any_acme = !proxy_has_inline_cert
-        && cfg
-            .services
-            .iter()
-            .any(|s| s.domain.is_some() && matches!(s.tls, TlsMode::Auto));
-    if any_acme && cfg.proxy.as_ref().and_then(|p| p.email.as_ref()).is_none() {
-        return Err(ConfigError::Invalid(
-            "at least one service uses `tls: auto` (Let's Encrypt) but `proxy.email:` \
-             is unset — Let's Encrypt requires a registration email (or set \
-             `proxy.tls.cert_secret` for an inline cert instead)"
-                .to_string(),
-        ));
-    }
+    // ACME-email validation moved out of load-time. The proxy renderer
+    // (`proxy::caddy::render`) checks the same condition when it
+    // actually emits the ACME policy and bails with the same operator-
+    // facing message. Keeping the check here too forced load failures
+    // on commands that don't render Caddy (`secrets edit`, `hosts add`,
+    // …), which broke the bootstrap-then-add-email flow.
 
     // Refuse the user-defined `_proxy` collision case. Safer than
     // silently overriding because the user's definition probably
@@ -590,13 +579,24 @@ services:
     }
 
     #[test]
-    fn auto_tls_without_email_errors() {
+    fn auto_tls_without_email_errors_at_render_time() {
+        // Load-time validation accepts the missing-email config so
+        // operators can bootstrap a project before setting it. The
+        // strict check fires at render time inside `proxy::caddy::render`,
+        // which is exercised by `yoink up`.
         let mut cfg = config_with_one_service(
             Some(DomainSpec::Single("api.example.com".into())),
             Some(8080),
         );
-        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
-        assert!(format!("{err}").contains("proxy.email"), "got: {err}");
+        // Load-time succeeds.
+        inject_implicit_proxy(&mut cfg).expect("load-time accepts missing email");
+        // Render-time bails with the same operator-facing message.
+        let err = crate::proxy::caddy::render(&cfg, |_| vec!["c1".into()], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("proxy.email") && msg.contains("Let's Encrypt"),
+            "got: {msg}"
+        );
     }
 
     #[test]
