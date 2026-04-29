@@ -52,6 +52,13 @@ pub struct InitOpts {
     /// `recipients:` block to drop in) or when the project will use
     /// `provider: command` instead.
     pub no_secrets: bool,
+    /// When set, also generate an ed25519 SSH keypair and seal the
+    /// private half into the new `secrets.age` under this name. The
+    /// rendered yoink.yaml's host entry references it via
+    /// `ssh_key_secret:`, and the `include:` glob is widened to
+    /// `hosts/*.yaml` so subsequent `yoink hosts add` calls compose.
+    /// Mutually exclusive with `no_secrets`.
+    pub create_ssh_key: Option<String>,
 }
 
 pub fn cmd_init(opts: InitOpts) -> Result<()> {
@@ -86,6 +93,39 @@ pub fn cmd_init(opts: InitOpts) -> Result<()> {
         Some(bootstrap_age_identity()?)
     };
     plan.age_recipient = bootstrap.as_ref().map(|b| b.public.clone());
+
+    // If the operator asked for a sealed deploy SSH key, generate it
+    // alongside the AGE identity so the rendered yoink.yaml can
+    // reference it via `ssh_key_secret:`. We do this BEFORE rendering
+    // so the field lands in the file from the start.
+    if let Some(seal_as) = opts.create_ssh_key.as_deref().filter(|s| !s.is_empty()) {
+        let recipients = plan
+            .age_recipient
+            .as_ref()
+            .map(std::slice::from_ref)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--create-ssh-key requires an age identity to seal against; remove --no-secrets or provide one"
+                )
+            })?;
+        let secrets_path = cwd.join("secrets.age");
+        let pub_openssh = crate::sealed::ssh_keygen_into_bundle(
+            &secrets_path,
+            recipients,
+            seal_as,
+            Some("yoink-init"),
+        )?;
+        plan.ssh_key_secret = Some(seal_as.to_string());
+        eprintln!(
+            "✓ sealed deploy SSH key as {seal_as:?} into {} (public: {})",
+            secrets_path.display(),
+            pub_openssh
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
 
     let yaml = render(&plan);
     // `Config::parse_str` runs `validate()` internally, so a clean
@@ -333,6 +373,10 @@ struct WizardPlan {
     /// — render emits a `secrets:` block. `None` when the operator
     /// passed `--no-secrets`.
     age_recipient: Option<String>,
+    /// `Some(seal_name)` when init also generated a sealed SSH key
+    /// for the host. Render adds `ssh_key_secret: <name>` to the host
+    /// entry and widens `include:` to pick up `hosts/*.yaml`.
+    ssh_key_secret: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -407,6 +451,7 @@ fn infer_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
             healthcheck_dup,
         },
         age_recipient: None,
+        ssh_key_secret: None,
     })
 }
 
@@ -468,6 +513,7 @@ fn fallback_plan(detection: &Detection) -> Result<WizardPlan> {
         user_override: None,
         sources: InferredSources::default(),
         age_recipient: None,
+        ssh_key_secret: None,
     })
 }
 
@@ -659,16 +705,27 @@ fn render(plan: &WizardPlan) -> String {
     ));
     out.push_str("# https://oddur.github.io/yoink/docs/reference/config\n\n");
     out.push_str("hosts:\n");
-    out.push_str(&format!(
-        "  - {{ address: {}, user: {} }}\n\n",
-        plan.host_address, plan.host_user
-    ));
+    if let Some(name) = &plan.ssh_key_secret {
+        out.push_str(&format!("  - address: {}\n", plan.host_address));
+        out.push_str(&format!("    user: {}\n", plan.host_user));
+        out.push_str(&format!("    ssh_key_secret: {name}\n\n"));
+    } else {
+        out.push_str(&format!(
+            "  - {{ address: {}, user: {} }}\n\n",
+            plan.host_address, plan.host_user
+        ));
+    }
     if let Some(public) = &plan.age_recipient {
         out.push_str("secrets:\n");
         out.push_str("  provider: age\n");
         out.push_str("  recipients:\n");
         out.push_str(&format!("    - {public}\n"));
         out.push('\n');
+    }
+    if plan.ssh_key_secret.is_some() {
+        out.push_str("# `yoink hosts add` writes per-host fragments here.\n");
+        out.push_str("include:\n");
+        out.push_str("  - hosts/*.yaml\n\n");
     }
     out.push_str("services:\n");
     out.push_str(&format!("  - name: {}\n", plan.service));
@@ -932,6 +989,7 @@ mod tests {
             user_override: Some("hono".into()),
             sources: InferredSources::default(),
             age_recipient: None,
+            ssh_key_secret: None,
         };
         let yaml = render(&plan);
         // `parse_str` validates internally, so a clean parse implies
@@ -952,6 +1010,7 @@ mod tests {
             user_override: None,
             sources: InferredSources::default(),
             age_recipient: None,
+            ssh_key_secret: None,
         };
         let yaml = render(&plan);
         // `parse_str` validates internally, so a clean parse implies
@@ -1044,6 +1103,7 @@ mod tests {
             age_recipient: Some(
                 "age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45".into(),
             ),
+            ssh_key_secret: None,
         };
         let yaml = render(&plan);
         assert!(yaml.contains("secrets:\n  provider: age\n"));
