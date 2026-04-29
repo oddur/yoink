@@ -1112,9 +1112,15 @@ fn default_replicas() -> u32 {
 }
 
 /// Subset of `Config` permitted in fragment files included via the
-/// main config's `include:` globs. Fragments may add services and
-/// pre-deploy hooks; they cannot redefine `hosts`, `deploy.network`,
-/// or `secrets` — those are global and live in the main file.
+/// main config's `include:` globs. Fragments may add services, hosts,
+/// and pre-deploy hooks; they cannot redefine `deploy.network` or
+/// `secrets` — those are global and live in the main file.
+///
+/// Hosts in fragments are appended to the main config's `hosts:` list
+/// before validation, so the existing duplicate-address check catches
+/// collisions across files. Useful pattern: `yoink hosts add` writes
+/// per-host fragment files (`hosts/<name>.yaml`) so yoink never has
+/// to round-trip-edit the operator's authored `yoink.yaml`.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFragment {
@@ -1122,6 +1128,8 @@ pub struct ConfigFragment {
     pub services: Vec<ServiceConfig>,
     #[serde(default)]
     pub hooks: HookConfig,
+    #[serde(default)]
+    pub hosts: Vec<HostConfig>,
 }
 
 /// True when one of the platform-default docker socket paths exists.
@@ -1438,6 +1446,7 @@ impl Config {
             let fragment: ConfigFragment = yaml_serde::from_str(&text)?;
             self.services.extend(fragment.services);
             self.hooks.pre_deploy.extend(fragment.hooks.pre_deploy);
+            self.hosts.extend(fragment.hosts);
         }
         Ok(())
     }
@@ -1999,6 +2008,75 @@ hooks:
         assert_eq!(cfg.deploy.networks, vec!["kamal".to_string()]);
         assert_eq!(cfg.hooks.pre_deploy.len(), 1);
         assert_eq!(cfg.hooks.pre_deploy[0].name, "migrate");
+    }
+
+    #[test]
+    fn include_glob_merges_hosts_from_fragments() {
+        let dir = write_temp_tree(&[
+            (
+                "yoink.yaml",
+                r#"
+deploy:
+  networks: [yoink]
+hosts:
+  - { address: prod-1, user: deploy }
+services:
+  - name: a
+    image: img
+    tag: v1
+    run: {}
+include:
+  - hosts/*.yaml
+"#,
+            ),
+            (
+                "hosts/scratch.yaml",
+                r#"
+hosts:
+  - address: 1.2.3.4
+    user: root
+    ssh_key_secret: DEPLOY_SSH_KEY
+"#,
+            ),
+        ]);
+        let cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
+        let addrs: Vec<&str> = cfg.hosts.iter().map(|h| h.address.as_str()).collect();
+        assert_eq!(addrs, vec!["prod-1", "1.2.3.4"]);
+        let scratch = cfg.hosts.iter().find(|h| h.address == "1.2.3.4").unwrap();
+        assert_eq!(scratch.user, "root");
+        assert_eq!(scratch.ssh_key_secret.as_deref(), Some("DEPLOY_SSH_KEY"));
+    }
+
+    #[test]
+    fn duplicate_host_address_across_files_is_rejected() {
+        let dir = write_temp_tree(&[
+            (
+                "yoink.yaml",
+                r#"
+hosts:
+  - { address: 1.2.3.4, user: root }
+services:
+  - name: a
+    image: img
+    tag: v1
+    run: {}
+include:
+  - hosts/*.yaml
+"#,
+            ),
+            (
+                "hosts/dupe.yaml",
+                r#"
+hosts:
+  - { address: 1.2.3.4, user: deploy }
+"#,
+            ),
+        ]);
+        let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate hosts.address"),
+            "got: {err}"
+        );
     }
 
     #[test]
