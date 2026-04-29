@@ -1,11 +1,48 @@
 ---
-title: Hetzner cx23 quickstart with HTTPS
+title: Hetzner → HTTPS in ~90 seconds
 weight: 5
 ---
 
-Empty Hetzner project → live HTTPS endpoint in ~90 seconds. The cheapest x86 EU tier ([cx23](https://www.hetzner.com/cloud), €3.99/mo, 2 vCPU / 4 GB / 40 GB), a fresh AGE-sealed deploy key, and a real Let's Encrypt cert against `<ip>.nip.io` — no domain to register, no DNS to wire up, nothing on disk besides one [AGE identity](/docs/guide/secrets#sealed-secrets-age--the-default).
+Empty Hetzner project → live HTTPS endpoint in **~90 seconds**, end-to-end. The cheapest x86 EU tier ([cx23](https://www.hetzner.com/cloud) — €3.99/mo, 2 vCPU / 4 GB / 40 GB), a fresh AGE-sealed deploy key, a real Let's Encrypt cert against `<ip>.nip.io`. No domain to register, no DNS records to wire up, no plaintext key material on disk.
 
-`<ip>.nip.io` is what makes the cert step work without a domain: nip.io's wildcard DNS resolves any `<anything>.<ip>.nip.io` to that IP, and it's been on the [Public Suffix List](https://publicsuffix.org/) since 2018 so each operator gets their own Let's Encrypt rate-limit bucket.
+{{< callout type="info" >}}
+**HTTPS without a domain.** `<ip>.nip.io` is wildcard DNS — `anything.1.2.3.4.nip.io` resolves to `1.2.3.4`. It's been on the [Public Suffix List](https://publicsuffix.org/) since 2018, so each operator gets their own Let's Encrypt rate-limit bucket. That's what lets the cert step work on a brand-new IP with zero DNS configuration.
+{{< /callout >}}
+
+<details>
+<summary><strong>The whole recipe as one paste</strong></summary>
+
+For the impatient. Drop the two YAML files described below into `./services/` and `./` respectively, then:
+
+```bash
+# one-time
+brew install hcloud oddur/yoink/yoink   # yoink ≥ 0.15.0
+
+# init: AGE identity + sealed deploy key + skeleton yoink.yaml
+yoink init --create-ssh-key DEPLOY_SSH_KEY --proxy-email you@example.com
+
+# provision a cx23 in nbg1, baked with cloud-init
+hcloud context create bt-scratch
+hcloud ssh-key create --name yoink-scratch \
+  --public-key-from-file <(yoink secrets ssh-key public --name DEPLOY_SSH_KEY)
+hcloud server create --name bt-scratch-01 --type cx23 \
+  --image ubuntu-24.04 --location nbg1 \
+  --ssh-key yoink-scratch \
+  --user-data-from-file cloud-init.yaml
+
+# register host with yoink + deploy
+IP=$(hcloud server ip bt-scratch-01)
+yoink hosts add --address $IP --user root --ssh-key-secret DEPLOY_SSH_KEY
+HOST_IP=$IP yoink preflight --wait 90s
+HOST_IP=$IP yoink up
+
+# verify
+curl https://$IP.nip.io   # → yoink!
+```
+
+Stop here if it works. The walkthrough below explains what each step does and why.
+
+</details>
 
 ## Architecture
 
@@ -133,27 +170,31 @@ yoink hosts add --address $IP --user root --ssh-key-secret DEPLOY_SSH_KEY
 
 `yoink hosts add` writes a fragment under `hosts/<derived>.yaml` and re-parses the fleet to catch address collisions. The fragment is the sole source of truth for the new host — the operator's `yoink.yaml` is never edited in place.
 
-### Deploy and verify
+### Deploy
 
 ```bash
-HOST_IP=$IP yoink preflight --wait 90s               # bridges cloud-init's docker install
-HOST_IP=$IP yoink up                                  # ACME runs inline; ~5–15s for the cert
-curl https://$IP.nip.io                               # → yoink!
+HOST_IP=$IP yoink preflight --wait 90s   # waits for cloud-init to finish installing Docker
+HOST_IP=$IP yoink up                      # ACME runs inline; ~5–15s for the cert
 ```
 
-[`preflight --wait`](/docs/troubleshooting) polls each host's docker daemon on backoff. `yoink up` then unseals the SSH key, brings up the bundled Caddy proxy, and obtains a real Let's Encrypt cert via HTTP-01 against `<ip>.nip.io`.
+`yoink up` unseals the SSH key, brings up the bundled Caddy proxy, and obtains a real Let's Encrypt cert via HTTP-01 against `<ip>.nip.io`. `HOST_IP=$IP` is what the service fragment's `${HOST_IP:-placeholder}.nip.io` resolves against. Set it once for both commands.
 
-`HOST_IP=$IP` is what the service fragment's `${HOST_IP:-placeholder}.nip.io` resolves against. Set it once for both commands.
+### You're done. Verify:
 
-Inspect the cert:
+```bash
+curl https://$IP.nip.io
+# → yoink!
+```
+
+{{< callout type="info" >}}
+**Bonus.** Inspect the cert to convince yourself it's a real Let's Encrypt leaf, not a self-signed placeholder:
 
 ```bash
 echo | openssl s_client -connect $IP.nip.io:443 -servername $IP.nip.io 2>/dev/null \
   | openssl x509 -noout -issuer -subject -dates
 # issuer=C=US, O=Let's Encrypt, CN=E8
-# subject=CN=<ip>.nip.io
-# notBefore / notAfter span 90 days
 ```
+{{< /callout >}}
 
 {{% /steps %}}
 
