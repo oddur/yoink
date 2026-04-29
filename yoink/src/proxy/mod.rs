@@ -71,70 +71,38 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         return Ok(());
     }
 
-    if let Some(p) = cfg.proxy.as_ref()
-        && let Some(extra) = p.config_extra.as_deref()
-    {
-        match serde_json::from_str::<serde_json::Value>(extra) {
-            Ok(serde_json::Value::Object(_)) => {}
-            Ok(_) => {
+    if let Some(p) = cfg.proxy.as_ref() {
+        if let Some(extra) = p.config_extra.as_deref() {
+            validate_json_shape(extra, "proxy.config_extra", JsonShape::ObjectOnly)?;
+        }
+        for (i, raw) in p.global_handlers.iter().enumerate() {
+            let label = format!("proxy.global_handlers[{i}]");
+            validate_json_shape(raw, &label, JsonShape::ObjectOrArray)?;
+        }
+        if let Some(x) = &p.xcaddy {
+            if p.image.is_some() {
                 return Err(ConfigError::Invalid(
-                    "proxy.config_extra must be a JSON object (top-level Caddy \
-                     config keys like `apps`, `storage`, `admin`)"
+                    "proxy.image and proxy.xcaddy are mutually exclusive — `image:` is the \
+                     bring-your-own-image escape hatch; `xcaddy:` is the managed-build path. \
+                     Pick one."
                         .to_string(),
                 ));
             }
-            Err(e) => {
-                return Err(ConfigError::Invalid(format!(
-                    "proxy.config_extra is not valid JSON: {e}"
-                )));
+            if x.plugins.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "proxy.xcaddy.plugins is empty — set at least one plugin or remove the \
+                     `xcaddy:` block to use vanilla `caddy:2`"
+                        .to_string(),
+                ));
             }
-        }
-    }
-
-    if let Some(p) = cfg.proxy.as_ref() {
-        for (i, raw) in p.global_handlers.iter().enumerate() {
-            match serde_json::from_str::<serde_json::Value>(raw) {
-                Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_)) => {}
-                Ok(_) => {
+            for plugin in &x.plugins {
+                if !is_plausible_go_module(plugin) {
                     return Err(ConfigError::Invalid(format!(
-                        "proxy.global_handlers[{i}] must be a JSON object (handler) or \
-                         array of handlers/routes"
+                        "proxy.xcaddy.plugins entry {plugin:?} doesn't look like a Go module \
+                         path (expected `<host>/<owner>/<repo>` or \
+                         `<host>/<owner>/<repo>@<version>`)"
                     )));
                 }
-                Err(e) => {
-                    return Err(ConfigError::Invalid(format!(
-                        "proxy.global_handlers[{i}] is not valid JSON: {e}"
-                    )));
-                }
-            }
-        }
-    }
-
-    if let Some(p) = cfg.proxy.as_ref()
-        && let Some(x) = &p.xcaddy
-    {
-        if p.image.is_some() {
-            return Err(ConfigError::Invalid(
-                "proxy.image and proxy.xcaddy are mutually exclusive — `image:` is the \
-                 bring-your-own-image escape hatch; `xcaddy:` is the managed-build path. \
-                 Pick one."
-                    .to_string(),
-            ));
-        }
-        if x.plugins.is_empty() {
-            return Err(ConfigError::Invalid(
-                "proxy.xcaddy.plugins is empty — set at least one plugin or remove the \
-                 `xcaddy:` block to use vanilla `caddy:2`"
-                    .to_string(),
-            ));
-        }
-        for plugin in &x.plugins {
-            if !is_plausible_go_module(plugin) {
-                return Err(ConfigError::Invalid(format!(
-                    "proxy.xcaddy.plugins entry {plugin:?} doesn't look like a Go module \
-                     path (expected `<host>/<owner>/<repo>` or \
-                     `<host>/<owner>/<repo>@<version>`)"
-                )));
             }
         }
     }
@@ -385,6 +353,42 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             ..ServiceRun::default()
         },
     }
+}
+
+/// JSON shapes accepted by `validate_json_shape`.
+enum JsonShape {
+    /// Top-level Caddy config block (`apps`, `storage`, `admin`, ...).
+    ObjectOnly,
+    /// A single handler / route, OR a list of either.
+    ObjectOrArray,
+}
+
+/// Verify a raw-JSON config value parses and matches the expected
+/// top-level shape. Used by both `proxy.config_extra` and
+/// `proxy.global_handlers[i]` validation; `label` becomes the
+/// human-readable prefix in error messages.
+fn validate_json_shape(raw: &str, label: &str, shape: JsonShape) -> Result<(), ConfigError> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| ConfigError::Invalid(format!("{label} is not valid JSON: {e}")))?;
+    let ok = match shape {
+        JsonShape::ObjectOnly => matches!(value, serde_json::Value::Object(_)),
+        JsonShape::ObjectOrArray => matches!(
+            value,
+            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+        ),
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid(match shape {
+        JsonShape::ObjectOnly => format!(
+            "{label} must be a JSON object (top-level Caddy config keys like \
+             `apps`, `storage`, `admin`)"
+        ),
+        JsonShape::ObjectOrArray => {
+            format!("{label} must be a JSON object (handler) or array of handlers/routes")
+        }
+    }))
 }
 
 /// Cheap shape-check for an xcaddy plugin entry. Accepts

@@ -82,31 +82,7 @@ where
         routes.insert(0, redirect_route_http_to_https());
     }
 
-    // `proxy.global_handlers:` runs the listed handlers for every
-    // request before any service route matches. Implementation: wrap
-    // the per-service routes in a single Caddy `subroute` handler,
-    // and prepend the user's handlers in front of it. The whole thing
-    // becomes one wildcard-match route so the chain runs unconditionally.
-    let global_handlers_raw = cfg
-        .proxy
-        .as_ref()
-        .map(|p| p.global_handlers.as_slice())
-        .unwrap_or(&[]);
-    if !global_handlers_raw.is_empty() {
-        let mut prepend: Vec<Value> = Vec::new();
-        for (i, raw) in global_handlers_raw.iter().enumerate() {
-            let parsed: Value = serde_json::from_str(raw)
-                .with_context(|| format!("proxy.global_handlers[{i}] is not valid JSON"))?;
-            let context = format!("proxy.global_handlers[{i}]");
-            prepend.extend(normalize_extra_json(parsed, &context)?);
-        }
-        let inner_routes = std::mem::take(&mut routes);
-        prepend.push(json!({
-            "handler": "subroute",
-            "routes": inner_routes,
-        }));
-        routes.push(json!({ "handle": prepend }));
-    }
+    apply_global_handlers(&mut routes, cfg)?;
 
     let mut http_server = json!({
         "listen": [":80", ":443"],
@@ -274,17 +250,62 @@ where
         entry["certificates"] = json!({ "load_pem": pem_entries });
     }
 
-    // Apply `proxy.config_extra:` last, after every yoink-managed
-    // section is in place. Merge is deep-recursive on objects (extras
-    // win at leaves; existing yoink keys at non-overlapping paths
-    // survive). Validated as a JSON object at config-load time.
-    if let Some(extra) = cfg.proxy.as_ref().and_then(|p| p.config_extra.as_deref()) {
-        let extra_value: Value = serde_json::from_str(extra)
-            .map_err(|e| anyhow!("proxy.config_extra is not valid JSON: {e}"))?;
-        deep_merge(&mut config, extra_value);
-    }
+    apply_config_extra(&mut config, cfg)?;
 
     Ok(config)
+}
+
+/// Wrap the per-service routes in a single wildcard-match route whose
+/// `handle` chain is `proxy.global_handlers:` followed by a `subroute`
+/// carrying the original routes. The result: every request runs the
+/// handler chain (e.g. CrowdSec, Coraza) before any service route can
+/// match. No-op when `global_handlers:` is empty.
+fn apply_global_handlers(routes: &mut Vec<Value>, cfg: &Config) -> Result<()> {
+    let snippets = cfg
+        .proxy
+        .as_ref()
+        .map(|p| p.global_handlers.as_slice())
+        .unwrap_or(&[]);
+    if snippets.is_empty() {
+        return Ok(());
+    }
+    let mut prepend: Vec<Value> = Vec::new();
+    for (i, raw) in snippets.iter().enumerate() {
+        let label = format!("proxy.global_handlers[{i}]");
+        prepend.extend(parse_handler_snippet(raw, &label)?);
+    }
+    let inner_routes = std::mem::take(routes);
+    prepend.push(json!({
+        "handler": "subroute",
+        "routes": inner_routes,
+    }));
+    routes.push(json!({ "handle": prepend }));
+    Ok(())
+}
+
+/// Deep-merge `proxy.config_extra:` (a top-level Caddy JSON snippet)
+/// over the rendered config. Extras win at leaf conflicts; yoink-managed
+/// keys at non-overlapping paths survive. Validated as a JSON object
+/// at config-load time. No-op when `config_extra:` is unset.
+fn apply_config_extra(config: &mut Value, cfg: &Config) -> Result<()> {
+    let Some(extra) = cfg.proxy.as_ref().and_then(|p| p.config_extra.as_deref()) else {
+        return Ok(());
+    };
+    let extra_value: Value = serde_json::from_str(extra)
+        .map_err(|e| anyhow!("proxy.config_extra is not valid JSON: {e}"))?;
+    deep_merge(config, extra_value);
+    Ok(())
+}
+
+/// Parse a single raw-JSON snippet (one entry of `caddy_extra_json:` /
+/// `proxy.global_handlers:`) into the list of handlers it expands to.
+/// Reused by both the per-service splice in `render_route` and the
+/// global splice in `apply_global_handlers` to keep error messages
+/// consistent and de-duplicate the parse-then-normalize pipeline.
+fn parse_handler_snippet(raw: &str, label: &str) -> Result<Vec<Value>> {
+    let parsed: Value =
+        serde_json::from_str(raw).with_context(|| format!("{label} is not valid JSON"))?;
+    normalize_extra_json(parsed, label)
 }
 
 /// Deep-merge `src` into `dst`. Both objects → merge keys (recurse
@@ -531,11 +552,8 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
     // auto-wrapped in a `subroute` handler so the operator never has
     // to know about `subroute` to inline a (match → handle).
     if let Some(extra) = svc.caddy_extra_json.as_deref() {
-        let parsed: Value = serde_json::from_str(extra).with_context(|| {
-            format!("service {:?}: caddy_extra_json is not valid JSON", svc.name,)
-        })?;
-        let context = format!("service {:?}: caddy_extra_json", svc.name);
-        for item in normalize_extra_json(parsed, &context)? {
+        let label = format!("service {:?}: caddy_extra_json", svc.name);
+        for item in parse_handler_snippet(extra, &label)? {
             handle.push(item);
         }
     }
