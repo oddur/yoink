@@ -89,6 +89,14 @@ pub enum SealedError {
         path_display: String,
         mode: u32,
     },
+    #[error("invalid secret name {0:?} (must match [A-Za-z_][A-Za-z0-9_]*)")]
+    InvalidSecretName(String),
+    #[error("ssh keygen: {0}")]
+    SshKeygen(String),
+    #[error(
+        "{0:?} already exists in the sealed bundle. Pick a different name, or run `yoink secrets edit` to remove the existing entry first."
+    )]
+    SecretAlreadySealed(String),
 }
 
 /// Resolve where the sealed file lives. Honors `secrets.file:` when
@@ -321,6 +329,74 @@ pub fn keygen() -> (String, String) {
     let secret = id.to_string().expose_secret().to_owned();
     let public = id.to_public().to_string();
     (secret, public)
+}
+
+/// Generate a fresh ed25519 SSH keypair, merge the private half (PEM
+/// format) into the sealed bundle at `target_path` under `seal_as`,
+/// and return the public half in OpenSSH single-line format.
+///
+/// The private key is generated in memory; no plaintext PEM is ever
+/// written to disk outside the sealed bundle. Existing entries in the
+/// bundle are preserved (same merge logic as `secrets edit` on save).
+/// Errors if `seal_as` already exists in the bundle (caller must
+/// remove it first).
+///
+/// `seal_as` is validated against the dotenv key shape
+/// (`[A-Za-z_][A-Za-z0-9_]*`).
+pub fn ssh_keygen_into_bundle(
+    target_path: &Path,
+    recipients: &[String],
+    seal_as: &str,
+    comment: Option<&str>,
+) -> Result<String, SealedError> {
+    use ssh_key::{Algorithm, LineEnding, PrivateKey, rand_core::OsRng};
+
+    if seal_as.is_empty()
+        || seal_as
+            .bytes()
+            .next()
+            .is_none_or(|b| !(b.is_ascii_alphabetic() || b == b'_'))
+        || !seal_as
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(SealedError::InvalidSecretName(seal_as.to_string()));
+    }
+
+    let mut rng = OsRng;
+    let mut key = PrivateKey::random(&mut rng, Algorithm::Ed25519)
+        .map_err(|e| SealedError::SshKeygen(format!("generate ed25519: {e}")))?;
+    if let Some(c) = comment {
+        key.set_comment(c);
+    }
+    let priv_pem = key
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| SealedError::SshKeygen(format!("encode private as OpenSSH PEM: {e}")))?;
+    let pub_openssh = key
+        .public_key()
+        .to_openssh()
+        .map_err(|e| SealedError::SshKeygen(format!("encode public as OpenSSH: {e}")))?;
+
+    let mut bundle = if target_path.exists() {
+        let identity = load_identity(recipients)?;
+        let ciphertext = std::fs::read(target_path).map_err(|source| SealedError::Write {
+            path: target_path.to_path_buf(),
+            source,
+        })?;
+        let plaintext = unseal(&ciphertext, &identity)?;
+        parse_dotenv(&plaintext)?
+    } else {
+        BTreeMap::new()
+    };
+    if bundle.contains_key(seal_as) {
+        return Err(SealedError::SecretAlreadySealed(seal_as.to_string()));
+    }
+    bundle.insert(seal_as.to_string(), (*priv_pem).clone());
+
+    let canonical = render_dotenv(&bundle);
+    let sealed_bytes = seal(canonical.as_bytes(), recipients)?;
+    write_atomically_secret(target_path, &sealed_bytes)?;
+    Ok(pub_openssh)
 }
 
 /// Seal `plaintext` against the recipients listed in `recipients`.

@@ -156,6 +156,21 @@ enum Command {
         /// `provider: command` for secrets.
         #[arg(long)]
         no_secrets: bool,
+        /// Also generate a fresh ed25519 SSH keypair and seal the
+        /// private half into the new `secrets.age` under the given
+        /// name. The rendered `yoink.yaml` references it via
+        /// `hosts[0].ssh_key_secret:`, so the deploy target uses it
+        /// instead of the operator's ssh-agent. Pair with
+        /// `yoink secrets ssh-key public --name <NAME>` to extract
+        /// the public half for upload to your cloud provider.
+        ///
+        /// Mutually exclusive with `--no-secrets`. Pass an empty value
+        /// or omit the flag to skip; pass a name like
+        /// `--create-ssh-key DEPLOY_SSH_KEY` to enable. The flag also
+        /// implies a richer `include:` glob (`hosts/*.yaml`) so
+        /// subsequent `yoink hosts add` calls just work.
+        #[arg(long, value_name = "NAME", conflicts_with = "no_secrets")]
+        create_ssh_key: Option<String>,
     },
     /// Drop a vetted template into your repo — accessory (postgres,
     /// redis, …) or full app (openclaw, …). Fetches from GitHub,
@@ -3596,6 +3611,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             no_port,
             image,
             no_secrets,
+            create_ssh_key,
         } => Some(yoink::init::cmd_init(yoink::init::InitOpts {
             host: host.clone(),
             force: *force,
@@ -3605,6 +3621,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
             no_port: *no_port,
             image: image.clone(),
             no_secrets: *no_secrets,
+            create_ssh_key: create_ssh_key.clone(),
         })),
         _ => None,
     }
@@ -3636,73 +3653,14 @@ fn cmd_secrets_ssh_key_generate(
     seal_as: &str,
     comment: Option<&str>,
 ) -> Result<()> {
-    use ssh_key::{Algorithm, LineEnding, PrivateKey, rand_core::OsRng};
     use yoink::sealed;
-
-    if seal_as.is_empty()
-        || seal_as
-            .bytes()
-            .next()
-            .is_none_or(|b| !(b.is_ascii_alphabetic() || b == b'_'))
-        || !seal_as
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        return Err(anyhow::anyhow!(
-            "--seal-as {seal_as:?} is not a valid secret name (must match [A-Za-z_][A-Za-z0-9_]*)"
-        ));
-    }
-
     let (file_override, recipients) = expect_age_block(config)?;
     let target = sealed::resolve_sealed_path(config, file_override.as_deref())?;
-
-    // ed25519 keypair, in memory only.
-    let mut rng = OsRng;
-    let key =
-        PrivateKey::random(&mut rng, Algorithm::Ed25519).context("generate ed25519 keypair")?;
-    let key = if let Some(c) = comment {
-        let mut k = key;
-        k.set_comment(c);
-        k
-    } else {
-        key
-    };
-    let priv_pem = key
-        .to_openssh(LineEnding::LF)
-        .context("encode private key as OpenSSH PEM")?;
-    let pub_openssh = key
-        .public_key()
-        .to_openssh()
-        .context("encode public key as OpenSSH")?;
-
-    // Merge into the existing bundle (if any) so we don't clobber
-    // unrelated keys. Same shape as `yoink secrets edit` on save.
-    let mut bundle = if target.exists() {
-        let identity = sealed::load_identity(recipients)?;
-        let ciphertext =
-            std::fs::read(&target).with_context(|| format!("read {}", target.display()))?;
-        let plaintext = sealed::unseal(&ciphertext, &identity)?;
-        sealed::parse_dotenv(&plaintext)?
-    } else {
-        std::collections::BTreeMap::new()
-    };
-    if bundle.contains_key(seal_as) {
-        return Err(anyhow::anyhow!(
-            "{seal_as:?} already exists in the sealed bundle. Pick a different --seal-as name, \
-             or run `yoink secrets edit` to remove the existing entry first."
-        ));
-    }
-    bundle.insert(seal_as.to_string(), (*priv_pem).clone());
-
-    let canonical = sealed::render_dotenv(&bundle);
-    let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
-    sealed::write_atomically_secret(&target, &sealed_bytes)?;
-
+    let pub_openssh = sealed::ssh_keygen_into_bundle(&target, recipients, seal_as, comment)?;
     eprintln!(
         "✓ sealed new ed25519 SSH private key as {seal_as:?} into {}",
         target.display()
     );
-    // stdout: just the public key, one line, ready to pipe.
     println!("{pub_openssh}");
     Ok(())
 }
