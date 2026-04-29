@@ -657,6 +657,14 @@ enum Command {
         #[command(subcommand)]
         action: SecretsAction,
     },
+    /// Manage `hosts:` entries — add, list, remove. Adds and removes
+    /// write fragment files under `hosts/<name>.yaml` (auto-included
+    /// via the `include:` glob), so yoink never has to round-trip-edit
+    /// the operator's authored `yoink.yaml`.
+    Hosts {
+        #[command(subcommand)]
+        action: HostsAction,
+    },
 }
 
 /// CLI value enum mirror of `yoink::pf::SchemeOverride`. Lives in
@@ -818,6 +826,48 @@ enum LockAction {
         /// Skip the "are you sure?" confirmation.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum HostsAction {
+    /// Append a host entry to the fleet by writing a fragment file
+    /// at `<dest-dir>/<name>.yaml`. The fragment is auto-included
+    /// when `yoink.yaml` has a glob like `include: [hosts/*.yaml]`.
+    /// After write, the resulting fleet is parsed end-to-end to
+    /// confirm the new host doesn't collide with an existing address;
+    /// if it does, the fragment is removed and the command errors.
+    Add {
+        /// Hostname or IP yoink will SSH into.
+        #[arg(long, value_name = "ADDR")]
+        address: String,
+        /// SSH user. Must be in the host's `docker` group, or be `root`.
+        #[arg(long, value_name = "USER", default_value = "root")]
+        user: String,
+        /// Name of a sealed SSH private key to use for connections.
+        /// When set, yoink decrypts the key into a per-process tempfile
+        /// and uses it instead of the operator's ssh-agent.
+        #[arg(long = "ssh-key-secret", value_name = "NAME")]
+        ssh_key_secret: Option<String>,
+        /// Logical name; becomes the fragment filename. Default: derived
+        /// from the address with `:` and `.` swapped for `-`.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Directory to write the fragment into. The directory is
+        /// created if absent. Default: `hosts`.
+        #[arg(long = "dest-dir", value_name = "DIR", default_value = "hosts")]
+        dest_dir: PathBuf,
+    },
+    /// List host entries in the loaded config, one per line. Includes
+    /// hosts from fragments.
+    List,
+    /// Remove the fragment file at `<dest-dir>/<name>.yaml`. Errors
+    /// if the file doesn't exist (so a typo doesn't silently no-op).
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long = "dest-dir", value_name = "DIR", default_value = "hosts")]
+        dest_dir: PathBuf,
     },
 }
 
@@ -1164,6 +1214,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Secrets { action } => cmd_secrets(&config, action),
+        Command::Hosts { action } => cmd_hosts(&config, cli.config.clone(), action),
         Command::Tui { mode, mouse } => cmd_tui(&config, cli.config.clone(), mode, mouse).await,
         Command::Init { .. } => unreachable!("init handled by run_bootstrap"),
     }
@@ -3564,6 +3615,156 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
         })),
         _ => None,
     }
+}
+
+fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Result<()> {
+    match action {
+        HostsAction::List => {
+            for host in &config.hosts {
+                let key_note = host
+                    .ssh_key_secret
+                    .as_deref()
+                    .map(|n| format!("  ssh_key_secret={n}"))
+                    .unwrap_or_default();
+                println!("{}@{}{}", host.user, host.address, key_note);
+            }
+            Ok(())
+        }
+        HostsAction::Add {
+            address,
+            user,
+            ssh_key_secret,
+            name,
+            dest_dir,
+        } => cmd_hosts_add(
+            config_path,
+            &address,
+            &user,
+            ssh_key_secret.as_deref(),
+            name.as_deref(),
+            &dest_dir,
+        ),
+        HostsAction::Remove { name, dest_dir } => cmd_hosts_remove(&dest_dir, &name),
+    }
+}
+
+fn cmd_hosts_add(
+    config_path: PathBuf,
+    address: &str,
+    user: &str,
+    ssh_key_secret: Option<&str>,
+    name: Option<&str>,
+    dest_dir: &Path,
+) -> Result<()> {
+    if address.trim().is_empty() {
+        return Err(anyhow::anyhow!("--address must not be empty"));
+    }
+    let derived_name = name
+        .map(str::to_string)
+        .unwrap_or_else(|| address.replace([':', '.'], "-"));
+    if derived_name.is_empty()
+        || !derived_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(anyhow::anyhow!(
+            "host name {derived_name:?} must match [A-Za-z0-9_-]+"
+        ));
+    }
+
+    // Resolve dest_dir relative to the config file's directory so the
+    // fragment lands somewhere the include glob will pick it up,
+    // regardless of where the operator runs the command from.
+    let config_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let absolute_dir = if dest_dir.is_absolute() {
+        dest_dir.to_path_buf()
+    } else {
+        config_dir.join(dest_dir)
+    };
+    std::fs::create_dir_all(&absolute_dir)
+        .with_context(|| format!("create directory {}", absolute_dir.display()))?;
+    let fragment_path = absolute_dir.join(format!("{derived_name}.yaml"));
+    if fragment_path.exists() {
+        return Err(anyhow::anyhow!(
+            "fragment {} already exists; pick a different --name or `yoink hosts remove {derived_name}` first",
+            fragment_path.display()
+        ));
+    }
+
+    let mut body = String::new();
+    body.push_str(&format!(
+        "# {derived_name} — generated by `yoink hosts add` {date}\n",
+        date = chrono_like_date()
+    ));
+    body.push_str("hosts:\n");
+    body.push_str(&format!("  - address: {address}\n"));
+    body.push_str(&format!("    user: {user}\n"));
+    if let Some(secret) = ssh_key_secret {
+        body.push_str(&format!("    ssh_key_secret: {secret}\n"));
+    }
+
+    std::fs::write(&fragment_path, &body)
+        .with_context(|| format!("write {}", fragment_path.display()))?;
+
+    // Re-parse the entire fleet to confirm the new host doesn't
+    // collide with an existing entry. On failure, roll back the write.
+    if let Err(e) = Config::load_from_path(&config_path) {
+        let _ = std::fs::remove_file(&fragment_path);
+        return Err(anyhow::anyhow!(
+            "config failed to reload after adding host {derived_name:?}: {e}"
+        ));
+    }
+    eprintln!(
+        "✓ added host {derived_name} ({user}@{address}) to {}",
+        fragment_path.display()
+    );
+    Ok(())
+}
+
+fn cmd_hosts_remove(dest_dir: &Path, name: &str) -> Result<()> {
+    let path = dest_dir.join(format!("{name}.yaml"));
+    if !path.exists() {
+        return Err(anyhow::anyhow!(
+            "no fragment at {}; nothing to remove",
+            path.display()
+        ));
+    }
+    std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+    eprintln!("✓ removed {}", path.display());
+    Ok(())
+}
+
+fn chrono_like_date() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    // YYYY-MM-DD only — coarse-grained for an audit comment, no
+    // dependency on chrono. Days since the unix epoch / seconds-per-day.
+    let days = secs / 86_400;
+    let (y, m, d) = days_to_ymd(days as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Days since 1970-01-01 → (year, month, day). Pure proleptic-Gregorian
+/// arithmetic; correct for any positive day count well beyond what yoink
+/// needs.
+fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
+    days += 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i32 + era as i32 * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
