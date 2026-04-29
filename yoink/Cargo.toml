@@ -59,5 +59,11 @@ pretty_assertions = "1"
 testcontainers = "0.27"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
 
+# Tests gated behind `--features integration_xcaddy` need a real local
+# Docker daemon. CI runs them in a dedicated workflow; locally, run with
+# `cargo test -p yoink --features integration_xcaddy --test xcaddy_integration`.
+[features]
+integration_xcaddy = []
+
 [lints]
 workspace = true

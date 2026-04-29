@@ -239,6 +239,19 @@ pub struct ProxyConfig {
     /// `/load`.
     #[serde(default)]
     pub global_handlers: Vec<String>,
+    /// Same shape as `global_handlers:`, but the listed handlers run
+    /// **after** the matched service route's handlers (and after any
+    /// per-service `caddy_extra_json:`). Use this slot when a global
+    /// concern needs to *follow* per-service logic — e.g. a fleet-wide
+    /// audit-log handler that runs after per-service auth has tagged
+    /// the request, or a global response-rewrite that runs after the
+    /// upstream has produced its response.
+    ///
+    /// Wire ordering inside the wrapper route is `pre_handlers...,
+    /// subroute(per-service routes), post_handlers...`. Yoink wraps
+    /// once when either list is non-empty.
+    #[serde(default)]
+    pub global_handlers_after: Vec<String>,
 }
 
 /// Build inputs for an on-host xcaddy compile. The resulting image is
@@ -266,6 +279,21 @@ pub struct XcaddyConfig {
     /// xcaddy CLI version.
     #[serde(default)]
     pub builder_image: Option<String>,
+    /// Environment variables exported into the builder stage before
+    /// `xcaddy build` runs. Useful for `GOPRIVATE`, `GOPROXY`,
+    /// `GOSUMDB`, `NETRC` overrides when fetching private Go modules.
+    /// Sorted by key before hashing so map insertion order doesn't
+    /// change the resulting image tag.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Go-module replace directives forwarded to xcaddy as `--replace
+    /// <entry>`. Each entry is the raw form xcaddy expects (e.g.
+    /// `github.com/foo/bar=github.com/me/bar-fork@v1.0.0`). Useful for
+    /// pinning a transitive dependency or running a forked plugin
+    /// before upstream merges your fix. Sorted alphabetically before
+    /// hashing / rendering.
+    #[serde(default)]
+    pub replace: Vec<String>,
 }
 
 /// Proxy-level TLS. When `cert_secret` + `key_secret` are set, ACME
@@ -388,9 +416,18 @@ impl XcaddyConfig {
         v
     }
 
-    /// 16-hex-char content hash over `(caddy_version, base_image,
-    /// builder_image, sorted_plugins)`. Inputs are joined with `\n`
-    /// separators so distinct field orderings can't alias.
+    /// `replace` entries, alphabetized. Same rationale as `sorted_plugins`.
+    #[must_use]
+    pub fn sorted_replace(&self) -> Vec<String> {
+        let mut v = self.replace.clone();
+        v.sort();
+        v
+    }
+
+    /// 16-hex-char content hash over every field that affects the
+    /// resulting binary: `(caddy_version, base_image, builder_image,
+    /// sorted_plugins, sorted_env, sorted_replace)`. Inputs are joined
+    /// with `\n` separators so distinct field orderings can't alias.
     /// `caddy_version` hashes as the empty string when unset, matching
     /// the Dockerfile renderer (which omits the positional arg →
     /// xcaddy uses caddy's latest tagged release).
@@ -405,6 +442,18 @@ impl XcaddyConfig {
         input.push('\n');
         for p in self.sorted_plugins() {
             input.push_str(&p);
+            input.push('\n');
+        }
+        // `BTreeMap` iteration is already key-sorted, so the encoding
+        // is stable without an extra sort step.
+        for (k, v) in &self.env {
+            input.push_str(k);
+            input.push('=');
+            input.push_str(v);
+            input.push('\n');
+        }
+        for r in self.sorted_replace() {
+            input.push_str(&r);
             input.push('\n');
         }
         crate::deploy::short_sha256(&input)

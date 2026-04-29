@@ -69,6 +69,19 @@ Containers are named in upstream entries (not IPs), so a container restart with 
 
 `run.port:` is required when `domain:` is set — the proxy needs to know which container port to forward to. `run.healthcheck_path:` (if set) is reused as Caddy's active health check URI.
 
+#### Per-route handler order
+
+The handler chain on a routed service runs in a fixed order:
+
+1. Your `caddy_extra_json:` snippet's handlers (in declaration order — hand-written `forward_auth` runs before hand-written `headers`, etc.).
+2. `compression` handler (`encode gzip zstd`), if `compression: true`.
+3. HSTS header handler, if `hsts: true` *and* the service is serving TLS (`tls: auto` or `tls: cert`, or proxy-level TLS).
+4. `reverse_proxy` to the upstream.
+
+This means your snippet sees the request *first*, and your handlers (auth gates, rate-limits, redirects) run before yoink's compression/HSTS/forwarding. If you need behavior between the yoink-managed handlers — say, "compress everything, then auth-gate, then forward" — write the full chain yourself in `caddy_extra_json:` (including the reverse_proxy at the end) and turn `compression: false` so yoink doesn't double-add it.
+
+For chains that should run *globally* on every request (CrowdSec, Coraza, fleet-wide rate-limit), use [`proxy.global_handlers:`](#proxyglobal_handlers-block--proxy-wide-middleware-chain) instead — they run before any per-service route matches.
+
 ### Top-level `proxy:` block
 
 | Field | Type | Default | Notes |
@@ -108,7 +121,7 @@ proxy:
     }
 ```
 
-The yoink-rendered server is named `main`, so global server-scoped settings live under `apps.http.servers.main`.
+> ⚠ **The yoink-rendered server is named `main`, not `srv0`.** Caddy's docs and Caddyfile-adapted output overwhelmingly use `srv0` as the default server name; yoink uses `main`. If you write `apps.http.servers.srv0.trusted_proxies` here, the deep-merge silently creates a *second* server config block named `srv0` that listens on nothing — your `trusted_proxies` is dead config. Always use `apps.http.servers.main.<…>` for server-scoped settings.
 
 Merge semantics:
 
@@ -116,6 +129,7 @@ Merge semantics:
 - Merge is recursive on objects: if both sides have an object at the same key, yoink merges their children; otherwise the user-supplied value wins.
 - Yoink's own keys at non-overlapping paths are preserved — e.g. setting `apps.http.servers.main.trusted_proxies` doesn't clobber the `routes` array yoink generates from your services.
 - User wins on every leaf conflict: setting `admin.listen` to your own value overrides yoink's default `0.0.0.0:2019`. Yoink trusts you.
+- **Two paths are reserved for yoink:** `apps.http.servers.main.routes` (writing here would wipe every per-service route yoink rendered) and `apps.http.servers.main.tls_connection_policies` (writing here would silently disable mTLS configured via `proxy.tls.client_auth:` — a security regression). Both fail at config-load with a denylist error pointing at the typed field that owns each path.
 
 Use it for plugin-specific top-level config too — for example, `caddy-storage-redis` for shared ACME state across a fleet ([recipe](../recipes/multi-host-redis-storage)), `caddyserver/cache-handler` advanced backends, `coraza` global directives, `crowdsec` agent connection settings.
 

@@ -256,30 +256,41 @@ where
 }
 
 /// Wrap the per-service routes in a single wildcard-match route whose
-/// `handle` chain is `proxy.global_handlers:` followed by a `subroute`
-/// carrying the original routes. The result: every request runs the
-/// handler chain (e.g. CrowdSec, Coraza) before any service route can
-/// match. No-op when `global_handlers:` is empty.
+/// `handle` chain is
+/// `proxy.global_handlers...,subroute(routes),proxy.global_handlers_after...`.
+/// Pre-handlers run on every request before any service route matches
+/// (CrowdSec, Coraza, fleet-wide rate-limit); post-handlers run after
+/// the matched service route's per-service handlers complete. No-op
+/// when both lists are empty.
 fn apply_global_handlers(routes: &mut Vec<Value>, cfg: &Config) -> Result<()> {
-    let snippets = cfg
+    let (pre_snips, post_snips) = cfg
         .proxy
         .as_ref()
-        .map(|p| p.global_handlers.as_slice())
-        .unwrap_or(&[]);
-    if snippets.is_empty() {
+        .map(|p| {
+            (
+                p.global_handlers.as_slice(),
+                p.global_handlers_after.as_slice(),
+            )
+        })
+        .unwrap_or((&[], &[]));
+    if pre_snips.is_empty() && post_snips.is_empty() {
         return Ok(());
     }
-    let mut prepend: Vec<Value> = Vec::new();
-    for (i, raw) in snippets.iter().enumerate() {
+    let mut chain: Vec<Value> = Vec::new();
+    for (i, raw) in pre_snips.iter().enumerate() {
         let label = format!("proxy.global_handlers[{i}]");
-        prepend.extend(parse_handler_snippet(raw, &label)?);
+        chain.extend(parse_handler_snippet(raw, &label)?);
     }
     let inner_routes = std::mem::take(routes);
-    prepend.push(json!({
+    chain.push(json!({
         "handler": "subroute",
         "routes": inner_routes,
     }));
-    routes.push(json!({ "handle": prepend }));
+    for (i, raw) in post_snips.iter().enumerate() {
+        let label = format!("proxy.global_handlers_after[{i}]");
+        chain.extend(parse_handler_snippet(raw, &label)?);
+    }
+    routes.push(json!({ "handle": chain }));
     Ok(())
 }
 
@@ -396,9 +407,10 @@ async fn adapt_snippet_to_handlers(snippet: &str, svc_name: &str) -> anyhow::Res
         .await
         .with_context(|| format!("service {svc_name:?}: wait on caddy adapt"))?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(anyhow!(
             "service {svc_name:?}: caddy adapt rejected the Caddyfile snippet:\n{}",
-            String::from_utf8_lossy(&output.stderr).trim(),
+            format_adapt_failure_with_hint(&stderr),
         ));
     }
 
@@ -629,6 +641,27 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
     }
 
     Ok(route)
+}
+
+/// Append a workaround hint when the adapter's stderr suggests the
+/// snippet hit a plugin directive that the bundled `caddy:2` adapter
+/// doesn't know. Yoink shells out to the vanilla `caddy:2` image for
+/// `caddy adapt` regardless of what `proxy.xcaddy:` compiles into the
+/// runtime — the adapter's directive registry is fixed, the runtime's
+/// is not. Operators hit this exactly when they try to write a
+/// plugin-aware `caddy_extra_caddyfile:` snippet.
+fn format_adapt_failure_with_hint(stderr: &str) -> String {
+    if stderr.contains("unknown directive") || stderr.contains("unrecognized directive") {
+        format!(
+            "{stderr}\n\nhint: `caddy_extra_caddyfile:` adapts via the \
+             vanilla caddy:2 adapter, which doesn't know plugin directives. \
+             Either write the same logic as `caddy_extra_json:` (skips the \
+             adapter entirely), or run a custom adapter image with the plugin \
+             compiled in."
+        )
+    } else {
+        stderr.to_string()
+    }
 }
 
 /// Coerce a `caddy_extra_json` / `proxy.global_handlers` parsed value
@@ -1138,6 +1171,141 @@ services:
                 .any(|r| r["match"][0]["host"][0].as_str() == Some("api.example.com")),
             "service route preserved inside the subroute",
         );
+    }
+
+    #[test]
+    fn global_handlers_after_runs_after_subroute() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  global_handlers:
+    - '{"handler": "crowdsec"}'
+  global_handlers_after:
+    - '{"handler": "log_append"}'
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let routes = json["apps"]["http"]["servers"]["main"]["routes"]
+            .as_array()
+            .expect("routes array");
+        assert_eq!(routes.len(), 1, "wrapped into one route");
+        let chain = routes[0]["handle"].as_array().expect("wrapper handle");
+        // Expected order: pre handler → subroute → post handler.
+        assert_eq!(chain[0]["handler"].as_str(), Some("crowdsec"));
+        assert_eq!(chain[1]["handler"].as_str(), Some("subroute"));
+        assert_eq!(chain[2]["handler"].as_str(), Some("log_append"));
+    }
+
+    #[test]
+    fn global_handlers_after_alone_still_wraps() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  global_handlers_after:
+    - '{"handler": "log_append"}'
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let routes = json["apps"]["http"]["servers"]["main"]["routes"]
+            .as_array()
+            .expect("routes array");
+        assert_eq!(routes.len(), 1, "wrapped into one route");
+        let chain = routes[0]["handle"].as_array().expect("wrapper handle");
+        assert_eq!(chain[0]["handler"].as_str(), Some("subroute"));
+        assert_eq!(chain[1]["handler"].as_str(), Some("log_append"));
+    }
+
+    #[test]
+    fn per_route_handler_order_is_extra_json_then_compression_then_hsts_then_proxy() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    compression: true
+    hsts: true
+    caddy_extra_json: '{"handler": "forward_auth"}'
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let route = &json["apps"]["http"]["servers"]["main"]["routes"][0];
+        let handlers = route["handle"]
+            .as_array()
+            .expect("route handle is array")
+            .iter()
+            .map(|h| h["handler"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>();
+        // Hand-written snippet first, then yoink's auto-added
+        // compression + HSTS, then the reverse_proxy at the end.
+        let auth_idx = handlers
+            .iter()
+            .position(|h| *h == "forward_auth")
+            .expect("forward_auth in chain");
+        let encode_idx = handlers
+            .iter()
+            .position(|h| *h == "encode")
+            .expect("encode in chain");
+        let headers_idx = handlers
+            .iter()
+            .position(|h| *h == "headers")
+            .expect("headers (HSTS) in chain");
+        let proxy_idx = handlers
+            .iter()
+            .position(|h| *h == "reverse_proxy")
+            .expect("reverse_proxy in chain");
+        assert!(
+            auth_idx < encode_idx,
+            "snippet runs before compression: {handlers:?}",
+        );
+        assert!(
+            encode_idx < headers_idx,
+            "compression runs before HSTS: {handlers:?}",
+        );
+        assert!(
+            headers_idx < proxy_idx,
+            "HSTS runs before reverse_proxy: {handlers:?}",
+        );
+    }
+
+    #[test]
+    fn adapt_failure_hint_steers_at_caddy_extra_json_for_plugin_directive() {
+        let stderr = "Caddyfile:1: unknown directive: rate_limit";
+        let formatted = format_adapt_failure_with_hint(stderr);
+        assert!(formatted.contains(stderr));
+        assert!(formatted.contains("hint:"));
+        assert!(formatted.contains("caddy_extra_json"));
+    }
+
+    #[test]
+    fn adapt_failure_hint_silent_for_unrelated_errors() {
+        let stderr = "Caddyfile:1: syntax error: unexpected `{`";
+        let formatted = format_adapt_failure_with_hint(stderr);
+        assert!(formatted.contains(stderr));
+        assert!(!formatted.contains("hint:"));
     }
 
     #[test]

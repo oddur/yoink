@@ -90,6 +90,13 @@ impl Host {
     }
 }
 
+/// Hard cap on a single `build_image` call's wall-clock. Generous: an
+/// xcaddy compile against a slow link with cold caches is rarely above
+/// 5 min, so 15 covers the worst case while keeping CI runners from
+/// sitting on a hung daemon for hours. Configurable later if anyone
+/// actually hits it; a `pub const` keeps the value findable.
+pub const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
+
 impl From<&YoinkHost> for Host {
     fn from(h: &YoinkHost) -> Self {
         Self {
@@ -1343,23 +1350,40 @@ impl DockerOps for RealDockerOps {
         // bollard maps daemon `errorDetail` chunks to stream errors, so
         // most failures arrive as `Err(_)` from `next()`; the explicit
         // `error_detail` branch catches the rare detail-only case.
-        while let Some(item) = stream.next().await {
-            let info = item.map_err(|s| Self::err(host, s))?;
-            if let Some(line) = info.stream.as_ref().filter(|s| !s.trim().is_empty()) {
-                tracing::debug!(host = %host.address, %tag, build = %line.trim_end(), "build");
+        // The whole drain is wrapped in a 15-min timeout: a network
+        // stall during `go mod download` would otherwise sit forever
+        // (the deploy lock heartbeat keeps the lock alive but neither
+        // operator-side Ctrl-C nor a CI-runner hard timeout is a great
+        // failure mode).
+        let drain = async {
+            while let Some(item) = stream.next().await {
+                let info = item.map_err(|s| Self::err(host, s))?;
+                if let Some(line) = info.stream.as_ref().filter(|s| !s.trim().is_empty()) {
+                    tracing::debug!(host = %host.address, %tag, build = %line.trim_end(), "build");
+                }
+                if let Some(detail) = info.error_detail.as_ref() {
+                    let msg = detail
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "build failed".into());
+                    return Err(DockerError::Invalid(format!(
+                        "build_image {tag} on {}: {msg}",
+                        host.address
+                    )));
+                }
             }
-            if let Some(detail) = info.error_detail.as_ref() {
-                let msg = detail
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "build failed".into());
-                return Err(DockerError::Invalid(format!(
-                    "build_image {tag} on {}: {msg}",
-                    host.address
-                )));
-            }
+            Ok(())
+        };
+        match tokio::time::timeout(BUILD_TIMEOUT, drain).await {
+            Ok(result) => result,
+            Err(_) => Err(DockerError::Invalid(format!(
+                "build_image {tag} on {}: timed out after {}s — \
+                 network stall during `go mod download`? \
+                 (configurable later if anyone needs longer)",
+                host.address,
+                BUILD_TIMEOUT.as_secs(),
+            ))),
         }
-        Ok(())
     }
 
     async fn list_containers_by_label(

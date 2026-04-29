@@ -169,6 +169,8 @@ proxy:
     }
 ```
 
+> ⚠ **Note the path: `apps.http.servers.main.<…>`.** Yoink's rendered server is named `main`, not the Caddy convention `srv0` you'll see in upstream docs and Caddyfile-adapted output. If you write `srv0` instead, the deep-merge silently creates a second server config that listens on nothing, and your `trusted_proxies` is dead config.
+
 [`caddy-cloudflare-ip`](https://github.com/WeidiDeng/caddy-cloudflare-ip) is the Caddy module that registers a `cloudflare` source for `trusted_proxies` and refreshes the IP list periodically. Without it, `trusted_proxies: {source: cloudflare}` would fail at config load.
 
 This pairs with the origin-pull mTLS above for a clean two-layer story: the origin only TLS-terminates for Cloudflare (mTLS), and within that pipe the real client IP propagates correctly via `CF-Connecting-IP`.

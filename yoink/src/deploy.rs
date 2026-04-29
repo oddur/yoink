@@ -1255,16 +1255,21 @@ pub async fn prefetch_images(
     services_filter: Option<&[String]>,
     secrets: Option<&SecretsBundle>,
     skip_locally_built: bool,
+    rebuild_proxy: bool,
     on_event: Arc<dyn Fn(DeployEvent) + Send + Sync>,
 ) -> Result<(), DeployError> {
     let credentials = registry_credentials(config, secrets);
 
-    // Mix xcaddy builds and registry pulls into the same fan-out — they
-    // touch independent resources on each host's daemon, so a fresh
-    // proxy host can compile caddy in parallel with other services
-    // pulling their images instead of serializing the two phases.
-    let mut futs: Vec<
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DeployError>> + Send>>,
+    // xcaddy builds run in their own collection so per-host failures
+    // can be bundled into a "X/N succeeded; failed on host Y" message
+    // — first-error-wins on a fleet hides which hosts have a fresh
+    // image and which still need the build to retry. Structurally the
+    // build futures still run concurrently with the regular pull
+    // fan-out below via `tokio::join!`.
+    let mut build_futs: Vec<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = (String, Result<(), DockerError>)> + Send>,
+        >,
     > = Vec::new();
 
     if let Some(proxy_cfg) = config.proxy.as_ref()
@@ -1278,17 +1283,23 @@ pub async fn prefetch_images(
             let host = Host::from(host_cfg);
             let ops = ops.clone();
             let xcaddy_cfg = xcaddy_cfg.clone();
-            futs.push(Box::pin(async move {
-                crate::proxy::xcaddy::ensure_xcaddy_image(&*ops, &host, &xcaddy_cfg)
-                    .await
-                    .map(|_tag| ())
-                    .map_err(|source| DeployError::Docker {
-                        host: host.address.clone(),
-                        source,
-                    })
+            build_futs.push(Box::pin(async move {
+                let result = crate::proxy::xcaddy::ensure_xcaddy_image(
+                    &*ops,
+                    &host,
+                    &xcaddy_cfg,
+                    rebuild_proxy,
+                )
+                .await
+                .map(|_tag| ());
+                (host.address.clone(), result)
             }));
         }
     }
+
+    let mut futs: Vec<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DeployError>> + Send>>,
+    > = Vec::new();
 
     for service in &config.services {
         if let Some(filter) = services_filter
@@ -1351,13 +1362,72 @@ pub async fn prefetch_images(
         }
     }
 
-    // First-error wins; the rest of the join_all completes anyway so
-    // we don't strand half-started pulls.
-    let results = futures_util::future::join_all(futs).await;
-    for r in results {
+    // Both fan-outs run concurrently: tokio::join! polls both futures
+    // cooperatively, so xcaddy builds on the proxy hosts overlap with
+    // image pulls on every host. After both complete, we fail-fast on
+    // either kind, but build failures get a structured per-host summary
+    // ("2/3 hosts succeeded; failed on h2: <reason>") since first-
+    // error-wins hides which hosts already have the new image.
+    let (build_outcomes, pull_results) = tokio::join!(
+        futures_util::future::join_all(build_futs),
+        futures_util::future::join_all(futs),
+    );
+    if let Some(err) = summarize_build_outcomes(build_outcomes) {
+        return Err(err);
+    }
+    for r in pull_results {
         r?;
     }
     Ok(())
+}
+
+/// Reduce the per-host xcaddy build outcomes into a single deploy
+/// error when any host failed. The bundled message preserves the
+/// signal "h1 succeeded, h2 failed" — first-error-wins would surface
+/// just one host's failure with no indication that other hosts already
+/// have the fresh image (and don't need a retry on a re-`up`).
+/// Returns `None` when every host succeeded.
+fn summarize_build_outcomes(
+    outcomes: Vec<(String, Result<(), DockerError>)>,
+) -> Option<DeployError> {
+    let total = outcomes.len();
+    let mut succeeded: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, DockerError)> = Vec::new();
+    for (host, result) in outcomes {
+        match result {
+            Ok(()) => succeeded.push(host),
+            Err(e) => failed.push((host, e)),
+        }
+    }
+    if failed.is_empty() {
+        return None;
+    }
+    // Single-failure-on-single-host case: keep the original error
+    // shape so existing one-host smoke tests / error parsers don't
+    // see a regression. Otherwise, bundle into a structured summary.
+    if total == 1 {
+        let (host, source) = failed.into_iter().next().expect("len==1");
+        return Some(DeployError::Docker { host, source });
+    }
+    let detail = failed
+        .iter()
+        .map(|(h, e)| format!("    {h}: {e}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let primary_host = failed[0].0.clone();
+    let primary_source = failed.into_iter().next().expect("non-empty").1;
+    let summary = format!(
+        "xcaddy build: {ok}/{total} hosts succeeded; {failed_n} failed:\n{detail}",
+        ok = succeeded.len(),
+        failed_n = total - succeeded.len(),
+    );
+    // Wrap the structured summary as the same `DeployError::Docker`
+    // shape with the first failed host's underlying error attached.
+    // Rendering nests cleanly: caller's `e` ends up "<host>: <summary>".
+    Some(DeployError::Docker {
+        host: format!("{primary_host}\n{summary}"),
+        source: primary_source,
+    })
 }
 
 async fn list_existing_containers(
@@ -1646,6 +1716,66 @@ fn hook_env(hook: &HookSpec, secrets: Option<&SecretsBundle>) -> BTreeMap<String
 mod tests {
     use super::*;
     use crate::docker_ops::FakeDockerOps;
+
+    #[test]
+    fn summarize_build_outcomes_all_success_is_none() {
+        let outcomes = vec![("h1".into(), Ok(())), ("h2".into(), Ok(()))];
+        assert!(summarize_build_outcomes(outcomes).is_none());
+    }
+
+    #[test]
+    fn summarize_build_outcomes_empty_is_none() {
+        assert!(summarize_build_outcomes(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn summarize_build_outcomes_single_host_keeps_classic_shape() {
+        let outcomes = vec![(
+            "h1".into(),
+            Err(DockerError::Invalid("compile failure".into())),
+        )];
+        let err = summarize_build_outcomes(outcomes).expect("err");
+        let msg = format!("{err}");
+        // Single-host failure path: don't bundle, keep the host name
+        // alone so existing error-parsing tests / scripts aren't
+        // surprised.
+        assert!(msg.contains("h1"), "got: {msg}");
+        assert!(!msg.contains("hosts succeeded"), "should not bundle: {msg}");
+    }
+
+    #[test]
+    fn summarize_build_outcomes_mixed_bundles_summary() {
+        let outcomes = vec![
+            ("h1".into(), Ok(())),
+            (
+                "h2".into(),
+                Err(DockerError::Invalid("network stall".into())),
+            ),
+            ("h3".into(), Ok(())),
+        ];
+        let err = summarize_build_outcomes(outcomes).expect("err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("xcaddy build: 2/3 hosts succeeded"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("h2"), "got: {msg}");
+        assert!(msg.contains("network stall"), "got: {msg}");
+    }
+
+    #[test]
+    fn summarize_build_outcomes_multi_failure_lists_each_host() {
+        let outcomes = vec![
+            ("h1".into(), Err(DockerError::Invalid("err one".into()))),
+            ("h2".into(), Err(DockerError::Invalid("err two".into()))),
+        ];
+        let err = summarize_build_outcomes(outcomes).expect("err");
+        let msg = format!("{err}");
+        assert!(msg.contains("h1: "), "got: {msg}");
+        assert!(msg.contains("h2: "), "got: {msg}");
+        assert!(msg.contains("err one"), "got: {msg}");
+        assert!(msg.contains("err two"), "got: {msg}");
+    }
 
     fn config_one_service() -> Config {
         Config::parse_str(

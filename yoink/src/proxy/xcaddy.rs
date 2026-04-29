@@ -26,12 +26,24 @@ pub async fn ensure_xcaddy_image(
     ops: &dyn DockerOps,
     host: &Host,
     cfg: &XcaddyConfig,
+    force_rebuild: bool,
 ) -> Result<String, DockerError> {
     let tag = cfg.resolved_local_tag();
     let (image_part, tag_part) = split_image_tag(&tag);
-    if ops.image_present(host, image_part, tag_part).await? {
+    // `force_rebuild` (`yoink up --rebuild-proxy`) skips the
+    // `image_present` short-circuit, e.g. when an unpinned plugin's
+    // upstream module changed but the config-derived hash hasn't.
+    if !force_rebuild && ops.image_present(host, image_part, tag_part).await? {
         return Ok(tag);
     }
+    // Refresh the builder image before running the build. `caddy:2-builder`
+    // is a floating tag, so a daemon with a stale cached digest would
+    // produce semantically older binaries than the hash claims; the
+    // explicit pull-then-build keeps the hash determinism honest. The
+    // pull is a no-op when the daemon already has the latest digest.
+    let (builder_image, builder_tag) = split_image_tag(cfg.resolved_builder_image());
+    ops.pull_image(host, builder_image, builder_tag, None)
+        .await?;
     let dockerfile = render_dockerfile(cfg);
     let context = build_tar_context(&dockerfile);
     ops.build_image(host, &tag, context).await?;
@@ -45,12 +57,18 @@ pub async fn ensure_xcaddy_image(
 #[must_use]
 pub fn render_dockerfile(cfg: &XcaddyConfig) -> String {
     let plugins = cfg.sorted_plugins();
+    let replace = cfg.sorted_replace();
     let mut s = String::new();
     s.push_str("# syntax=docker/dockerfile:1\n");
     s.push_str(&format!(
         "FROM {} AS builder\n",
         cfg.resolved_builder_image()
     ));
+    // `BTreeMap` iter is already key-sorted; emit one ENV per entry so
+    // GOPRIVATE/GOPROXY/NETRC overrides reach the `xcaddy build` shell.
+    for (k, v) in &cfg.env {
+        s.push_str(&format!("ENV {k}={v}\n"));
+    }
     // `xcaddy build` takes the Caddy version (a git tag like `v2.8.4`)
     // as a positional arg. Omitted → xcaddy uses the latest tagged
     // release. Only emit the arg when the user pinned it explicitly,
@@ -63,6 +81,10 @@ pub fn render_dockerfile(cfg: &XcaddyConfig) -> String {
     for plugin in &plugins {
         s.push_str(" \\\n    --with ");
         s.push_str(plugin);
+    }
+    for entry in &replace {
+        s.push_str(" \\\n    --replace ");
+        s.push_str(entry);
     }
     s.push_str("\n\n");
     s.push_str(&format!("FROM {}\n", cfg.resolved_base_image()));
@@ -109,6 +131,8 @@ mod tests {
             caddy_version: None,
             base_image: None,
             builder_image: None,
+            env: std::collections::BTreeMap::new(),
+            replace: Vec::new(),
         }
     }
 
@@ -169,6 +193,43 @@ mod tests {
     }
 
     #[test]
+    fn hash_changes_on_env_or_replace_change() {
+        let mut a = cfg(&["github.com/a/one"]);
+        let mut b = cfg(&["github.com/a/one"]);
+        a.env.insert("GOPRIVATE".into(), "*.example.com".into());
+        let h_with_env = a.hash();
+        assert_ne!(b.hash(), h_with_env);
+        b.replace
+            .push("github.com/foo/bar=github.com/me/bar-fork@v1.0.0".into());
+        assert_ne!(b.hash(), h_with_env);
+        assert_ne!(a.hash(), b.hash());
+    }
+
+    #[test]
+    fn dockerfile_emits_env_and_replace() {
+        let mut c = cfg(&["github.com/foo/bar"]);
+        c.env.insert("GOPRIVATE".into(), "*.example.com".into());
+        c.env.insert("NETRC".into(), "/run/secrets/netrc".into());
+        c.replace
+            .push("github.com/x/y=github.com/me/y-fork@v0.2.0".into());
+        let df = render_dockerfile(&c);
+        // ENV lines emit between `FROM ... AS builder` and `RUN xcaddy build`.
+        assert!(df.contains("ENV GOPRIVATE=*.example.com"), "got: {df}");
+        assert!(df.contains("ENV NETRC=/run/secrets/netrc"), "got: {df}");
+        // BTreeMap iteration is key-sorted → GOPRIVATE before NETRC.
+        let goprivate_idx = df.find("ENV GOPRIVATE").unwrap();
+        let netrc_idx = df.find("ENV NETRC").unwrap();
+        let run_idx = df.find("RUN xcaddy build").unwrap();
+        assert!(goprivate_idx < netrc_idx);
+        assert!(netrc_idx < run_idx);
+        // `--replace` flag appears on the `xcaddy build` line.
+        assert!(
+            df.contains("--replace github.com/x/y=github.com/me/y-fork@v0.2.0"),
+            "got: {df}",
+        );
+    }
+
+    #[test]
     fn tar_context_has_dockerfile_entry() {
         let bytes = build_tar_context("FROM scratch\n");
         // tar entries start at offset 0; first 100 bytes are the name.
@@ -189,13 +250,42 @@ mod tests {
         let (image, tag_part) = split_image_tag(&tag);
         ops.mark_image_present(image, tag_part);
 
-        let returned = ensure_xcaddy_image(&ops, &host, &c).await.expect("ok");
+        let returned = ensure_xcaddy_image(&ops, &host, &c, false)
+            .await
+            .expect("ok");
         assert_eq!(returned, tag);
         assert!(
             !ops.calls()
                 .iter()
                 .any(|c| matches!(c, RecordedCall::BuildImage(_, _, _))),
             "build should not run when image already present"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_image_force_rebuild_ignores_image_present() {
+        use crate::docker_ops::{FakeDockerOps, RecordedCall};
+        let ops = FakeDockerOps::new();
+        let host = Host {
+            user: "u".into(),
+            address: "h".into(),
+        };
+        let c = cfg(&["github.com/a/one"]);
+        let tag = c.resolved_local_tag();
+        let (image, tag_part) = split_image_tag(&tag);
+        ops.mark_image_present(image, tag_part);
+        ops.push_pull_image(Ok(()));
+        ops.push_build_image(Ok(()));
+
+        // force_rebuild=true ignores the cached image and re-runs the build.
+        ensure_xcaddy_image(&ops, &host, &c, true)
+            .await
+            .expect("ok");
+        assert!(
+            ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::BuildImage(_, _, _))),
+            "build should run when force_rebuild is set"
         );
     }
 
@@ -208,21 +298,28 @@ mod tests {
             address: "h".into(),
         };
         let c = cfg(&["github.com/a/one"]);
-        ops.push_build_image(Ok(()));
+        ops.push_pull_image(Ok(())); // builder pull
+        ops.push_build_image(Ok(())); // xcaddy build
 
-        let returned = ensure_xcaddy_image(&ops, &host, &c).await.expect("ok");
+        let returned = ensure_xcaddy_image(&ops, &host, &c, false)
+            .await
+            .expect("ok");
         assert_eq!(returned, c.resolved_local_tag());
-        let built: Vec<_> = ops
-            .calls()
-            .into_iter()
-            .filter_map(|c| {
-                if let RecordedCall::BuildImage(_, t, _) = c {
-                    Some(t)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(built, vec![c.resolved_local_tag()]);
+
+        // Pull-then-build is the contract — recorded call order matters
+        // because a stale builder image breaks hash determinism.
+        let calls = ops.calls();
+        let pull_idx = calls.iter().position(|c| {
+            matches!(
+                c,
+                RecordedCall::PullImage(_, image, tag) if image == "caddy" && tag == "2-builder"
+            )
+        });
+        let build_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::BuildImage(_, _, _)));
+        assert!(pull_idx.is_some(), "builder pull recorded");
+        assert!(build_idx.is_some(), "build recorded");
+        assert!(pull_idx < build_idx, "pull before build");
     }
 }

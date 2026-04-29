@@ -254,6 +254,16 @@ enum Command {
         /// alongside `--no-registry`.
         #[arg(long)]
         build: bool,
+        /// Force a fresh xcaddy build of the proxy image, skipping the
+        /// per-host `image_present` short-circuit. Useful when an
+        /// unpinned plugin's underlying module changed upstream — the
+        /// hash hasn't moved (the config string is identical) but the
+        /// resolved Go module would. Without this flag, an `up`
+        /// reuses the cached `yoink-caddy:<hash>` image. With it,
+        /// every proxy host re-runs `xcaddy build` and re-tags the
+        /// image. No-op when `proxy.xcaddy:` isn't set.
+        #[arg(long)]
+        rebuild_proxy: bool,
         /// Force a redeploy even when the running container already
         /// matches the desired spec. Skips the at-spec early-return,
         /// so every selected service goes through the full
@@ -1000,6 +1010,7 @@ async fn run(cli: Cli) -> Result<()> {
                         no_registry: false,
                         transport: TransportMode::Auto.into(),
                         build: false,
+                        rebuild_proxy: false,
                         force: false,
                         here: false,
                         plan: false,
@@ -1022,6 +1033,7 @@ async fn run(cli: Cli) -> Result<()> {
             no_registry,
             transport,
             build,
+            rebuild_proxy,
             force,
             here,
             plan,
@@ -1038,6 +1050,7 @@ async fn run(cli: Cli) -> Result<()> {
                     no_registry,
                     transport: transport.into(),
                     build,
+                    rebuild_proxy,
                     force,
                     here,
                     plan,
@@ -1184,6 +1197,10 @@ struct UpOptions<'a> {
     no_registry: bool,
     transport: yoink::transport::Transport,
     build: bool,
+    /// Force a fresh xcaddy build even when `image_present` would
+    /// short-circuit. Threaded through to `prefetch_images` →
+    /// `ensure_xcaddy_image`. No-op when `proxy.xcaddy:` is unset.
+    rebuild_proxy: bool,
     force: bool,
     /// Pin every selected service to the current git short SHA.
     here: bool,
@@ -1278,11 +1295,13 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         no_registry,
         transport,
         build,
+        rebuild_proxy: _,
         force,
         here,
         // `dry_run` arrives as a separate parameter (collapsed with
         // `plan` upstream); `plan`, `watch`, `config_path` are
-        // handled by the caller.
+        // handled by the caller. `rebuild_proxy` is consumed via
+        // `up.rebuild_proxy` further down inside `prefetch_images`.
         dry_run: _,
         plan: _,
         watch: _,
@@ -1445,6 +1464,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             services_filter,
             bundle.as_ref(),
             true,
+            up.rebuild_proxy,
             prefetch_cb,
         )
         .await
@@ -1677,6 +1697,7 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
             no_registry: false,
             transport: yoink::transport::Transport::Auto,
             build: false,
+            rebuild_proxy: false,
             force: false,
             here: false,
             plan: false,
