@@ -211,23 +211,20 @@ caddy_extra_json: |
   }]
 ```
 
-## Plugins (custom Caddy image required)
+## Plugins via `proxy.xcaddy:`
 
-These need an `xcaddy`-built image — set `proxy.image:` to your custom build.
+For directives that aren't in stock caddy (rate-limit, l4, redis-storage, third-party DNS providers), list the plugins under `proxy.xcaddy:` and yoink builds caddy on each proxy host with those modules baked in. No registry, no operator-side Dockerfile. See the [proxy guide](../guide/proxy#proxyxcaddy-block--caddy-plugins-without-a-registry) for the full block.
+
+> **Snippets vs plugin directives:** `caddy_extra_caddyfile:` adapts via the bundled `caddy:2` adapter on the operator's machine, which doesn't know plugin-provided directives. If your snippet uses one (e.g. `rate_limit { ... }`), write it as `caddy_extra_json:` instead — that path skips the adapter entirely.
 
 ### Rate limiting (`caddy-ratelimit`)
 
-```dockerfile
-FROM caddy:2-builder AS builder
-RUN xcaddy build --with github.com/mholt/caddy-ratelimit
-FROM caddy:2
-COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-```
-
 ```yaml
 proxy:
-  image: ghcr.io/me/caddy-ratelimit:2.7
   email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/mholt/caddy-ratelimit
 
 services:
   - name: public-api
@@ -242,7 +239,7 @@ services:
 
 ### Multi-host LE certs (`caddy-storage-redis`)
 
-See the [Multi-host Redis storage recipe](/docs/recipes/multi-host-redis-storage) — also needs an xcaddy image.
+See the [Multi-host Redis storage recipe](/docs/recipes/multi-host-redis-storage) — same `proxy.xcaddy:` story, different plugin.
 
 ## See also
 

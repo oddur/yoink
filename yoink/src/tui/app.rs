@@ -3927,7 +3927,8 @@ async fn reconcile_all(
         &overrides,
         None,
         secrets_ref,
-        true, // never try to pull `build:` services from a registry — they're local-only
+        true,  // never try to pull `build:` services from a registry — they're local-only
+        false, // TUI doesn't expose --rebuild-proxy; CLI is the path for that
         prefetch_cb,
     )
     .await

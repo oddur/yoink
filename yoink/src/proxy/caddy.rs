@@ -82,6 +82,8 @@ where
         routes.insert(0, redirect_route_http_to_https());
     }
 
+    apply_global_handlers(&mut routes, cfg)?;
+
     let mut http_server = json!({
         "listen": [":80", ":443"],
         "routes": routes,
@@ -248,7 +250,92 @@ where
         entry["certificates"] = json!({ "load_pem": pem_entries });
     }
 
+    apply_config_extra(&mut config, cfg)?;
+
     Ok(config)
+}
+
+/// Wrap the per-service routes in a single wildcard-match route whose
+/// `handle` chain is
+/// `proxy.global_handlers...,subroute(routes),proxy.global_handlers_after...`.
+/// Pre-handlers run on every request before any service route matches
+/// (CrowdSec, Coraza, fleet-wide rate-limit); post-handlers run after
+/// the matched service route's per-service handlers complete. No-op
+/// when both lists are empty.
+fn apply_global_handlers(routes: &mut Vec<Value>, cfg: &Config) -> Result<()> {
+    let (pre_snips, post_snips) = cfg
+        .proxy
+        .as_ref()
+        .map(|p| {
+            (
+                p.global_handlers.as_slice(),
+                p.global_handlers_after.as_slice(),
+            )
+        })
+        .unwrap_or((&[], &[]));
+    if pre_snips.is_empty() && post_snips.is_empty() {
+        return Ok(());
+    }
+    let mut chain: Vec<Value> = Vec::new();
+    for (i, raw) in pre_snips.iter().enumerate() {
+        let label = format!("proxy.global_handlers[{i}]");
+        chain.extend(parse_handler_snippet(raw, &label)?);
+    }
+    let inner_routes = std::mem::take(routes);
+    chain.push(json!({
+        "handler": "subroute",
+        "routes": inner_routes,
+    }));
+    for (i, raw) in post_snips.iter().enumerate() {
+        let label = format!("proxy.global_handlers_after[{i}]");
+        chain.extend(parse_handler_snippet(raw, &label)?);
+    }
+    routes.push(json!({ "handle": chain }));
+    Ok(())
+}
+
+/// Deep-merge `proxy.config_extra:` (a top-level Caddy JSON snippet)
+/// over the rendered config. Extras win at leaf conflicts; yoink-managed
+/// keys at non-overlapping paths survive. Validated as a JSON object
+/// at config-load time. No-op when `config_extra:` is unset.
+fn apply_config_extra(config: &mut Value, cfg: &Config) -> Result<()> {
+    let Some(extra) = cfg.proxy.as_ref().and_then(|p| p.config_extra.as_deref()) else {
+        return Ok(());
+    };
+    let extra_value: Value = serde_json::from_str(extra)
+        .map_err(|e| anyhow!("proxy.config_extra is not valid JSON: {e}"))?;
+    deep_merge(config, extra_value);
+    Ok(())
+}
+
+/// Parse a single raw-JSON snippet (one entry of `caddy_extra_json:` /
+/// `proxy.global_handlers:`) into the list of handlers it expands to.
+/// Reused by both the per-service splice in `render_route` and the
+/// global splice in `apply_global_handlers` to keep error messages
+/// consistent and de-duplicate the parse-then-normalize pipeline.
+fn parse_handler_snippet(raw: &str, label: &str) -> Result<Vec<Value>> {
+    let parsed: Value =
+        serde_json::from_str(raw).with_context(|| format!("{label} is not valid JSON"))?;
+    normalize_extra_json(parsed, label)
+}
+
+/// Deep-merge `src` into `dst`. Both objects → merge keys (recurse
+/// where both sides are objects, src wins on scalar leaves and arrays).
+/// Non-object src wholesale replaces dst at this position.
+fn deep_merge(dst: &mut Value, src: Value) {
+    match (dst, src) {
+        (Value::Object(dst_map), Value::Object(src_map)) => {
+            for (k, v) in src_map {
+                match dst_map.get_mut(&k) {
+                    Some(existing) => deep_merge(existing, v),
+                    None => {
+                        dst_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, src) => *slot = src,
+    }
 }
 
 /// Expand every `caddy_extra_caddyfile:` snippet in `cfg` into its
@@ -296,7 +383,7 @@ async fn adapt_snippet_to_handlers(snippet: &str, svc_name: &str) -> anyhow::Res
             "-i",
             "--entrypoint",
             "sh",
-            "caddy:2",
+            crate::config::CADDY_DEFAULT_IMAGE,
             "-c",
             "cat > /tmp/snippet.caddyfile && \
              caddy adapt --config /tmp/snippet.caddyfile --adapter caddyfile",
@@ -320,9 +407,10 @@ async fn adapt_snippet_to_handlers(snippet: &str, svc_name: &str) -> anyhow::Res
         .await
         .with_context(|| format!("service {svc_name:?}: wait on caddy adapt"))?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(anyhow!(
             "service {svc_name:?}: caddy adapt rejected the Caddyfile snippet:\n{}",
-            String::from_utf8_lossy(&output.stderr).trim(),
+            format_adapt_failure_with_hint(&stderr),
         ));
     }
 
@@ -476,10 +564,8 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
     // auto-wrapped in a `subroute` handler so the operator never has
     // to know about `subroute` to inline a (match → handle).
     if let Some(extra) = svc.caddy_extra_json.as_deref() {
-        let parsed: Value = serde_json::from_str(extra).with_context(|| {
-            format!("service {:?}: caddy_extra_json is not valid JSON", svc.name,)
-        })?;
-        for item in normalize_extra_json(parsed, &svc.name)? {
+        let label = format!("service {:?}: caddy_extra_json", svc.name);
+        for item in parse_handler_snippet(extra, &label)? {
             handle.push(item);
         }
     }
@@ -557,8 +643,29 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
     Ok(route)
 }
 
-/// Coerce `caddy_extra_json` parsed value into a list of handler
-/// objects ready to splice into the route's `handle` array.
+/// Append a workaround hint when the adapter's stderr suggests the
+/// snippet hit a plugin directive that the bundled `caddy:2` adapter
+/// doesn't know. Yoink shells out to the vanilla `caddy:2` image for
+/// `caddy adapt` regardless of what `proxy.xcaddy:` compiles into the
+/// runtime — the adapter's directive registry is fixed, the runtime's
+/// is not. Operators hit this exactly when they try to write a
+/// plugin-aware `caddy_extra_caddyfile:` snippet.
+fn format_adapt_failure_with_hint(stderr: &str) -> String {
+    if stderr.contains("unknown directive") || stderr.contains("unrecognized directive") {
+        format!(
+            "{stderr}\n\nhint: `caddy_extra_caddyfile:` adapts via the \
+             vanilla caddy:2 adapter, which doesn't know plugin directives. \
+             Either write the same logic as `caddy_extra_json:` (skips the \
+             adapter entirely), or run a custom adapter image with the plugin \
+             compiled in."
+        )
+    } else {
+        stderr.to_string()
+    }
+}
+
+/// Coerce a `caddy_extra_json` / `proxy.global_handlers` parsed value
+/// into a list of handler objects ready to splice into a `handle` array.
 ///
 /// - Handler shape (`{"handler": "x", ...}`) → pass-through.
 /// - Route shape (`{"match": ..., "handle": ...}`) → wrapped in a
@@ -566,14 +673,17 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
 ///   shape ("when X, do Y") without knowing `subroute` exists.
 /// - Mixed lists → each entry classified independently; route-shaped
 ///   entries are wrapped together in one `subroute`.
-fn normalize_extra_json(parsed: Value, svc_name: &str) -> Result<Vec<Value>> {
+///
+/// `context` is a human-readable prefix included verbatim in error
+/// messages — e.g. `service "api": caddy_extra_json` or
+/// `proxy.global_handlers[0]`.
+fn normalize_extra_json(parsed: Value, context: &str) -> Result<Vec<Value>> {
     let items: Vec<Value> = match parsed {
         Value::Array(xs) => xs,
         Value::Object(_) => vec![parsed],
         other => {
             return Err(anyhow!(
-                "service {svc_name:?}: caddy_extra_json must be a JSON object or array \
-                 of objects, got {}",
+                "{context}: must be a JSON object or array of objects, got {}",
                 discriminant_str(&other),
             ));
         }
@@ -586,8 +696,7 @@ fn normalize_extra_json(parsed: Value, svc_name: &str) -> Result<Vec<Value>> {
             Some(_) => item,
             None => {
                 return Err(anyhow!(
-                    "service {svc_name:?}: caddy_extra_json entries must be JSON \
-                     objects (a handler or a route), got {}",
+                    "{context}: entries must be JSON objects (a handler or a route), got {}",
                     discriminant_str(&item),
                 ));
             }
@@ -606,8 +715,8 @@ fn normalize_extra_json(parsed: Value, svc_name: &str) -> Result<Vec<Value>> {
             routes_buf.push(obj);
         } else {
             return Err(anyhow!(
-                "service {svc_name:?}: caddy_extra_json entry has neither `handler` \
-                 (handler form) nor `match`/`handle` (route form): {obj}",
+                "{context}: entry has neither `handler` (handler form) nor \
+                 `match`/`handle` (route form): {obj}",
             ));
         }
     }
@@ -970,5 +1079,255 @@ services:
         let json1 = render(&cfg, |_| vec!["api-1".into()], None).unwrap();
         let json2 = render(&cfg, |_| vec!["api-1".into()], None).unwrap();
         assert_eq!(config_fingerprint(&json1), config_fingerprint(&json2));
+    }
+
+    #[test]
+    fn config_extra_merges_into_rendered_config() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  config_extra: |
+    {
+      "storage": {"module": "redis", "address": "redis:6379"},
+      "apps": {
+        "http": {
+          "servers": {
+            "main": {
+              "trusted_proxies": {"source": "cloudflare"},
+              "client_ip_headers": ["CF-Connecting-IP"]
+            }
+          }
+        }
+      }
+    }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        // Top-level escape hatch keys land where the user put them.
+        assert_eq!(json["storage"]["module"].as_str(), Some("redis"));
+        assert_eq!(
+            json["apps"]["http"]["servers"]["main"]["trusted_proxies"]["source"].as_str(),
+            Some("cloudflare"),
+        );
+        assert_eq!(
+            json["apps"]["http"]["servers"]["main"]["client_ip_headers"][0].as_str(),
+            Some("CF-Connecting-IP"),
+        );
+        // Yoink-managed siblings under the same `main` server survive
+        // the merge — routes were not clobbered.
+        let routes = json["apps"]["http"]["servers"]["main"]["routes"]
+            .as_array()
+            .expect("routes array");
+        assert!(!routes.is_empty(), "yoink routes preserved across merge");
+    }
+
+    #[test]
+    fn global_handlers_wrap_service_routes_in_subroute() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  global_handlers:
+    - '{"handler": "crowdsec", "appsec_url": "http://crowdsec:8080"}'
+    - '{"handler": "waf", "directives": ["SecRuleEngine On"]}'
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let routes = json["apps"]["http"]["servers"]["main"]["routes"]
+            .as_array()
+            .expect("routes array");
+        // With global_handlers set, every yoink-managed route lives
+        // inside a single wildcard wrapper.
+        assert_eq!(routes.len(), 1, "wrapped into one route");
+        let wrapper_handle = routes[0]["handle"].as_array().expect("wrapper handle");
+        // Order: crowdsec, waf, then a subroute carrying the original
+        // service routes.
+        assert_eq!(wrapper_handle[0]["handler"].as_str(), Some("crowdsec"));
+        assert_eq!(wrapper_handle[1]["handler"].as_str(), Some("waf"));
+        assert_eq!(wrapper_handle[2]["handler"].as_str(), Some("subroute"));
+        let inner_routes = wrapper_handle[2]["routes"]
+            .as_array()
+            .expect("inner subroute carries the service routes");
+        assert!(
+            inner_routes
+                .iter()
+                .any(|r| r["match"][0]["host"][0].as_str() == Some("api.example.com")),
+            "service route preserved inside the subroute",
+        );
+    }
+
+    #[test]
+    fn global_handlers_after_runs_after_subroute() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  global_handlers:
+    - '{"handler": "crowdsec"}'
+  global_handlers_after:
+    - '{"handler": "log_append"}'
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let routes = json["apps"]["http"]["servers"]["main"]["routes"]
+            .as_array()
+            .expect("routes array");
+        assert_eq!(routes.len(), 1, "wrapped into one route");
+        let chain = routes[0]["handle"].as_array().expect("wrapper handle");
+        // Expected order: pre handler → subroute → post handler.
+        assert_eq!(chain[0]["handler"].as_str(), Some("crowdsec"));
+        assert_eq!(chain[1]["handler"].as_str(), Some("subroute"));
+        assert_eq!(chain[2]["handler"].as_str(), Some("log_append"));
+    }
+
+    #[test]
+    fn global_handlers_after_alone_still_wraps() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  global_handlers_after:
+    - '{"handler": "log_append"}'
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let routes = json["apps"]["http"]["servers"]["main"]["routes"]
+            .as_array()
+            .expect("routes array");
+        assert_eq!(routes.len(), 1, "wrapped into one route");
+        let chain = routes[0]["handle"].as_array().expect("wrapper handle");
+        assert_eq!(chain[0]["handler"].as_str(), Some("subroute"));
+        assert_eq!(chain[1]["handler"].as_str(), Some("log_append"));
+    }
+
+    #[test]
+    fn per_route_handler_order_is_extra_json_then_compression_then_hsts_then_proxy() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    compression: true
+    hsts: true
+    caddy_extra_json: '{"handler": "forward_auth"}'
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let route = &json["apps"]["http"]["servers"]["main"]["routes"][0];
+        let handlers = route["handle"]
+            .as_array()
+            .expect("route handle is array")
+            .iter()
+            .map(|h| h["handler"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>();
+        // Hand-written snippet first, then yoink's auto-added
+        // compression + HSTS, then the reverse_proxy at the end.
+        let auth_idx = handlers
+            .iter()
+            .position(|h| *h == "forward_auth")
+            .expect("forward_auth in chain");
+        let encode_idx = handlers
+            .iter()
+            .position(|h| *h == "encode")
+            .expect("encode in chain");
+        let headers_idx = handlers
+            .iter()
+            .position(|h| *h == "headers")
+            .expect("headers (HSTS) in chain");
+        let proxy_idx = handlers
+            .iter()
+            .position(|h| *h == "reverse_proxy")
+            .expect("reverse_proxy in chain");
+        assert!(
+            auth_idx < encode_idx,
+            "snippet runs before compression: {handlers:?}",
+        );
+        assert!(
+            encode_idx < headers_idx,
+            "compression runs before HSTS: {handlers:?}",
+        );
+        assert!(
+            headers_idx < proxy_idx,
+            "HSTS runs before reverse_proxy: {handlers:?}",
+        );
+    }
+
+    #[test]
+    fn adapt_failure_hint_steers_at_caddy_extra_json_for_plugin_directive() {
+        let stderr = "Caddyfile:1: unknown directive: rate_limit";
+        let formatted = format_adapt_failure_with_hint(stderr);
+        assert!(formatted.contains(stderr));
+        assert!(formatted.contains("hint:"));
+        assert!(formatted.contains("caddy_extra_json"));
+    }
+
+    #[test]
+    fn adapt_failure_hint_silent_for_unrelated_errors() {
+        let stderr = "Caddyfile:1: syntax error: unexpected `{`";
+        let formatted = format_adapt_failure_with_hint(stderr);
+        assert!(formatted.contains(stderr));
+        assert!(!formatted.contains("hint:"));
+    }
+
+    #[test]
+    fn config_extra_user_keys_win_on_conflict() {
+        // User explicitly overrides yoink's default admin block.
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  config_extra: |
+    {"admin": {"listen": "127.0.0.1:9999"}}
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        assert_eq!(json["admin"]["listen"].as_str(), Some("127.0.0.1:9999"));
     }
 }

@@ -254,6 +254,16 @@ enum Command {
         /// alongside `--no-registry`.
         #[arg(long)]
         build: bool,
+        /// Force a fresh xcaddy build of the proxy image, skipping the
+        /// per-host `image_present` short-circuit. Useful when an
+        /// unpinned plugin's underlying module changed upstream — the
+        /// hash hasn't moved (the config string is identical) but the
+        /// resolved Go module would. Without this flag, an `up`
+        /// reuses the cached `yoink-caddy:<hash>` image. With it,
+        /// every proxy host re-runs `xcaddy build` and re-tags the
+        /// image. No-op when `proxy.xcaddy:` isn't set.
+        #[arg(long)]
+        rebuild_proxy: bool,
         /// Force a redeploy even when the running container already
         /// matches the desired spec. Skips the at-spec early-return,
         /// so every selected service goes through the full
@@ -577,6 +587,11 @@ enum Command {
     /// (uses service-name fallbacks) so this works without a host
     /// connection.
     ProxyRender,
+    /// Print the synthesized xcaddy Dockerfile for the current
+    /// `proxy.xcaddy:` config. No docker calls; useful for code review,
+    /// testing the build locally with `docker build -`, or pinning a
+    /// specific Dockerfile in CI.
+    ProxyDockerfile,
     /// Inspect or release the per-host deploy lock.
     ///
     /// Each `yoink up` acquires a sentinel container as a deploy lock so
@@ -995,6 +1010,7 @@ async fn run(cli: Cli) -> Result<()> {
                         no_registry: false,
                         transport: TransportMode::Auto.into(),
                         build: false,
+                        rebuild_proxy: false,
                         force: false,
                         here: false,
                         plan: false,
@@ -1017,6 +1033,7 @@ async fn run(cli: Cli) -> Result<()> {
             no_registry,
             transport,
             build,
+            rebuild_proxy,
             force,
             here,
             plan,
@@ -1033,6 +1050,7 @@ async fn run(cli: Cli) -> Result<()> {
                     no_registry,
                     transport: transport.into(),
                     build,
+                    rebuild_proxy,
                     force,
                     here,
                     plan,
@@ -1124,6 +1142,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Validate { check_hosts } => cmd_validate(&config, check_hosts).await,
         Command::Doctor { json } => cmd_doctor(&config, json).await,
         Command::ProxyRender => cmd_proxy_render(&config).await,
+        Command::ProxyDockerfile => cmd_proxy_dockerfile(&config),
         Command::Lock { action } => cmd_lock(&config, action).await,
         Command::Diff { service, tag } => cmd_diff(&config, &service, tag.as_deref()).await,
         Command::Completions { shell } => {
@@ -1178,6 +1197,10 @@ struct UpOptions<'a> {
     no_registry: bool,
     transport: yoink::transport::Transport,
     build: bool,
+    /// Force a fresh xcaddy build even when `image_present` would
+    /// short-circuit. Threaded through to `prefetch_images` →
+    /// `ensure_xcaddy_image`. No-op when `proxy.xcaddy:` is unset.
+    rebuild_proxy: bool,
     force: bool,
     /// Pin every selected service to the current git short SHA.
     here: bool,
@@ -1272,11 +1295,13 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         no_registry,
         transport,
         build,
+        rebuild_proxy: _,
         force,
         here,
         // `dry_run` arrives as a separate parameter (collapsed with
         // `plan` upstream); `plan`, `watch`, `config_path` are
-        // handled by the caller.
+        // handled by the caller. `rebuild_proxy` is consumed via
+        // `up.rebuild_proxy` further down inside `prefetch_images`.
         dry_run: _,
         plan: _,
         watch: _,
@@ -1439,6 +1464,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             services_filter,
             bundle.as_ref(),
             true,
+            up.rebuild_proxy,
             prefetch_cb,
         )
         .await
@@ -1671,6 +1697,7 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
             no_registry: false,
             transport: yoink::transport::Transport::Auto,
             build: false,
+            rebuild_proxy: false,
             force: false,
             here: false,
             plan: false,
@@ -3188,8 +3215,22 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
         return Ok(());
     }
 
+    // With `proxy.xcaddy:` the proxy image is built per-host as
+    // `yoink-caddy:<hash>` and doesn't exist on the operator's machine,
+    // so spawning `docker run yoink-caddy:<hash>` here would 404. Skip
+    // — the rendered config still ran through `proxy::caddy::render`
+    // above (catches schema errors), and Caddy refuses bad configs at
+    // `/load` time on the host anyway.
+    if config.proxy.as_ref().is_some_and(|p| p.xcaddy.is_some()) {
+        eprintln!(
+            "  (skipping Caddy schema check — proxy.xcaddy is set; the proxy image only \
+             exists on hosts. Caddy will reject any bad config at /load time.)"
+        );
+        return Ok(());
+    }
+
     let image = config.proxy.as_ref().map_or_else(
-        || "caddy:2".to_string(),
+        || yoink::config::CADDY_DEFAULT_IMAGE.to_string(),
         yoink::config::ProxyConfig::resolved_image,
     );
     let mut child = tokio::process::Command::new("docker")
@@ -3246,6 +3287,22 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
         };
         anyhow::bail!("Caddy rejected the rendered config:\n{stderr}{hint}");
     }
+}
+
+fn cmd_proxy_dockerfile(config: &Config) -> Result<()> {
+    let xcaddy = config
+        .proxy
+        .as_ref()
+        .and_then(|p| p.xcaddy.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "proxy.xcaddy is not set — there's no Dockerfile to render. Add a \
+                 `proxy.xcaddy.plugins:` block first."
+            )
+        })?;
+    let dockerfile = yoink::proxy::xcaddy::render_dockerfile(xcaddy);
+    print!("{dockerfile}");
+    Ok(())
 }
 
 async fn cmd_proxy_render(config: &Config) -> Result<()> {

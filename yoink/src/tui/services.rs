@@ -386,10 +386,28 @@ impl ServiceDetailState {
     ) {
         let layout = pane_layout(area);
         let header_text = match &self.service {
-            Some(name) => format!(
-                "yoink service · {name} · {} container(s) · ↑↓ select · enter for logs",
-                self.rows.len()
-            ),
+            Some(name) => {
+                // Surface the xcaddy plugin set on the synthesized
+                // proxy row so an operator can see what's compiled
+                // into the running caddy without docker-inspecting
+                // the image. Inlined into the existing single-line
+                // header (pane_layout reserves one row).
+                let plugins = if name == crate::proxy::PROXY_SERVICE_NAME {
+                    xcaddy_plugin_list(config)
+                } else {
+                    None
+                };
+                match plugins {
+                    Some(p) => format!(
+                        "yoink service · {name} · {} container(s) · plugins: {p} · ↑↓ select",
+                        self.rows.len()
+                    ),
+                    None => format!(
+                        "yoink service · {name} · {} container(s) · ↑↓ select · enter for logs",
+                        self.rows.len()
+                    ),
+                }
+            }
             None => "yoink service · (no service selected)".into(),
         };
         let header = Paragraph::new(header_text).style(bold());
@@ -461,6 +479,27 @@ impl ServiceDetailState {
     }
 }
 
+/// Comma-joined plugin list for the proxy detail header. `None` when
+/// `proxy.xcaddy:` isn't configured (so the operator's running stock
+/// caddy:2 / a `proxy.image:` BYO build, neither of which yoink can
+/// introspect for plugins). Sorted to match what xcaddy bakes in. The
+/// `github.com/` prefix is stripped from each entry — the host part is
+/// noise on the only-takes-one-row TUI header, and `caddyserver/x`
+/// vs `mholt/y` is what an operator actually wants to see.
+fn xcaddy_plugin_list(config: &Config) -> Option<String> {
+    let plugins = config.proxy.as_ref()?.xcaddy.as_ref()?.sorted_plugins();
+    if plugins.is_empty() {
+        return None;
+    }
+    Some(
+        plugins
+            .iter()
+            .map(|p| p.strip_prefix("github.com/").unwrap_or(p))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +518,40 @@ services:
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn xcaddy_plugin_list_none_when_no_proxy() {
+        assert!(xcaddy_plugin_list(&cfg()).is_none());
+    }
+
+    #[test]
+    fn xcaddy_plugin_list_sorted_csv_with_github_prefix_stripped() {
+        let cfg = Config::parse_str(
+            r#"
+hosts: [{ address: a, user: deploy }]
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/zeta/last
+      - github.com/alpha/first
+services:
+  - { name: api, image: img/api, tag: v1, domain: api.example.com, run: { port: 8080 } }
+"#,
+        )
+        .unwrap();
+        let listed = xcaddy_plugin_list(&cfg).expect("plugins listed");
+        assert!(
+            !listed.contains("github.com/"),
+            "github.com/ stripped: {listed}"
+        );
+        assert!(listed.contains("alpha/first"));
+        assert!(listed.contains("zeta/last"));
+        assert!(
+            listed.find("alpha/first").unwrap() < listed.find("zeta/last").unwrap(),
+            "sorted alphabetically: {listed}"
+        );
     }
 
     fn report() -> StatusReport {

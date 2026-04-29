@@ -19,6 +19,8 @@
 
 pub mod admin;
 pub mod caddy;
+pub mod plugins;
+pub mod xcaddy;
 
 use crate::config::{
     Config, ConfigError, ProxyConfig, ServiceConfig, ServiceKind, ServiceRun, TlsMode,
@@ -68,6 +70,73 @@ pub fn is_proxied(svc: &ServiceConfig) -> bool {
 pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
     if !proxy_enabled(cfg) {
         return Ok(());
+    }
+
+    if let Some(p) = cfg.proxy.as_ref() {
+        if let Some(extra) = p.config_extra.as_deref() {
+            let parsed = validate_json_shape(extra, "proxy.config_extra", JsonShape::ObjectOnly)?;
+            reject_reserved_config_extra_paths(&parsed)?;
+        }
+        // Parsed JSON for each handler-shaped field, kept so the
+        // missing-plugin warning pass below can walk them without a
+        // second parse round-trip.
+        let mut parsed_handler_snippets: Vec<(String, serde_json::Value)> = Vec::new();
+        for (i, raw) in p.global_handlers.iter().enumerate() {
+            let label = format!("proxy.global_handlers[{i}]");
+            let parsed = validate_json_shape(raw, &label, JsonShape::ObjectOrArray)?;
+            parsed_handler_snippets.push((label, parsed));
+        }
+        for (i, raw) in p.global_handlers_after.iter().enumerate() {
+            let label = format!("proxy.global_handlers_after[{i}]");
+            let parsed = validate_json_shape(raw, &label, JsonShape::ObjectOrArray)?;
+            parsed_handler_snippets.push((label, parsed));
+        }
+        // Per-service `caddy_extra_json:` is parsed lazily by the
+        // renderer; for the missing-plugin check we parse here too.
+        // Errors at this layer are best-effort (the renderer surfaces
+        // shape errors with full context); skip silently on parse fail.
+        for svc in &cfg.services {
+            if let Some(extra) = svc.caddy_extra_json.as_deref()
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(extra)
+            {
+                let label = format!("service {:?}: caddy_extra_json", svc.name);
+                parsed_handler_snippets.push((label, parsed));
+            }
+        }
+        if let Some(x) = &p.xcaddy {
+            for warning in unpinned_plugin_warnings(&x.plugins) {
+                tracing::warn!(target: "yoink::proxy::xcaddy", "{warning}");
+            }
+            if p.image.is_some() {
+                return Err(ConfigError::Invalid(
+                    "proxy.image and proxy.xcaddy are mutually exclusive — `image:` is the \
+                     bring-your-own-image escape hatch; `xcaddy:` is the managed-build path. \
+                     Pick one."
+                        .to_string(),
+                ));
+            }
+            if x.plugins.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "proxy.xcaddy.plugins is empty — set at least one plugin or remove the \
+                     `xcaddy:` block to use vanilla `caddy:2`"
+                        .to_string(),
+                ));
+            }
+            for plugin in &x.plugins {
+                if !is_plausible_go_module(plugin) {
+                    return Err(ConfigError::Invalid(format!(
+                        "proxy.xcaddy.plugins entry {plugin:?} doesn't look like a Go module \
+                         path (expected `<host>/<owner>/<repo>` or \
+                         `<host>/<owner>/<repo>@<version>`)"
+                    )));
+                }
+            }
+            for (label, snippet) in &parsed_handler_snippets {
+                for warning in plugins::missing_plugin_warnings(snippet, &x.plugins, label) {
+                    tracing::warn!(target: "yoink::proxy::xcaddy", "{warning}");
+                }
+            }
+        }
     }
 
     let proxy_has_inline_cert = cfg.proxy.as_ref().and_then(|p| p.tls.as_ref()).is_some();
@@ -318,6 +387,143 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
     }
 }
 
+/// JSON shapes accepted by `validate_json_shape`.
+enum JsonShape {
+    /// Top-level Caddy config block (`apps`, `storage`, `admin`, ...).
+    ObjectOnly,
+    /// A single handler / route, OR a list of either.
+    ObjectOrArray,
+}
+
+/// Verify a raw-JSON config value parses and matches the expected
+/// top-level shape. Used by both `proxy.config_extra` and
+/// `proxy.global_handlers[i]` validation; `label` becomes the
+/// human-readable prefix in error messages.
+fn validate_json_shape(
+    raw: &str,
+    label: &str,
+    shape: JsonShape,
+) -> Result<serde_json::Value, ConfigError> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| ConfigError::Invalid(format!("{label} is not valid JSON: {e}")))?;
+    let ok = match shape {
+        JsonShape::ObjectOnly => matches!(value, serde_json::Value::Object(_)),
+        JsonShape::ObjectOrArray => matches!(
+            value,
+            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+        ),
+    };
+    if ok {
+        return Ok(value);
+    }
+    Err(ConfigError::Invalid(match shape {
+        JsonShape::ObjectOnly => format!(
+            "{label} must be a JSON object (top-level Caddy config keys like \
+             `apps`, `storage`, `admin`)"
+        ),
+        JsonShape::ObjectOrArray => {
+            format!("{label} must be a JSON object (handler) or array of handlers/routes")
+        }
+    }))
+}
+
+/// Top-level Caddy config keys that yoink renders itself and that
+/// would silently disappear if a user wrote them into `proxy.config_extra:`.
+/// `deep_merge` replaces arrays wholesale (Caddy config doesn't have a
+/// concept of array merging), so a top-level write to either of these
+/// paths would clobber yoink's output. The two routes-shaped slots are
+/// the dangerous ones — `routes` would wipe every service yoink rendered,
+/// and `tls_connection_policies` would silently disable mTLS configured
+/// via `proxy.tls.client_auth:` (a security regression). Other routes-
+/// shaped paths inside the rendered config (e.g. `apps.tls.automation.policies`)
+/// are also yoink-managed but the realistic operator footguns are these two.
+const RESERVED_CONFIG_EXTRA_PATHS: &[(&[&str], &str)] = &[
+    (
+        &["apps", "http", "servers", "main", "routes"],
+        "set this via `proxy.global_handlers:` / `caddy_extra_json:` instead",
+    ),
+    (
+        &["apps", "http", "servers", "main", "tls_connection_policies"],
+        "set this via `proxy.tls.client_auth:` instead",
+    ),
+];
+
+/// Walk `parsed` for any of the reserved nested-object paths and reject
+/// the config if the user wrote there. The paths describe descents
+/// through nested objects, so `apps.http.servers.main.routes` matches a
+/// `parsed` that has an `apps` object containing `http` containing
+/// `servers` containing `main` with a key `routes` (any value type).
+fn reject_reserved_config_extra_paths(parsed: &serde_json::Value) -> Result<(), ConfigError> {
+    for (path, hint) in RESERVED_CONFIG_EXTRA_PATHS {
+        if walks_to(parsed, path) {
+            return Err(ConfigError::Invalid(format!(
+                "proxy.config_extra: writes to `{}` are reserved for yoink — {hint}",
+                path.join(".")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `true` when `value` has an object descent matching every segment of
+/// `path` — i.e. the user supplied a value at that path. Stops as soon
+/// as a non-object is found; so a partial overlap (e.g. extras only
+/// reach `apps.http.servers.main` without setting `routes` underneath)
+/// is fine.
+fn walks_to(value: &serde_json::Value, path: &[&str]) -> bool {
+    let mut cursor = value;
+    for segment in path {
+        match cursor.get(*segment) {
+            Some(next) => cursor = next,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// One warning line per `xcaddy.plugins` entry that lacks an `@version`
+/// pin. Without the pin, `xcaddy build` resolves whatever Go's module
+/// proxy decides on the day of the build, so two hosts that compile at
+/// different times can produce semantically different binaries with
+/// the same `yoink-caddy:<hash>` tag (the hash captures the *string*,
+/// not the resolved module version). Pure for unit-testability; the
+/// caller wraps each line in `tracing::warn!`.
+fn unpinned_plugin_warnings(plugins: &[String]) -> Vec<String> {
+    plugins
+        .iter()
+        .filter(|p| !p.contains('@'))
+        .map(|p| {
+            format!(
+                "proxy.xcaddy.plugins entry {p:?} has no `@<version>` pin — \
+                 the resolved module version will drift across builds. Pin \
+                 e.g. {p}@v1.2.3 for reproducible images."
+            )
+        })
+        .collect()
+}
+
+/// Cheap shape-check for an xcaddy plugin entry. Accepts
+/// `<host>/<owner>/<repo>(/<sub>)*` optionally followed by `@<version>`.
+/// We don't try to parse Go module semantics here — xcaddy itself will
+/// reject anything truly malformed at build time. The goal is to catch
+/// obvious typos at config-load.
+fn is_plausible_go_module(s: &str) -> bool {
+    let module_part = s.split_once('@').map_or(s, |(m, _)| m);
+    if module_part.is_empty() || module_part.starts_with('/') || module_part.ends_with('/') {
+        return false;
+    }
+    let segments: Vec<&str> = module_part.split('/').collect();
+    if segments.len() < 3 {
+        return false;
+    }
+    if !segments[0].contains('.') {
+        return false;
+    }
+    segments
+        .iter()
+        .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_graphic() && c != '@'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +617,190 @@ services:
             config_with_one_service(Some(DomainSpec::Single("api.example.com".into())), None);
         let err = inject_implicit_proxy(&mut cfg).unwrap_err();
         assert!(format!("{err}").contains("run.port"), "got: {err}");
+    }
+
+    #[test]
+    fn xcaddy_and_image_mutually_exclusive() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            image: Some("ghcr.io/me/caddy:custom".into()),
+            xcaddy: Some(crate::config::XcaddyConfig {
+                plugins: vec!["github.com/caddy-dns/cloudflare".into()],
+                caddy_version: None,
+                base_image: None,
+                builder_image: None,
+                env: std::collections::BTreeMap::new(),
+                replace: Vec::new(),
+            }),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(
+            format!("{err}").contains("mutually exclusive"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn xcaddy_empty_plugins_rejected() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            xcaddy: Some(crate::config::XcaddyConfig {
+                plugins: vec![],
+                caddy_version: None,
+                base_image: None,
+                builder_image: None,
+                env: std::collections::BTreeMap::new(),
+                replace: Vec::new(),
+            }),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(format!("{err}").contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn config_extra_rejects_routes_clobber() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            config_extra: Some(r#"{"apps":{"http":{"servers":{"main":{"routes":[]}}}}}"#.into()),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("apps.http.servers.main.routes"), "got: {msg}");
+        assert!(msg.contains("proxy.global_handlers"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_extra_rejects_tls_connection_policies_clobber() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            config_extra: Some(
+                r#"{"apps":{"http":{"servers":{"main":{"tls_connection_policies":[]}}}}}"#.into(),
+            ),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("tls_connection_policies"), "got: {msg}");
+        assert!(msg.contains("proxy.tls.client_auth"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_extra_allows_legitimate_paths_under_main() {
+        // Setting trusted_proxies on `main` is exactly the supported path.
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            config_extra: Some(
+                r#"{"apps":{"http":{"servers":{"main":{"trusted_proxies":{"source":"cloudflare"}}}}}}"#
+                    .into(),
+            ),
+            ..ProxyConfig::default()
+        });
+        inject_implicit_proxy(&mut cfg).expect("legitimate config_extra should pass");
+    }
+
+    #[test]
+    fn config_extra_must_be_a_json_object() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            config_extra: Some("[1, 2, 3]".into()),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(
+            format!("{err}").contains("must be a JSON object"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn global_handlers_must_be_json() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            global_handlers: vec!["{not json".into()],
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(
+            format!("{err}").contains("proxy.global_handlers[0] is not valid JSON"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn config_extra_must_be_valid_json() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            config_extra: Some("{not json".into()),
+            ..ProxyConfig::default()
+        });
+        let err = inject_implicit_proxy(&mut cfg).unwrap_err();
+        assert!(format!("{err}").contains("not valid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn unpinned_plugin_warnings_flags_unpinned_only() {
+        let plugins = vec![
+            "github.com/foo/bar".to_string(),
+            "github.com/baz/quux@v0.1.0".to_string(),
+            "github.com/zip/zap".to_string(),
+        ];
+        let warnings = unpinned_plugin_warnings(&plugins);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("github.com/foo/bar"));
+        assert!(warnings[1].contains("github.com/zip/zap"));
+        assert!(!warnings.iter().any(|w| w.contains("github.com/baz/quux")));
+    }
+
+    #[test]
+    fn unpinned_plugin_warnings_empty_when_all_pinned() {
+        let plugins = vec!["github.com/foo/bar@v1.0.0".to_string()];
+        assert!(unpinned_plugin_warnings(&plugins).is_empty());
+    }
+
+    #[test]
+    fn xcaddy_plugin_shape_validation() {
+        assert!(is_plausible_go_module("github.com/caddy-dns/cloudflare"));
+        assert!(is_plausible_go_module("github.com/foo/bar@v1.2.3"));
+        assert!(is_plausible_go_module("git.example.org/owner/repo/sub"));
+        assert!(!is_plausible_go_module("not-a-module"));
+        assert!(!is_plausible_go_module("github.com/foo"));
+        assert!(!is_plausible_go_module("/leading/slash/repo"));
+        assert!(!is_plausible_go_module("nopath/in/firstseg"));
     }
 
     #[test]

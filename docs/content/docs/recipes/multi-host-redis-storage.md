@@ -9,10 +9,17 @@ If you're using Cloudflare's edge, the simpler answer is [Origin Certificates](/
 
 ## Architecture
 
-```
-host-1 ──┐
-host-2 ──┤── all reach ──→ redis:6379 (on tailnet) ──→ shared ACME state
-host-3 ──┘
+```mermaid
+flowchart LR
+    H1["host-1"]
+    H2["host-2"]
+    H3["host-3"]
+    Redis[("redis:6379<br/>on tailnet")]
+    Acme[/"shared ACME state"/]
+    H1 --> Redis
+    H2 --> Redis
+    H3 --> Redis
+    Redis --> Acme
 ```
 
 - A **single Redis** instance, deployed by yoink onto one canonical host.
@@ -21,28 +28,21 @@ host-3 ──┘
 
 The single Redis is a small SPOF, but a tractable one (it's only used for cert issuance/renewal, not request-path traffic). Backups via tailnet-replicated snapshots if you need it.
 
-## Build a custom Caddy image with the storage plugin
+## Bake the plugin into caddy
 
-`caddy-storage-redis` isn't in the base `caddy:2` image. Build one with [`xcaddy`](https://github.com/caddyserver/xcaddy):
+`caddy-storage-redis` isn't in the base `caddy:2` image. The plugin part is straightforward — `proxy.xcaddy:` does the build on every proxy host:
 
-```dockerfile
-# Dockerfile.caddy-redis
-FROM caddy:2-builder AS builder
-RUN xcaddy build \
-    --with github.com/pberkel/caddy-storage-redis
-
-FROM caddy:2
-COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/pberkel/caddy-storage-redis
 ```
 
-```sh
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -f Dockerfile.caddy-redis \
-  -t ghcr.io/me/caddy-redis:2.7 \
-  --push .
-```
+That gets the storage *module* compiled into the caddy binary on each host. Wiring caddy to actually *use* Redis as its storage backend takes one more step — see the [Wire caddy's storage backend](#wire-caddys-storage-backend) section below.
 
-(Or use `yoink build` against a service that wraps this Dockerfile, then `proxy.image:` it.)
+See [Caddy plugins (xcaddy, no registry)](/docs/recipes/caddy-plugins) for the full xcaddy story (build cost, idempotency, debugging).
 
 ## Run Redis as a yoink service
 
@@ -72,37 +72,28 @@ services:
 
 The published port on Tailscale's IP makes Redis reachable from `prod-2` and `prod-3` over the tailnet, but **not** from the public internet (Hetzner / your hosting provider's external interface).
 
-## Point Caddy at Redis
+## Wire caddy's storage backend
 
-Use the custom image, and add the storage block via `caddy_extra_json:` at the proxy level — wait, this doesn't exist as a field yet. For v1, the cleanest path is to bake the storage config into a custom `Caddyfile` baked into the image, OR use a small `proxy.config_extra:` field if/when that lands.
+`proxy.xcaddy:` compiles the plugin in. `proxy.config_extra:` hands caddy the top-level `storage` block that tells it to *use* Redis instead of the local `/data` volume:
 
-For v1 today, the practical path: build the xcaddy image with the storage config baked in via a custom entrypoint that writes the storage block before `caddy run`. Example wrapper:
-
-```dockerfile
-FROM caddy:2-builder AS builder
-RUN xcaddy build --with github.com/pberkel/caddy-storage-redis
-
-FROM caddy:2
-COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-COPY caddy-bootstrap.json /etc/caddy/bootstrap.json
-ENTRYPOINT ["caddy", "run", "--resume", "--config", "/etc/caddy/bootstrap.json"]
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/pberkel/caddy-storage-redis
+  config_extra: |
+    {
+      "storage": {
+        "module": "redis",
+        "address": "redis:6379"
+      }
+    }
 ```
 
-`caddy-bootstrap.json`:
+Yoink deep-merges that JSON into the rendered Caddy config before `/load`-ing it. The `storage` block sits at the top level alongside `admin` and `apps`, which is exactly where Caddy expects it. See the [`config_extra:` reference](/docs/guide/proxy#proxyconfig_extra-block--global-caddy-config-escape-hatch) for merge semantics.
 
-```json
-{
-  "storage": {
-    "module": "redis",
-    "address": "redis:6379"
-  },
-  "admin": {"listen": ":2019"}
-}
-```
-
-Caddy's `--resume` flag loads this bootstrap config first; yoink's `/load` then merges in the rendered routing config on top. Storage stays Redis-backed.
-
-A future yoink release will likely add `proxy.storage:` as a typed field; until then, the bootstrap-image trick is the working path.
+Every proxy host now reads ACME state from the shared Redis instead of its local `/data` volume. The `yoink_caddy_data` named volume becomes empty — but you can leave it; it does no harm.
 
 ## Tailscale on every host
 

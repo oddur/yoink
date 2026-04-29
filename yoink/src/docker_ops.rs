@@ -90,6 +90,13 @@ impl Host {
     }
 }
 
+/// Hard cap on a single `build_image` call's wall-clock. Generous: an
+/// xcaddy compile against a slow link with cold caches is rarely above
+/// 5 min, so 15 covers the worst case while keeping CI runners from
+/// sitting on a hung daemon for hours. Configurable later if anyone
+/// actually hits it; a `pub const` keeps the value findable.
+pub const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
+
 impl From<&YoinkHost> for Host {
     fn from(h: &YoinkHost) -> Self {
         Self {
@@ -602,6 +609,21 @@ pub trait DockerOps: Send + Sync {
     /// docker daemon doesn't silently elide pulls.
     async fn image_present(&self, host: &Host, image: &str, tag: &str)
     -> Result<bool, DockerError>;
+
+    /// Build an image on `host` from an in-memory tar context (a
+    /// Dockerfile + any files it `COPY`s). Tag is what the resulting
+    /// image is reachable as locally — e.g. `yoink-caddy:abc123`. The
+    /// underlying call is bollard `POST /build` over the same
+    /// SSH-tunnelled connection used by `pull_image`. Default impl
+    /// errors so test fakes that don't need it stay terse.
+    async fn build_image(
+        &self,
+        _host: &Host,
+        _tag: &str,
+        _context_tar: bytes::Bytes,
+    ) -> Result<(), DockerError> {
+        Err(DockerError::Invalid("build_image not supported".into()))
+    }
 
     async fn list_containers_by_label(
         &self,
@@ -1307,6 +1329,61 @@ impl DockerOps for RealDockerOps {
             item.map_err(|s| Self::err(host, s))?;
         }
         Ok(())
+    }
+
+    async fn build_image(
+        &self,
+        host: &Host,
+        tag: &str,
+        context_tar: bytes::Bytes,
+    ) -> Result<(), DockerError> {
+        use bollard::query_parameters::BuildImageOptionsBuilder;
+        let docker = self.client_for(host).await?;
+        let opts = BuildImageOptionsBuilder::default()
+            .dockerfile("Dockerfile")
+            .t(tag)
+            .rm(true)
+            .build();
+        let mut stream = docker.build_image(opts, None, Some(bollard::body_full(context_tar)));
+        // xcaddy compiles emit hundreds of progress lines — log at DEBUG
+        // so `--verbose` (INFO) stays focused on deploy milestones.
+        // bollard maps daemon `errorDetail` chunks to stream errors, so
+        // most failures arrive as `Err(_)` from `next()`; the explicit
+        // `error_detail` branch catches the rare detail-only case.
+        // The whole drain is wrapped in a 15-min timeout: a network
+        // stall during `go mod download` would otherwise sit forever
+        // (the deploy lock heartbeat keeps the lock alive but neither
+        // operator-side Ctrl-C nor a CI-runner hard timeout is a great
+        // failure mode).
+        let drain = async {
+            while let Some(item) = stream.next().await {
+                let info = item.map_err(|s| Self::err(host, s))?;
+                if let Some(line) = info.stream.as_ref().filter(|s| !s.trim().is_empty()) {
+                    tracing::debug!(host = %host.address, %tag, build = %line.trim_end(), "build");
+                }
+                if let Some(detail) = info.error_detail.as_ref() {
+                    let msg = detail
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "build failed".into());
+                    return Err(DockerError::Invalid(format!(
+                        "build_image {tag} on {}: {msg}",
+                        host.address
+                    )));
+                }
+            }
+            Ok(())
+        };
+        match tokio::time::timeout(BUILD_TIMEOUT, drain).await {
+            Ok(result) => result,
+            Err(_) => Err(DockerError::Invalid(format!(
+                "build_image {tag} on {}: timed out after {}s — \
+                 network stall during `go mod download`? \
+                 (configurable later if anyone needs longer)",
+                host.address,
+                BUILD_TIMEOUT.as_secs(),
+            ))),
+        }
     }
 
     async fn list_containers_by_label(
@@ -2309,6 +2386,11 @@ struct FakeState {
     ensure_network: VecDeque<Result<bool, DockerError>>,
     pull_image: VecDeque<Result<(), DockerError>>,
     load_image: VecDeque<Result<(), DockerError>>,
+    build_image: VecDeque<Result<(), DockerError>>,
+    /// `image:tag` → presence flag. Defaults `false` so existing tests
+    /// (which expect pulls to actually fire) keep working. After a
+    /// successful `build_image` the entry is upserted to `true`.
+    images_present: HashMap<String, bool>,
     list_containers: VecDeque<Result<Vec<ContainerInfo>, DockerError>>,
     create_container: VecDeque<Result<String, DockerError>>,
     start_container: VecDeque<Result<(), DockerError>>,
@@ -2332,6 +2414,7 @@ pub enum RecordedCall {
     EnsureNetwork(Host, String),
     PullImage(Host, String, String),
     LoadImage(Host),
+    BuildImage(Host, String, usize),
     ListContainersByLabel(Host, String),
     ListRunningContainers(Host),
     CreateContainer(Host, String),
@@ -2371,6 +2454,15 @@ impl FakeDockerOps {
     }
     pub fn push_pull_image(&self, v: Result<(), DockerError>) {
         self.lock().pull_image.push_back(v);
+    }
+    pub fn push_build_image(&self, v: Result<(), DockerError>) {
+        self.lock().build_image.push_back(v);
+    }
+    /// Mark `image:tag` as already present so `image_present` returns
+    /// `true` and the caller skips its pull/build.
+    pub fn mark_image_present(&self, image: &str, tag: &str) {
+        let key = crate::docker::image_reference(image, tag);
+        self.lock().images_present.insert(key, true);
     }
     pub fn push_list_containers(&self, v: Result<Vec<ContainerInfo>, DockerError>) {
         self.lock().list_containers.push_back(v);
@@ -2491,17 +2583,36 @@ impl DockerOps for FakeDockerOps {
     async fn image_present(
         &self,
         _host: &Host,
-        _image: &str,
-        _tag: &str,
+        image: &str,
+        tag: &str,
     ) -> Result<bool, DockerError> {
-        // Tests want pulls to actually fire by default; presence-check
-        // returning false keeps existing test expectations intact.
-        Ok(false)
+        let key = crate::docker::image_reference(image, tag);
+        Ok(*self.lock().images_present.get(&key).unwrap_or(&false))
     }
     async fn load_image(&self, host: &Host, _body: ImageTarStream) -> Result<(), DockerError> {
         let mut s = self.lock();
         s.calls.push(RecordedCall::LoadImage(host.clone()));
         pop(&mut s.load_image, "load_image")
+    }
+    async fn build_image(
+        &self,
+        host: &Host,
+        tag: &str,
+        context_tar: bytes::Bytes,
+    ) -> Result<(), DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::BuildImage(
+            host.clone(),
+            tag.into(),
+            context_tar.len(),
+        ));
+        let result = pop(&mut s.build_image, "build_image");
+        if result.is_ok() {
+            // Successful build leaves the image present for subsequent
+            // `image_present` checks — mirrors real docker behavior.
+            s.images_present.insert(tag.into(), true);
+        }
+        result
     }
     async fn list_containers_by_label(
         &self,
