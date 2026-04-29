@@ -86,7 +86,7 @@ secrets:
   command: ["doppler", "secrets", "download", "--no-file", "--format", "env"]
 ```
 
-See the [external-secrets recipe](/docs/guide/secrets) for per-tool wiring.
+See the [secrets guide](/docs/guide/secrets) for per-tool wiring.
 
 ## Registry
 

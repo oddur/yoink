@@ -45,5 +45,5 @@ run:
 This shape works fine forever for hobby / utility / internal-tool deployments. You'd outgrow it when:
 
 - **You need replicas** — a single container's downtime during the swap is your downtime. Add `replicas: 2` (yoink does a rolling swap, capacity stays N-1).
-- **You need multiple hosts** — yoink ships the build artifact from your local daemon to every host on every deploy. Once that's painful, set up a [self-hosted tailnet registry](/docs/recipes/self-hosted-registry) so the hosts pull from a shared cache instead.
+- **You need multiple hosts** — yoink ships the build artifact from your local daemon to every host on every deploy. Once that's painful, set up a [self-hosted tailnet registry](/docs/how-to/self-hosted-registry) so the hosts pull from a shared cache instead.
 - **You need deploys triggered from CI** — keep the `build:` block + add a real registry, switch to `yoink build --push` + `yoink up`.

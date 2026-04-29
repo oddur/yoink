@@ -263,8 +263,8 @@ The TUI's `↦` marker shows which replica row was selected when you pressed `f`
 
 - [Security](/docs/guide/security) — why `publish:` should be the exception, not the rule.
 - [Reverse proxy](/docs/guide/proxy) — HTTPS / hostname routing for services with `domain:`.
-- [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage) — proxy-side coordination when more than one host fronts the same domain.
-- [Run staging alongside prod](/docs/recipes/staging-alongside-prod) — same primitives, separate `yoink.yaml` per environment.
-- [TanStack Start + postgres](/docs/recipes/tanstack-stack) — end-to-end recipe that uses `yoink pf` to verify the deploy.
+- [Multi-host Let's Encrypt with Redis](/docs/how-to/multi-host-redis-storage) — proxy-side coordination when more than one host fronts the same domain.
+- [Run staging alongside prod](/docs/how-to/staging-alongside-prod) — same primitives, separate `yoink.yaml` per environment.
+- [TanStack Start + postgres](/docs/how-to/tanstack-stack) — end-to-end recipe that uses `yoink pf` to verify the deploy.
 - [CLI reference: pf](/docs/reference/cli) — full flag surface.
 - [Configuration reference](/docs/reference/config) — full `hosts:` / `replicas:` / `pin:` schema.

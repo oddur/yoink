@@ -151,7 +151,7 @@ Yoink deep-merges this into the rendered Caddy config; the `apps.cache` block la
 
 ### Multi-host LE certs (`caddy-storage-redis`)
 
-Share ACME state via Redis so multiple proxies don't each hit Let's Encrypt's rate limits. See [Multi-host Let's Encrypt with Redis storage](/docs/recipes/multi-host-redis-storage) — same `proxy.xcaddy:` mechanism, plus a Redis service definition.
+Share ACME state via Redis so multiple proxies don't each hit Let's Encrypt's rate limits. See [Multi-host Let's Encrypt with Redis storage](/docs/how-to/multi-host-redis-storage) — same `proxy.xcaddy:` mechanism, plus a Redis service definition.
 
 ### Layer-4 (TCP/UDP) routing
 
@@ -195,8 +195,8 @@ A non-exhaustive map of caddy plugins worth knowing about — yoink doesn't mode
 - **[`corazawaf/coraza-caddy`](https://github.com/corazawaf/coraza-caddy)** — ModSecurity-compatible Web Application Firewall. OWASP Core Rule Set out of the box, request inspection, virtual-patching for known CVEs. Most useful behind a non-WAF CDN, or as defence-in-depth even if you have one. Heavy compared to the rest of this list; benchmark before turning it on for hot endpoints.
 - **[`hslatman/caddy-crowdsec-bouncer`](https://github.com/hslatman/caddy-crowdsec-bouncer)** — Enforces [CrowdSec](https://www.crowdsec.net/) community-IP blocklists at the proxy. Cheap/free DDoS-bot and credential-stuffing mitigation when you're not behind a managed edge. Needs a CrowdSec local API instance reachable from the proxy (run it as another yoink service).
 - **[`caddy-dns/*`](https://github.com/caddy-dns)** — DNS-01 ACME challenge providers (cloudflare, route53, digitalocean, hetzner, dozens more). Required for wildcard certs. See the worked recipe above.
-- **[`pberkel/caddy-storage-redis`](https://github.com/pberkel/caddy-storage-redis)** — Shared ACME storage backend for multi-host fleets. See the [redis-storage recipe](/docs/recipes/multi-host-redis-storage).
-- **[`WeidiDeng/caddy-cloudflare-ip`](https://github.com/WeidiDeng/caddy-cloudflare-ip)** — Auto-refreshing Cloudflare IP-range trust source. Drop in when running behind Cloudflare so the real client IP propagates correctly to logs, geo-IP, and IP-aware rate limits — pairs with `trusted_proxies` in `proxy.config_extra:`. See the [Origin Certs recipe](/docs/recipes/cloudflare-origin-certs#real-client-ip-from-cf-connecting-ip).
+- **[`pberkel/caddy-storage-redis`](https://github.com/pberkel/caddy-storage-redis)** — Shared ACME storage backend for multi-host fleets. See the [redis-storage recipe](/docs/how-to/multi-host-redis-storage).
+- **[`WeidiDeng/caddy-cloudflare-ip`](https://github.com/WeidiDeng/caddy-cloudflare-ip)** — Auto-refreshing Cloudflare IP-range trust source. Drop in when running behind Cloudflare so the real client IP propagates correctly to logs, geo-IP, and IP-aware rate limits — pairs with `trusted_proxies` in `proxy.config_extra:`. See the [Origin Certs recipe](/docs/how-to/cloudflare-origin-certs#real-client-ip-from-cf-connecting-ip).
 
 For the broader ecosystem, [caddy's own module index](https://caddyserver.com/download) lets you browse every published module.
 
@@ -310,7 +310,7 @@ xcaddy errors are surfaced verbatim through the deploy error chain. Common shape
 
 - [Reverse proxy guide](/docs/guide/proxy) — full schema reference for the routing primitives yoink models, including the `proxy.xcaddy:` field table.
 - [Caddy snippets cookbook](/docs/guide/proxy#snippets-cookbook) — JSON shapes for `caddy_extra_json:` (the path you need when your snippet uses plugin directives).
-- [Defense-in-depth web serving](/docs/recipes/defense-in-depth) — composing the security plugins above into a Cloudflare + CrowdSec + Coraza stack.
-- [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage) — the canonical "I need a plugin" worked example.
+- [Defense-in-depth web serving](/docs/how-to/defense-in-depth) — composing the security plugins above into a Cloudflare + CrowdSec + Coraza stack.
+- [Multi-host Let's Encrypt with Redis](/docs/how-to/multi-host-redis-storage) — the canonical "I need a plugin" worked example.
 - [xcaddy on GitHub](https://github.com/caddyserver/xcaddy) — upstream tool docs.
 - [caddy-dns providers](https://github.com/caddy-dns) — directory of DNS-provider plugins for DNS-01 / wildcard certs.

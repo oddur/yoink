@@ -30,11 +30,11 @@ Point `api.example.com` DNS at `1.2.3.4`. Run `yoink up`. Done — `https://api.
 That's the floor. The rest of this page is reference + advanced patterns.
 
 {{< callout type="info" >}}
-**Recipes for advanced setups** are split into focused pages:
+**Walkthroughs for advanced setups** are split into focused how-to pages:
 
-- [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs) — skip Let's Encrypt with a 15-year cert + origin-pull mTLS that locks your origin to Cloudflare's edge.
-- [gRPC hosting](/docs/recipes/grpc-hosting) — `upstream_h2c: true` for native gRPC backends (Tonic, grpc-go, grpc-java).
-- [Multi-host Let's Encrypt with Redis storage](/docs/recipes/multi-host-redis-storage) — share ACME state across hosts to avoid rate limits.
+- [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs) — skip Let's Encrypt with a 15-year cert + origin-pull mTLS that locks your origin to Cloudflare's edge.
+- [gRPC hosting](/docs/how-to/grpc-hosting) — `upstream_h2c: true` for native gRPC backends (Tonic, grpc-go, grpc-java).
+- [Multi-host Let's Encrypt with Redis storage](/docs/how-to/multi-host-redis-storage) — share ACME state across hosts to avoid rate limits.
 {{< /callout >}}
 
 ## How it works
@@ -130,7 +130,7 @@ Merge semantics:
 - User wins on every leaf conflict: setting `admin.listen` to your own value overrides yoink's default `0.0.0.0:2019`. Yoink trusts you.
 - **Two paths are reserved for yoink:** `apps.http.servers.main.routes` (writing here would wipe every per-service route yoink rendered) and `apps.http.servers.main.tls_connection_policies` (writing here would silently disable mTLS configured via `proxy.tls.client_auth:` — a security regression). Both fail at config-load with a denylist error pointing at the typed field that owns each path.
 
-Use it for plugin-specific top-level config too — for example, `caddy-storage-redis` for shared ACME state across a fleet ([recipe](../recipes/multi-host-redis-storage)), `caddyserver/cache-handler` advanced backends, `coraza` global directives, `crowdsec` agent connection settings.
+Use it for plugin-specific top-level config too — for example, `caddy-storage-redis` for shared ACME state across a fleet ([how-to](../how-to/multi-host-redis-storage)), `caddyserver/cache-handler` advanced backends, `coraza` global directives, `crowdsec` agent connection settings.
 
 ### `proxy.global_handlers:` block — proxy-wide middleware chain
 
@@ -170,7 +170,7 @@ Each entry is a JSON snippet: a single handler object (`{"handler": "x", ...}`),
 
 ### `proxy.xcaddy:` block — caddy plugins without a registry
 
-> Task-oriented walkthrough with debugging tips, common-plugin recipes, and operational notes lives at [Caddy plugins (xcaddy, no registry)](/docs/recipes/caddy-plugins). What follows is the schema reference.
+> Task-oriented walkthrough with debugging tips, common-plugin recipes, and operational notes lives at [Caddy plugins (xcaddy, no registry)](/docs/how-to/caddy-plugins). What follows is the schema reference.
 
 Want rate-limit, redis-storage, the L4 module, or a non-bundled DNS provider? Just list them and yoink builds caddy on each host the proxy runs on:
 
@@ -479,7 +479,7 @@ services:
 
 #### Multi-host LE certs (`caddy-storage-redis`)
 
-See the [Multi-host Redis storage recipe](/docs/recipes/multi-host-redis-storage) — same `proxy.xcaddy:` story, different plugin.
+See the [Multi-host Redis storage recipe](/docs/how-to/multi-host-redis-storage) — same `proxy.xcaddy:` story, different plugin.
 
 ## What yoink doesn't model
 
@@ -487,7 +487,7 @@ Auth, rate limiting, headers, CORS, redirects, mTLS, geo-blocking, WAF, L4/TCP r
 
 ## See also
 
-- [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs) — skip Let's Encrypt entirely with a 15-year cert from Cloudflare, sealed in the repo.
-- [Multi-host LE with Redis storage](/docs/recipes/multi-host-redis-storage) — share ACME state across hosts so they don't all hit Let's Encrypt rate limits.
+- [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs) — skip Let's Encrypt entirely with a 15-year cert from Cloudflare, sealed in the repo.
+- [Multi-host LE with Redis storage](/docs/how-to/multi-host-redis-storage) — share ACME state across hosts so they don't all hit Let's Encrypt rate limits.
 - [Caddy JSON config reference](https://caddyserver.com/docs/json/) — for `caddy_extra_json:` snippets.
 - [Caddyfile docs](https://caddyserver.com/docs/caddyfile) — for `caddy_extra_caddyfile:` syntax.

@@ -24,7 +24,7 @@ flowchart LR
 
 What each layer brings:
 
-- **Cloudflare Free + Origin Certs** — DDoS absorption, implicit IP-reputation filtering across millions of zones, Bot Fight Mode, and the Cloudflare Free Managed Ruleset (curated subset focused on high-profile/emergency CVEs like Log4j and Shellshock). Pair with a Cloudflare Origin Certificate and `client_auth: require_and_verify` to lock your origin so it only TLS-terminates for connections presenting a Cloudflare-signed client cert — leaked origin IPs become useless. See the [Origin Certs recipe](/docs/recipes/cloudflare-origin-certs) for the dashboard step. Limits: 1 MB request-body inspection cap; broader managed rules and OWASP CRS at the edge are Pro+.
+- **Cloudflare Free + Origin Certs** — DDoS absorption, implicit IP-reputation filtering across millions of zones, Bot Fight Mode, and the Cloudflare Free Managed Ruleset (curated subset focused on high-profile/emergency CVEs like Log4j and Shellshock). Pair with a Cloudflare Origin Certificate and `client_auth: require_and_verify` to lock your origin so it only TLS-terminates for connections presenting a Cloudflare-signed client cert — leaked origin IPs become useless. See the [Origin Certs recipe](/docs/how-to/cloudflare-origin-certs) for the dashboard step. Limits: 1 MB request-body inspection cap; broader managed rules and OWASP CRS at the edge are Pro+.
 - **CrowdSec + caddy-crowdsec-bouncer** — log-based behavioural detection. The CrowdSec agent reads your Caddy/app logs for failed logins, 404 scanning, brute force, path traversal probes, and emits decisions specific to *your* traffic. The bouncer enforces them at the proxy, microseconds per request. Plus a crowdsourced blocklist from the global CrowdSec community.
 - **Coraza** — drop-in ModSecurity replacement with the full OWASP Core Rule Set (PL1–PL4). Signature-based payload inspection — scans request bodies, headers, and URLs against thousands of CVE/exploit patterns. Complements CrowdSec (CrowdSec catches *who*, Coraza catches *what*).
 
@@ -138,8 +138,8 @@ Plugin-specific operations — CRS paranoia levels, false-positive tuning, Crowd
 
 ## See also
 
-- [Caddy plugins (xcaddy, no registry)](/docs/recipes/caddy-plugins) — the building block. Each plugin in this recipe is one line of `proxy.xcaddy.plugins:`.
-- [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs) — the mTLS origin-pull setup the `proxy.tls:` block above relies on.
+- [Caddy plugins (xcaddy, no registry)](/docs/how-to/caddy-plugins) — the building block. Each plugin in this recipe is one line of `proxy.xcaddy.plugins:`.
+- [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs) — the mTLS origin-pull setup the `proxy.tls:` block above relies on.
 - [Reverse proxy guide § `proxy.config_extra:`](/docs/guide/proxy#proxyconfig_extra-block--global-caddy-config-escape-hatch) and [§ `proxy.global_handlers:`](/docs/guide/proxy#proxyglobal_handlers-block--proxy-wide-middleware-chain) — schema reference for the proxy-wide config and middleware chain used here.
 - [CrowdSec docs](https://docs.crowdsec.net/) and [`caddy-crowdsec-bouncer`](https://github.com/hslatman/caddy-crowdsec-bouncer) — agent setup, scenarios, hub, bouncer config.
 - [Coraza docs](https://coraza.io/docs/) and [`coraza-caddy`](https://github.com/corazawaf/coraza-caddy) — directives, paranoia levels, audit logs.

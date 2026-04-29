@@ -70,7 +70,7 @@ proxy:
       trust_pool_secret: CF_ORIGIN_PULL_CA
 ```
 
-For ACME (Let's Encrypt) instead of sealed Cloudflare origin certs, drop `proxy.tls` and set `proxy.email: ops@example.com` — every service with `domain:` then auto-issues. See the [proxy guide](/docs/guide/proxy) and the [Cloudflare Origin Certs recipe](/docs/recipes/cloudflare-origin-certs).
+For ACME (Let's Encrypt) instead of sealed Cloudflare origin certs, drop `proxy.tls` and set `proxy.email: ops@example.com` — every service with `domain:` then auto-issues. See the [proxy guide](/docs/guide/proxy) and the [Cloudflare Origin Certs recipe](/docs/how-to/cloudflare-origin-certs).
 
 ## `services/prod/api.yaml`
 
@@ -201,7 +201,7 @@ Two repo workflows do the work. Skeleton:
     path: diff.md
 ```
 
-See [PR-comment dry-run](/docs/recipes/pr-comment-dry-run) for the complete workflow.
+See [PR-comment dry-run](/docs/how-to/pr-comment-dry-run) for the complete workflow.
 
 ## What this exercises
 
@@ -212,4 +212,4 @@ See [PR-comment dry-run](/docs/recipes/pr-comment-dry-run) for the complete work
 - **`files:` mounts** — content-hashed bind that feeds into `spec_hash`. Edit the otel config, redeploy → the otel container reroles automatically because its hash changed.
 - **Surgical security opt-outs** — `otel` opts out of the hardened defaults (with a comment explaining why); everything else inherits the defaults.
 - **Config fragmentation** — one file per service, glob-included. Each fragment is independent; renaming a service is a one-file operation.
-- **Staging alongside prod** — see [the recipe](/docs/recipes/staging-alongside-prod) for the same hosts running a `yoink.staging.yaml` with `name: api-staging` etc.
+- **Staging alongside prod** — see [the recipe](/docs/how-to/staging-alongside-prod) for the same hosts running a `yoink.staging.yaml` with `name: api-staging` etc.

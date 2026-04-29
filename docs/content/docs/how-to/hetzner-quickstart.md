@@ -228,7 +228,7 @@ Hetzner billing is hourly capped at the monthly price; `hcloud server list` is w
 
 - **Bring your own app** — drop the `cmd:` and the loose `options:` from `services/yoink-hello.yaml`; point `image:`/`tag:` at your image. The Caddy + ACME wiring stays the same.
 - **Build the image on your laptop** instead of pulling from a registry. Add a `build:` block and run `yoink up --build`. See [Deploy modes](/docs/guide/deploy-modes).
-- **Add a third-party service** like postgres, redis, or restic backups via [`yoink add`](/docs/guide/templates) — one command renders a vetted service fragment alongside your config. The [TanStack stack recipe](/docs/recipes/tanstack-stack) walks the full pattern; the [restic-backups recipe](/docs/recipes/volume-backups) shows the secrets-and-schedule shape.
+- **Add a third-party service** like postgres, redis, or restic backups via [`yoink add`](/docs/guide/templates) — one command renders a vetted service fragment alongside your config. The [TanStack stack recipe](/docs/how-to/tanstack-stack) walks the full pattern; the [restic-backups recipe](/docs/how-to/volume-backups) shows the secrets-and-schedule shape.
 - **Move from `<ip>.nip.io` to a real hostname** — replace the `domain:` value, point an A record at `$IP`. Nothing else changes.
-- **Tighten TLS** with [Cloudflare Origin Certificates + origin-pull mTLS](/docs/recipes/cloudflare-origin-certs) once you have a real domain.
-- **Scale to multiple hosts** sharing one ACME state pool: [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage).
+- **Tighten TLS** with [Cloudflare Origin Certificates + origin-pull mTLS](/docs/how-to/cloudflare-origin-certs) once you have a real domain.
+- **Scale to multiple hosts** sharing one ACME state pool: [Multi-host Let's Encrypt with Redis](/docs/how-to/multi-host-redis-storage).

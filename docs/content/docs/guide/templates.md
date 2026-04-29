@@ -360,6 +360,6 @@ For the rendered service fragment, see [Config reference](/docs/reference/config
 ## See also
 
 - [Configuration reference](/docs/reference/config) — schema for the rendered service fragment.
-- [TanStack Start + postgres from scratch](/docs/recipes/tanstack-stack) — `yoink add` in an end-to-end recipe.
-- [Volume backups](/docs/recipes/volume-backups) — recipe pairing the `restic-backups` and `rustfs` templates.
+- [TanStack Start + postgres from scratch](/docs/how-to/tanstack-stack) — `yoink add` in an end-to-end recipe.
+- [Volume backups](/docs/how-to/volume-backups) — recipe pairing the `restic-backups` and `rustfs` templates.
 - [Secrets](/docs/guide/secrets) — how the secrets that templates seal get decrypted at deploy time.

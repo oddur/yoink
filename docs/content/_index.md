@@ -32,7 +32,7 @@ yoink rollback api        # roll back to the previous version
   {{< card link="/docs/guide/deploy-modes" title="Three deploy modes" subtitle="CI-built, local-build push-then-deploy, registry-less standalone." icon="server" >}}
   {{< card link="/docs/guide/security" title="Secure by default" subtitle="non-root uid, cap_drop=ALL, read-only rootfs, no-new-privileges, init=tini, …" icon="shield-check" >}}
   {{< card link="/docs/guide/ai-agents" title="Driving yoink from an AI agent" subtitle="CLI + YAML, no GUI. Patterns for Claude Code, Cursor, GitHub Actions." icon="terminal" >}}
-  {{< card link="/docs/recipes" title="Recipes" subtitle="Staging alongside prod, sealed secrets, Cloudflare origin certs, Caddy snippets." icon="clipboard-list" >}}
+  {{< card link="/docs/how-to" title="How-to walkthroughs" subtitle="Hetzner cx23 quickstart, sealed-secrets workflow, Cloudflare origin certs, staging alongside prod." icon="clipboard-list" >}}
   {{< card link="/docs/reference" title="Reference" subtitle="Every CLI flag, every config field, every TUI keybind." icon="document-text" >}}
 {{< /cards >}}
 

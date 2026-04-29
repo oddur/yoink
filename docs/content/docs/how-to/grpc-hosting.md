@@ -52,7 +52,7 @@ services:
 Browsers can't speak native gRPC — they need [gRPC-Web](https://github.com/grpc/grpc-web), which uses HTTP/1.1 or HTTP/2 (no h2c required) plus a translation layer. Two options:
 
 - **Translation in your backend**: Tonic has [`tonic-web`](https://docs.rs/tonic-web/), grpc-go has [improbable-eng/grpc-web](https://github.com/improbable-eng/grpc-web/tree/master/go/grpcwebproxy). Backend speaks both gRPC and gRPC-Web on the same port. `upstream_h2c: true` on yoink covers both because gRPC-Web traffic is regular HTTP/1.1 over h2c.
-- **Caddy plugin**: there's a `caddy-grpc-web` plugin that translates at the proxy layer. Add it via [`proxy.xcaddy:`](/docs/recipes/caddy-plugins) — yoink builds a custom caddy with the module on each proxy host.
+- **Caddy plugin**: there's a `caddy-grpc-web` plugin that translates at the proxy layer. Add it via [`proxy.xcaddy:`](/docs/how-to/caddy-plugins) — yoink builds a custom caddy with the module on each proxy host.
 
 ## Reflection / grpcurl
 
@@ -67,7 +67,7 @@ If your backend has reflection enabled, the `list` should print your service des
 
 ## Mutual TLS (Cloudflare origin-pull)
 
-If you're fronting via Cloudflare, the [Cloudflare Origin Certificates recipe](/docs/recipes/cloudflare-origin-certs) covers the mTLS setup that locks your origin to Cloudflare's edge IPs. gRPC + mTLS works the same way — `upstream_h2c: true` + `proxy.tls.client_auth` together:
+If you're fronting via Cloudflare, the [Cloudflare Origin Certificates recipe](/docs/how-to/cloudflare-origin-certs) covers the mTLS setup that locks your origin to Cloudflare's edge IPs. gRPC + mTLS works the same way — `upstream_h2c: true` + `proxy.tls.client_auth` together:
 
 ```yaml
 proxy:
@@ -92,6 +92,6 @@ A common shape: Tonic + Axum behind Cloudflare with origin-pull mTLS — a singl
 ## See also
 
 - [Reverse proxy guide](/docs/guide/proxy) — full schema reference.
-- [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs) — for the mTLS edge story.
+- [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs) — for the mTLS edge story.
 - [Caddy snippets cookbook](/docs/guide/proxy#snippets-cookbook) — for content-type matchers, request body limits, and other escape-hatch patterns.
 - [Caddy reverse_proxy docs](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#transport) — the transport options for the underlying primitive.
