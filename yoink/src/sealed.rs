@@ -386,24 +386,35 @@ pub fn unseal(ciphertext: &[u8], identity: &x25519::Identity) -> Result<String, 
 /// Recognized:
 ///   - `KEY=value` (no surrounding whitespace required)
 ///   - `KEY="quoted value"` and `KEY='single-quoted'`
+///   - `export KEY=value` (shell-style prefix, stripped)
+///   - quoted values that span multiple lines (PEM keys, certs) — the
+///     value runs from the opening quote through the matching close
+///     quote on a later line; newlines between are preserved verbatim
 ///   - blank lines and `# comments`
 ///
-/// Not supported (intentionally): variable interpolation, `export `
-/// prefixes, multi-line values. yoink secrets are simple key=value
-/// strings — anything fancier should be derived at runtime, not
-/// committed.
+/// Not supported (intentionally): variable interpolation. Secrets that
+/// need to compose at runtime should be derived in code from the
+/// resolved bundle, not from the file format.
 pub fn parse_dotenv(input: &str) -> Result<BTreeMap<String, String>, SealedError> {
     let mut out = BTreeMap::new();
-    for (idx, raw) in input.lines().enumerate() {
+    let mut iter = input.lines().enumerate();
+    while let Some((idx, raw)) = iter.next() {
         let line_no = idx + 1;
         let trimmed = raw.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let (key, value) = trimmed.split_once('=').ok_or_else(|| SealedError::Dotenv {
-            line: line_no,
-            reason: "expected `KEY=VALUE`".into(),
-        })?;
+        let after_export = trimmed
+            .strip_prefix("export ")
+            .unwrap_or(trimmed)
+            .trim_start();
+        let (key, first_value) =
+            after_export
+                .split_once('=')
+                .ok_or_else(|| SealedError::Dotenv {
+                    line: line_no,
+                    reason: "expected `KEY=VALUE`".into(),
+                })?;
         let key = key.trim();
         if key.is_empty() {
             return Err(SealedError::Dotenv {
@@ -419,10 +430,66 @@ pub fn parse_dotenv(input: &str) -> Result<BTreeMap<String, String>, SealedError
                 reason: format!("invalid key {key:?} (must match [A-Za-z_][A-Za-z0-9_]*)"),
             });
         }
-        let value = strip_optional_quotes(value.trim_end());
-        out.insert(key.to_string(), value.to_string());
+        let value_start = first_value.trim_start();
+        let value = if let Some(quote) = opening_unmatched_quote(value_start) {
+            consume_multiline_value(quote, value_start, line_no, &mut iter)?
+        } else {
+            strip_optional_quotes(value_start.trim_end()).to_string()
+        };
+        out.insert(key.to_string(), value);
     }
     Ok(out)
+}
+
+/// Detect a value that opens with a quote but doesn't close on the
+/// same line. Returns the quote char so the caller can scan forward
+/// for the matching close. `None` means the line is fully self-
+/// contained (single-line value, possibly quoted).
+fn opening_unmatched_quote(s: &str) -> Option<char> {
+    let first = s.chars().next()?;
+    if first != '\'' && first != '"' {
+        return None;
+    }
+    if s[first.len_utf8()..].contains(first) {
+        return None;
+    }
+    Some(first)
+}
+
+/// Pulled out of `parse_dotenv` to keep the main loop one screen tall.
+/// Consumes lines from `iter` until the closing `quote` is found;
+/// returns the accumulated value with surrounding quotes stripped.
+/// Newlines between lines are preserved verbatim — PEM keys and
+/// certificates rely on them.
+fn consume_multiline_value<'a, I>(
+    quote: char,
+    value_start: &str,
+    start_line_no: usize,
+    iter: &mut I,
+) -> Result<String, SealedError>
+where
+    I: Iterator<Item = (usize, &'a str)>,
+{
+    let mut acc = String::from(&value_start[quote.len_utf8()..]);
+    for (_, line) in iter.by_ref() {
+        acc.push('\n');
+        if let Some(close) = line.find(quote) {
+            let after = &line[close + quote.len_utf8()..];
+            if !after.trim().is_empty() {
+                return Err(SealedError::Dotenv {
+                    line: start_line_no,
+                    reason: format!("trailing content after closing {quote} for multi-line value"),
+                });
+            }
+            acc.push_str(&line[..close]);
+            return Ok(acc);
+        }
+        acc.push_str(line);
+    }
+    Err(SealedError::Dotenv {
+        line: start_line_no,
+        reason: format!("unterminated multi-line value (missing closing {quote})"),
+    })
 }
 
 fn strip_optional_quotes(s: &str) -> &str {
@@ -585,6 +652,47 @@ BAZ=plain
         let err = parse_dotenv("1FOO=bar\n").unwrap_err();
         assert!(matches!(err, SealedError::Dotenv { .. }));
         let err = parse_dotenv("FOO-BAR=bar\n").unwrap_err();
+        assert!(matches!(err, SealedError::Dotenv { .. }));
+    }
+
+    #[test]
+    fn parse_dotenv_handles_multiline_pem() {
+        // Realistic shape: an ed25519 private key wrapped in a single-quoted
+        // multi-line value, the way `printf "K='"; cat key.pem; printf "'\n"`
+        // would render it.
+        let input = "FOO=1\nKEY='-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXkt\nQyNTUxOQAAACDa\n-----END OPENSSH PRIVATE KEY-----'\nBAR=2\n";
+        let parsed = parse_dotenv(input).unwrap();
+        assert_eq!(parsed.get("FOO"), Some(&"1".to_string()));
+        assert_eq!(parsed.get("BAR"), Some(&"2".to_string()));
+        let key = parsed.get("KEY").unwrap();
+        assert!(key.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert!(key.contains("b3BlbnNzaC1rZXkt"));
+        assert!(key.ends_with("-----END OPENSSH PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn parse_dotenv_handles_multiline_double_quoted() {
+        let input = "KEY=\"line one\nline two\nline three\"\nNEXT=ok\n";
+        let parsed = parse_dotenv(input).unwrap();
+        assert_eq!(
+            parsed.get("KEY"),
+            Some(&"line one\nline two\nline three".to_string())
+        );
+        assert_eq!(parsed.get("NEXT"), Some(&"ok".to_string()));
+    }
+
+    #[test]
+    fn parse_dotenv_unterminated_multiline_errors() {
+        let err = parse_dotenv("KEY='line one\nline two\n").unwrap_err();
+        assert!(matches!(err, SealedError::Dotenv { .. }));
+        if let SealedError::Dotenv { reason, .. } = err {
+            assert!(reason.contains("unterminated"), "got: {reason}");
+        }
+    }
+
+    #[test]
+    fn parse_dotenv_trailing_after_close_quote_errors() {
+        let err = parse_dotenv("KEY='line one\nline two' garbage\n").unwrap_err();
         assert!(matches!(err, SealedError::Dotenv { .. }));
     }
 
