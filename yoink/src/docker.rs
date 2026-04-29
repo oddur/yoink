@@ -48,6 +48,64 @@ pub fn image_registry_host(image: &str) -> Option<&str> {
     (head == "localhost" || head.contains('.') || head.contains(':')).then_some(head)
 }
 
+/// Validate a single `--device` spec without producing the bollard
+/// `DeviceMapping`. Same grammar as [`parse_device`]; used by
+/// `Config::validate()` so malformed entries are caught at config-load
+/// time without dragging bollard's types into `config.rs`.
+pub(crate) fn validate_device_spec(spec: &str) -> Result<(), BuildError> {
+    parse_device(spec).map(|_| ())
+}
+
+/// Parse a single `--device` spec — `<host-path>[:<container-path>[:<perms>]]`,
+/// matching docker's CLI. Defaults: container path == host path; perms `rwm`.
+///
+/// Validates: both paths must begin with `/`; perms (when present) must be
+/// non-empty, drawn from `{r, w, m}`, with no duplicates.
+fn parse_device(spec: &str) -> Result<bollard::models::DeviceMapping, BuildError> {
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    let bad = || BuildError::Device(spec.to_string());
+
+    let host = *parts.first().ok_or_else(bad)?;
+    if host.is_empty() || !host.starts_with('/') {
+        return Err(bad());
+    }
+
+    let container = match parts.get(1).copied() {
+        None => host,
+        Some(c) if c.starts_with('/') => c,
+        _ => return Err(bad()),
+    };
+
+    let perms = match parts.get(2).copied() {
+        None => "rwm",
+        Some(p) => {
+            if p.is_empty() || p.len() > 3 {
+                return Err(bad());
+            }
+            let mut seen = [false; 3];
+            for ch in p.chars() {
+                let idx = match ch {
+                    'r' => 0,
+                    'w' => 1,
+                    'm' => 2,
+                    _ => return Err(bad()),
+                };
+                if seen[idx] {
+                    return Err(bad());
+                }
+                seen[idx] = true;
+            }
+            p
+        }
+    };
+
+    Ok(bollard::models::DeviceMapping {
+        path_on_host: Some(host.to_string()),
+        path_in_container: Some(container.to_string()),
+        cgroup_permissions: Some(perms.to_string()),
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum BuildError {
     #[error("invalid memory value {0:?}: expected like \"512m\", \"512Mi\", or \"1Gi\"")]
@@ -56,6 +114,11 @@ pub enum BuildError {
         "invalid cpus value {0:?}: expected an absolute core count like \"2\", \"1.5\", or \"500m\""
     )]
     Cpus(String),
+    #[error(
+        "invalid device spec {0:?}: expected \"<host-path>[:<container-path>[:<perms>]]\" \
+         with absolute paths and `<perms>` drawn from `r`, `w`, `m`"
+    )]
+    Device(String),
     #[error("unknown restart policy {0:?}: expected one of no|always|unless-stopped|on-failure")]
     RestartPolicy(String),
     #[error(
@@ -217,6 +280,18 @@ fn build_host_config(
     let cap_add = vec_opt(&options.cap_add);
     let security_opt = vec_opt(&options.security_opt);
 
+    let devices = if options.devices.is_empty() {
+        None
+    } else {
+        Some(
+            options
+                .devices
+                .iter()
+                .map(|s| parse_device(s))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    };
+
     let mut binds: Vec<String> = Vec::new();
     binds.extend(spec.binds.iter().map(|b| default_bind_to_ro(b)));
     binds.extend(spec.volumes.iter().cloned());
@@ -240,6 +315,7 @@ fn build_host_config(
         tmpfs,
         binds,
         port_bindings,
+        devices,
         restart_policy: Some(RestartPolicy {
             name: Some(restart_policy),
             maximum_retry_count: None,
@@ -536,6 +612,7 @@ pub fn compute_spec_hash(spec: &RunSpec) -> String {
     feed_list(&mut h, "cap_drop", &opts.cap_drop);
     feed_list(&mut h, "cap_add", &opts.cap_add);
     feed_list(&mut h, "security_opt", &opts.security_opt);
+    feed_list(&mut h, "devices", &opts.devices);
     feed(&mut h, "read_only", &[u8::from(opts.read_only)]);
     feed(&mut h, "init", &[u8::from(opts.init)]);
     feed_map(&mut h, "tmpfs", &opts.tmpfs);
@@ -661,6 +738,7 @@ mod tests {
                 restart: None,
                 user: None,
                 init: true,
+                devices: Vec::new(),
             },
             entrypoint: None,
             command: vec![],
@@ -1032,5 +1110,98 @@ mod tests {
         let aliases = yoink_ep.aliases.as_ref().unwrap();
         assert!(aliases.contains(&"app-a-a1b2c3d".to_string()));
         assert!(aliases.contains(&"api".to_string()));
+    }
+
+    #[test]
+    fn parse_device_one_field_defaults_container_path_and_perms() {
+        let d = parse_device("/dev/fuse").unwrap();
+        assert_eq!(d.path_on_host.as_deref(), Some("/dev/fuse"));
+        assert_eq!(d.path_in_container.as_deref(), Some("/dev/fuse"));
+        assert_eq!(d.cgroup_permissions.as_deref(), Some("rwm"));
+    }
+
+    #[test]
+    fn parse_device_two_fields_remaps_container_path() {
+        let d = parse_device("/dev/sdb:/dev/disk").unwrap();
+        assert_eq!(d.path_on_host.as_deref(), Some("/dev/sdb"));
+        assert_eq!(d.path_in_container.as_deref(), Some("/dev/disk"));
+        assert_eq!(d.cgroup_permissions.as_deref(), Some("rwm"));
+    }
+
+    #[test]
+    fn parse_device_three_fields_honors_perms() {
+        let d = parse_device("/dev/null:/dev/null:r").unwrap();
+        assert_eq!(d.cgroup_permissions.as_deref(), Some("r"));
+
+        let d = parse_device("/dev/x:/dev/x:wm").unwrap();
+        assert_eq!(d.cgroup_permissions.as_deref(), Some("wm"));
+    }
+
+    #[test]
+    fn parse_device_rejects_relative_paths() {
+        assert!(matches!(
+            parse_device("dev/fuse"),
+            Err(BuildError::Device(_))
+        ));
+        assert!(matches!(
+            parse_device("/dev/fuse:dev/x"),
+            Err(BuildError::Device(_))
+        ));
+    }
+
+    #[test]
+    fn parse_device_rejects_bad_perms() {
+        // Empty perms (trailing colon).
+        assert!(matches!(
+            parse_device("/dev/fuse:/dev/fuse:"),
+            Err(BuildError::Device(_))
+        ));
+        // Unknown char.
+        assert!(matches!(
+            parse_device("/dev/fuse:/dev/fuse:rwx"),
+            Err(BuildError::Device(_))
+        ));
+        // Duplicates.
+        assert!(matches!(
+            parse_device("/dev/fuse:/dev/fuse:rrw"),
+            Err(BuildError::Device(_))
+        ));
+        // Too long.
+        assert!(matches!(
+            parse_device("/dev/fuse:/dev/fuse:rwmw"),
+            Err(BuildError::Device(_))
+        ));
+    }
+
+    #[test]
+    fn build_host_config_emits_devices_when_set() {
+        let mut spec = sample_spec();
+        spec.options.devices = vec!["/dev/fuse".into(), "/dev/dri:/dev/dri:rw".into()];
+        let host = build_host_config(&spec, HashMap::new()).unwrap();
+        let devices = host.devices.expect("devices should be set");
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].path_on_host.as_deref(), Some("/dev/fuse"));
+        assert_eq!(devices[0].cgroup_permissions.as_deref(), Some("rwm"));
+        assert_eq!(devices[1].path_in_container.as_deref(), Some("/dev/dri"));
+        assert_eq!(devices[1].cgroup_permissions.as_deref(), Some("rw"));
+    }
+
+    #[test]
+    fn build_host_config_omits_devices_when_empty() {
+        let host = build_host_config(&sample_spec(), HashMap::new()).unwrap();
+        assert!(host.devices.is_none());
+    }
+
+    #[test]
+    fn spec_hash_differs_when_devices_change() {
+        let base = compute_spec_hash(&sample_spec());
+
+        let mut with_dev = sample_spec();
+        with_dev.options.devices = vec!["/dev/fuse".into()];
+        assert_ne!(base, compute_spec_hash(&with_dev));
+
+        let mut other_dev = sample_spec();
+        other_dev.options.devices = vec!["/dev/dri".into()];
+        assert_ne!(compute_spec_hash(&with_dev), compute_spec_hash(&other_dev));
     }
 }

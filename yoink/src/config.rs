@@ -795,6 +795,18 @@ pub struct RunOptions {
     /// (systemd-in-containers, s6-overlay, supervisord, …).
     #[serde(default = "default_init")]
     pub init: bool,
+    /// Host devices to expose into the container (docker's `--device`).
+    /// Each entry is `<host-path>[:<container-path>[:<perms>]]`;
+    /// `<perms>` is a combination of `r`, `w`, `m` (defaults to `rwm`).
+    /// Each listed device is both bind-mounted *and* added to the
+    /// cgroup `devices.allow` list — bind alone hits `EPERM` on
+    /// `open()` from the cgroup whitelist. Narrower than
+    /// `--privileged` (deliberately not exposed): only the listed
+    /// devices become accessible. See the [hardware passthrough
+    /// recipe](https://yoink.dev/docs/recipes/hardware-passthrough/)
+    /// for GPU / USB / FUSE / TPM patterns.
+    #[serde(default)]
+    pub devices: Vec<String>,
 }
 
 fn default_cap_drop() -> Vec<String> {
@@ -845,6 +857,7 @@ impl Default for RunOptions {
             restart: None,
             user: default_user(),
             init: default_init(),
+            devices: Vec::new(),
         }
     }
 }
@@ -1281,6 +1294,14 @@ impl Config {
                     "service {:?}.run.port required when healthcheck_path is set",
                     service.name
                 )));
+            }
+            for spec in &service.run.options.devices {
+                if let Err(e) = crate::docker::validate_device_spec(spec) {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.run.options.devices: {e}",
+                        service.name
+                    )));
+                }
             }
             // depends_on validation (refs + duplicates + self). Cycle
             // detection lives in `topo_sort_services` since it needs
@@ -2027,6 +2048,73 @@ services:
         assert!(opts.read_only);
         assert!(opts.init);
         assert_eq!(opts.pids_limit, Some(1024));
+        assert!(opts.devices.is_empty());
+    }
+
+    #[test]
+    fn devices_validate_rejects_relative_host_path() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: media
+    image: jellyfin/jellyfin
+    tag: v1
+    run:
+      port: 8096
+      options:
+        devices: ["dev/fuse"]
+"#;
+        let err = Config::parse_str(s).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid device spec") && msg.contains("dev/fuse"),
+            "expected device-spec rejection, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn devices_validate_rejects_bad_perms() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: media
+    image: jellyfin/jellyfin
+    tag: v1
+    run:
+      port: 8096
+      options:
+        devices: ["/dev/fuse:/dev/fuse:rwx"]
+"#;
+        let err = Config::parse_str(s).unwrap_err();
+        assert!(err.to_string().contains("invalid device spec"));
+    }
+
+    #[test]
+    fn devices_round_trip_through_yaml() {
+        let s = r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: media
+    image: jellyfin/jellyfin
+    tag: v1
+    run:
+      port: 8096
+      options:
+        devices:
+          - /dev/dri
+          - /dev/fuse:/dev/fuse:rwm
+"#;
+        let c = Config::parse_str(s).unwrap();
+        assert_eq!(
+            c.services[0].run.options.devices,
+            vec![
+                "/dev/dri".to_string(),
+                "/dev/fuse:/dev/fuse:rwm".to_string()
+            ],
+        );
     }
 
     #[test]
