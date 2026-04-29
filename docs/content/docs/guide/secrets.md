@@ -5,7 +5,7 @@ weight: 6
 
 Two providers, one mental model: a key→value bundle resolved at deploy time and injected as env vars into the containers that reference it. The default (`provider: age`) seals the bundle into a file you commit to git; the escape hatch (`provider: command`) shells out to whatever secret manager you already run.
 
-Either way, **the resolved values feed into `yoink.spec_hash`** — rotating a secret triggers a redeploy, exactly like a config change.
+Either way, **the resolved values feed into [`yoink.spec_hash`](/docs/guide/architecture#drift-detection)** — rotating a secret triggers a redeploy, exactly like a config change.
 
 ## Sealed secrets (age) — the default
 

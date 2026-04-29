@@ -120,7 +120,7 @@ Log out and back in (or restart the SSH session) for the group change to take ef
 
 ## TUI shows containers but `yoink up` says "no changes"
 
-Working as intended. `spec_hash` matches — nothing to do. If you expected a redeploy, something in the input didn't actually change. To force one, bump a label:
+Working as intended. [`spec_hash`](/docs/guide/architecture#drift-detection) matches — nothing to do. If you expected a redeploy, something in the input didn't actually change. To force one, bump a label:
 
 ```yaml
 labels:
