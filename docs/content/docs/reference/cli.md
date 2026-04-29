@@ -9,10 +9,22 @@ Every subcommand accepts:
 
 ```
 -c, --config <PATH>   Path to the yoink.yaml config file (default: ./yoink.yaml)
--v, --verbose         Increase log verbosity (-v info, -vv debug, -vvv trace)
+-v, --verbose         Increase log verbosity (-v info, -vv debug, -vvv trace).
+                      Repeatable.
+-q, --quiet           Suppress informational stderr (-q most, -qq all but errors).
+                      Repeatable. Doesn't affect stdout — primary results stay
+                      readable.
+    --color <COLOR>   When to colour output: auto (default; detects TTY) /
+                      always / never. Honours NO_COLOR regardless.
 -h, --help            Per-subcommand help
 -V, --version         Print version
 ```
+
+Env vars yoink reads: `YOINK_AGE_KEY` / `YOINK_AGE_KEY_FILE` (sealed-secrets
+identity), `YOINK_ALLOW_REVEAL_IN_CI` (override `secrets show --reveal`'s CI
+guard), `EDITOR` / `VISUAL` (`secrets edit`), `PAGER` (long output),
+`NO_COLOR` (disable colour), `CI` (triggers the reveal guard above), `RUST_LOG`
+(fine-grained per-module logging — overrides `-v`).
 
 ## Subcommand reference
 
@@ -35,6 +47,23 @@ yoink init [HOST]                        generate yoink.yaml + an age identity f
   --no-secrets                           skip generating an age identity (use when bringing
                                          your own key, or when the project will use
                                          `provider: command` for secrets)
+
+yoink add [REF]                          drop a vetted template into your repo: fetch from
+                                         GitHub, run a wizard for variables, seal generated
+                                         secrets, extend yoink.yaml's `include:`. Bare REF
+                                         (`postgres`) for the bundled set; `gh:owner/repo/path`
+                                         for 3rd-party. Omit REF for the interactive picker.
+                                         See the templates guide.
+  --from-path <PATH>                     local directory as the template source instead of
+                                         GitHub (template-author iteration). PATH must
+                                         contain a template.yaml.
+  --refresh                              re-resolve a branch/tag ref to the latest SHA,
+                                         bypassing the local cache mapping. Pinned-SHA
+                                         refs are unaffected.
+  --var <KEY=VALUE>                      manifest variable override (repeatable)
+  --up                                   run `yoink up` after the fragment is in place
+                                         (auto-yes for `kind: app` templates)
+  --yes                                  skip every confirmation prompt; required in CI
 
 yoink preflight                          verify Docker is reachable on each configured host
 
@@ -134,12 +163,29 @@ yoink top                                htop-style CPU/mem snapshot per running
 yoink version <SERVICE>                  print currently-running tag(s) per replica
 
 yoink validate                           lint the config; optionally ping each docker daemon
+  --check-hosts                          also test the ssh+docker connection to every host
+                                         (CI gate for "the deploy will actually go through")
 yoink doctor                             diagnose deploy-blockers (host reachability, age
                                          identity, DNS for `domain:` services, arch alignment,
                                          common config friction). Exits non-zero on Errors.
-  --json                                 output as JSON for piping / agent consumption
-yoink lock                               inspect / release the per-host deploy lock (useful
-                                         after a crashed deploy left a sentinel container)
+  --json                                 output as JSON for piping / agent consumption.
+                                         Each entry: `{severity, category, title, detail, fix}`.
+
+yoink proxy-render                       print the Caddy admin-API JSON yoink would push for
+                                         the current config. Read-only; no host connection
+                                         required (uses service-name fallbacks instead of
+                                         live container lookups). Pipe into `caddy adapt` or
+                                         a debug Caddy's `/load` for schema validation.
+yoink proxy-dockerfile                   print the synthesized xcaddy Dockerfile for the
+                                         current `proxy.xcaddy:` config. No docker calls;
+                                         useful for code review or pinning a Dockerfile in CI.
+
+yoink lock <COMMAND>                     inspect / release the per-host deploy lock
+  status                                 print holder + age of the deploy lock on each host
+  release                                force-remove the deploy lock sentinel on each host.
+                                         Use after a crashed deploy left a sentinel running;
+                                         only safe when no operator is actually deploying.
+
 yoink completions <shell>                generate shell completions (bash/zsh/fish/...)
 
 yoink secrets key generate               generate an age keypair. By default the

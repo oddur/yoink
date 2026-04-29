@@ -264,7 +264,7 @@ caddy_extra_json: |
   }]
 ```
 
-A future yoink could adapt on a host instead of the operator to fix this; for now, `caddy_extra_json:` is the supported path for plugin-aware snippets. See [Caddy snippets cookbook](/docs/recipes/caddy-snippets) for the JSON-shape conventions.
+A future yoink could adapt on a host instead of the operator to fix this; for now, `caddy_extra_json:` is the supported path for plugin-aware snippets. See [Caddy snippets cookbook](/docs/guide/proxy#snippets-cookbook) for the JSON-shape conventions.
 
 ### `yoink validate` skips the docker check
 
@@ -309,7 +309,7 @@ xcaddy errors are surfaced verbatim through the deploy error chain. Common shape
 ## See also
 
 - [Reverse proxy guide](/docs/guide/proxy) — full schema reference for the routing primitives yoink models, including the `proxy.xcaddy:` field table.
-- [Caddy snippets cookbook](/docs/recipes/caddy-snippets) — JSON shapes for `caddy_extra_json:` (the path you need when your snippet uses plugin directives).
+- [Caddy snippets cookbook](/docs/guide/proxy#snippets-cookbook) — JSON shapes for `caddy_extra_json:` (the path you need when your snippet uses plugin directives).
 - [Defense-in-depth web serving](/docs/recipes/defense-in-depth) — composing the security plugins above into a Cloudflare + CrowdSec + Coraza stack.
 - [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage) — the canonical "I need a plugin" worked example.
 - [xcaddy on GitHub](https://github.com/caddyserver/xcaddy) — upstream tool docs.

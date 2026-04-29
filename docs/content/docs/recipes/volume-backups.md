@@ -113,7 +113,7 @@ yoink secrets edit
 
 ### Deploy and watch dedup do its thing
 
-`yoink up` deploys the backups service. Watch the second backup land — only changed chunks ship. See [pairing with Tailscale](/docs/guide/pairing) for tailnet hostname conventions.
+`yoink up` deploys the backups service. Watch the second backup land — only changed chunks ship. See [pairing with Tailscale](/docs/guide/networking) for tailnet hostname conventions.
 
 {{% /steps %}}
 
@@ -254,7 +254,7 @@ docker run --rm \
 
 ## Restore
 
-`restic restore` and `restic mount` (FUSE browsing) run as one-off `docker run` invocations against the same `mazzolino/restic` image — pass the same env vars as the verify step above, plus `--device /dev/fuse --cap-add SYS_ADMIN` for the mount case. Full restore syntax lives in the [restic docs](https://restic.readthedocs.io/en/stable/050_restore.html); a long-lived FUSE service in a deploy reconcile loop is the wrong shape, but if you genuinely want one, [hardware passthrough](/docs/recipes/hardware-passthrough#fuse-eg-juicefs-sshfs-restic-mount) covers the `devices:` + `cap_add:` config.
+`restic restore` and `restic mount` (FUSE browsing) run as one-off `docker run` invocations against the same `mazzolino/restic` image — pass the same env vars as the verify step above, plus `--device /dev/fuse --cap-add SYS_ADMIN` for the mount case. Full restore syntax lives in the [restic docs](https://restic.readthedocs.io/en/stable/050_restore.html); a long-lived FUSE service in a deploy reconcile loop is the wrong shape, but if you genuinely want one, [hardware passthrough](/docs/guide/security#fuse-eg-juicefs-sshfs-restic-mount) covers the `devices:` + `cap_add:` config.
 
 ## Troubleshooting
 
@@ -266,10 +266,10 @@ The repo doesn't exist yet. The first `restic backup` initializes it automatical
 
 ## See also
 
-- [`yoink add` templates](/docs/recipes/add-templates) — how the bundled templates work and how to author your own.
-- [Sealed secrets](/docs/recipes/sealed-secrets) — `yoink secrets edit` flow and `secrets.age` mechanics.
-- [Hardware passthrough](/docs/recipes/hardware-passthrough) — `devices:` and `cap_add:` if you want FUSE / GPU / USB inside a yoink-managed container.
-- [Pairing with Tailscale](/docs/guide/pairing) — tailnet hostname conventions for the self-hosted RustFS path.
+- [`yoink add` templates](/docs/guide/templates) — how the bundled templates work and how to author your own.
+- [Sealed secrets](/docs/guide/secrets) — `yoink secrets edit` flow and `secrets.age` mechanics.
+- [Hardware passthrough](/docs/guide/security#hardware-passthrough-devices) — `devices:` and `cap_add:` if you want FUSE / GPU / USB inside a yoink-managed container.
+- [Pairing with Tailscale](/docs/guide/networking) — tailnet hostname conventions for the self-hosted RustFS path.
 - [restic docs](https://restic.readthedocs.io/) — backend semantics, retention policies, restore patterns. We don't re-explain restic here.
 - [resticker](https://github.com/djmaze/resticker) — the upstream image that bundles restic + go-cron, plus its full env-var surface (`PRE_COMMANDS` for db dumps, `POST_COMMANDS_*` for notifications).
 - [RustFS](https://rustfs.com/) — the upstream object storage daemon used by the `rustfs` template.

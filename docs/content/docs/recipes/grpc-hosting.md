@@ -93,5 +93,5 @@ A common shape: Tonic + Axum behind Cloudflare with origin-pull mTLS — a singl
 
 - [Reverse proxy guide](/docs/guide/proxy) — full schema reference.
 - [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs) — for the mTLS edge story.
-- [Caddy snippets cookbook](/docs/recipes/caddy-snippets) — for content-type matchers, request body limits, and other escape-hatch patterns.
+- [Caddy snippets cookbook](/docs/guide/proxy#snippets-cookbook) — for content-type matchers, request body limits, and other escape-hatch patterns.
 - [Caddy reverse_proxy docs](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#transport) — the transport options for the underlying primitive.

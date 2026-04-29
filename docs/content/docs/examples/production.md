@@ -29,13 +29,13 @@ deploy:
 hosts:
   - { address: prod-eu-1, user: deploy }
   # add more as needed; replicas + services[].hosts handle distribution
-  # — see /docs/recipes/multi-host-distribution
+  # — see /docs/guide/networking#multi-host-distribution
 
 # Age-sealed secrets committed to the repo. Decrypted once per `up`
 # from the identity in `YOINK_AGE_KEY` (CI) or auto-discovered from
 # `~/.config/yoink/keys/<recipient>.key` (laptop) and folded into
-# spec_hash. See /docs/recipes/sealed-secrets for the full flow;
-# /docs/recipes/secrets-external-cli covers the `provider: command`
+# spec_hash. See /docs/guide/secrets for the full flow;
+# /docs/guide/secrets covers the `provider: command`
 # alternative if you'd rather pull from Doppler / 1Password / Vault /
 # AWS Secrets Manager / the Infisical CLI.
 secrets:

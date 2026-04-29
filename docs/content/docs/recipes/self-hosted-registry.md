@@ -7,9 +7,11 @@ The middle ground between "real remote registry" (ghcr.io, etc.) and "no registr
 
 Best for "I want a registry but I don't want to pay for one and I don't want to run it on a separate machine."
 
-## The recipe
+## Setup
 
-Declare the registry as just another service in your `yoink.yaml`:
+{{% steps %}}
+
+### Declare the registry as just another service in your `yoink.yaml`
 
 ```yaml
 services:
@@ -25,13 +27,13 @@ services:
         memory: "256Mi"
 ```
 
-Bring it up once:
+### Bring it up
 
 ```sh
 yoink up --service registry
 ```
 
-Now point your app's `image:` at the tailnet hostname:
+### Point your app's `image:` at the tailnet hostname
 
 ```yaml
 services:
@@ -42,12 +44,14 @@ services:
       context: .
 ```
 
-And use it like any registry:
+### Use it like any registry
 
 ```sh
 yoink build api --push          # docker build → docker push to your tailnet registry
 yoink up --service api          # docker pull from the tailnet registry on each host
 ```
+
+{{% /steps %}}
 
 ## Why this works
 
@@ -64,4 +68,4 @@ yoink up --service api          # docker pull from the tailnet registry on each 
 ## See also
 
 - [Three deploy modes](/docs/guide/deploy-modes) — when registry vs. registry-less (`build:` blocks shipped via unregistry over SSH) makes sense.
-- [Multi-host distribution](/docs/recipes/multi-host-distribution) — pinning services to specific hosts when you've split images across registries.
+- [Multi-host distribution](/docs/guide/networking#multi-host-distribution) — pinning services to specific hosts when you've split images across registries.

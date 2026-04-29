@@ -87,10 +87,10 @@ Where it matters: the `pre_deploy` hooks for a service run *before* that service
 
 Two providers, dispatched by `secrets.provider:`:
 
-- **`age`** (default, batteries-included) — yoink decrypts a sealed `secrets.age` file at deploy time using one X25519 identity, resolved in priority order: `YOINK_AGE_KEY` env (CI), `YOINK_AGE_KEY_FILE` env (explicit override), `~/.config/yoink/keys/<recipient>.key` (laptop default — yoink scans the dir and picks the key whose public matches `secrets.recipients:`), then `~/.config/yoink/age.key` (legacy fallback). `yoink secrets key generate` writes to the keys dir; the first `yoink up` after that finds the right key automatically. For CI, `yoink secrets key generate --print | gh secret set YOINK_AGE_KEY` pipes the secret into your store, and the workflow surfaces it as `YOINK_AGE_KEY` at deploy time. See [Sealed secrets (age)](/docs/recipes/sealed-secrets) for the full mental model.
+- **`age`** (default, batteries-included) — yoink decrypts a sealed `secrets.age` file at deploy time using one X25519 identity, resolved in priority order: `YOINK_AGE_KEY` env (CI), `YOINK_AGE_KEY_FILE` env (explicit override), `~/.config/yoink/keys/<recipient>.key` (laptop default — yoink scans the dir and picks the key whose public matches `secrets.recipients:`), then `~/.config/yoink/age.key` (legacy fallback). `yoink secrets key generate` writes to the keys dir; the first `yoink up` after that finds the right key automatically. For CI, `yoink secrets key generate --print | gh secret set YOINK_AGE_KEY` pipes the secret into your store, and the workflow surfaces it as `YOINK_AGE_KEY` at deploy time. See [Sealed secrets (age)](/docs/guide/secrets) for the full mental model.
 - **`command`** — yoink invokes the configured command, captures stdout, and parses it as a secrets bundle. Format is auto-detected: stdout starting with `{` is JSON, anything else is dotenv (`KEY=value\n`). One spawn per `yoink up` (and once on TUI startup). Stderr is captured and surfaced when the command exits non-zero.
 
-There's no first-party integration with any specific manager. Operators wire their tool of choice via its standard CLI: `doppler secrets download --format env`, `infisical export --format=dotenv`, `vault kv get -format=json`, `aws secretsmanager get-secret-value`, etc. See [external secrets via CLI](/docs/recipes/secrets-external-cli) for per-tool recipes.
+There's no first-party integration with any specific manager. Operators wire their tool of choice via its standard CLI: `doppler secrets download --format env`, `infisical export --format=dotenv`, `vault kv get -format=json`, `aws secretsmanager get-secret-value`, etc. See [external secrets via CLI](/docs/guide/secrets) for per-tool recipes.
 
 Both providers produce the same shape: a key→value bundle. Every service that lists `secrets:` (or `env_from_secrets:`) gets its values picked out of that bundle and injected as env vars on the container — which means the values feed into `yoink.spec_hash`, which is why a rotated secret triggers a redeploy.
 
@@ -120,7 +120,7 @@ When yoink creates a container, the docker host config it sends is built from `s
 - **Port bindings** parsed from `publish:` entries
 - **Restart policy** = the `restart:` string (`no` / `always` / `unless-stopped` / `on-failure`); default unset = no restart
 
-The full security-defaults table is on [Secure by default](/docs/guide/security-defaults).
+The full security-defaults table is on [Secure by default](/docs/guide/security).
 
 ## Healthcheck-gated rolling swap
 

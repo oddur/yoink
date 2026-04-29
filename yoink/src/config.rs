@@ -991,8 +991,8 @@ pub struct RunOptions {
     /// cgroup `devices.allow` list — bind alone hits `EPERM` on
     /// `open()` from the cgroup whitelist. Narrower than
     /// `--privileged` (deliberately not exposed): only the listed
-    /// devices become accessible. See the [hardware passthrough
-    /// recipe](https://yoink.dev/docs/recipes/hardware-passthrough/)
+    /// devices become accessible. See the [security guide's hardware
+    /// passthrough section](https://oddur.github.io/yoink/docs/guide/security/#hardware-passthrough-devices)
     /// for GPU / USB / FUSE / TPM patterns.
     #[serde(default)]
     pub devices: Vec<String>,

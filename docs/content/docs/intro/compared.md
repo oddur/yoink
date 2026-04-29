@@ -46,7 +46,7 @@ A high-level cross-section before the per-tool deep dives. ✓ = built-in, ◐ =
 | Auto-scaling | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
 | Multi-tenancy / RBAC | ✗ | ✗ | ✓ | ◐ | ✓ | ✗ | ✗ | ✓ |
 
-The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, standalone (no-registry) mode, port-forwarding to services that don't publish host ports** (a kubectl-style affordance only Kubernetes itself otherwise offers in this peer group), **and one-line templates** (`yoink add postgres`, `yoink add openclaw`, `yoink add gh:acme/templates/foo` — see the [recipe](/docs/recipes/add-templates)). The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
+The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, standalone (no-registry) mode, port-forwarding to services that don't publish host ports** (a kubectl-style affordance only Kubernetes itself otherwise offers in this peer group), **and one-line templates** (`yoink add postgres`, `yoink add openclaw`, `yoink add gh:acme/templates/foo` — see the [recipe](/docs/guide/templates)). The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
 
 ## vs. [Kamal](https://kamal-deploy.org)
 
