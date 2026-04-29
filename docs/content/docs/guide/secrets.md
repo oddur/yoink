@@ -162,13 +162,11 @@ If staging and prod genuinely share values (a 12-factor "same image, different c
 
 ## Backup and recovery
 
-The sealed file is in git, so it's already replicated everywhere your repo is. The age identity is the irreplaceable part — losing it makes every value sealed against it permanently unrecoverable.
+The sealed file is in git, replicated everywhere the repo is. The age identity is the irreplaceable part: lose it and every value sealed against it is unrecoverable.
 
-What that means in practice:
-
-- **The identity must live in two places.** Whatever store holds the canonical key (GitHub Actions secret, 1Password vault, AWS SM, Vault, …) is the primary; pick a second offline copy as the recovery key — common patterns are a sealed envelope in a safe, an encrypted USB stick in a desk drawer, or a second password manager owned by a different operator. Don't co-locate them (two GitHub repos in the same org, two 1Password vaults under the same SSO) — a single account compromise wipes both copies.
-- **Test the recovery path before you need it.** Once a quarter, decrypt `secrets.age` on a clean machine using *only* the recovery key. If you can't, you don't have a backup — you have a copy you've never verified.
-- **Rotation isn't a backup substitute.** Rotating the key (next section) replaces the active identity but doesn't help if you lost the *current* one. If both copies of the live key are gone, you re-seal from scratch — every value the team can still recover from upstream sources (Stripe dashboard, AWS console, the manager's CLI), and accept that anything else is lost.
+- **Keep the identity in two stores that can't fail together.** Primary in your secret manager (GitHub Actions secret, 1Password, AWS SM, Vault); recovery copy offline (sealed envelope in a safe, encrypted USB, second manager under a different account). Don't co-locate them under one SSO — a single compromise wipes both.
+- **Test the recovery path quarterly.** Decrypt `secrets.age` on a clean machine using only the recovery key. An untested copy is not a backup.
+- **Rotation isn't a backup substitute.** Rotating swaps the active identity; it doesn't help if the current one is already gone. If both copies are lost, re-seal from scratch — recover values from upstream sources (Stripe dashboard, AWS console, the manager's CLI) and accept that anything else is lost.
 
 ## Compromised key — emergency rotation
 
@@ -299,13 +297,12 @@ secrets:
 
 Stderr is captured and surfaced when the command exits non-zero. No shell interpolation — yoink spawns the binary directly with the supplied argv (no `sh -c`). If you need pipes or env-var expansion, wrap the call in a shell script and point yoink at that.
 
-> **Stdout must be bundle-shaped, full stop.** Anything the command prints to stdout is parsed as your secrets bundle — no progress bars, no `Logging in…` banners, no shell `set -x` traces. Wrapper scripts that emit anything other than the dotenv/JSON payload will either fail to parse or (worse) silently treat the noise as a malformed secret. Print human-readable diagnostics to **stderr only** (`>&2`). Yoink also enforces a 10 MB cap on stdout and a 60 s wall-clock timeout — chunk large bundles, and don't shell out to a CLI that retries forever.
->
-> **Spawned commands run with a locked-down environment.** Yoink scrubs the environment and forwards only an explicit allowlist (`PATH`, `HOME`, `USER`, `XDG_CONFIG_HOME`, `LANG`, `LC_ALL`, `TERM`, `TZ`, plus per-tool auth tokens: `DOPPLER_TOKEN`, `INFISICAL_TOKEN`, `OP_SERVICE_ACCOUNT_TOKEN`, `VAULT_ADDR`/`VAULT_TOKEN`, `AWS_*`, `AZURE_*`, `GOOGLE_APPLICATION_CREDENTIALS`, `BWS_ACCESS_TOKEN`, `SOPS_AGE_KEY`/`SOPS_AGE_KEY_FILE`). `YOINK_AGE_KEY` is **not** forwarded — yoink's own identity stays out of the third-party CLI's env. If your provider needs another env var, wrap the call in a shell script that re-exports it from a file the script reads itself.
->
-> **All allowlisted tokens are a single trust unit.** If you set both `SOPS_AGE_KEY` and `DOPPLER_TOKEN` in the shell that runs `yoink up`, both flow into whichever provider command runs — even if your `provider: command` is `doppler` and has no business seeing the sops key. The threat is bounded (a malicious provider can already see every secret it returns), but treat the env vars listed above as collectively visible to any provider you invoke. If that's not acceptable, run yoink in a wrapper that scrubs the env down to the one tool's tokens before calling.
->
-> **`secrets.file:` rejects `..` and absolute paths but does not follow symlinks.** A committed sealed file that is a symlink to somewhere outside the repo will: on read, attempt to age-decrypt the target (fails noisily for non-age files); on write (`yoink secrets edit`/`seal`/`rotate`), be replaced by the new sealed file via `rename(2)`, leaving the original target untouched. Still — don't commit symlinked sealed files; PR review is the right place to catch that, not yoink.
+### Constraints worth knowing
+
+- **Stdout must be bundle-shaped.** Anything printed to stdout is parsed as the secrets bundle — no progress bars, no `Logging in…` banners, no `set -x` traces. Print diagnostics to stderr (`>&2`). Yoink caps stdout at 10 MB and the call at 60 s wall-clock.
+- **The spawn environment is allowlisted.** Yoink forwards only `PATH`, `HOME`, `USER`, `XDG_CONFIG_HOME`, `LANG`, `LC_ALL`, `TERM`, `TZ`, plus per-tool auth tokens (`DOPPLER_TOKEN`, `INFISICAL_TOKEN`, `OP_SERVICE_ACCOUNT_TOKEN`, `VAULT_ADDR`/`VAULT_TOKEN`, `AWS_*`, `AZURE_*`, `GOOGLE_APPLICATION_CREDENTIALS`, `BWS_ACCESS_TOKEN`, `SOPS_AGE_KEY`/`SOPS_AGE_KEY_FILE`). `YOINK_AGE_KEY` is **not** forwarded. Other env vars need a wrapper script that re-exports them.
+- **All allowlisted tokens flow to any provider you invoke.** If both `SOPS_AGE_KEY` and `DOPPLER_TOKEN` are in the shell, both reach the spawned command regardless of which provider it is. Run yoink in an env-scrubbed wrapper if that's not acceptable.
+- **`secrets.file:` rejects `..` and absolute paths but does not follow symlinks.** A committed sealed file that is a symlink: on read, age-decrypt fails on the target's bytes; on write, `rename(2)` replaces the symlink, leaving the original target untouched. Don't commit symlinked sealed files — that's a PR-review concern, not yoink's.
 
 ### sops
 

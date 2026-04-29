@@ -159,29 +159,17 @@ Wave ordering (`depends_on`) is global — `redis` finishes its host fan-out bef
 
 `yoink pf <service>` opens a tunnel from your laptop to a container port — the same shape `kubectl port-forward` gives you, reusing the SSH connection yoink already has to the host. Works whether or not the service publishes a host port; **you don't need to publish anything to debug a service**. Open URL, `Ctrl-C` to close.
 
-### Why this matters — make the secure default the easy one
+### Why this matters
 
-The biggest production-security win on a single-host docker deploy is *not publishing host ports*. Specifically:
+Yoink doesn't add `publish:` entries by default — backend services sit on the docker network and are reachable through Caddy on `:443`, never bound to a host port. Operator UIs (pgadmin, monitoring) that need direct reach bind `127.0.0.1` over SSH/tailnet, not `0.0.0.0`. The proxy is the only thing on `:443`; with origin-pull mTLS, the origin is unreachable except through Cloudflare's edge.
 
-- The **reverse proxy** (yoink-proxy / Caddy) terminates TLS and is the only thing that should bind `:443` (and `:80` for the redirect). Cloudflare's edge is the only thing that should reach it.
-- Every backend service — api, web, the SSR worker, internal admin endpoints — should sit on a **docker network with no host-side port binding**. They're reachable through Caddy on the public side, and through docker DNS aliases (`api`, `web`, …) for in-network calls.
-- Operator UIs (pgadmin, monitoring dashboards) that genuinely need to be operator-reachable should bind `127.0.0.1:<port>` only — never `0.0.0.0` — so they're inaccessible from the public internet but reachable through SSH from a laptop on the tailnet.
+The standard pressure to weaken that default is debugging. Without `pf`, operators reach for one of three workarounds, each of which makes it worse:
 
-This shape buys you a lot:
+1. Add `publish:` "temporarily" — and the line stays in the yaml forever because removing it is a chore.
+2. `docker exec` + curl from inside — only works on images that ship `curl`, no browser path.
+3. One-off `docker run --network=container:<target>` shell with socat / nc — real-but-fiddly, manual cleanup per host.
 
-- **Smaller attack surface.** A misconfigured firewall or a kernel that suddenly forwards `0.0.0.0` ports doesn't matter — the ports aren't bound there in the first place.
-- **No accidental exposure.** Adding a service is "declare it in yoink.yaml, attach to a network." There's no checklist of "and remember to NOT publish unless you really need to" — the default doesn't publish.
-- **Origin-pull mTLS actually works.** If the only public-facing port is `:443` and that listener is locked to Cloudflare's CA via `client_auth: require_and_verify`, the origin is genuinely unreachable from anywhere except Cloudflare's edge. Direct hits to the IP fail at TLS handshake.
-
-The standard objection: **"but how do I debug api / poke a database / hit an internal admin endpoint when something's wrong at 2 AM?"** Most ops teams answer this with one of three workarounds, each of which weakens the default:
-
-1. **Add `publish:` "temporarily"** so you can curl from your laptop. The temporary publish stays in the yaml because removing it after the incident is a chore. Now api is on the public internet for the rest of forever.
-2. **`docker exec` into the target** and curl localhost from inside. Works, but only if the target image happens to ship `curl` / `wget` (most distroless / `FROM scratch` images don't), and only if the operator wants to see one ad-hoc response — there's no way to point a real browser at a debug UI this way.
-3. **Run a one-off `docker run --network=container:<target>` shell** with socat / nc / curl pre-installed. Real-but-fiddly. Different invocation per host, manual cleanup, no shared muscle memory across the team.
-
-`yoink pf` is the ergonomic version of #3 — but with auto-cleanup, one-key TUI invocation, and a footer band that makes the open tunnel impossible to forget. The "should I temporarily publish this port?" question disappears: **debugging never requires changing what's exposed in production**. The locked-down default stays the only default; the on-call operator gets a browser-pointable URL in <2 seconds without editing yoink.yaml or restarting anything.
-
-In other words: the security posture and the debugging posture stop fighting. The right default for production *is* the right default for everything; `pf` papers over the awkwardness that used to make operators reach for `publish:` as a workaround.
+`yoink pf` is option 3 made automatic: same SSH path as the deploy, auto-cleanup on Ctrl-C, one-key TUI invocation, footer band so you don't forget tunnels are open. **Debugging never requires changing what's exposed in production** — the locked-down default stays the only default.
 
 ### What it works on
 
