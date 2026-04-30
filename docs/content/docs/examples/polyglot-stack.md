@@ -3,7 +3,9 @@ title: Polyglot stack
 weight: 2
 ---
 
-A single host running a Rust API + Node web + Caddy reverse proxy + Redis cache. Per-tier networks isolate the blast radius. Image references are CI-built, deployed via `yoink up` after the registry already has the SHA-tagged images.
+Most real apps aren't one container — they're a backend, a frontend, a cache, and something fronting them with TLS. The instinctive shape ("docker-compose up on a VPS") works until the first time a deploy half-rolls and you're SSHing in to figure out what state which container is in.
+
+This example is what that same stack looks like under yoink: **a single host running a Rust API + Node web + Caddy reverse proxy + Redis cache**, with each tier on its own docker network so a compromise of one doesn't reach the others. Images come from a real registry (CI-built); `yoink up` rolls them with healthcheck-gated swaps and dependency-ordered waves. The pattern scales out to multiple hosts by adding entries to `hosts:` — see [Production-shape](/docs/examples/production) for that next step.
 
 ```yaml
 # yoink.yaml

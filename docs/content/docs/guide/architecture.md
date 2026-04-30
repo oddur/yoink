@@ -3,7 +3,9 @@ title: How it works
 weight: 4
 ---
 
-The mental model for what yoink does under the hood. Useful when an output surprises you and you want to understand why.
+The deploy tools most operators reach for first — `docker compose up`, `ssh && docker run`, hand-rolled bash — share a few rough edges. They re-create containers when nothing changed (or fail to re-create them when something did). They swap containers atomically only if you remember to add the right healthcheck flags. They give you no audit trail of what was deployed when. And running them concurrently from two terminals (or two CI jobs) corrupts the host's state silently.
+
+Yoink's design is what falls out of taking those four edges seriously: **a content hash on every container so it knows what's drifted**, **a deploy-lock so two operators can't fight**, **a healthcheck-gated swap so a broken build can't replace a working one**, and **an audit trail of every deploy with a one-key rollback**. This page is the mental model for each of those — useful when an output surprises you and you want to understand why.
 
 ## Drift detection
 

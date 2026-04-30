@@ -3,7 +3,9 @@ title: Hobby tool / utility
 weight: 1
 ---
 
-The minimum viable `yoink.yaml`: one host, one service, `Dockerfile` next to the config, no registry. Drop in a repo, `yoink up --build`, done.
+You wrote a small utility — a Slack bot, an admin CLI, an internal status board, a cron-job-as-container. It needs to run somewhere. Setting up CI, a container registry, and a Kubernetes cluster for a single container that doesn't take real traffic feels absurd.
+
+This is the shape for that case: **the minimum viable `yoink.yaml`** — one host, one service, `Dockerfile` next to the config, no registry. Drop in a repo, `yoink up --build`, done.
 
 ```yaml
 # yoink.yaml — sits alongside the Dockerfile

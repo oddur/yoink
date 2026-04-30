@@ -3,7 +3,9 @@ title: Reverse proxy
 weight: 4
 ---
 
-Yoink bundles **Caddy** as a managed proxy service. One field exposes a service on a domain with TLS — yoink runs Caddy, renders its config from your `yoink.yaml`, issues certs via Let's Encrypt, and routes traffic to your container.
+Putting an app behind HTTPS used to be a 30-line nginx or Caddy config plus a Let's Encrypt CLI dance plus a renewal cron. Yoink replaces that with **one field**.
+
+Set `domain: api.example.com` on a service and yoink stands up a managed Caddy in front of it: routes the hostname, issues a Let's Encrypt cert, sets up auto-renewal, and rolls cleanly with the service it's fronting. The Caddy is a normal yoink-managed service — same drift detection, same logs, same TUI — you just don't write its config yourself.
 
 ## TL;DR
 

@@ -3,6 +3,8 @@ title: Install
 weight: 1
 ---
 
+Yoink is a single self-contained binary — no daemon to install on your laptop, no config files to bootstrap, no language runtime to set up. Pick whichever install path matches your shell habits; all four produce the same `yoink` on your `PATH`.
+
 {{< tabs items="Homebrew,Cargo,curl,Pre-built binary" >}}
 
   {{< tab >}}

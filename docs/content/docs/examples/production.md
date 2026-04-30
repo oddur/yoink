@@ -3,7 +3,9 @@ title: Production-shape
 weight: 3
 ---
 
-A real prod-shape config: multiple hosts (in case you scale out later — one host today is fine), age-sealed secrets in the repo, registry-pulled images that CI builds, fragmented across files for sanity, with a separate staging entry.
+Once your deploy graduates from "one container on a VPS" to "this is what the team ships against", you start needing more: secrets that aren't in the repo as plaintext, a config you can split across files instead of one wall, pre-deploy migrations, an environment for QA that mirrors prod without paying for separate hardware, and a way for reviewers to see what a PR will change before it merges.
+
+This is the shape for that case: **a real prod-shape `yoink.yaml`** with multiple hosts (you can run on one and scale out later), age-sealed secrets committed to the repo, registry-pulled images that CI builds, fragmented across files for sanity, plus a separate staging entry that runs alongside prod on the same hosts.
 
 ## Layout
 
