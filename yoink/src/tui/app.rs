@@ -159,17 +159,17 @@ impl View {
         let global = vec![
             "global",
             "  q / Ctrl-C    quit yoink",
-            "  d h s l       dashboard / hosts / services / logs",
-            "  R e           resources / encrypted-secrets",
+            "  1 2 3 4 5 6   dashboard / hosts / services / logs / resources / secrets",
+            "  d h s l R e   same panes, letter aliases (R = resources, e = secrets)",
+            "  Tab / S-Tab   cycle panes forward / backward",
             "  D             doctor — diagnose deploy-blockers",
             "  E             edit config in $EDITOR (jumps to focused service/host)",
             "  ~             show drift detail for the focused service",
             "  f             port-forward the focused service (auto: published or sidecar)",
-            "  o / O         open the active port-forward URL in the browser (any view)",
+            "  o / O         open the active port-forward URL in the browser",
             "  F             close every active port-forward",
             "  v             open VS Code in browser, rooted in the focused service's container",
             "  V             close every active vscode session",
-            "  Tab / S-Tab   cycle modes forward / backward",
             "  ?             toggle this help overlay",
             "",
         ];
@@ -1866,36 +1866,42 @@ impl App {
             return false;
         }
         match key.code {
-            // Lowercase `d` is dashboard nav from any view. Per-view
-            // delete actions live on `x` (vim-like) so the global
-            // pane-switch mnemonic stays consistent everywhere.
-            KeyCode::Char('d') => {
+            // Pane navigation — digits are the canonical mnemonic
+            // (printed on each tab in the header), letters are
+            // back-compat aliases.
+            //   1 / d  Dashboard
+            //   2 / h  Hosts
+            //   3 / s  Services
+            //   4 / l  Logs
+            //   5 / R  Resources (uppercase R because lowercase r
+            //          is universally "refresh" inside panes)
+            //   6 / e  Secrets
+            // Per-view bindings that previously collided (delete,
+            // restart, edit, container-logs) have been moved off
+            // these letters — see the secrets/resources/host-detail
+            // handlers below.
+            KeyCode::Char('1') | KeyCode::Char('d') => {
                 self.transition(View::Dashboard).await;
                 return false;
             }
-            KeyCode::Char('h') => {
+            KeyCode::Char('2') | KeyCode::Char('h') => {
                 self.transition(View::Hosts).await;
                 return false;
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('3') | KeyCode::Char('s') => {
                 self.transition(View::Services).await;
                 return false;
             }
-            KeyCode::Char('l') => {
+            KeyCode::Char('4') | KeyCode::Char('l') => {
                 self.transition(View::Logs).await;
                 return false;
             }
-            KeyCode::Char('e') => {
-                self.transition(View::Secrets).await;
+            KeyCode::Char('5') | KeyCode::Char('R') => {
+                self.transition(View::Resources).await;
                 return false;
             }
-            KeyCode::Char('R') if !matches!(self.view, View::Resources) => {
-                // Capital `R` enters the Resources pane from any other
-                // top-level view. While *inside* Resources, we let the
-                // per-view match below own the `R` key (lower-case is
-                // already used for refresh; the per-view handler can
-                // map capital R to other things if needed).
-                self.transition(View::Resources).await;
+            KeyCode::Char('6') | KeyCode::Char('e') => {
+                self.transition(View::Secrets).await;
                 return false;
             }
             // Capital `D` opens the doctor modal — runs the same checks
@@ -3582,13 +3588,17 @@ impl App {
             },
             |(_, msg)| format!("● {msg}"),
         );
+        // Digits are printed right on the tab so the nav mnemonic is
+        // self-documenting — `1` → Dashboard, `2` → Hosts, etc. The
+        // letter mnemonics (`d h s l R e`) still work for muscle
+        // memory; digits are the cross-pane consistent path.
         let tabs = [
-            "Dashboard",
-            "Hosts",
-            "Services",
-            "Logs",
-            "Resources",
-            "Secrets",
+            "1 Dashboard",
+            "2 Hosts",
+            "3 Services",
+            "4 Logs",
+            "5 Resources",
+            "6 Secrets",
         ];
         let selected_tab = Some(self.view.top_section());
         super::ui::render_header(
