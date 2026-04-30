@@ -39,7 +39,6 @@ proxy:
 services:
   - name: docs
     image: yoink-docs                 # bare name — `build:` makes it local-only
-    tag: latest
     build:
       context: .                      # docs/ — same dir as this yaml
     domain: yoink.is

@@ -11,10 +11,12 @@ COPY . .
 RUN pnpm build
 
 FROM nginx:alpine
+# Clear the default nginx welcome page before copying our build output,
+# otherwise Docker's merge-copy leaves index.html from the base image in
+# place (our SPA build has no root index.html — it uses _shell.html).
+RUN rm -rf /usr/share/nginx/html/*
 COPY --from=builder /src/.output/public /usr/share/nginx/html
-# Tell Cloudflare (and browsers) to cache static responses. Without
-# explicit Cache-Control, CF Free serves HTML as `cf-cache-status:
-# DYNAMIC` (i.e. uncached), which puts every request on the origin.
-# Inserted into the default server block via /etc/nginx/conf.d/.
+# SPA routing + Cloudflare cache headers.
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY nginx-cache.conf /etc/nginx/conf.d/cache.conf
 EXPOSE 80

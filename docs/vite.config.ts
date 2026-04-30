@@ -22,6 +22,7 @@ export default defineConfig({
       },
 
       pages: [
+        { path: '/' },
         { path: '/docs' },
         { path: '/about' },
         { path: '/blog' },

@@ -95,6 +95,113 @@ pub fn resolve_service_tag(
         })
 }
 
+/// Return whether a tag can be resolved without building first.
+pub fn has_tag(svc: &ServiceConfig, overrides: &BTreeMap<String, String>) -> bool {
+    overrides.contains_key(&svc.name) || svc.tag.is_some()
+}
+
+/// Build a service and return the tag derived from the resulting image's
+/// content digest. Uses `--iidfile` to capture the image ID that Docker
+/// computes, extracts the first 12 hex chars of the SHA256, and retags
+/// the image under that short digest. The tag is deterministic: the same
+/// Dockerfile + context produces the same hash, so unchanged images cause
+/// no spec_hash diff and yoink skips the container restart automatically.
+pub async fn build_and_capture_tag(
+    config: &Config,
+    service: &ServiceConfig,
+    no_cache: bool,
+) -> Result<String, BuildError> {
+    let build = service
+        .build
+        .as_ref()
+        .ok_or_else(|| BuildError::NoBuildBlock(service.name.clone()))?;
+    let context_path = resolve_relative_to_config(config, &build.context);
+
+    let iidfile = tempfile::Builder::new()
+        .prefix("yoink-iid-")
+        .suffix(".txt")
+        .tempfile()
+        .map_err(|source| BuildError::Spawn {
+            program: "tempfile".into(),
+            source,
+        })?;
+
+    // Probe tag used only long enough to retag with the digest below.
+    let probe_ref = docker::image_reference(&service.image, "yoink-build-probe");
+    let mut cmd = Command::new("docker");
+    cmd.arg("build")
+        .arg("--tag")
+        .arg(&probe_ref)
+        .arg("--iidfile")
+        .arg(iidfile.path());
+
+    if let Some(df) = &build.dockerfile {
+        cmd.arg("--file").arg(resolve_relative_to_config(config, df));
+    }
+    for (k, v) in &build.args {
+        cmd.arg("--build-arg").arg(format!("{k}={v}"));
+    }
+    if let Some(target) = &build.target {
+        cmd.arg("--target").arg(target);
+    }
+    if no_cache {
+        cmd.arg("--no-cache");
+    }
+    for extra in &build.extra_args {
+        cmd.arg(extra);
+    }
+    cmd.arg(&context_path);
+
+    eprintln!(
+        "yoink build {}: docker build (auto-tag from digest, context: {})",
+        service.name,
+        context_path.display()
+    );
+
+    let status = cmd.status().await.map_err(|source| BuildError::Spawn {
+        program: "docker".into(),
+        source,
+    })?;
+    if !status.success() {
+        return Err(BuildError::DockerBuildFailed {
+            service: service.name.clone(),
+            status: status.to_string(),
+        });
+    }
+
+    // Docker writes "sha256:<hex>" into the iidfile.
+    let iid = std::fs::read_to_string(iidfile.path()).map_err(|source| BuildError::Spawn {
+        program: "iidfile".into(),
+        source,
+    })?;
+    let short_tag: String = iid
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(iid.trim())
+        .chars()
+        .take(12)
+        .collect();
+
+    let final_ref = docker::image_reference(&service.image, &short_tag);
+    let tag_status = Command::new("docker")
+        .args(["tag", &probe_ref, &final_ref])
+        .status()
+        .await
+        .map_err(|source| BuildError::Spawn {
+            program: "docker".into(),
+            source,
+        })?;
+    if !tag_status.success() {
+        return Err(BuildError::DockerBuildFailed {
+            service: service.name.clone(),
+            status: tag_status.to_string(),
+        });
+    }
+
+    eprintln!("yoink build {}: tagged → {final_ref}", service.name);
+    Ok(short_tag)
+}
+
 /// Build one service, tagging the result on the operator's local
 /// daemon as `<image>:<tag>`. When `push` is `true`, follow the
 /// build with `docker push <image>:<tag>` so the image lands in a
