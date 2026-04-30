@@ -23,10 +23,10 @@ The four cells share a deploy engine — drift detection, healthcheck-gated roll
 
 ```mermaid
 flowchart LR
-    CI["CI builds + pushes\nyoink up --tag api=sha"] --> D
-    Local["yoink build --push\nyoink up"] --> D
-    Standalone["yoink up --build\nships direct over SSH"] --> D
-    D([rolling deploy])
+    Deploy([rolling deploy])
+    CI["CI-built\nyoink up --tag api=sha"] --> Deploy
+    Local["Local-build\nyoink build --push + yoink up"] --> Deploy
+    Standalone["Standalone\nyoink up --build"] --> Deploy
 ```
 
 ## CI-built — the default

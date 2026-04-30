@@ -11,17 +11,12 @@ Yoink addresses each: **a content hash on every container** for drift detection,
 ```mermaid
 flowchart TB
     A([yoink up]) --> B{spec_hash\nchanged?}
-    B -- no --> Z([done — no-op])
-    B -- yes --> C[acquire deploy lock]
-    C --> D[resolve secrets · build spec]
-    D --> E[pull / ship image]
-    E --> F[start new container]
-    F --> G{healthcheck\npasses?}
-    G -- yes --> H[stop old container]
-    H --> I[release lock]
-    I --> Z2([done — updated])
-    G -- no --> J[leave old running · surface error]
-    J --> I2[release lock]
+    B -- no --> Z([skip — no-op])
+    B -- yes --> C[lock · resolve secrets · ship]
+    C --> D[start new container]
+    D --> E{healthcheck\npasses?}
+    E -- yes --> F[stop old · unlock · done]
+    E -- no --> G[keep old running · unlock]
 ```
 
 ## Drift detection
