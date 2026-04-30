@@ -1,27 +1,25 @@
 # Media roadmap
 
-Tracking the docs pages that would benefit most from screen recordings, asciinema, or diagrams. Authors pick these off as bandwidth allows; nothing here blocks the doc text.
+Docs pages that need a recording or diagram. Pick off as bandwidth allows; not blocking.
 
-This file lives in `docs/` (not `docs/content/`) so Hugo doesn't render it.
+Lives in `docs/` (not `docs/content/`) so Hugo doesn't render it.
 
 ## Asciinema (priority order)
 
-Each line below is a high-impact "show, don't tell" spot. Asciinema is the right format when the value is *seeing the cadence* of a CLI flow — multi-step output, prompts, progress bars, a moment of "wait for it… ✓".
-
-| Page | What to record | Why it lands |
+| Page | What to record | Why |
 |---|---|---|
-| [`start/first-deploy.md`](content/docs/start/first-deploy.md) | `yoink up` against a fresh host: pull → create → healthcheck → swap | The literal "first time" moment. Watching the rolling deploy lands the value prop in 30s flat. |
-| [`how-to/hetzner-quickstart.md`](content/docs/how-to/hetzner-quickstart.md) | The 90-second flow end-to-end (init → hcloud server create → preflight wait → up → curl) | Proves the "90 seconds" claim viscerally. Could be the homepage hero. |
-| [`reference/tui.md`](content/docs/reference/tui.md) | TUI navigation tour — Dashboard → HostDetail → Logs → port-forward (`f`) → Secrets pane (`e`) | TUI keybinds in a table are dead text. Watching key overlays + pane transitions is 10× clearer. |
-| [`how-to/using-templates.md`](content/docs/how-to/using-templates.md) | `yoink add postgres` interactive wizard: variable prompts → confirmation diff → seal animation | The wizard's interactive shape is the whole point; static screenshots miss the diff-then-confirm rhythm. |
-| [`how-to/sealed-secrets-workflow.md`](content/docs/how-to/sealed-secrets-workflow.md) | `yoink secrets edit` round-trip: open editor, edit dotenv, save, watch reseal | Demystifies the "where do my secrets live" question in one clip. |
-| [`how-to/watch-mode.md`](content/docs/how-to/watch-mode.md) | Edit Dockerfile in one pane, `yoink up --watch --build` in the other, see redeploy fire | Literally about watching things reload — recording IS the docs. |
-| [`how-to/pr-comment-dry-run.md`](content/docs/how-to/pr-comment-dry-run.md) | A real PR getting the dry-run sticky comment posted by CI | Shows the "what changed" diff that operators get for free. Could be a screenshot if asciinema doesn't fit. |
-| [`how-to/standalone-mode.md`](content/docs/how-to/standalone-mode.md) | `yoink up --build` showing the unregistry sidecar spin-up + per-host progress bars | The progress bars + concurrent fan-out are visual; static text doesn't convey the speed. |
+| [`start/first-deploy.md`](content/docs/start/first-deploy.md) | `yoink up` against a fresh host: pull → create → healthcheck → swap | The first-deploy moment in 30s. |
+| [`how-to/hetzner-quickstart.md`](content/docs/how-to/hetzner-quickstart.md) | End-to-end: init → hcloud server create → preflight wait → up → curl | Proves the 90-second claim. Candidate homepage hero. |
+| [`reference/tui.md`](content/docs/reference/tui.md) | Dashboard → HostDetail → Logs → port-forward (`f`) → Secrets pane (`e`) | Keybind tables don't show pane transitions. |
+| [`how-to/using-templates.md`](content/docs/how-to/using-templates.md) | `yoink add postgres` wizard: variable prompts → confirmation diff → seal | Static screenshots miss the diff-then-confirm rhythm. |
+| [`how-to/sealed-secrets-workflow.md`](content/docs/how-to/sealed-secrets-workflow.md) | `yoink secrets edit` round-trip: open editor, edit dotenv, save, reseal | Shows where secrets live. |
+| [`how-to/watch-mode.md`](content/docs/how-to/watch-mode.md) | Edit Dockerfile in one pane, `yoink up --watch --build` in the other | Recording is the feature. |
+| [`how-to/pr-comment-dry-run.md`](content/docs/how-to/pr-comment-dry-run.md) | A real PR getting the dry-run sticky comment from CI | Screenshot works if asciinema doesn't fit. |
+| [`how-to/standalone-mode.md`](content/docs/how-to/standalone-mode.md) | `yoink up --build` with unregistry sidecar spin-up + per-host progress bars | Concurrent fan-out is visual. |
 
 ## Mermaid diagrams (priority order)
 
-Spots where the prose is fundamentally describing a graph or sequence. Mermaid renders inline in Hextra (the Hetzner quickstart already uses one).
+Where the prose is describing a graph or sequence. Mermaid renders inline in Hextra (the Hetzner quickstart uses one).
 
 | Page | Diagram | What it shows |
 |---|---|---|
@@ -34,19 +32,19 @@ Spots where the prose is fundamentally describing a graph or sequence. Mermaid r
 | [`guide/secrets.md`](content/docs/guide/secrets.md) | `flowchart` — identity resolution lookup order | YOINK_AGE_KEY → YOINK_AGE_KEY_FILE → keys-dir scan → legacy path. The table at line 50 reads bottom-to-top in the operator's mental model; a flowchart inverts that into top-down. |
 | [`guide/deploy-modes.md`](content/docs/guide/deploy-modes.md) | `flowchart` — build origin × distribution decision | "Where am I building?" → "Where does the image go?" → matrix cell. The 2×2 table works but a flowchart helps newcomers pick. |
 
-## Videos (longer-form, narrated)
+## Videos (3–5 min, narrated)
 
-Different shape from asciinema — these are 3–5 min walkthroughs with voiceover, suited to the homepage and YouTube. Lower priority than the asciinema list because they require recording effort + editing.
+Lower priority than asciinema — more recording + editing effort.
 
 | Page | Video | Pitch |
 |---|---|---|
-| Homepage / [`intro/what-and-why.md`](content/docs/intro/what-and-why.md) | "yoink in 5 minutes" | Pitch + first deploy + TUI tour. Embed at the top of `intro/what-and-why.md` and as the hero on the homepage. |
-| [`reference/tui.md`](content/docs/reference/tui.md) | "TUI tour" | 3–4 min walking through every pane, narrating what each shows. Pairs with the keybind table. |
-| [`how-to/cloudflare-origin-certs.md`](content/docs/how-to/cloudflare-origin-certs.md) | "Setting up Cloudflare origin-pull mTLS" | The dashboard click-path is hard to convey in screenshots; video makes the IAM-style toggles + "where's the origin cert?" obvious. |
+| Homepage / [`intro/what-and-why.md`](content/docs/intro/what-and-why.md) | "yoink in 5 minutes" | Pitch + first deploy + TUI tour. Hero embed. |
+| [`reference/tui.md`](content/docs/reference/tui.md) | "TUI tour" | Walk every pane, narrate what each shows. |
+| [`how-to/cloudflare-origin-certs.md`](content/docs/how-to/cloudflare-origin-certs.md) | "Cloudflare origin-pull mTLS" | The dashboard click-path is hard to screenshot. |
 
 ## Conventions
 
-- **Asciinema cast files** → `docs/static/asciinema/<page-slug>.cast` and embed via the [asciinema-player](https://github.com/asciinema/asciinema-player) shortcode (Hextra doesn't ship one; can hand-roll a partial under `docs/layouts/shortcodes/asciinema.html`).
-- **Diagrams** → inline mermaid blocks (`` ```mermaid ``); see `how-to/hetzner-quickstart.md` for the existing precedent.
-- **Videos** → host on YouTube, embed via Hextra's `{{< youtube >}}` shortcode.
-- **Screenshots** (the cheap fallback when recording isn't worth it) → `docs/static/img/<page-slug>/<topic>.png`, embed via standard markdown.
+- **Asciinema casts** → `docs/static/asciinema/<page-slug>.cast`, embed via [asciinema-player](https://github.com/asciinema/asciinema-player) (Hextra doesn't ship a shortcode; hand-roll under `docs/layouts/shortcodes/asciinema.html`).
+- **Diagrams** → inline mermaid blocks; see `how-to/hetzner-quickstart.md`.
+- **Videos** → YouTube, embed via Hextra's `{{< youtube >}}`.
+- **Screenshots** → `docs/static/img/<page-slug>/<topic>.png`, standard markdown embed.

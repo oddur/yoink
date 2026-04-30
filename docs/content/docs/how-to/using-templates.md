@@ -3,9 +3,9 @@ title: Adding a service via `yoink add`
 weight: 16
 ---
 
-Pick a vetted template, answer a few prompts, get a sealed-secret-having service fragment dropped into your project. Same code path serves bundled templates and arbitrary 3rd-party repos.
+Pick a template, answer the prompts, get a service fragment with sealed secrets dropped into your project. Same code path for bundled templates and 3rd-party repos.
 
-For the author side (publish your own template that anyone can `yoink add`), see [Authoring templates](/docs/guide/templates).
+To publish your own, see [Authoring templates](/docs/guide/templates).
 
 ## Try it
 
@@ -20,15 +20,15 @@ yoink add openclaw --up       # app: render fragment + run `yoink up`
 
 ## What it does
 
-1. Fetches `templates/<name>/` from `oddur/yoink@main` over GitHub (or any repo you point it at — see below).
+1. Fetches `templates/<name>/` from `oddur/yoink@main` (or another repo — see below).
 2. Reads the template's `template.yaml` manifest.
-3. Asks for any variables that don't have a default (or, with `--yes`, uses every default — useful in CI).
-4. Renders the template files with [minijinja](https://github.com/mitsuhiko/minijinja).
-5. Generates and **seals** any declared secrets straight into your `secrets.age` (the random bytes never leave the local process).
-6. Adds the fragment glob to your `yoink.yaml` `include:` list if it isn't already covered.
-7. Prints the manifest's notes — usually a one-liner showing how to wire the new service into your existing app.
+3. Prompts for variables without a default. `--yes` uses every default.
+4. Renders the files with [minijinja](https://github.com/mitsuhiko/minijinja).
+5. Generates and **seals** declared secrets into your `secrets.age` — random bytes never leave the local process.
+6. Adds the fragment glob to your `yoink.yaml` `include:` list if not already covered.
+7. Prints the manifest's notes — usually how to wire the service into your app.
 
-Every step gates on a confirmation diff in interactive mode. `--yes` skips all prompts and is required in CI.
+Every step gates on a confirmation diff. `--yes` skips prompts (required in CI).
 
 ## Bundled templates
 
@@ -45,16 +45,16 @@ The full set lives at <https://github.com/oddur/yoink/tree/main/templates>.
 
 ## Pinning to a specific version
 
-By default, `yoink add postgres` resolves the bundled template at `oddur/yoink@main`. To pin to a tag or commit:
+`yoink add postgres` resolves to `oddur/yoink@main` by default. Pin to a tag or commit:
 
 ```sh
 yoink add postgres@v0.12.0
 yoink add postgres@a1b2c3d
 ```
 
-The cache is content-addressed by the resolved commit SHA, so re-running with the same pin is a no-op (no network).
+The cache is content-addressed by resolved SHA — re-running with the same pin is a no-op (no network).
 
-To bypass the `main → SHA` mapping cache (e.g. when a branch was just updated and you want the latest):
+To bypass the `main → SHA` cache after a branch update:
 
 ```sh
 yoink add postgres --refresh
@@ -62,7 +62,7 @@ yoink add postgres --refresh
 
 ## 3rd-party templates
 
-Anyone can author templates and publish them in any GitHub repo. Use the `gh:` prefix to point at one:
+Use the `gh:` prefix:
 
 ```sh
 yoink add gh:acme/yoink-templates/clickhouse
@@ -70,11 +70,11 @@ yoink add gh:acme/yoink-templates@v1.0.0/clickhouse
 yoink add gh:acme/yoink-templates@a1b2c3d/clickhouse
 ```
 
-The same diff/confirm flow applies to 3rd-party sources — even bundled templates are run through it. The confirmation header shows the resolved short SHA so you know exactly what version you're applying.
+Same diff/confirm flow as bundled templates. The confirmation header shows the resolved short SHA.
 
 ## CI / non-interactive
 
-Every variable can be set via `--var key=value`, and `--yes` skips confirmations:
+Set variables via `--var key=value`; `--yes` skips confirmations:
 
 ```sh
 yoink add postgres --yes \
@@ -82,13 +82,13 @@ yoink add postgres --yes \
   --var memory=1g
 ```
 
-Variables without a default fail fast in non-interactive mode, so typos surface as clear errors instead of silently using empty values.
+Missing variables fail fast in non-interactive mode rather than defaulting to empty.
 
 ## Troubleshooting
 
 - **"variable X has no default"**: pass `--var X=value` or run interactively.
-- **"couldn't resolve …@main"**: GitHub API unreachable; if you've added this template before with the same ref, `yoink add` falls back to the cached SHA. Otherwise pass a pinned `@<sha>`.
-- **"rendered file failed yoink validation"**: bug in the template; please report it (or open a PR if it's one of the bundled ones).
+- **"couldn't resolve …@main"**: GitHub API unreachable. Falls back to the cached SHA if you've added this template before with the same ref; otherwise pass `@<sha>`.
+- **"rendered file failed yoink validation"**: template bug — report it (or open a PR for bundled templates).
 
 ## See also
 

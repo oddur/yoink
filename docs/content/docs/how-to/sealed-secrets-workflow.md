@@ -3,13 +3,13 @@ title: Sealed secrets workflow
 weight: 14
 ---
 
-The operator-facing tasks for working with `provider: age` sealed secrets — generating an identity, sealing values, consuming them from services, splitting staging/prod, backups, and rotation. For the mental model (why age, the asymmetric keypair, the threat model), see the [Secrets guide](/docs/guide/secrets).
+Operator tasks for `provider: age`: generating an identity, sealing values, consuming them, splitting staging/prod, backups, rotation. For the mental model (asymmetric keypair, threat model), see the [Secrets guide](/docs/guide/secrets).
 
 ## One-time setup
 
-If you ran `yoink init`, you can skip this section — `init` already generated an identity, saved it to `~/.config/yoink/keys/<recipient>.key`, added a `secrets:` block to your `yoink.yaml`, and printed a backup notice. Skip ahead to [Sealing values](#sealing-values).
+If you ran `yoink init`, skip to [Sealing values](#sealing-values) — `init` already generated an identity at `~/.config/yoink/keys/<recipient>.key` and added the `secrets:` block to your `yoink.yaml`.
 
-Otherwise, the manual flow is two steps.
+Manual flow:
 
 {{% steps %}}
 
@@ -19,13 +19,13 @@ Otherwise, the manual flow is two steps.
 yoink secrets key generate
 ```
 
-Writes a fresh identity to `~/.config/yoink/keys/<recipient>.key` (mode 0600) and prints the matching **recipient** (the `age1…` public half) for the next step. yoink discovers the key automatically every time you seal or unseal — no env var to set, no per-project gitignore to maintain. Multiple projects with different identities coexist in the dir; the filename is the recipient, so yoink picks the right one for each `yoink.yaml`.
+Writes a fresh identity to `~/.config/yoink/keys/<recipient>.key` (mode 0600) and prints the matching **recipient** (the `age1…` public half). Yoink discovers the key automatically on seal/unseal — no env var, no per-project gitignore. Multiple projects with different identities coexist in the dir; the filename is the recipient, so yoink picks the right one per `yoink.yaml`.
 
-**Back the key up.** It's the only thing that can decrypt your sealed values; lose it and the values in this repo are unrecoverable. Pick at least one:
+**Back the key up.** Lose it and every value sealed against it is unrecoverable. Pick at least one:
 
-- Password manager: `cat ~/.config/yoink/keys/<recipient>.key` and paste into 1Password / Bitwarden / Keychain.
-- Encrypted backup volume: `cp ~/.config/yoink/keys/<recipient>.key ~/Backups/`.
-- Teammate handoff: add their `age1…` recipient to `yoink.yaml` (multi-recipient sealing) — defence in depth so the file survives losing your laptop.
+- Password manager: paste from `cat ~/.config/yoink/keys/<recipient>.key` into 1Password / Bitwarden / Keychain.
+- Encrypted backup: `cp ~/.config/yoink/keys/<recipient>.key ~/Backups/`.
+- Teammate handoff: add their `age1…` recipient to `yoink.yaml` so a second identity can also unseal.
 
 ### Add the recipient to `yoink.yaml`
 
@@ -36,15 +36,15 @@ secrets:
     - age1w8jcq22re378p38nxrudmjqdkyh42cyzsge7snwzqxlzyqt7fgkqmmvy45
 ```
 
-The recipient is the public half — safe to commit. (`yoink secrets key public` re-derives it from your current identity if you didn't save the printed string.)
+The recipient is the public half — safe to commit. `yoink secrets key public` re-derives it from your current identity.
 
 {{% /steps %}}
 
-That's setup done — [Sealing values](#sealing-values) below creates `secrets.age` and you commit it normally.
+[Sealing values](#sealing-values) below creates `secrets.age`; commit it.
 
 ## Routing the identity to a managed store
 
-When you need the identity in a place other than your laptop's keys dir — typically a GitHub Actions secret, but also 1Password, AWS Secrets Manager, macOS Keychain, etc. — pass `--print` to send the secret to **stdout** while everything else (header, recipient, instructions) goes to **stderr**:
+To put the identity somewhere other than the laptop's keys dir (GitHub Actions secret, 1Password, AWS Secrets Manager, macOS Keychain), pass `--print` — secret goes to **stdout**, header/recipient/instructions go to **stderr**:
 
 ```sh
 # GitHub Actions
@@ -63,15 +63,15 @@ yoink secrets key generate --print | security add-generic-password \
   -s yoink-your-repo -a $USER -w
 ```
 
-The pipe captures only the `AGE-SECRET-KEY-1…` line. The recipient prints to your terminal (stderr) — copy that into `yoink.yaml`.
+The pipe captures only the `AGE-SECRET-KEY-1…` line. The recipient prints to stderr — copy that into `yoink.yaml`.
 
 {{< callout type="warning" >}}
-**Don't run `key generate --print` bare and copy-paste.** Many shells log stdout to scrollback, iTerm shared sessions, or tmux capture-pane history, and a bare `key generate --print` leaves the identity in your terminal. The default (no `--print`) is safe — it writes to disk and never touches stdout. Use `--print` only when piping directly into a store.
+**Don't run `key generate --print` bare and copy-paste.** Shell scrollback, iTerm shared sessions, and tmux capture-pane history retain the identity. The default (no `--print`) writes to disk and never touches stdout. Use `--print` only when piping into a store.
 {{< /callout >}}
 
-`--out PATH` writes to a specific file (mode 0600) instead — useful for keeping a project-local keyfile alongside `yoink.yaml`.
+`--out PATH` writes to a specific file (mode 0600) — for a project-local keyfile alongside `yoink.yaml`.
 
-For a complete CI walkthrough — generate identity, add recipient, wire the workflow — see the [AGE secrets in GitHub Actions recipe](/docs/how-to/age-in-github-actions).
+For a complete CI walkthrough see [AGE secrets in GitHub Actions](/docs/how-to/age-in-github-actions).
 
 ## Sealing values
 
@@ -112,28 +112,28 @@ services:
       OTEL_EXPORTER_OTLP_HEADERS: GRAFANA_AUTH_HEADER
 ```
 
-Yoink resolves them out of the sealed bundle and feeds them as env vars to the runtime container. The values flow into [`spec_hash`](/docs/guide/architecture#drift-detection) too — rotating a secret triggers a redeploy, exactly like a config change. (One consequence worth knowing: editing *any* key in `secrets.age` rerolls every service that references *any* secret. The dry-run output (`yoink up --dry-run`) shows the diff before you merge.)
+Yoink resolves the values from the sealed bundle and injects them as env vars. The values feed into [`spec_hash`](/docs/guide/architecture#drift-detection), so rotating a secret triggers a redeploy like a config change. Editing *any* key in `secrets.age` rerolls every service that references *any* secret — `yoink up --dry-run` shows the diff first.
 
 ## Multiple environments (staging / prod)
 
-Most projects want different values in staging vs prod, and ideally a leak of the staging key shouldn't unlock prod. The yoink-native shape:
+To keep staging and prod values separate so a leaked staging key can't unlock prod:
 
 ```
 yoink.staging.yaml   secrets.staging.age   YOINK_AGE_KEY (in staging CI)
 yoink.prod.yaml      secrets.prod.age      YOINK_AGE_KEY (in prod CI)
 ```
 
-Each yaml carries its own `secrets.recipients:` (one recipient per environment) and `secrets.file:`. The CI workflow that targets staging only ever has access to the staging *identity*; the prod deploy workflow runs with the prod identity. A compromised staging identity can't decrypt prod's sealed file — that file is sealed against a different recipient, which only the prod identity unlocks.
+Each yaml carries its own `secrets.recipients:` and `secrets.file:`. The staging CI workflow only has the staging identity; prod runs with the prod identity. A compromised staging identity can't decrypt the prod file — different recipient.
 
-If staging and prod genuinely share values (a 12-factor "same image, different config" deploy that just needs a different `DATABASE_URL`), you can put both recipients on a single sealed file — either identity decrypts, deploys carry the right env's overrides via `--tag` / per-host yaml, and you only manage one `secrets.age`. The trade-off is that compromise of either identity reveals both environments' values.
+If staging and prod share values (same image, different `DATABASE_URL` only), put both recipients on one sealed file: either identity decrypts, deploys carry env-specific overrides via `--tag` or per-host yaml. Trade-off: compromise of either identity reveals both environments.
 
 ## Backup and recovery
 
-The sealed file is in git, replicated everywhere the repo is. The age identity is the irreplaceable part: lose it and every value sealed against it is unrecoverable.
+The sealed file is in git. The identity is the irreplaceable part.
 
-- **Keep the identity in two stores that can't fail together.** Primary in your secret manager (GitHub Actions secret, 1Password, AWS SM, Vault); recovery copy offline (sealed envelope in a safe, encrypted USB, second manager under a different account). Don't co-locate them under one SSO — a single compromise wipes both.
-- **Test the recovery path quarterly.** Decrypt `secrets.age` on a clean machine using only the recovery key. An untested copy is not a backup.
-- **Rotation isn't a backup substitute.** Rotating swaps the active identity; it doesn't help if the current one is already gone. If both copies are lost, re-seal from scratch — recover values from upstream sources (Stripe dashboard, AWS console, the manager's CLI) and accept that anything else is lost.
+- **Two stores that can't fail together.** Primary in your secret manager; recovery offline (sealed envelope, encrypted USB, second manager under a different account). Don't co-locate under one SSO.
+- **Test recovery quarterly.** Decrypt `secrets.age` on a clean machine using only the recovery key.
+- **Rotation isn't a backup.** It swaps the active identity; it doesn't help if the current one is already gone. If both copies are lost, re-seal from scratch from upstream sources (Stripe dashboard, AWS console, manager CLIs).
 
 ## Planned key rotation
 
@@ -141,11 +141,11 @@ The sealed file is in git, replicated everywhere the repo is. The age identity i
 yoink secrets rotate
 ```
 
-Generates a new identity, re-seals `secrets.age` against [existing recipients + new public key], and prints the new private + public so you can update CI / your secret manager. The transitional state has both keys able to decrypt — no deploy outage during the swap.
+Generates a new identity, re-seals `secrets.age` against [existing recipients + new public key], and prints the new private + public for updating CI / your secret manager. Both keys decrypt during the transition — no deploy outage.
 
-**When is it safe to drop the old recipient?** Concretely: after at least one successful `yoink up` has run with *only* the new private key in `YOINK_AGE_KEY` (no fallback). Verify by checking the deploy log — if the run reads `secrets.age` and reconciles services without an "age decrypt failed" error, every consumer of the sealed file is on the new key. Until that confirmation, leave both recipients in place; a premature drop bricks any operator / CI runner still on the old key (they can no longer decrypt new edits).
+**When is it safe to drop the old recipient?** After at least one successful `yoink up` has run with *only* the new private key in `YOINK_AGE_KEY`. Check the deploy log: a run that reads `secrets.age` and reconciles without "age decrypt failed" confirms every consumer is on the new key. A premature drop bricks any operator or CI runner still on the old key.
 
-Once that's confirmed: remove the old recipient from `yoink.yaml` and run `yoink secrets edit` (save without changes) to drop it from the sealed file. Wipe the old `YOINK_AGE_KEY` from your manager only after the recipient is gone — until then it's still legitimately in use.
+Then remove the old recipient from `yoink.yaml`, run `yoink secrets edit` (save without changes) to drop it from the sealed file, and only after that wipe the old `YOINK_AGE_KEY` from your manager.
 
 Manual flow:
 
@@ -191,27 +191,27 @@ Remove from `secrets.recipients:`, re-seal one more time, commit, then delete th
 
 ## Compromised key — emergency rotation
 
-If `YOINK_AGE_KEY` lands somewhere it shouldn't (Slack paste, leaked workflow log, stolen unlocked laptop, terminated employee's password manager), rotate **today** — the rotation flow above is the same one for routine hygiene, but the urgency is different and so is the cleanup.
+If `YOINK_AGE_KEY` leaks (Slack paste, workflow log, stolen unlocked laptop, terminated employee's password manager), rotate **today**. Same flow as planned rotation, different urgency and cleanup.
 
-The compromised key can decrypt every value sealed against it for as long as the operator can pull the repo, so:
+The leaked key decrypts every value sealed against it for as long as the attacker has the repo:
 
 {{% steps %}}
 
 ### Generate a new identity, re-seal, ship
 
-Run `yoink secrets rotate` (or the manual flow above). From this point forward, only the new identity decrypts new sealed-file revisions.
+Run `yoink secrets rotate` (or the manual flow above). From this point only the new identity decrypts new revisions.
 
 ### Rotate every value in the bundle, not just the key
 
-A leaked age key is equivalent to leaking every secret it ever decrypted. The attacker has a copy of `secrets.age` (it's in the public repo or wherever they got the key from) and now decrypts it freely. So: roll the database password, regenerate the JWT signing key, rotate the GHCR token, etc., and re-seal those new values into the new sealed file. Use the post-incident checklist your org normally runs for "secret X leaked" — yoink's rotation only swaps the wrapping key, not the contents.
+A leaked age key equals every secret it ever decrypted. The attacker has `secrets.age` and decrypts it freely. Roll the database password, regenerate the JWT signing key, rotate the GHCR token, re-seal the new values. Yoink's rotation swaps the wrapping key, not the contents — run your "secret X leaked" checklist.
 
-### Revoke any cached copies of the old key
+### Revoke cached copies of the old key
 
-GitHub Actions secret: delete and replace. 1Password / vault entries: delete the old version, not just edit it (some managers keep history). Laptop key files: `srm` / `shred` (or just remove and let the SSD's GC eventually take it).
+GitHub Actions secret: delete and replace. 1Password / vault entries: delete the old version (some managers retain edit history). Laptop key files: `srm` / `shred`.
 
 ### Audit the deploy log
 
-`git log secrets.age` shows when the file was last changed; `gh run list --workflow=deploy.yml` shows who triggered deploys with the key. If an unknown deploy ran in the leak window, treat the host as suspect.
+`git log secrets.age` shows file edits; `gh run list --workflow=deploy.yml` shows deploys with the key. Unknown deploys in the leak window mean the host is suspect.
 
 {{% /steps %}}
 

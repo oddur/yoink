@@ -3,19 +3,19 @@ title: Caddy snippets cookbook
 weight: 17
 ---
 
-`caddy_extra_json:` (and `caddy_extra_caddyfile:`) are the escape hatch for Caddy features that aren't deploy primitives — auth, rate limiting, headers, redirects, IP allowlists, body limits. Yoink models the routing graph; Caddy models the traffic handling.
+`caddy_extra_json:` and `caddy_extra_caddyfile:` are the escape hatch for Caddy features that aren't deploy primitives — auth, rate limiting, headers, redirects, IP allowlists, body limits.
 
-Each snippet below shows both the Caddyfile shape (friendlier syntax; what Caddy's own docs use) and the JSON equivalent (lower-level; what the admin API consumes). Both forms work on vanilla `caddy:2` — no plugins required unless noted.
+Each snippet shows both the Caddyfile form (Caddy's docs use this) and the JSON equivalent (admin API consumes this). Both work on vanilla `caddy:2` unless noted.
 
-For the proxy block schema and the full "how the bundled Caddy fits into yoink" mental model, see the [Reverse proxy guide](/docs/guide/proxy).
+For the proxy block schema, see the [Reverse proxy guide](/docs/guide/proxy).
 
 {{< callout type="info" >}}
-**Caddyfile vs JSON**: pick whichever you prefer. `caddy_extra_caddyfile:` shells out to `caddy adapt` at render time (requires docker on the operator's machine; one-time pull). `caddy_extra_json:` is parsed inline (no docker dep at render time). They're mutually exclusive on a single service.
+**Caddyfile vs JSON**: `caddy_extra_caddyfile:` shells out to `caddy adapt` at render time (needs docker on the operator's machine). `caddy_extra_json:` is parsed inline. Mutually exclusive on a single service.
 {{< /callout >}}
 
 ## Forward auth → Authelia / Authentik / oauth2-proxy
 
-Gates every request to this service through an auth-decision endpoint on another service. Standard pattern for SSO over self-hosted apps.
+Gates every request through an auth-decision endpoint on another service. Standard SSO pattern for self-hosted apps.
 
 **Caddyfile:**
 ```yaml
@@ -49,7 +49,7 @@ caddy_extra_json: |
 
 ## Basic auth (single user)
 
-For a quick admin page or dashboard. Caddy hashes the password with bcrypt at config-load.
+For an admin page or dashboard. Caddy bcrypt-hashes the password at config-load.
 
 **Caddyfile:**
 ```yaml
@@ -81,7 +81,7 @@ docker run --rm caddy:2 caddy hash-password --plaintext 'your-password'
 
 ## IP allowlist
 
-Restrict access to a set of IPs (CIDR ranges OK). Common pattern for tailnet-only routes.
+Restrict access to a set of IPs (CIDR ranges OK). Tailnet-only routes use this.
 
 **Caddyfile:**
 ```yaml
@@ -209,7 +209,7 @@ caddy_extra_json: |
 
 ## Plugins via `proxy.xcaddy:`
 
-For directives that aren't in stock caddy (rate-limit, l4, redis-storage, third-party DNS providers), list the plugins under `proxy.xcaddy:` and yoink builds caddy on each proxy host with those modules baked in. No registry, no operator-side Dockerfile. See the [`proxy.xcaddy:`](/docs/guide/proxy#proxyxcaddy-block--caddy-plugins-without-a-registry) section in the guide for the full block.
+For directives outside stock Caddy (rate-limit, l4, redis-storage, third-party DNS providers), list plugins under `proxy.xcaddy:`. Yoink builds Caddy on each proxy host with those modules baked in — no registry, no operator-side Dockerfile. See [`proxy.xcaddy:`](/docs/guide/proxy#proxyxcaddy-block--caddy-plugins-without-a-registry).
 
 ### Rate limiting (`caddy-ratelimit`)
 
