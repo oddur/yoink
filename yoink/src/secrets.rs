@@ -241,6 +241,13 @@ fn config_references_secrets(config: &Config) -> bool {
     {
         return true;
     }
+    if config
+        .hosts
+        .iter()
+        .any(|h| h.address_secret.is_some() || h.ssh_key_secret.is_some())
+    {
+        return true;
+    }
     config
         .hooks
         .pre_deploy

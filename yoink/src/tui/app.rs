@@ -1162,6 +1162,19 @@ impl App {
         // it, so without this the synthetic `local` host disappears
         // every CONFIG_RELOAD_TICK.
         new_config.push_local_host_if_socket();
+        // If the config has any `address_secret:` hosts, resolve them
+        // against the cached secrets bundle. The TUI loads the bundle
+        // asynchronously via the `secrets` Arc; until that bundle
+        // lands, sealed-address hosts will render with empty
+        // addresses — which is a strong visual signal that the bundle
+        // hasn't loaded yet. Once the bundle is cached, every reload
+        // tick re-applies the resolution and the hosts populate.
+        if new_config.any_host_address_sealed()
+            && let Some(bundle) = self.secrets.try_read().ok().and_then(|g| g.clone())
+            && let Err(e) = new_config.resolve_host_addresses(Some(bundle.as_ref()))
+        {
+            tracing::debug!(error = %e, "tui: resolve_host_addresses failed");
+        }
         if new_config == *self.config {
             return;
         }

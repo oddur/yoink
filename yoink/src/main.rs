@@ -911,9 +911,16 @@ enum HostsAction {
     /// confirm the new host doesn't collide with an existing address;
     /// if it does, the fragment is removed and the command errors.
     Add {
-        /// Hostname or IP yoink will SSH into.
-        #[arg(long, value_name = "ADDR")]
-        address: String,
+        /// Hostname or IP yoink will SSH into. Mutually exclusive with
+        /// `--address-secret`.
+        #[arg(long, value_name = "ADDR", conflicts_with = "address_secret")]
+        address: Option<String>,
+        /// Name of a sealed-secret entry holding the host address (IP
+        /// or hostname). Resolved at deploy time. Use this when the
+        /// deploy config sits in a public repo and the host's address
+        /// itself is sensitive. Mutually exclusive with `--address`.
+        #[arg(long = "address-secret", value_name = "NAME")]
+        address_secret: Option<String>,
         /// SSH user. Must be in the host's `docker` group, or be `root`.
         #[arg(long, value_name = "USER", default_value = "root")]
         user: String,
@@ -922,8 +929,10 @@ enum HostsAction {
         /// and uses it instead of the operator's ssh-agent.
         #[arg(long = "ssh-key-secret", value_name = "NAME")]
         ssh_key_secret: Option<String>,
-        /// Logical name; becomes the fragment filename. Default: derived
-        /// from the address with `:` and `.` swapped for `-`.
+        /// Logical name; becomes the fragment filename. Required when
+        /// the address is sealed (no literal value to derive from).
+        /// Default: derived from the address with `:` and `.` swapped
+        /// for `-`.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
         /// Directory to write the fragment into. The directory is
@@ -1095,12 +1104,14 @@ async fn run(cli: Cli) -> Result<()> {
     // `yoink add postgres` ran), so it loads through the relaxed
     // path that skips cross-service validation. Every other command
     // assumes a deployable config.
-    let config = if matches!(cli.command, Command::Add { .. }) {
+    let mut config = if matches!(cli.command, Command::Add { .. }) {
         Config::load_from_path_relaxed(&cli.config)
     } else {
         Config::load_from_path(&cli.config)
     }
     .with_context(|| format!("loading {}", cli.config.display()))?;
+
+    resolve_sealed_host_addresses(&mut config).await?;
 
     match cli.command {
         Command::Add {
@@ -1128,8 +1139,9 @@ async fn run(cli: Cli) -> Result<()> {
                 // include: edits + new fragment files mean the in-memory
                 // config we loaded above is now stale. Reload before
                 // running up so the freshly-added service is included.
-                let reloaded = Config::load_from_path(&cli.config)
+                let mut reloaded = Config::load_from_path(&cli.config)
                     .with_context(|| format!("reloading {}", cli.config.display()))?;
+                resolve_sealed_host_addresses(&mut reloaded).await?;
                 let no_services: Vec<String> = Vec::new();
                 let no_tags: Vec<String> = Vec::new();
                 cmd_up(
@@ -1924,6 +1936,23 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
     secrets::load_bundle(config)
         .await
         .context("load secrets bundle")
+}
+
+/// If any host has `address_secret:` set, eagerly load the secrets
+/// bundle and populate `host.address` from it. Idempotent — calling
+/// twice is safe. Skipped (no work, no bundle access) when no host
+/// is sealed, so configs that don't use the feature pay nothing.
+async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
+    if !config.any_host_address_sealed() {
+        return Ok(());
+    }
+    let bundle = secrets::load_bundle(config)
+        .await
+        .context("load secrets bundle to resolve hosts[].address_secret")?;
+    config
+        .resolve_host_addresses(bundle.as_ref())
+        .context("resolve hosts[].address_secret against the sealed bundle")?;
+    Ok(())
 }
 
 /// Build a `RealDockerOps` aware of any `hosts[].ssh_key_secret`
@@ -3706,19 +3735,33 @@ fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Resu
                     .as_deref()
                     .map(|n| format!("  ssh_key_secret={n}"))
                     .unwrap_or_default();
-                println!("{}@{}{}", host.user, host.address, key_note);
+                // Prefer the resolved literal when available; fall
+                // back to `<address_secret:KEY>` only when resolution
+                // hasn't populated `address` yet (no bundle, or
+                // running this command before the eager resolve in
+                // `run`).
+                let display_address = if !host.address.is_empty() {
+                    host.address.clone()
+                } else if let Some(secret) = host.address_secret.as_deref() {
+                    format!("<address_secret:{secret}>")
+                } else {
+                    String::new()
+                };
+                println!("{}@{}{}", host.user, display_address, key_note);
             }
             Ok(())
         }
         HostsAction::Add {
             address,
+            address_secret,
             user,
             ssh_key_secret,
             name,
             dest_dir,
         } => cmd_hosts_add(
             config_path,
-            &address,
+            address.as_deref(),
+            address_secret.as_deref(),
             &user,
             ssh_key_secret.as_deref(),
             name.as_deref(),
@@ -3730,18 +3773,37 @@ fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Resu
 
 fn cmd_hosts_add(
     config_path: PathBuf,
-    address: &str,
+    address: Option<&str>,
+    address_secret: Option<&str>,
     user: &str,
     ssh_key_secret: Option<&str>,
     name: Option<&str>,
     dest_dir: &Path,
 ) -> Result<()> {
-    if address.trim().is_empty() {
-        return Err(anyhow::anyhow!("--address must not be empty"));
+    let address = address.map(str::trim).filter(|s| !s.is_empty());
+    let address_secret = address_secret.map(str::trim).filter(|s| !s.is_empty());
+    match (address, address_secret) {
+        (None, None) => {
+            return Err(anyhow::anyhow!(
+                "set either --address or --address-secret"
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "--address and --address-secret are mutually exclusive"
+            ));
+        }
+        _ => {}
     }
-    let derived_name = name
-        .map(str::to_string)
-        .unwrap_or_else(|| address.replace([':', '.'], "-"));
+    let derived_name = match (name, address) {
+        (Some(n), _) => n.to_string(),
+        (None, Some(addr)) => addr.replace([':', '.'], "-"),
+        (None, None) => {
+            return Err(anyhow::anyhow!(
+                "--name is required when --address-secret is used (no literal address to derive a name from)"
+            ));
+        }
+    };
     if derived_name.is_empty()
         || !derived_name
             .chars()
@@ -3780,7 +3842,11 @@ fn cmd_hosts_add(
         date = chrono_like_date()
     ));
     body.push_str("hosts:\n");
-    body.push_str(&format!("  - address: {address}\n"));
+    if let Some(addr) = address {
+        body.push_str(&format!("  - address: {addr}\n"));
+    } else if let Some(secret) = address_secret {
+        body.push_str(&format!("  - address_secret: {secret}\n"));
+    }
     body.push_str(&format!("    user: {user}\n"));
     if let Some(secret) = ssh_key_secret {
         body.push_str(&format!("    ssh_key_secret: {secret}\n"));
@@ -3797,8 +3863,12 @@ fn cmd_hosts_add(
             "config failed to reload after adding host {derived_name:?}: {e}"
         ));
     }
+    let display_address = address
+        .map(str::to_string)
+        .or_else(|| address_secret.map(|s| format!("<address_secret:{s}>")))
+        .unwrap_or_default();
     eprintln!(
-        "✓ added host {derived_name} ({user}@{address}) to {}",
+        "✓ added host {derived_name} ({user}@{display_address}) to {}",
         fragment_path.display()
     );
     Ok(())
