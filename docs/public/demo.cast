@@ -851,3 +851,4 @@
 [0.355, "o", "[docs] [203.0.113.10] stopped old docs-61b702f9-0\r\n[docs] [203.0.113.10] done — docs-c1d70c8a-0\r\n"]
 [0.038, "o", "✓ reconciled 2 service(s)\r\n  yoink-proxy:2\r\n    203.0.113.10: yoink-proxy-ae548533 (healthy after 0 attempt(s); stopped 0 old)\r\n  docs:5d26e1f\r\n    203.0.113.10: docs-c1d70c8a-0 (healthy after 1 attempt(s); stopped 4 old)\r\n"]
 [0.026, "x", "0"]
+[5.0, "o", ""]
