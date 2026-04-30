@@ -17,6 +17,12 @@ There are good tools in this neighborhood already — Kamal, Dokku, Coolify, pla
 
 It was originally meant for small side projects, sharing a prototype, running an experiment cheaply on a VPS without spinning up a registry and a CI pipeline first. It still is. But the same primitives — healthcheck-gated swaps, pre-deploy migrations, sealed secrets, multi-host fan-out — also operate a production-quality setup if you wield it that way.
 
+## yoink.is is dogfooded on a $4 Hetzner box
+
+This very site is deployed by yoink. A `cax11` ARM box (€3.29/mo) in Nuremberg runs four `nginx:alpine` replicas behind yoink's bundled Caddy, fronted by Cloudflare with Authenticated Origin Pulls so direct-IP traffic gets rejected at the TLS handshake. Every secret — the box IP, the deploy SSH key, the Cloudflare Origin Certificate — lives sealed in `docs/secrets.age`, committed to this very repo, decryptable only with an age identity that doesn't.
+
+`cd docs && yoink up --build` from a laptop rebuilds the Hugo site, ships only the changed layers over SSH via unregistry, and rolls the four replicas. The whole deploy config is one file: [`docs/yoink.yaml`](https://github.com/oddur/yoink/blob/main/docs/yoink.yaml).
+
 If yoink ends up useful to you, I'd love to hear about it — [oddur.me](https://oddur.me).
 
 PRs, issues, and template contributions are very welcome. The repo is at [github.com/oddur/yoink](https://github.com/oddur/yoink). If you've built a yoink template for a service worth sharing (databases, caches, search, object storage, backup tooling), open a PR against [`templates/`](https://github.com/oddur/yoink/tree/main/templates).
