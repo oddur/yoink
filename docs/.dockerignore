@@ -1,0 +1,9 @@
+# Hugo build artifacts — regenerated inside the builder stage.
+public/
+resources/_gen/
+.hugo_build.lock
+
+# Yoink deploy artifacts that sit alongside the docs source — must not
+# end up in the container image.
+yoink.yaml
+secrets.age
