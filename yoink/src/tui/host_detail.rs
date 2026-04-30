@@ -84,6 +84,12 @@ impl HostDetailState {
         // filtered list for a frame.
         let n = self.visible_indices().len();
         clamp_selection(&mut self.table, n);
+        // Auto-select row 0 once data lands so per-row actions
+        // (`f` port-forward, `v` vscode, `S`/`X`/`T`/`K` lifecycle)
+        // are usable without first nudging the cursor with j/k.
+        if n > 0 && self.table.selected().is_none() {
+            self.table.select(Some(0));
+        }
     }
 
     pub fn select_next(&mut self) {
@@ -295,7 +301,7 @@ impl HostDetailState {
         }
         let footer = filter_footer(
             &self.filter,
-            "↑↓ select · enter logs · i inspect · ! shell · D debug · S start · X stop · R restart · K kill · U reconcile · r refresh",
+            "↑↓ select · enter logs · i inspect · ! shell · f forward · v vscode · D debug · S start · X stop · T restart · K kill · U reconcile · r refresh",
         );
         frame.render_widget(footer, footer_area);
 

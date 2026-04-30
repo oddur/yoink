@@ -428,7 +428,7 @@ impl SecretsState {
         }
         let mut parts = vec!["q quit", "↑↓ select", "/ filter", "r reveal"];
         if writable {
-            parts.extend_from_slice(&["a add", "e edit", "d delete"]);
+            parts.extend_from_slice(&["a add", "Enter edit", "x delete"]);
         }
         parts.push("esc back");
         parts.join(" · ")

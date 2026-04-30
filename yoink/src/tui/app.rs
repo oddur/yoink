@@ -200,7 +200,9 @@ impl View {
                 "  i            container detail (labels, env, live cpu/mem)",
                 "  !            shell into container (bash/sh)",
                 "  B            debug sidecar (alpine, target's pid+net ns)",
-                "  S            start · X stop · R restart container",
+                "  f            port-forward (localhost ↔ container)",
+                "  v            VS Code in browser, rooted in container fs",
+                "  S            start · X stop · T restart container",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
                 "  /            filter substring · esc to clear",
@@ -212,9 +214,10 @@ impl View {
             ],
             View::ContainerDetail { .. } => vec![
                 "container detail",
-                "  enter / l    live logs",
+                "  enter        live logs",
                 "  !            shell · B debug sidecar",
-                "  S            start · X stop · R restart container",
+                "  f            port-forward · v VS Code in browser",
+                "  S            start · X stop · T restart container",
                 "  K            SIGKILL container (with confirmation)",
                 "  U            reconcile this service (with confirmation)",
                 "  p            processes (docker top)",
@@ -1863,11 +1866,10 @@ impl App {
             return false;
         }
         match key.code {
-            // Lowercase `d` is dashboard nav from anywhere EXCEPT the
-            // Secrets and Resources panes — both bind `d` to delete the
-            // selected item, and a delete key shouldn't surprise-route
-            // to a pane switch when the operator's intent is "remove."
-            KeyCode::Char('d') if !matches!(self.view, View::Secrets | View::Resources) => {
+            // Lowercase `d` is dashboard nav from any view. Per-view
+            // delete actions live on `x` (vim-like) so the global
+            // pane-switch mnemonic stays consistent everywhere.
+            KeyCode::Char('d') => {
                 self.transition(View::Dashboard).await;
                 return false;
             }
@@ -2105,7 +2107,11 @@ impl App {
                         self.spawn_lifecycle(host, container, LifecycleOp::Stop);
                     }
                 }
-                KeyCode::Char('R') => {
+                // `T` (resTart) — capital `R` is the global "go to
+                // Resources" nav and would shadow this binding. The
+                // `S`/`X`/`K`/`T` family is consistent across
+                // container-action surfaces.
+                KeyCode::Char('T') => {
                     if let (Some(host), Some(container)) = (
                         self.host_detail.host().cloned(),
                         self.host_detail.selected_container(),
@@ -2135,7 +2141,9 @@ impl App {
                 KeyCode::Char('X') => {
                     self.spawn_lifecycle(host.clone(), container.clone(), LifecycleOp::Stop);
                 }
-                KeyCode::Char('R') => {
+                // `T` (resTart) — capital `R` is the global "go to
+                // Resources" nav (see HostDetail handler above).
+                KeyCode::Char('T') => {
                     self.spawn_lifecycle(host.clone(), container.clone(), LifecycleOp::Restart);
                 }
                 KeyCode::Char('K') => {
@@ -2161,7 +2169,9 @@ impl App {
                     let host = host.clone();
                     self.transition(View::HostDetail(host)).await;
                 }
-                KeyCode::Char('l') | KeyCode::Enter => {
+                // `Enter` only — lowercase `l` is the global "go to
+                // Logs" nav and would shadow this binding.
+                KeyCode::Enter => {
                     let host = host.clone();
                     let container = container.clone();
                     self.transition(View::ContainerLogs { host, container })
@@ -2218,6 +2228,7 @@ impl App {
                 KeyCode::Char('c') => self.logs.clear(),
                 KeyCode::Char('y') => self.copy_logs_to_clipboard(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
+                KeyCode::Char('w') => self.logs.toggle_wrap(),
                 KeyCode::Up => self.logs.scroll_up(1),
                 KeyCode::Down => self.logs.scroll_down(1),
                 KeyCode::PageUp => self.logs.scroll_up(10),
@@ -2349,7 +2360,6 @@ impl App {
                         }
                     }
                     KeyCode::Esc => self.transition(View::ServiceDetail(svc)).await,
-                    KeyCode::Char('R') => self.schedule_history_refresh(svc),
                     _ => {}
                 }
             }
@@ -2362,6 +2372,7 @@ impl App {
                 KeyCode::Char('y') => self.copy_logs_to_clipboard(),
                 KeyCode::Char('c') => self.logs.clear(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
+                KeyCode::Char('w') => self.logs.toggle_wrap(),
                 KeyCode::Up => self.logs.scroll_up(1),
                 KeyCode::Down => self.logs.scroll_down(1),
                 KeyCode::PageUp => self.logs.scroll_up(10),
@@ -2375,10 +2386,12 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.secrets_state.select_next(),
                 KeyCode::Char('r') => self.secrets_state.toggle_reveal(),
                 KeyCode::Char('a') => self.secrets_state.begin_add(),
-                KeyCode::Char('e') | KeyCode::Enter => {
+                // `Enter` only — lowercase `e` is the global "go to
+                // Secrets" nav and would shadow this binding.
+                KeyCode::Enter => {
                     self.secrets_state.begin_edit_selected();
                 }
-                KeyCode::Char('d') => self.secrets_state.begin_remove_selected(),
+                KeyCode::Char('x') => self.secrets_state.begin_remove_selected(),
                 _ => {}
             },
             View::Resources => match key.code {
@@ -2387,7 +2400,7 @@ impl App {
                 KeyCode::Char('i') => self.resources.set_tab(ResourceTab::Images),
                 KeyCode::Char('v') => self.resources.set_tab(ResourceTab::Volumes),
                 KeyCode::Char('n') => self.resources.set_tab(ResourceTab::Networks),
-                KeyCode::Char('d') => {
+                KeyCode::Char('x') => {
                     if let Some(target) = self.resources.selected_target(&self.config) {
                         self.resource_remove_target = Some(target);
                     }

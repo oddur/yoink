@@ -332,6 +332,12 @@ impl ServiceDetailState {
             // indexes into `visible_indices()`, not `self.rows`.
             let n = self.visible_indices().len();
             clamp_selection(&mut self.table, n);
+            // Auto-select row 0 once data lands so per-row actions
+            // (`f` port-forward, `v` vscode, `!` shell) are usable
+            // without first nudging the cursor with j/k.
+            if n > 0 && self.table.selected().is_none() {
+                self.table.select(Some(0));
+            }
         }
     }
 
@@ -496,7 +502,7 @@ impl ServiceDetailState {
 
         let footer = filter_footer(
             &self.filter,
-            "q quit · esc back · ↑↓ select · enter logs · ! shell · D debug",
+            "q quit · esc back · ↑↓ select · enter logs · ! shell · f forward · v vscode · D debug",
         );
         frame.render_widget(footer, layout[2]);
     }

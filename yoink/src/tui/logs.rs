@@ -10,7 +10,7 @@
 use ratatui::Frame;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::config::Config;
 
@@ -32,6 +32,12 @@ pub struct LogsState {
     filter: Option<String>,
     /// `Some(buf)` while the user is typing into the filter prompt.
     input_buffer: Option<String>,
+    /// When true, long lines wrap inside the pane instead of being
+    /// truncated at the right edge. Toggled by `w`. Works regardless
+    /// of whether the line came from `hl` (styled spans) or the plain
+    /// forwarder — `Paragraph::wrap` wraps on the rendered glyph
+    /// stream after styling has been applied.
+    wrap: bool,
 }
 
 /// One line in the buffer. `plain` is what the filter matches against;
@@ -126,6 +132,15 @@ impl LogsState {
         self.scroll = 0;
     }
 
+    pub fn toggle_wrap(&mut self) {
+        self.wrap = !self.wrap;
+    }
+
+    #[cfg(test)]
+    pub fn wrap_enabled(&self) -> bool {
+        self.wrap
+    }
+
     // ─── filter input ──────────────────────────────────────────────────
 
     pub fn input_mode(&self) -> bool {
@@ -213,7 +228,16 @@ impl LogsState {
             };
             Paragraph::new(placeholder).style(Style::default().fg(Color::DarkGray))
         } else {
-            Paragraph::new(Text::from(filtered)).scroll((scroll, 0))
+            let p = Paragraph::new(Text::from(filtered)).scroll((scroll, 0));
+            // `wrap.trim: false` keeps leading whitespace inside a
+            // wrapped line — important when a logger emits indented
+            // continuation lines (stack traces, structured-log
+            // multi-line values) that should stay visually aligned.
+            if self.wrap {
+                p.wrap(Wrap { trim: false })
+            } else {
+                p
+            }
         }
         .block(Block::default().borders(Borders::ALL).title("logs"));
         frame.render_widget(body, layout[1]);
@@ -234,9 +258,10 @@ impl LogsState {
             Paragraph::new(format!("/{buf}_  (enter apply · esc cancel)"))
                 .style(Style::default().fg(Color::Yellow))
         } else {
-            Paragraph::new(
-                "q quit · k clear · / filter · ↑↓ scroll · g top · G bottom · d dashboard · h hosts",
-            )
+            let wrap_hint = if self.wrap { "w wrap*" } else { "w wrap" };
+            Paragraph::new(format!(
+                "q quit · k clear · / filter · ↑↓ scroll · g top · G bottom · {wrap_hint} · d dashboard · h hosts",
+            ))
             .style(Style::default().fg(Color::DarkGray))
         };
         frame.render_widget(footer, layout[2]);
