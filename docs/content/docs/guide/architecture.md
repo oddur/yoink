@@ -9,18 +9,18 @@ weight: 4
 Yoink addresses each: **a content hash on every container** for drift detection, **a deploy lock** for concurrent runs, **a healthcheck-gated swap** so a broken build can't replace a working one, and **an audit trail with one-key rollback**. This page covers each.
 
 ```mermaid
-flowchart LR
+flowchart TB
     A([yoink up]) --> B{spec_hash\nchanged?}
     B -- no --> Z([done — no-op])
-    B -- yes --> C[acquire\ndeploy lock]
-    C --> D[resolve secrets\nbuild spec]
-    D --> E[pull / ship\nimage]
-    E --> F[start new\ncontainer]
+    B -- yes --> C[acquire deploy lock]
+    C --> D[resolve secrets · build spec]
+    D --> E[pull / ship image]
+    E --> F[start new container]
     F --> G{healthcheck\npasses?}
-    G -- yes --> H[stop old\ncontainer]
+    G -- yes --> H[stop old container]
     H --> I[release lock]
     I --> Z2([done — updated])
-    G -- no --> J[leave old running\nsurface error]
+    G -- no --> J[leave old running · surface error]
     J --> I2[release lock]
 ```
 
