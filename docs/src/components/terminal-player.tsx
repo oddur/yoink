@@ -6,6 +6,7 @@ export function TerminalPlayer({ src }: { src: string }) {
   useEffect(() => {
     if (!ref.current) return;
     const el = ref.current;
+    let cancelled = false;
     let dispose: (() => void) | undefined;
 
     Promise.all([
@@ -13,6 +14,7 @@ export function TerminalPlayer({ src }: { src: string }) {
       // @ts-expect-error — CSS module loaded for side-effects
       import('asciinema-player/dist/bundle/asciinema-player.css'),
     ]).then(([{ create }]) => {
+      if (cancelled) return;
       const player = create(src, el, {
         cols: 100,
         rows: 18,
@@ -27,7 +29,10 @@ export function TerminalPlayer({ src }: { src: string }) {
       dispose = () => player.dispose();
     });
 
-    return () => dispose?.();
+    return () => {
+      cancelled = true;
+      dispose?.();
+    };
   }, [src]);
 
   return <div ref={ref} />;
