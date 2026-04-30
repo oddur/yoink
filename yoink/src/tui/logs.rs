@@ -28,10 +28,14 @@ pub struct LogsState {
     /// lines stay in view.
     auto_follow: bool,
     /// Substring filter; lines whose plain text doesn't contain this are
-    /// hidden. Empty string is treated as no filter.
+    /// hidden. Empty string is treated as no filter. Updated live on
+    /// every keystroke while in input mode (vim-`/` style).
     filter: Option<String>,
     /// `Some(buf)` while the user is typing into the filter prompt.
     input_buffer: Option<String>,
+    /// Snapshot of `filter` when input mode began — restored on Esc
+    /// so cancelling reverts to the prior view instead of clearing.
+    prev_filter: Option<String>,
     /// When true, long lines wrap inside the pane instead of being
     /// truncated at the right edge. Toggled by `w`. Works regardless
     /// of whether the line came from `hl` (styled spans) or the plain
@@ -148,32 +152,46 @@ impl LogsState {
     }
 
     pub fn begin_filter_input(&mut self) {
+        self.prev_filter = self.filter.clone();
         self.input_buffer = Some(self.filter.clone().unwrap_or_default());
     }
 
     pub fn filter_push_char(&mut self, c: char) {
         if let Some(buf) = self.input_buffer.as_mut() {
             buf.push(c);
+            self.sync_filter_from_buffer();
         }
     }
 
     pub fn filter_backspace(&mut self) {
         if let Some(buf) = self.input_buffer.as_mut() {
             buf.pop();
+            self.sync_filter_from_buffer();
         }
     }
 
+    /// Commit the filter — exit input mode and re-pin to the bottom
+    /// so the newest matching lines are visible. The `filter` itself
+    /// is already up to date (each keystroke synced it live).
     pub fn filter_apply(&mut self) {
-        if let Some(buf) = self.input_buffer.take() {
-            self.filter = if buf.is_empty() { None } else { Some(buf) };
-            // Re-pin to bottom so the newest matching lines are visible.
+        if self.input_buffer.is_some() {
+            self.input_buffer = None;
+            self.prev_filter = None;
             self.auto_follow = true;
             self.scroll = 0;
         }
     }
 
+    /// Abandon the in-progress filter — restore whatever filter was
+    /// active before `/` was pressed.
     pub fn filter_cancel(&mut self) {
         self.input_buffer = None;
+        self.filter = self.prev_filter.take();
+    }
+
+    fn sync_filter_from_buffer(&mut self) {
+        let buf = self.input_buffer.clone().unwrap_or_default();
+        self.filter = if buf.is_empty() { None } else { Some(buf) };
     }
 
     #[cfg(test)]
@@ -255,7 +273,7 @@ impl LogsState {
         );
 
         let footer = if let Some(buf) = &self.input_buffer {
-            Paragraph::new(format!("/{buf}_  (enter apply · esc cancel)"))
+            Paragraph::new(format!("/{buf}_  (live · enter keep · esc revert)"))
                 .style(Style::default().fg(Color::Yellow))
         } else {
             let wrap_hint = if self.wrap { "w wrap*" } else { "w wrap" };
