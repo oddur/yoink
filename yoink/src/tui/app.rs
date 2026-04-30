@@ -1866,20 +1866,9 @@ impl App {
             return false;
         }
         match key.code {
-            // Pane navigation — digits are the canonical mnemonic
-            // (printed on each tab in the header), letters are
-            // back-compat aliases.
-            //   1 / d  Dashboard
-            //   2 / h  Hosts
-            //   3 / s  Services
-            //   4 / l  Logs
-            //   5 / R  Resources (uppercase R because lowercase r
-            //          is universally "refresh" inside panes)
-            //   6 / e  Secrets
-            // Per-view bindings that previously collided (delete,
-            // restart, edit, container-logs) have been moved off
-            // these letters — see the secrets/resources/host-detail
-            // handlers below.
+            // Pane nav: digits are canonical (printed on each tab),
+            // letters are aliases. `R` is uppercase because lowercase
+            // `r` is universally "refresh" inside panes.
             KeyCode::Char('1') | KeyCode::Char('d') => {
                 self.transition(View::Dashboard).await;
                 return false;
@@ -2147,8 +2136,6 @@ impl App {
                 KeyCode::Char('X') => {
                     self.spawn_lifecycle(host.clone(), container.clone(), LifecycleOp::Stop);
                 }
-                // `T` (resTart) — capital `R` is the global "go to
-                // Resources" nav (see HostDetail handler above).
                 KeyCode::Char('T') => {
                     self.spawn_lifecycle(host.clone(), container.clone(), LifecycleOp::Restart);
                 }

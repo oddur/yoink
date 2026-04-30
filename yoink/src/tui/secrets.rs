@@ -409,11 +409,8 @@ impl SecretsState {
         };
         frame.render_widget(footer, layout[2]);
 
-        // Add / edit / remove flows render as modals on top of the
-        // table. Removing already had a confirmation footer; adding +
-        // editing previously inlined an extra row in the table, which
-        // operators found confusing — the table is the data, the
-        // modal is the input. Clean separation.
+        // Add / view-edit modal renders on top of the table when
+        // input mode is active.
         if self.input_mode() {
             self.render_input_modal(frame);
         }
@@ -562,20 +559,10 @@ impl SecretsState {
             .split(inner);
 
         let label_style = Style::default().add_modifier(Modifier::BOLD);
-        let dim = Style::default().fg(Color::DarkGray);
-        let focused_text = Style::default().fg(Color::Yellow);
-        let unfocused_text = Style::default();
-
         frame.render_widget(Paragraph::new("KEY").style(label_style), rows[0]);
-        let key_field = render_field(key_text, key_focused, focused_text, unfocused_text);
-        frame.render_widget(key_field, rows[1]);
-
+        frame.render_widget(render_field(key_text, key_focused), rows[1]);
         frame.render_widget(Paragraph::new("VALUE").style(label_style), rows[3]);
-        // Mask the value when not revealing AND the operator is just
-        // looking at an existing entry. While they're typing it's
-        // shown literally — they're the source of the bytes.
-        let value_field = render_field(value_text, value_focused, focused_text, unfocused_text);
-        frame.render_widget(value_field, rows[4]);
+        frame.render_widget(render_field(value_text, value_focused), rows[4]);
 
         let hint = match &self.edit {
             EditState::AddingKey { .. } => "enter → next field · esc cancel",
@@ -584,7 +571,10 @@ impl SecretsState {
             }
             _ => "",
         };
-        frame.render_widget(Paragraph::new(hint).style(dim), rows[6]);
+        frame.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            rows[6],
+        );
     }
 
     /// Lines for the confirmation-modal renderer (`render_modal`).
@@ -609,23 +599,22 @@ impl SecretsState {
 }
 
 /// One input field row inside the add/edit modal. Focused field
-/// renders the buffer + a cursor; unfocused field renders the value
-/// (or `(empty)` placeholder) in a dim style.
-fn render_field(
-    buffer: &str,
-    focused: bool,
-    focused_style: Style,
-    unfocused_style: Style,
-) -> Paragraph<'_> {
+/// renders the buffer + blinking cursor in yellow; unfocused field
+/// renders the value (or `(empty)` placeholder) in default style.
+fn render_field(buffer: &str, focused: bool) -> Paragraph<'_> {
+    let focused_style = Style::default().fg(Color::Yellow);
     if focused {
         Paragraph::new(Line::from(vec![
-            Span::styled(buffer.to_string(), focused_style),
+            Span::styled(buffer, focused_style),
             Span::styled("_", focused_style.add_modifier(Modifier::SLOW_BLINK)),
         ]))
     } else if buffer.is_empty() {
-        Paragraph::new(Span::styled("(empty)", unfocused_style.fg(Color::DarkGray)))
+        Paragraph::new(Span::styled(
+            "(empty)",
+            Style::default().fg(Color::DarkGray),
+        ))
     } else {
-        Paragraph::new(Span::styled(buffer.to_string(), unfocused_style))
+        Paragraph::new(Span::raw(buffer))
     }
 }
 

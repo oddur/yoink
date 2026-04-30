@@ -330,14 +330,10 @@ impl ServiceDetailState {
             self.rows = rows;
             // Clamp against the *filtered* count — `table.selected()`
             // indexes into `visible_indices()`, not `self.rows`.
+            // `clamp_selection` also picks row 0 when none was set,
+            // so per-row actions work on first apply.
             let n = self.visible_indices().len();
             clamp_selection(&mut self.table, n);
-            // Auto-select row 0 once data lands so per-row actions
-            // (`f` port-forward, `v` vscode, `!` shell) are usable
-            // without first nudging the cursor with j/k.
-            if n > 0 && self.table.selected().is_none() {
-                self.table.select(Some(0));
-            }
         }
     }
 

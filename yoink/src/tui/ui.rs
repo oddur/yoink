@@ -499,13 +499,13 @@ impl FilterState {
     /// Empty buffer means "no filter" so the user typing `/` then
     /// backspacing back to empty restores the unfiltered view.
     fn sync_filter_from_buffer(&mut self) {
-        let buf = self.input_buffer.clone().unwrap_or_default();
+        let buf = self.input_buffer.as_deref().unwrap_or("");
         if buf.is_empty() {
             self.filter = None;
             self.filter_lc = None;
         } else {
             self.filter_lc = Some(buf.to_ascii_lowercase());
-            self.filter = Some(buf);
+            self.filter = Some(buf.to_string());
         }
     }
 

@@ -83,13 +83,10 @@ impl HostDetailState {
         // larger unfiltered count would let `selected` point past the
         // filtered list for a frame.
         let n = self.visible_indices().len();
+        // `clamp_selection` already picks row 0 when none was set, so
+        // per-row actions (`f` port-forward, `v` vscode, `S`/`X`/`T`/`K`
+        // lifecycle) are usable on first apply without nudging j/k.
         clamp_selection(&mut self.table, n);
-        // Auto-select row 0 once data lands so per-row actions
-        // (`f` port-forward, `v` vscode, `S`/`X`/`T`/`K` lifecycle)
-        // are usable without first nudging the cursor with j/k.
-        if n > 0 && self.table.selected().is_none() {
-            self.table.select(Some(0));
-        }
     }
 
     pub fn select_next(&mut self) {
