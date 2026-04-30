@@ -17,6 +17,8 @@ There are good tools in this neighborhood already — Kamal, Dokku, Coolify, pla
 
 It was originally meant for small side projects, sharing a prototype, running an experiment cheaply on a VPS without spinning up a registry and a CI pipeline first. It still is. But the same primitives — healthcheck-gated swaps, pre-deploy migrations, sealed secrets, multi-host fan-out — also operate a production-quality setup if you wield it that way.
 
+In fact, we dogfood it to serve this very site off a $4/mo VPS — [check out how](https://github.com/oddur/yoink/blob/main/docs/yoink.yaml).
+
 If yoink ends up useful to you, I'd love to hear about it — [oddur.me](https://oddur.me).
 
 PRs, issues, and template contributions are very welcome. The repo is at [github.com/oddur/yoink](https://github.com/oddur/yoink). If you've built a yoink template for a service worth sharing (databases, caches, search, object storage, backup tooling), open a PR against [`templates/`](https://github.com/oddur/yoink/tree/main/templates).

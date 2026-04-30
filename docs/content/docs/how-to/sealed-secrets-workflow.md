@@ -93,9 +93,14 @@ One-shot alternative (piping in from elsewhere):
 
 ```sh
 echo "FOO=bar" | yoink secrets seal
-yoink secrets seal --in plain.env --out secrets.age
+yoink secrets seal --in plain.env
 yoink secrets seal --as DEPLOY_KEY=@/tmp/deploy_key   # single key from a file
+yoink secrets seal --as YOINK_DOCS_HOST=5.75.123.45 \
+                   --as CF_ORIGIN_CERT=@cert.pem \
+                   --as CF_ORIGIN_KEY=@key.pem        # multiple in one shot
 ```
+
+`secrets seal` **merges into the existing bundle by default** — adds the new keys, updates any that already exist, leaves the rest alone. Output reports added / updated / preserved counts. To wholesale-rewrite the bundle (rare), pass `--replace`; if that would drop existing keys, you'll be prompted to confirm (skip with `--yes`).
 
 For per-key tweaks during incident response, the TUI's secrets pane (`e` from any view) lets you view / add / edit / remove individual keys without leaving the dashboard. Bulk multi-line edits stay on `yoink secrets edit` — the TUI is per-key only.
 

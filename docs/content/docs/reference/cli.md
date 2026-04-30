@@ -217,8 +217,13 @@ yoink secrets show [--reveal]            print KEY=value (values masked unless -
                                          Refuses --reveal in CI ($CI set) unless
                                          YOINK_ALLOW_REVEAL_IN_CI=1.
 yoink secrets seal --in <PATH>           seal a plaintext dotenv (or read from stdin)
+  --as KEY=value                         set one key directly; --as KEY=@PATH reads
+                                         the value from a file. Repeatable.
   --out <PATH>                           override the output path (defaults to
                                          the configured `secrets.file:`)
+  --replace                              wholesale-rewrite the bundle (default is
+                                         merge); prompts on key drops, --yes skips
+                                         the prompt
 yoink secrets rotate                     generate a new keypair and re-seal under
                                          [existing recipients + new recipient];
                                          prints the new identity for pasting into
