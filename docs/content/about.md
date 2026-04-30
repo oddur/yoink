@@ -15,7 +15,7 @@ So yoink is a swiss army pocket knife of the utilities I missed, mixed with my o
 
 There are good tools in this neighborhood already — Kamal, Dokku, Coolify, plain `docker compose`, hand-rolled bash. None of them quite did what I wanted in the way I wanted it. See the [comparison page](/docs/intro/compared) for the honest version of where each one sits and where yoink ends up.
 
-It was originally meant for small side projects, sharing a prototype, running an experiment cheaply on a VPS without spinning up a registry and a CI pipeline first. It still is. But the same primitives — healthcheck-gated swaps, pre-deploy migrations, sealed secrets, multi-host fan-out — also operate a production-quality setup if you wield it that way. Several do.
+It was originally meant for small side projects, sharing a prototype, running an experiment cheaply on a VPS without spinning up a registry and a CI pipeline first. It still is. But the same primitives — healthcheck-gated swaps, pre-deploy migrations, sealed secrets, multi-host fan-out — also operate a production-quality setup if you wield it that way.
 
 If yoink ends up useful to you, I'd love to hear about it — [oddur.me](https://oddur.me).
 
