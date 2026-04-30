@@ -11,6 +11,21 @@ import { Suspense } from 'react';
 import browserCollections from 'collections/browser';
 
 export const Route = createFileRoute('/blog/$slug')({
+  head: ({ loaderData }) => {
+    if (!loaderData) return {};
+    const { title, description, url } = loaderData;
+    const fullTitle = `${title} — yoink blog`;
+    return {
+      links: [{ rel: 'canonical', href: `https://yoink.is${url}` }],
+      meta: [
+        { title: fullTitle },
+        { name: 'description', content: description },
+        { property: 'og:title', content: fullTitle },
+        { property: 'og:description', content: description },
+        { property: 'og:url', content: `https://yoink.is${url}` },
+      ].filter((m) => 'content' in m ? Boolean(m.content) : true),
+    };
+  },
   component: BlogPost,
   loader: async ({ params }) => {
     const data = await loadPost({ data: params.slug });
@@ -29,6 +44,9 @@ const loadPost = createServerFn({ method: 'GET' })
     return {
       path: page.path,
       pageTree: await source.serializePageTree(source.getPageTree()),
+      title: page.data.title as string,
+      description: (page.data.description ?? '') as string,
+      url: page.url,
     };
   });
 

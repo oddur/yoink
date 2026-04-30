@@ -19,7 +19,24 @@ import { InlineTOC } from 'fumadocs-ui/components/inline-toc';
 import { Suspense } from 'react';
 import { useMDXComponents } from '@/components/mdx';
 
+const BASE_URL = 'https://yoink.is';
+
 export const Route = createFileRoute('/docs/$')({
+  head: ({ loaderData }) => {
+    if (!loaderData) return {};
+    const { title, description, url } = loaderData;
+    const fullTitle = `${title} — yoink`;
+    return {
+      links: [{ rel: 'canonical', href: `${BASE_URL}${url}` }],
+      meta: [
+        { title: fullTitle },
+        { name: 'description', content: description },
+        { property: 'og:title', content: fullTitle },
+        { property: 'og:description', content: description },
+        { property: 'og:url', content: `${BASE_URL}${url}` },
+      ].filter((m) => 'content' in m ? Boolean(m.content) : true),
+    };
+  },
   component: Page,
   loader: async ({ params }) => {
     const slugs = params._splat?.split('/') ?? [];
@@ -42,13 +59,15 @@ const loader = createServerFn({
       path: page.path,
       markdownUrl: getPageMarkdownUrl(page).url,
       pageTree: await source.serializePageTree(source.getPageTree()),
+      title: page.data.title as string,
+      description: (page.data.description ?? '') as string,
+      url: page.url,
     };
   });
 
 const clientLoader = browserCollections.docs.createClientLoader({
   component(
     { toc, frontmatter, default: MDX },
-    // you can define props for the component
     {
       markdownUrl,
       path,

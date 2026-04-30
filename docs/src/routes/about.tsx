@@ -11,6 +11,15 @@ import { Suspense } from 'react';
 import browserCollections from 'collections/browser';
 
 export const Route = createFileRoute('/about')({
+  head: () => ({
+    links: [{ rel: 'canonical', href: 'https://yoink.is/about' }],
+    meta: [
+      { title: 'About — yoink' },
+      { name: 'description', content: 'The story behind yoink — a container deploy tool built out of frustration with control planes on €4/mo boxes.' },
+      { property: 'og:title', content: 'About — yoink' },
+      { property: 'og:url', content: 'https://yoink.is/about' },
+    ],
+  }),
   component: AboutPage,
   loader: async () => {
     const data = await loadAbout();
