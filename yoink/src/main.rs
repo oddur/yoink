@@ -3784,9 +3784,7 @@ fn cmd_hosts_add(
     let address_secret = address_secret.map(str::trim).filter(|s| !s.is_empty());
     match (address, address_secret) {
         (None, None) => {
-            return Err(anyhow::anyhow!(
-                "set either --address or --address-secret"
-            ));
+            return Err(anyhow::anyhow!("set either --address or --address-secret"));
         }
         (Some(_), Some(_)) => {
             return Err(anyhow::anyhow!(
