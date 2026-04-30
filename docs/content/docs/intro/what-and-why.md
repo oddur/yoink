@@ -78,3 +78,9 @@ The same shape applies elsewhere: registry credentials, CI integrations, host-le
 - **No web dashboard or REST API.** Everything happens through the CLI and YAML. The TUI is a keyboard-driven inspector, not a control plane.
 - **No multi-cluster, HA failover, or geo-distribution.** One operator, one config, one deploy at a time. For multi-region, run separate yoink configs per region.
 - **No load balancer or geo-routing.** Yoink ships a [bundled Caddy reverse proxy](/docs/guide/proxy) for HTTPS + per-host routing, but it does not coordinate traffic across hosts. [Tailscale](/docs/guide/networking) is a clean way to bridge several hosts into one network.
+
+## See also
+
+- [Is this for me?](/docs/intro/compared) — side-by-side matrix vs Kamal, Coolify, Dokku, Komodo, Kubernetes, plain compose.
+- [Start: first deploy](/docs/start/first-deploy) — five-minute hands-on against a real host.
+- [Architecture](/docs/guide/architecture) — the deploy engine in detail.

@@ -57,3 +57,10 @@ Drop a `yoink.yaml` next to your `Dockerfile`, run `yoink up --build`. Build, sh
 For the operator-side commands and the transport details, see [Standalone (no-registry) deploys](/docs/how-to/standalone-mode).
 
 For the middle ground — your own registry without paying for one — see [Self-hosted registry on a yoink host](/docs/how-to/self-hosted-registry).
+
+## See also
+
+- [Standalone (no-registry) deploys](/docs/how-to/standalone-mode) — the operator-side walkthrough.
+- [Self-hosted registry on a yoink host](/docs/how-to/self-hosted-registry) — registry without paying for one.
+- [Edit-save-deploy with `--watch`](/docs/how-to/watch-mode) — pair with standalone for the tightest iteration loop.
+- [Configuration: `build:` block](/docs/reference/config) — full schema for the build origin side.

@@ -7,6 +7,12 @@ weight: 1
 
 Five sections, picked for what you're trying to do: an **intro** for orientation, a **start** for the first run, a **guide** for the mental model, **how-to** walkthroughs for specific tasks, and a **reference** for the exhaustive surface.
 
+**New here?** Read [What and why](/docs/intro/what-and-why) (3 min), then [First deploy](/docs/start/first-deploy) (5 min). That's enough to ship a real container against a real host.
+
+**Already running yoink and want to do X?** Skip to [How-to](/docs/how-to). Each page takes you from "I want X" to "X is running in production."
+
+**Looking up a flag, field, or keybind?** [Reference](/docs/reference). Lookup-shaped, no prose.
+
 {{< cards cols="2" >}}
   {{< card link="/docs/intro" title="Intro" subtitle="What yoink is, why it exists, how it compares to Kamal / Kubernetes / plain compose." icon="information-circle" >}}
   {{< card link="/docs/start" title="Start" subtitle="Install, then a five-minute first deploy from a fresh repo." icon="lightning-bolt" >}}

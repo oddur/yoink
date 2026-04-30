@@ -78,3 +78,8 @@ curl -LsSf https://github.com/oddur/yoink/releases/latest/download/yoink-install
 ```
 
 Release notes for every version are on the [GitHub releases page](https://github.com/oddur/yoink/releases). Yoink follows SemVer; minor bumps may add new fields but won't break existing `yoink.yaml` configs.
+
+## See also
+
+- [First deploy](/docs/start/first-deploy) — drop a `yoink.yaml`, run one command.
+- [Hetzner cx23 quickstart with HTTPS](/docs/how-to/hetzner-quickstart) — empty cloud account → live HTTPS in 90 seconds.

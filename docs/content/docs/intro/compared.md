@@ -223,3 +223,9 @@ The honest baseline. Many small deployments are exactly this and that's fine.
 **Pick "just ssh + docker run" when**: you have one container, you only need to deploy occasionally, and you don't mind that `docker run` doesn't roll, doesn't healthcheck, doesn't drain, doesn't track who deployed what when.
 
 **Pick yoink when**: you've started writing shell scripts wrapping `ssh + docker run` and you'd like to stop. The yoink config is roughly the shape of those scripts but declarative, and the tool gives you the rolling/healthcheck/drift/history pieces you'd otherwise build yourself.
+
+## See also
+
+- [What and why](/docs/intro/what-and-why) — the design philosophy in one page.
+- [Start: first deploy](/docs/start/first-deploy) — five-minute hands-on if the matrix above lands you on yoink.
+- [Architecture](/docs/guide/architecture) — drift detection, deploy lock, healthcheck-gated swap.
