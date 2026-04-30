@@ -11,15 +11,15 @@ yoink history api         # who deployed what, when
 yoink rollback api        # roll back to the previous version
 ```
 
-## 📚 Full docs: <https://oddur.github.io/yoink/>
+## 📚 Full docs: <https://yoink.is/>
 
-The README is a pointer; the [docs site](https://oddur.github.io/yoink/) is canonical.
+The README is a pointer; the [docs site](https://yoink.is/) is canonical.
 
-- [Is this for me?](https://oddur.github.io/yoink/docs/intro/compared) — vs. Kamal, Kubernetes, plain compose
-- [Five-minute first deploy](https://oddur.github.io/yoink/docs/start/first-deploy) — install + run
-- [Three deploy modes](https://oddur.github.io/yoink/docs/guide/deploy-modes), [Secure by default](https://oddur.github.io/yoink/docs/guide/security), [Pairing with Tailscale + caddy](https://oddur.github.io/yoink/docs/guide/networking)
-- [Recipes](https://oddur.github.io/yoink/docs/recipes) — staging alongside prod, self-hosted registry, external secrets via CLI, PR-comment dry-run
-- [Reference](https://oddur.github.io/yoink/docs/reference) — CLI / config schema / TUI keybinds
+- [Is this for me?](https://yoink.is/docs/intro/compared) — vs. Kamal, Kubernetes, plain compose
+- [Five-minute first deploy](https://yoink.is/docs/start/first-deploy) — install + run
+- [Three deploy modes](https://yoink.is/docs/guide/deploy-modes), [Secure by default](https://yoink.is/docs/guide/security), [Pairing with Tailscale + caddy](https://yoink.is/docs/guide/networking)
+- [Recipes](https://yoink.is/docs/recipes) — staging alongside prod, self-hosted registry, external secrets via CLI, PR-comment dry-run
+- [Reference](https://yoink.is/docs/reference) — CLI / config schema / TUI keybinds
 
 ## Install
 
@@ -29,7 +29,7 @@ brew install oddur/yoink/yoink
 
 Or `cargo install --git https://github.com/oddur/yoink yoink`. Or curl-pipe-sh: `curl -LsSf https://github.com/oddur/yoink/releases/latest/download/yoink-installer.sh | sh`.
 
-See the [install page](https://oddur.github.io/yoink/docs/start/install) for the full list and prerequisites.
+See the [install page](https://yoink.is/docs/start/install) for the full list and prerequisites.
 
 ## License
 

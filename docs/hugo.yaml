@@ -2,7 +2,7 @@
 # GitHub Pages off the `oddur/yoink` repo (no custom domain). The
 # Hextra theme is pulled in as a Hugo module — `hugo mod tidy` resolves
 # it from the registry; `hugo --gc --minify` builds for prod.
-baseURL: "https://oddur.github.io/yoink/"
+baseURL: "https://yoink.is/"
 title: 🪝 yoink
 languageCode: en-us
 
