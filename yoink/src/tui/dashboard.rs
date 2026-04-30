@@ -334,9 +334,11 @@ impl DashboardState {
                 let drift_cell = render_drift_cell(c, config, secrets);
 
                 let service_cell = match c.yoink_service.as_deref() {
-                    Some(svc) => super::services::build_container_marker_cell(
-                        svc, &host.host, &c.name, forwards, vscode,
-                    ),
+                    Some(svc) => {
+                        let pf = forwards.is_container_forwarded(&host.host, &c.name)
+                            || forwards.is_service_forwarded_unscoped(svc);
+                        super::services::build_marker_cell(svc, pf, vscode)
+                    }
                     None => Cell::from("-"),
                 };
                 rows.push(Row::new(vec![

@@ -241,9 +241,11 @@ impl HostDetailState {
                         .and_then(StatsHistory::latest);
                     let health = c.health_hint().unwrap_or("-");
                     let service_cell = match c.yoink_service.as_deref() {
-                        Some(svc) => super::services::build_container_marker_cell(
-                            svc, &host_addr, &c.name, forwards, vscode,
-                        ),
+                        Some(svc) => {
+                            let pf = forwards.is_container_forwarded(&host_addr, &c.name)
+                                || forwards.is_service_forwarded_unscoped(svc);
+                            super::services::build_marker_cell(svc, pf, vscode)
+                        }
                         None => Cell::from("-"),
                     };
                     Row::new(vec![

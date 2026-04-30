@@ -96,6 +96,13 @@ pub enum VscodeError {
          label). Has `yoink up` finished?"
     )]
     TargetNotRunning { service: String, host: String },
+    #[error("list containers by label {label} on {host}: {source}")]
+    ListContainers {
+        host: String,
+        label: String,
+        #[source]
+        source: crate::docker_ops::DockerError,
+    },
     #[error(transparent)]
     Sidecar(#[from] SidecarError),
     #[error(
@@ -119,12 +126,10 @@ pub async fn resolve_target(
     let containers = ops
         .list_containers_by_label(host, &label)
         .await
-        .map_err(|e| {
-            VscodeError::Sidecar(SidecarError::Inspect {
-                host: host.address.clone(),
-                name: format!("label:{label}"),
-                source: e,
-            })
+        .map_err(|source| VscodeError::ListContainers {
+            host: host.address.clone(),
+            label: label.clone(),
+            source,
         })?;
 
     let target = containers
@@ -162,7 +167,7 @@ pub async fn spawn_codeserver_sidecar(
 ) -> std::result::Result<SidecarHandle, VscodeError> {
     use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
 
-    let container_name = unique_vscode_sidecar_name(target_service);
+    let container_name = pf::unique_sidecar_name_with_prefix("yoink-vscode", target_service);
 
     let cached = ops
         .image_present(&host, CODE_SERVER_IMAGE, CODE_SERVER_TAG)
@@ -272,34 +277,21 @@ pub async fn spawn_codeserver_sidecar(
     ))
 }
 
-fn unique_vscode_sidecar_name(target_service: &str) -> String {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    let suffix = format!("{pid:x}{:x}", nanos & 0xff_ffff);
-    format!("yoink-vscode-{target_service}-{suffix}")
-}
-
-/// Poll `http://127.0.0.1:<local_port>/` after the SSH tunnel is up,
-/// return when code-server answers anything (any HTTP status — the
-/// "ready" signal is "Express has bound and is responding", not a
-/// specific status code).
-pub async fn wait_for_http(local_port: u16) -> std::result::Result<(), VscodeError> {
+/// Poll loopback `local_port` until a TCP connect succeeds — the
+/// signal that the SSH tunnel is up AND code-server's listener has
+/// bound. Code-server's Express handler answers immediately after
+/// the listener accepts, so a successful TCP connect is enough; no
+/// HTTP round-trip needed.
+pub async fn wait_for_local_tcp(local_port: u16) -> std::result::Result<(), VscodeError> {
     let deadline = std::time::Instant::now() + HTTP_READY_TIMEOUT;
     loop {
-        if let Ok(stream) = tokio::time::timeout(
+        if let Ok(Ok(_)) = tokio::time::timeout(
             HTTP_READY_POLL,
             tokio::net::TcpStream::connect(("127.0.0.1", local_port)),
         )
         .await
         {
-            if stream.is_ok() {
-                // TCP up; give code-server one extra poll-interval to
-                // finish its HTTP handshake. Cheap insurance.
-                tokio::time::sleep(HTTP_READY_POLL).await;
-                return Ok(());
-            }
+            return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             return Err(VscodeError::HttpNotReady {
@@ -312,7 +304,7 @@ pub async fn wait_for_http(local_port: u16) -> std::result::Result<(), VscodeErr
 }
 
 /// Resolve service → host → SSH probe → spawn sidecar → SSH-tunnel →
-/// open browser. Mirrors `cmd_pf` shape.
+/// open browser. Holds open until SIGINT.
 pub async fn cmd_vscode(
     config: &Config,
     service_name: &str,
@@ -421,7 +413,7 @@ pub async fn cmd_vscode(
     );
     eprintln!("  waiting for code-server …");
 
-    if let Err(e) = wait_for_http(local_port).await {
+    if let Err(e) = wait_for_local_tcp(local_port).await {
         // Tear down before propagating so we don't leave the sidecar
         // running after a readiness failure.
         handle.close().await;
@@ -449,18 +441,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unique_vscode_sidecar_name_is_unique_across_calls() {
-        let a = unique_vscode_sidecar_name("api");
-        // Sleep a nanosecond-resolution tick so the suffix changes.
-        std::thread::sleep(std::time::Duration::from_micros(1));
-        let b = unique_vscode_sidecar_name("api");
-        assert_ne!(a, b);
-        assert!(a.starts_with("yoink-vscode-api-"));
-        assert!(b.starts_with("yoink-vscode-api-"));
-    }
-
-    #[test]
-    fn fs_error_messages_actionable() {
+    fn vscode_error_messages_actionable() {
         let e = VscodeError::NoNetwork {
             service: "api".into(),
         };

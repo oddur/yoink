@@ -223,7 +223,7 @@ fn build_service_row<'a>(
     } else {
         hosts.join(", ")
     };
-    let name_cell = build_service_marker_cell(name, forwards, vscode);
+    let name_cell = build_marker_cell(name, forwards.is_service_forwarded(name), vscode);
     Row::new(vec![
         name_cell,
         Cell::from(image_tag),
@@ -233,50 +233,22 @@ fn build_service_row<'a>(
     ])
 }
 
-/// Build the marker-prefixed cell for a service / container row.
-/// `↦` = port-forward active, `◊` = vscode session active. Markers
-/// stack when both are up. Cyan-colored when any marker is present
-/// so the row catches the eye.
-pub(super) fn build_service_marker_cell(
+/// Marker-prefixed cell for a service / container row. Pass the
+/// already-decided `pf_active` (callers either ask the per-service
+/// or per-container predicate); vscode sessions are per-service so
+/// the helper looks them up itself. `↦` = port-forward active,
+/// `◊` = vscode session active. Markers stack; cyan when any active.
+pub(super) fn build_marker_cell(
     service: &str,
-    forwards: &super::pf::PortForwardState,
+    pf_active: bool,
     vscode: &super::vscode::VscodeSessionState,
 ) -> Cell<'static> {
-    let pf = forwards.is_service_forwarded(service);
     let vs = vscode.is_service_active(service);
-    if !pf && !vs {
+    if !pf_active && !vs {
         return Cell::from(service.to_string());
     }
     let mut prefix = String::with_capacity(4);
-    if pf {
-        prefix.push('↦');
-    }
-    if vs {
-        prefix.push('◊');
-    }
-    Cell::from(format!("{prefix} {service}"))
-        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan))
-}
-
-/// Variant of `build_service_marker_cell` that respects pf's
-/// container-scoped `↦` (only the specific replica the operator
-/// pressed `f` on lights up). Vscode sessions don't carry replica
-/// scope today, so `◊` is per-service for every container row.
-pub(super) fn build_container_marker_cell(
-    service: &str,
-    host: &str,
-    container: &str,
-    forwards: &super::pf::PortForwardState,
-    vscode: &super::vscode::VscodeSessionState,
-) -> Cell<'static> {
-    let pf = forwards.is_container_forwarded(host, container)
-        || forwards.is_service_forwarded_unscoped(service);
-    let vs = vscode.is_service_active(service);
-    if !pf && !vs {
-        return Cell::from(service.to_string());
-    }
-    let mut prefix = String::with_capacity(4);
-    if pf {
+    if pf_active {
         prefix.push('↦');
     }
     if vs {

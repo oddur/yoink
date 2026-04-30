@@ -3377,7 +3377,7 @@ impl App {
                 }
             };
             let local_port = tunnel.local_port();
-            if let Err(e) = crate::vscode::wait_for_http(local_port).await {
+            if let Err(e) = crate::vscode::wait_for_local_tcp(local_port).await {
                 handle.close().await;
                 drop(tunnel);
                 let _ = tx.send(Update::Toast(format!("✗ vscode: {e}")));
@@ -3518,9 +3518,9 @@ impl App {
     #[allow(clippy::too_many_lines)]
     pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let (header_area, mut pane_area) = super::ui::split_with_header(frame.area());
-        // Slice a single row off the bottom for the port-forward footer
-        // when any tunnels are active. Goal: operators can't forget they
-        // have an open tunnel — the band stays visible across every pane.
+        // Slice one row off the bottom per active footer (port-forward,
+        // vscode). Goal: operators can't forget they have an open
+        // session — the band stays visible across every pane.
         let footer_rows: u16 =
             u16::from(!self.forwards.is_empty()) + u16::from(!self.vscode.is_empty());
         let (pf_footer_area, vscode_footer_area) =

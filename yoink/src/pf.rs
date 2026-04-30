@@ -439,9 +439,9 @@ pub struct SidecarHandle {
 }
 
 impl SidecarHandle {
-    /// Construct a handle for an already-running sidecar container.
-    /// Used by sibling commands (`yoink fs`) that spin up their own
-    /// sidecars but want the same Drop / `close()` lifecycle.
+    /// Construct a handle for an already-running sidecar container —
+    /// for callers that did the create/start themselves but want the
+    /// same Drop / `close()` lifecycle.
     pub(crate) fn from_running(
         container_name: String,
         host: Host,
@@ -709,15 +709,22 @@ fn host_port_from_detail(ports: &[String], internal_port: u16) -> Option<u16> {
 }
 
 fn unique_sidecar_name(target_service: &str, target_port: u16) -> String {
-    // Compact pid + nanos suffix is enough to avoid collisions across
-    // concurrent `pf` invocations from the same operator. We never
-    // reuse a sidecar across `pf` runs.
+    unique_sidecar_name_with_prefix("yoink-pf", &format!("{target_service}-{target_port}"))
+}
+
+/// Generic version of `unique_sidecar_name` for sibling commands
+/// (`yoink vscode` and friends) that spawn their own sidecars but
+/// want the same pid+nanos collision-avoidance scheme.
+pub(crate) fn unique_sidecar_name_with_prefix(prefix: &str, qualifier: &str) -> String {
+    // Compact pid + nanos suffix avoids collisions across concurrent
+    // invocations from the same operator. We never reuse a sidecar
+    // across runs.
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
     let suffix = format!("{pid:x}{:x}", nanos & 0xff_ffff);
-    format!("yoink-pf-{target_service}-{target_port}-{suffix}")
+    format!("{prefix}-{qualifier}-{suffix}")
 }
 
 #[cfg(test)]
