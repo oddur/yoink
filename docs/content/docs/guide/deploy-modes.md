@@ -23,27 +23,10 @@ The four cells share a deploy engine — drift detection, healthcheck-gated roll
 
 ```mermaid
 flowchart LR
-    subgraph CI ["CI-built (registry)"]
-        direction TB
-        C1[CI builds image] --> C2[push to registry]
-        C2 --> C3["yoink up --tag api=sha"]
-        C3 --> C4[host pulls from registry]
-    end
-    subgraph Local ["Local-build + push"]
-        direction TB
-        L1["yoink build --push"] --> L2[image in registry]
-        L2 --> L3[yoink up]
-        L3 --> L4[host pulls from registry]
-    end
-    subgraph Standalone ["Standalone (no registry)"]
-        direction TB
-        S1["yoink up --build"] --> S2[docker build local]
-        S2 --> S3[ship via unregistry]
-        S3 --> S4[host loads image]
-    end
-    CI --> Deploy([rolling deploy])
-    Local --> Deploy
-    Standalone --> Deploy
+    CI["CI builds + pushes\nyoink up --tag api=sha"] --> D
+    Local["yoink build --push\nyoink up"] --> D
+    Standalone["yoink up --build\nships direct over SSH"] --> D
+    D([rolling deploy])
 ```
 
 ## CI-built — the default
