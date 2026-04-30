@@ -73,6 +73,8 @@ Cross-cutting terms. Each entry is one paragraph with a link to the page that co
 
 **`ssh_key_secret:`.** A field on a host entry naming a sealed-secret entry holding a PEM SSH private key. Yoink decrypts the key into a per-process tempfile for SSH instead of using the operator's ssh-agent. Pair with `yoink secrets ssh-key generate --seal-as <NAME>`.
 
+**`address_secret:`.** A field on a host entry naming a sealed-secret entry holding the host's address (IP or hostname). Resolved at config-load time from the same sealed bundle that feeds `ssh_key_secret:`. Use when the deploy config sits in a public repo and the host's address itself is sensitive. Mutually exclusive with `address:`. Pair with `yoink hosts add --address-secret <KEY> --user <USER> --name <NAME>`.
+
 **`include:` glob.** Top-level list of file globs relative to `yoink.yaml`. Each matched file is parsed as a fragment and its `services:`, `hosts:`, and `hooks.pre_deploy:` lists merge into the main config.
 
 ## Templates

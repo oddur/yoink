@@ -153,6 +153,7 @@ services:
     fn prepare_returns_none_when_no_host_declares_secret() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: None,
         }]);
@@ -164,6 +165,7 @@ services:
     fn prepare_errors_when_secret_missing_from_bundle() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: Some("h1_key".into()),
         }]);
@@ -180,6 +182,7 @@ services:
     fn prepare_errors_when_no_secrets_block() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: Some("h1_key".into()),
         }]);
@@ -193,11 +196,13 @@ services:
         let cfg = config_with_hosts(vec![
             HostConfig {
                 address: "h1".into(),
+                address_secret: None,
                 user: "deploy".into(),
                 ssh_key_secret: Some("h1_key".into()),
             },
             HostConfig {
                 address: "h2".into(),
+                address_secret: None,
                 user: "deploy".into(),
                 ssh_key_secret: None,
             },

@@ -135,7 +135,21 @@ pub enum OnFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
+    /// Literal address (IP or hostname). Mutually exclusive with
+    /// `address_secret`. Empty until populated either by the parsed
+    /// YAML or by `Config::resolve_host_addresses` after the sealed
+    /// bundle loads.
+    #[serde(default)]
     pub address: String,
+    /// Optional: name of a sealed-secret entry holding the host's
+    /// address (IP or hostname). Resolved at config-load time after
+    /// the secrets bundle is decrypted. Use this when the deploy
+    /// config sits in a public repo and the host's address itself is
+    /// sensitive (e.g. a Hetzner box with an exposed public IP that
+    /// you front through Cloudflare). Mutually exclusive with the
+    /// literal `address:` field — set exactly one.
+    #[serde(default)]
+    pub address_secret: Option<String>,
     pub user: String,
     /// Optional: name of a sealed-secret entry holding an SSH private
     /// key (PEM format) to use when connecting to this host. When set,
@@ -1264,6 +1278,54 @@ impl Config {
         Ok(())
     }
 
+    /// `true` when at least one host declares `address_secret:`.
+    /// Used by the secrets loader to know it must decrypt the bundle
+    /// even if no service-level secret keys are referenced.
+    #[must_use]
+    pub fn any_host_address_sealed(&self) -> bool {
+        self.hosts.iter().any(|h| h.address_secret.is_some())
+    }
+
+    /// Walk hosts and populate `host.address` from the sealed bundle
+    /// for any host that declared `address_secret:`. Idempotent —
+    /// calling twice is safe (the second call sees `address_secret`
+    /// still set but the field already populated; we re-resolve and
+    /// overwrite).
+    ///
+    /// Errors:
+    ///
+    /// - `address_secret` set but no bundle was loaded (caller must
+    ///   pass `Some(bundle)` whenever `any_host_address_sealed()` is
+    ///   true).
+    /// - `address_secret` references a key not present in the bundle.
+    pub fn resolve_host_addresses(
+        &mut self,
+        bundle: Option<&crate::secrets::SecretsBundle>,
+    ) -> Result<(), ConfigError> {
+        for (i, host) in self.hosts.iter_mut().enumerate() {
+            let Some(key) = host.address_secret.as_deref() else {
+                continue;
+            };
+            let Some(bundle) = bundle else {
+                return Err(ConfigError::Invalid(format!(
+                    "hosts[{i}].address_secret = {key:?} requires a sealed-secrets bundle, but no `secrets:` block is configured"
+                )));
+            };
+            let value = bundle.get(key).ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "hosts[{i}].address_secret = {key:?} not found in the sealed bundle"
+                ))
+            })?;
+            if value.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "hosts[{i}].address_secret = {key:?} resolved to an empty value"
+                )));
+            }
+            host.address = value.to_string();
+        }
+        Ok(())
+    }
+
     /// Walk `self.services` filtered by an optional name list. `None`
     /// returns every service in topo order; `Some(&[…])` keeps only
     /// the named ones (in topo order, not in the order the operator
@@ -1428,6 +1490,7 @@ impl Config {
         }
         self.hosts.push(HostConfig {
             address: local.to_string(),
+            address_secret: None,
             user: local.to_string(),
             ssh_key_secret: None,
         });
@@ -1494,10 +1557,23 @@ impl Config {
         // empty for a moment. Commands that need a host call
         // `Config::require_hosts` at their own boundary.
         for (i, host) in self.hosts.iter().enumerate() {
-            if host.address.trim().is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "hosts[{i}].address must not be empty"
-                )));
+            let has_literal = !host.address.trim().is_empty();
+            let has_secret = host
+                .address_secret
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            match (has_literal, has_secret) {
+                (false, false) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "hosts[{i}]: set either `address:` or `address_secret:`"
+                    )));
+                }
+                (true, true) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "hosts[{i}]: `address:` and `address_secret:` are mutually exclusive"
+                    )));
+                }
+                _ => {}
             }
             if host.user.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
@@ -1505,15 +1581,39 @@ impl Config {
                 )));
             }
         }
-        let mut host_addresses: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // Duplicate detection runs against whatever identifier is
+        // present in the unresolved config — literal addresses are
+        // compared directly; sealed addresses are compared by
+        // secret-key name (two hosts naming the same address_secret
+        // would resolve to the same address). Address resolution
+        // happens later via `resolve_host_addresses`.
+        let mut host_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for host in &self.hosts {
-            if !host_addresses.insert(host.address.as_str()) {
-                return Err(ConfigError::Invalid(format!(
-                    "duplicate hosts.address {:?}",
-                    host.address
-                )));
+            let key = if !host.address.trim().is_empty() {
+                format!("addr:{}", host.address)
+            } else if let Some(s) = host.address_secret.as_deref() {
+                format!("secret:{s}")
+            } else {
+                continue; // already errored above
+            };
+            if !host_keys.insert(key.clone()) {
+                let display = key
+                    .strip_prefix("addr:")
+                    .map(|a| format!("address {a:?}"))
+                    .or_else(|| {
+                        key.strip_prefix("secret:")
+                            .map(|s| format!("address_secret {s:?}"))
+                    })
+                    .unwrap_or(key);
+                return Err(ConfigError::Invalid(format!("duplicate host {display}")));
             }
         }
+        let host_addresses: std::collections::HashSet<&str> = self
+            .hosts
+            .iter()
+            .filter(|h| !h.address.trim().is_empty())
+            .map(|h| h.address.as_str())
+            .collect();
 
         // Top-level network declarations: each entry must be unique
         // and non-empty. Services can only attach to networks
@@ -2104,9 +2204,177 @@ hosts:
         ]);
         let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
         assert!(
-            format!("{err}").contains("duplicate hosts.address"),
+            format!("{err}").contains("duplicate host address"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn host_address_secret_only_loads_ok() {
+        let dir = write_temp_tree(&[(
+            "yoink.yaml",
+            r#"
+deploy:
+  networks: [main]
+hosts:
+  - { address_secret: PROD_HOST_IP, user: deploy }
+secrets:
+  provider: age
+  recipients: [age1example]
+"#,
+        )]);
+        let cfg = Config::load_from_path(&dir.join("yoink.yaml")).expect("loads");
+        assert_eq!(cfg.hosts.len(), 1);
+        assert_eq!(cfg.hosts[0].address_secret.as_deref(), Some("PROD_HOST_IP"));
+        assert!(cfg.hosts[0].address.is_empty());
+        assert!(cfg.any_host_address_sealed());
+    }
+
+    #[test]
+    fn host_with_neither_address_nor_secret_is_rejected() {
+        let dir = write_temp_tree(&[(
+            "yoink.yaml",
+            r#"
+deploy:
+  networks: [main]
+hosts:
+  - { user: deploy }
+"#,
+        )]);
+        let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("hosts[0]") && msg.contains("address") && msg.contains("address_secret"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn host_with_both_address_and_secret_is_rejected() {
+        let dir = write_temp_tree(&[(
+            "yoink.yaml",
+            r#"
+deploy:
+  networks: [main]
+hosts:
+  - { address: 1.2.3.4, address_secret: PROD_HOST_IP, user: deploy }
+secrets:
+  provider: age
+  recipients: [age1example]
+"#,
+        )]);
+        let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn duplicate_address_secret_across_hosts_is_rejected() {
+        let dir = write_temp_tree(&[(
+            "yoink.yaml",
+            r#"
+deploy:
+  networks: [main]
+hosts:
+  - { address_secret: SHARED_KEY, user: deploy }
+  - { address_secret: SHARED_KEY, user: deploy }
+secrets:
+  provider: age
+  recipients: [age1example]
+"#,
+        )]);
+        let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_host_addresses_populates_from_bundle() {
+        use crate::secrets::SecretsBundle;
+        let dir = write_temp_tree(&[(
+            "yoink.yaml",
+            r#"
+deploy:
+  networks: [main]
+hosts:
+  - { address_secret: PROD_HOST_IP, user: deploy }
+secrets:
+  provider: age
+  recipients: [age1example]
+"#,
+        )]);
+        let mut cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("PROD_HOST_IP".to_string(), "10.0.0.42".to_string());
+        let bundle = SecretsBundle::new(values);
+        cfg.resolve_host_addresses(Some(&bundle)).expect("resolves");
+        assert_eq!(cfg.hosts[0].address, "10.0.0.42");
+    }
+
+    #[test]
+    fn resolve_host_addresses_errors_on_missing_key() {
+        use crate::secrets::SecretsBundle;
+        let dir = write_temp_tree(&[(
+            "yoink.yaml",
+            r#"
+deploy:
+  networks: [main]
+hosts:
+  - { address_secret: NOT_IN_BUNDLE, user: deploy }
+secrets:
+  provider: age
+  recipients: [age1example]
+"#,
+        )]);
+        let mut cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
+        let bundle = SecretsBundle::default();
+        let err = cfg.resolve_host_addresses(Some(&bundle)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("NOT_IN_BUNDLE") && msg.contains("not found"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_host_addresses_errors_when_no_bundle_available() {
+        let dir = write_temp_tree(&[(
+            "yoink.yaml",
+            r#"
+deploy:
+  networks: [main]
+hosts:
+  - { address_secret: PROD_HOST_IP, user: deploy }
+secrets:
+  provider: age
+  recipients: [age1example]
+"#,
+        )]);
+        let mut cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
+        let err = cfg.resolve_host_addresses(None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("PROD_HOST_IP") && msg.contains("requires a sealed-secrets bundle"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_host_addresses_is_noop_for_literal_hosts() {
+        let dir = write_temp_tree(&[(
+            "yoink.yaml",
+            r#"
+deploy:
+  networks: [main]
+hosts:
+  - { address: 1.2.3.4, user: root }
+"#,
+        )]);
+        let mut cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
+        // Literal-only fleet — resolve should be a no-op even with no bundle.
+        cfg.resolve_host_addresses(None).expect("noop ok");
+        assert_eq!(cfg.hosts[0].address, "1.2.3.4");
+        assert!(!cfg.any_host_address_sealed());
     }
 
     #[test]

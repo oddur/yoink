@@ -21,9 +21,12 @@ Full schema for `yoink.yaml`. Canonical source: [`yoink/src/config.rs`](https://
 
 ## Host
 
+Each host needs an address; that can be either a literal `address:` or, for cases where the address itself is sensitive (a public IP that you front through Cloudflare, a tailnet hostname you'd rather not commit), a sealed-secret reference via `address_secret:`. Set exactly one — neither or both is rejected at config load.
+
 | Field | Type | Notes |
 |---|---|---|
-| `address` | string | Hostname or IP. Anything your local SSH client accepts: a raw IP, a DNS name, a `~/.ssh/config` alias, or a tailnet hostname. |
+| `address` | string | Hostname or IP. Anything your local SSH client accepts: a raw IP, a DNS name, a `~/.ssh/config` alias, or a tailnet hostname. Mutually exclusive with `address_secret`. |
+| `address_secret` | string (optional) | Name of an entry in your sealed-secrets bundle holding the host's address (IP or hostname). Resolved at config-load time after the bundle decrypts. Use this when the deploy config sits in a public repo and the host's address is sensitive. Mutually exclusive with `address`. |
 | `user` | string | SSH user. Must be in the `docker` group on the host (or be `root`). |
 | `ssh_key_secret` | string (optional) | Name of an entry in your sealed-secrets bundle holding a PEM-formatted SSH private key. When set, yoink decrypts the key into a per-process tempfile (mode `0o600`) and uses it for this host's SSH connections — both the docker daemon connection and the pre-flight ssh probe. Lets you ship the deploy key with the repo (encrypted at rest in `secrets.age`) instead of relying on every operator's personal `ssh-agent`. |
 
@@ -37,7 +40,15 @@ hosts:
   - address: 1.2.3.4
     user: root
     ssh_key_secret: PROD_HOST_SSH_KEY
+
+  # Address-in-repo-too flavour: the IP lives in `secrets.age`,
+  # never in the committed yaml. Resolved at deploy time.
+  - address_secret: DOCS_HOST_IP
+    user: deploy
+    ssh_key_secret: DOCS_DEPLOY_SSH_KEY
 ```
+
+`yoink hosts add --address-secret <KEY> --user <USER> --name <NAME>` writes the sealed-address fragment shape. `--name` is required (no literal address to derive a fragment filename from).
 
 ## Deploy
 
