@@ -8,7 +8,13 @@ export function Mermaid({ chart }: { chart: string }) {
       fg: 'var(--color-fd-foreground)',
       transparent: true,
     });
-    return <div dangerouslySetInnerHTML={{ __html: svg }} />;
+    // Strip fixed pixel width/height so the SVG scales with its container.
+    // The viewBox is preserved, so aspect ratio is maintained at any size.
+    const responsive = svg.replace(
+      /(<svg[^>]*?)\s+width="[^"]*"\s+height="[^"]*"/,
+      '$1 style="max-width:100%;height:auto;"',
+    );
+    return <div dangerouslySetInnerHTML={{ __html: responsive }} />;
   } catch {
     return (
       <CodeBlock title="Mermaid">
