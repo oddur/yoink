@@ -1,8 +1,11 @@
-import { createRootRoute, HeadContent, Outlet, Scripts } from '@tanstack/react-router';
+import { createRootRoute, HeadContent, Outlet, Scripts, useRouterState } from '@tanstack/react-router';
 import * as React from 'react';
 import appCss from '@/styles/app.css?url';
 import { RootProvider } from 'fumadocs-ui/provider/tanstack';
 import SearchDialog from '@/components/search';
+import { init, trackEvent } from '@aptabase/web';
+
+const APTABASE_KEY = 'A-EU-6868521188';
 
 export const Route = createRootRoute({
   head: () => ({
@@ -33,6 +36,20 @@ export const Route = createRootRoute({
   component: RootComponent,
 });
 
+function Analytics() {
+  const location = useRouterState({ select: (s) => s.location });
+
+  React.useEffect(() => {
+    init(APTABASE_KEY);
+  }, []);
+
+  React.useEffect(() => {
+    trackEvent('page_view', { path: location.pathname });
+  }, [location.pathname]);
+
+  return null;
+}
+
 function RootComponent() {
   return (
     <html lang="en" suppressHydrationWarning>
@@ -44,6 +61,7 @@ function RootComponent() {
           search={{ SearchDialog }}
           theme={{ attribute: 'class', defaultTheme: 'system', disableTransitionOnChange: true }}
         >
+          <Analytics />
           <Outlet />
         </RootProvider>
         <Scripts />

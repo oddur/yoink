@@ -12,6 +12,7 @@
     "types:check": "fumadocs-mdx && tsc --noEmit"
   },
   "dependencies": {
+    "@aptabase/web": "^0.5.0",
     "@orama/orama": "^3.1.18",
     "@tanstack/react-router": "1.168.25",
     "@tanstack/react-router-devtools": "1.166.13",
