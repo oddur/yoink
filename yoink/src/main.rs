@@ -489,6 +489,31 @@ enum Command {
         #[arg(long, value_enum, default_value_t = PfMode::Auto)]
         mode: PfMode,
     },
+    /// Open VS Code in your browser, rooted in a running container's
+    /// filesystem. Spawns a `codercom/code-server` sidecar on the host,
+    /// shares the target's PID namespace, and serves `/proc/1/root` —
+    /// the target's live rootfs — over an SSH tunnel.
+    ///
+    /// Usage:
+    ///   yoink vscode api                   # open in browser
+    ///   yoink vscode api --no-open         # print URL, don't open
+    ///   yoink vscode api --port 8080       # pin local port
+    Vscode {
+        /// Service name as declared in the config.
+        service: String,
+        /// Pin to a specific host when the service runs on multiple.
+        #[arg(long)]
+        host: Option<String>,
+        /// Replica index (0-based) for services with `replicas: > 1`.
+        #[arg(short = 'r', long, default_value_t = 0)]
+        replica: usize,
+        /// Don't open a browser; just print the URL.
+        #[arg(long)]
+        no_open: bool,
+        /// Pin the laptop-side port (otherwise OS-assigned).
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Like `shell` but spawns an `alpine` debug sidecar in the
     /// target's pid+net namespaces — for distroless / shell-less
     /// images. The sidecar is `--rm` and is force-removed on exit.
@@ -1260,6 +1285,28 @@ async fn run(cli: Cli) -> Result<()> {
                 scheme.into(),
                 json,
                 mode.into(),
+            )
+            .await
+        }
+        Command::Vscode {
+            service,
+            host,
+            replica,
+            no_open,
+            port,
+        } => {
+            let ops: std::sync::Arc<dyn DockerOps> =
+                std::sync::Arc::new(build_real_ops(&config, None).await?);
+            yoink::vscode::cmd_vscode(
+                &config,
+                &service,
+                yoink::vscode::VscodeOptions {
+                    host_filter: host,
+                    replica,
+                    open: !no_open,
+                    local_port: port,
+                },
+                ops,
             )
             .await
         }

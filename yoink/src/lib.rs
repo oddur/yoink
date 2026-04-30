@@ -25,3 +25,4 @@ pub mod ssh_probe;
 pub mod status;
 pub mod transport;
 pub mod tui;
+pub mod vscode;

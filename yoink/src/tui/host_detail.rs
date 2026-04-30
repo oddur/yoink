@@ -166,6 +166,7 @@ impl HostDetailState {
         events: &[String],
         history: &HashMap<(String, String), StatsHistory>,
         forwards: &super::pf::PortForwardState,
+        vscode: &super::vscode::VscodeSessionState,
         throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         // 5-section layout: header · summary · containers (Min) · events (Length 8 when present) · footer.
@@ -240,15 +241,11 @@ impl HostDetailState {
                         .and_then(StatsHistory::latest);
                     let health = c.health_hint().unwrap_or("-");
                     let service_cell = match c.yoink_service.as_deref() {
-                        Some(svc)
-                            if forwards.is_container_forwarded(&host_addr, &c.name)
-                                || forwards.is_service_forwarded_unscoped(svc) =>
-                        {
-                            Cell::from(format!("↦ {svc}")).style(
-                                ratatui::style::Style::default().fg(ratatui::style::Color::Cyan),
-                            )
+                        Some(svc) => {
+                            let pf = forwards.is_container_forwarded(&host_addr, &c.name)
+                                || forwards.is_service_forwarded_unscoped(svc);
+                            super::services::build_marker_cell(svc, pf, vscode)
                         }
-                        Some(svc) => Cell::from(svc.to_string()),
                         None => Cell::from("-"),
                     };
                     Row::new(vec![

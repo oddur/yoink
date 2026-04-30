@@ -192,6 +192,7 @@ impl DashboardState {
         secrets: Option<&SecretsBundle>,
         history: &HashMap<(String, String), StatsHistory>,
         forwards: &super::pf::PortForwardState,
+        vscode: &super::vscode::VscodeSessionState,
         throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         let layout = pane_layout(area);
@@ -208,7 +209,7 @@ impl DashboardState {
         .style(bold());
         frame.render_widget(header, layout[0]);
 
-        let rows = self.build_rows(config, secrets, history, forwards, throbber);
+        let rows = self.build_rows(config, secrets, history, forwards, vscode, throbber);
         let widths = [
             Constraint::Length(18), // host
             Constraint::Length(14), // service
@@ -265,6 +266,7 @@ impl DashboardState {
         secrets: Option<&SecretsBundle>,
         history: &HashMap<(String, String), StatsHistory>,
         forwards: &super::pf::PortForwardState,
+        vscode: &super::vscode::VscodeSessionState,
         throbber: &throbber_widgets_tui::ThrobberState,
     ) -> Vec<Row<'static>> {
         let Some(report) = &self.report else {
@@ -332,14 +334,11 @@ impl DashboardState {
                 let drift_cell = render_drift_cell(c, config, secrets);
 
                 let service_cell = match c.yoink_service.as_deref() {
-                    Some(svc)
-                        if forwards.is_container_forwarded(&host.host, &c.name)
-                            || forwards.is_service_forwarded_unscoped(svc) =>
-                    {
-                        Cell::from(format!("↦ {svc}"))
-                            .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan))
+                    Some(svc) => {
+                        let pf = forwards.is_container_forwarded(&host.host, &c.name)
+                            || forwards.is_service_forwarded_unscoped(svc);
+                        super::services::build_marker_cell(svc, pf, vscode)
                     }
-                    Some(svc) => Cell::from(svc.to_string()),
                     None => Cell::from("-"),
                 };
                 rows.push(Row::new(vec![

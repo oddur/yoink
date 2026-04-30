@@ -439,6 +439,24 @@ pub struct SidecarHandle {
 }
 
 impl SidecarHandle {
+    /// Construct a handle for an already-running sidecar container —
+    /// for callers that did the create/start themselves but want the
+    /// same Drop / `close()` lifecycle.
+    pub(crate) fn from_running(
+        container_name: String,
+        host: Host,
+        host_port: u16,
+        ops: Arc<dyn DockerOps>,
+    ) -> Self {
+        Self {
+            container_name,
+            host,
+            host_port,
+            ops,
+            cleanup_done: false,
+        }
+    }
+
     /// Host-side port the sidecar listens on. Pass to `ssh -L
     /// laptop:CONTAINER_HOST_PORT` to reach the target.
     #[must_use]
@@ -635,7 +653,7 @@ async fn spawn_sidecar(
     })
 }
 
-async fn wait_for_host_port(
+pub(crate) async fn wait_for_host_port(
     ops: &dyn DockerOps,
     host: &Host,
     container_name: &str,
@@ -691,15 +709,22 @@ fn host_port_from_detail(ports: &[String], internal_port: u16) -> Option<u16> {
 }
 
 fn unique_sidecar_name(target_service: &str, target_port: u16) -> String {
-    // Compact pid + nanos suffix is enough to avoid collisions across
-    // concurrent `pf` invocations from the same operator. We never
-    // reuse a sidecar across `pf` runs.
+    unique_sidecar_name_with_prefix("yoink-pf", &format!("{target_service}-{target_port}"))
+}
+
+/// Generic version of `unique_sidecar_name` for sibling commands
+/// (`yoink vscode` and friends) that spawn their own sidecars but
+/// want the same pid+nanos collision-avoidance scheme.
+pub(crate) fn unique_sidecar_name_with_prefix(prefix: &str, qualifier: &str) -> String {
+    // Compact pid + nanos suffix avoids collisions across concurrent
+    // invocations from the same operator. We never reuse a sidecar
+    // across runs.
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
     let suffix = format!("{pid:x}{:x}", nanos & 0xff_ffff);
-    format!("yoink-pf-{target_service}-{target_port}-{suffix}")
+    format!("{prefix}-{qualifier}-{suffix}")
 }
 
 #[cfg(test)]
