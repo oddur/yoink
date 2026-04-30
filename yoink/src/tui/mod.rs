@@ -19,5 +19,6 @@ mod secrets;
 mod services;
 mod shell;
 mod ui;
+mod vscode;
 
 pub use app::{Mode, run};

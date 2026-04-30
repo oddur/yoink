@@ -167,6 +167,8 @@ impl View {
             "  f             port-forward the focused service (auto: published or sidecar)",
             "  o / O         open the active port-forward URL in the browser (any view)",
             "  F             close every active port-forward",
+            "  v             open VS Code in browser, rooted in the focused service's container",
+            "  V             close every active vscode session",
             "  Tab / S-Tab   cycle modes forward / backward",
             "  ?             toggle this help overlay",
             "",
@@ -449,6 +451,16 @@ enum Update {
         /// service in that case.
         target_container: Option<String>,
     },
+    /// Background `v`-key vscode session succeeded — registers the
+    /// `SshTunnel` + `SidecarHandle` into the App's `vscode` state
+    /// so they outlive the spawning task.
+    VscodeOpened {
+        host: String,
+        service: String,
+        url: String,
+        tunnel: crate::transport::tunnel::SshTunnel,
+        sidecar: crate::pf::SidecarHandle,
+    },
 }
 
 /// Auto-pop error overlay carrying the full text (including URLs
@@ -702,6 +714,7 @@ async fn run_loop(
                             // SshTunnel children get killed by
                             // their own Drop on App teardown.
                             app.forwards.close_all_async().await;
+                            app.vscode.close_all_async().await;
                             return Ok(());
                         }
                         if let Some(target) = app.take_pending_editor() {
@@ -830,6 +843,7 @@ pub struct App {
     /// or by dropping the App. Each entry owns its `SshTunnel`
     /// child; Drop kills the ssh subprocess on session exit.
     forwards: super::pf::PortForwardState,
+    vscode: super::vscode::VscodeSessionState,
     /// `Some((service, tag))` while a reconcile-confirmation modal
     /// is open. `y` / Enter confirms; anything else cancels.
     reconcile_target: Option<(String, String)>,
@@ -968,6 +982,7 @@ impl App {
             drift: super::drift::DriftState::default(),
             doctor: super::doctor::DoctorState::default(),
             forwards: super::pf::PortForwardState::default(),
+            vscode: super::vscode::VscodeSessionState::default(),
             reconcile_target: None,
             prune_target: false,
             reconcile_all_target: false,
@@ -1924,6 +1939,23 @@ impl App {
                 self.forwards.close_all_async().await;
                 if n > 0 {
                     self.push_toast(format!("✓ closed {n} port-forward(s)"));
+                }
+                return false;
+            }
+            // `v` opens VS Code in the browser, rooted in the focused
+            // service's container filesystem. Resources view binds `v`
+            // to the Volumes sub-tab; we let that win there.
+            KeyCode::Char('v') if !matches!(self.view, View::Resources) => {
+                if let Some((host, service)) = self.drift_focus() {
+                    self.open_vscode_session(host, service);
+                }
+                return false;
+            }
+            KeyCode::Char('V') => {
+                let n = self.vscode.len();
+                self.vscode.close_all_async().await;
+                if n > 0 {
+                    self.push_toast(format!("✓ closed {n} vscode session(s)"));
                 }
                 return false;
             }
@@ -3017,6 +3049,21 @@ impl App {
                     sidecar,
                 ));
             }
+            Update::VscodeOpened {
+                host,
+                service,
+                url,
+                tunnel,
+                sidecar,
+            } => {
+                self.push_toast(format!("◊ vscode {service} → {url}"));
+                if let Err(e) = crate::pf::open_in_browser(&url) {
+                    self.push_toast(format!("✗ open browser: {e} — paste {url}"));
+                }
+                self.vscode.insert(super::vscode::ActiveSession::new(
+                    &host, &service, url, tunnel, sidecar,
+                ));
+            }
         }
     }
 
@@ -3245,6 +3292,108 @@ impl App {
         });
     }
 
+    /// Spawn a code-server sidecar for the focused (host, service)
+    /// and open VS Code in the browser. No-op when a session is
+    /// already up for that pair (the toast says so).
+    fn open_vscode_session(&mut self, host: Host, service_name: String) {
+        if let Some(existing) = self.vscode.get(&host.address, &service_name) {
+            self.push_toast(format!("◊ already up: {}", existing.url));
+            return;
+        }
+        let Some(service) = self
+            .config
+            .services
+            .iter()
+            .find(|s| s.name == service_name)
+            .cloned()
+        else {
+            self.push_toast(format!("✗ no service named {service_name}"));
+            return;
+        };
+
+        let host_for_task = host.clone();
+        let service_for_task = service.clone();
+        let service_name_for_task = service_name.clone();
+        let ops = self.ops.clone();
+        let tx = self.update_tx.clone();
+        self.push_toast(format!("◊ vscode {service_name}: starting sidecar …"));
+        tokio::spawn(async move {
+            let keyfile = ops.ssh_keyfile(&host_for_task);
+            if let Err(e) =
+                crate::ssh_probe::probe(&host_for_task, keyfile.as_deref().and_then(|p| p.to_str()))
+                    .await
+            {
+                let _ = tx.send(Update::Toast(format!(
+                    "✗ ssh probe to {} failed: {e}",
+                    host_for_task.address
+                )));
+                return;
+            }
+            let (target_container, network) = match crate::vscode::resolve_target(
+                ops.as_ref(),
+                &host_for_task,
+                &service_for_task,
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let _ = tx.send(Update::Toast(format!("✗ vscode: {e}")));
+                    return;
+                }
+            };
+            let handle = match crate::vscode::spawn_codeserver_sidecar(
+                ops.clone(),
+                host_for_task.clone(),
+                &service_name_for_task,
+                &target_container,
+                &network,
+            )
+            .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = tx.send(Update::Toast(format!("✗ vscode: {e}")));
+                    return;
+                }
+            };
+            let host_port = handle.host_port();
+            let tunnel = match crate::transport::tunnel::SshTunnel::open_with_local_port(
+                &host_for_task.user,
+                &host_for_task.address,
+                crate::pf::SIDECAR_DIAL_HOST,
+                host_port,
+                None,
+                crate::pf::TUNNEL_READY_TIMEOUT,
+                keyfile.as_deref(),
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    handle.close().await;
+                    let _ = tx.send(Update::Toast(format!("✗ vscode tunnel: {e}")));
+                    return;
+                }
+            };
+            let local_port = tunnel.local_port();
+            if let Err(e) = crate::vscode::wait_for_http(local_port).await {
+                handle.close().await;
+                drop(tunnel);
+                let _ = tx.send(Update::Toast(format!("✗ vscode: {e}")));
+                return;
+            }
+            let url = format!("http://127.0.0.1:{local_port}/?folder=/proc/1/root");
+            let _ = tx.send(Update::VscodeOpened {
+                host: host_for_task.address,
+                service: service_name_for_task,
+                url,
+                tunnel,
+                sidecar: handle,
+            });
+        });
+    }
+
     /// React to a `docker events` push by refreshing whichever pane is
     /// visible. Container start/stop/die/health-status are the events
     /// that mean what the user sees on screen has changed; we ignore
@@ -3372,19 +3521,36 @@ impl App {
         // Slice a single row off the bottom for the port-forward footer
         // when any tunnels are active. Goal: operators can't forget they
         // have an open tunnel — the band stays visible across every pane.
-        let pf_footer_area = if !self.forwards.is_empty() && pane_area.height >= 2 {
-            let split = ratatui::layout::Layout::default()
-                .direction(ratatui::layout::Direction::Vertical)
-                .constraints([
-                    ratatui::layout::Constraint::Min(0),
-                    ratatui::layout::Constraint::Length(1),
-                ])
-                .split(pane_area);
-            pane_area = split[0];
-            Some(split[1])
-        } else {
-            None
-        };
+        let footer_rows: u16 =
+            u16::from(!self.forwards.is_empty()) + u16::from(!self.vscode.is_empty());
+        let (pf_footer_area, vscode_footer_area) =
+            if footer_rows > 0 && pane_area.height >= footer_rows + 1 {
+                let mut constraints = vec![ratatui::layout::Constraint::Min(0)];
+                for _ in 0..footer_rows {
+                    constraints.push(ratatui::layout::Constraint::Length(1));
+                }
+                let split = ratatui::layout::Layout::default()
+                    .direction(ratatui::layout::Direction::Vertical)
+                    .constraints(constraints)
+                    .split(pane_area);
+                pane_area = split[0];
+                let mut idx = 1;
+                let pf = if !self.forwards.is_empty() {
+                    let a = Some(split[idx]);
+                    idx += 1;
+                    a
+                } else {
+                    None
+                };
+                let vs = if !self.vscode.is_empty() {
+                    Some(split[idx])
+                } else {
+                    None
+                };
+                (pf, vs)
+            } else {
+                (None, None)
+            };
         let crumbs = self.view.breadcrumb();
         // Drop expired toasts and pick the freshest live one for the
         // right-side info slot. When nothing's live, fall back to the
@@ -3712,6 +3878,9 @@ impl App {
 
         if let Some(area) = pf_footer_area {
             self.forwards.render_footer(frame, area);
+        }
+        if let Some(area) = vscode_footer_area {
+            self.vscode.render_footer(frame, area);
         }
 
         if self.drift.is_visible() {
