@@ -224,6 +224,78 @@ Every page ends with `## See also` listing 2–4 cross-links:
 - Code fences always get a language tag: `yaml`, `sh`, `rust`, `text` for output, `dotenv` (not `env`) for env files.
 - Comments inside YAML examples explain *why* a field is set, not *what* it is.
 
+## Terminal recordings (asciinema)
+
+The home page (`docs/src/routes/index.tsx`) embeds a terminal demo via `<TerminalPlayer src="/demo.cast" />`. The cast file lives at `docs/public/demo.cast` and is served statically. The player component (`docs/src/components/terminal-player.tsx`) lazy-loads `asciinema-player` after mount to avoid SSR issues.
+
+### Recording
+
+```sh
+brew install asciinema   # one-time
+cd docs
+asciinema rec public/demo.cast --cols 100 --rows 18 --command "yoink up --build --tag docs=$(git rev-parse --short HEAD)"
+```
+
+Record in headless mode (no interactive TTY needed — the Bash tool can run this). Aim to capture: the build announcement line, shipping via unregistry, and the rolling healthcheck deploy. Docker build output can be cut afterward.
+
+### Cast file format
+
+The file uses **asciinema v3** format: JSON header on line 1, one event per subsequent line. Each event: `[relative_seconds, type, data]` where type is `"o"` (output) or `"x"` (exit). Timestamps are **relative to the previous event**, not absolute from start.
+
+### Editing the cast
+
+**Remove docker build noise** — keep only the build announcement line + shipping/deploy events:
+```python
+with open('docs/public/demo.cast') as f:
+    lines = f.readlines()
+header = lines[0]
+events = [json.loads(l) for l in lines[1:] if l.strip()]
+# Keep: events[0] (build announcement), then skip build churn, resume at shipping
+kept = [events[0]] + [[1.5, "o", "\r\n"]] + events[shipping_start_idx:]
+with open('docs/public/demo.cast', 'w') as f:
+    f.write(header)
+    for e in kept: f.write(json.dumps(e) + '\n')
+```
+
+**Mask private IPs** — replace real host IPs with RFC 5737 documentation addresses:
+```python
+content = content.replace('actual.ip.here', '203.0.113.10')
+```
+
+**Remove unwanted lines** (WARN, error noise):
+```python
+lines = [l for l in lines if 'WARN' not in l and 'ERROR' not in l]
+```
+
+**Add a pause at the end** — insert a blank output event BEFORE the exit event (`"x"`), not after it (the player stops at the exit event):
+```python
+exit_idx = next(i for i, e in enumerate(events) if e[1] == 'x')
+events.insert(exit_idx, [10.0, "o", ""])
+```
+
+**Watch out for double-encoding** — if you read lines with `f.readlines()` and then write them with `json.dumps(line_string)`, the string gets double-encoded. Write kept lines raw; only use `json.dumps` for synthetic events you construct as Python lists. To fix an already-double-encoded file:
+```python
+parsed = json.loads(line)
+if isinstance(parsed, str):
+    parsed = json.loads(parsed)  # decode the inner array
+```
+
+### Verifying the cast
+
+```sh
+# Check event count and structure
+python3 -c "
+import json
+with open('docs/public/demo.cast') as f: lines = f.readlines()
+events = [json.loads(l) for l in lines[1:] if l.strip()]
+print(f'{len(events)} events')
+for e in events[:3] + events[-3:]: print(e[1], e[0], repr(e[2][:60]))
+"
+
+# Verify no real IPs or WARN lines remain
+grep -c "WARN\|your.real.ip" docs/public/demo.cast || echo "clean"
+```
+
 ## Verification protocol
 
 1. **Per-page word-count delta is negative**:
