@@ -1,0 +1,9 @@
+{
+  "title": "Reference",
+  "pages": [
+    "tui",
+    "glossary",
+    "config",
+    "cli"
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "title": "Guide",
+  "pages": [
+    "deploy-modes",
+    "security",
+    "architecture",
+    "proxy",
+    "networking",
+    "secrets",
+    "templates",
+    "ai-agents"
+  ]
+}

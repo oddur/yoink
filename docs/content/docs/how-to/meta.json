@@ -1,0 +1,23 @@
+{
+  "title": "How-to",
+  "pages": [
+    "tanstack-stack",
+    "age-in-github-actions",
+    "hetzner-quickstart",
+    "caddy-plugins",
+    "volume-backups",
+    "pr-comment-dry-run",
+    "watch-mode",
+    "vscode",
+    "staging-alongside-prod",
+    "self-hosted-registry",
+    "cloudflare-origin-certs",
+    "defense-in-depth",
+    "grpc-hosting",
+    "sealed-secrets-workflow",
+    "standalone-mode",
+    "multi-host-redis-storage",
+    "using-templates",
+    "caddy-snippets"
+  ]
+}

@@ -1,0 +1,24 @@
+---
+title: Documentation
+sidebar:
+  open: true
+weight: 1
+---
+
+Five sections, picked for what you're trying to do: an **intro** for orientation, a **start** for the first run, a **guide** for the mental model, **how-to** walkthroughs for specific tasks, and a **reference** for the exhaustive surface.
+
+**New here?** Read [What and why](/docs/intro/what-and-why) (3 min), then [First deploy](/docs/start/first-deploy) (5 min). That's enough to ship a real container against a real host.
+
+**Already running yoink and want to do X?** Skip to [How-to](/docs/how-to). Each page takes you from "I want X" to "X is running in production."
+
+**Looking up a flag, field, or keybind?** [Reference](/docs/reference). Lookup-shaped, no prose.
+
+<Cards>
+  <Card href="/docs/intro" title="Intro" description="What yoink is, why it exists, how it compares to Kamal / Kubernetes / plain compose." />
+  <Card href="/docs/start" title="Start" description="Install, then a five-minute first deploy from a fresh repo." />
+  <Card href="/docs/guide" title="Guide" description="Deploy modes, security defaults, drift detection, pairing with Tailscale + caddy." />
+  <Card href="/docs/how-to" title="How-to" description="Task-oriented walkthroughs: provision a Hetzner cx23 with HTTPS, run staging alongside prod, wire external secrets, PR-comment dry-run." />
+  <Card href="/docs/reference" title="Reference" description="Every CLI flag, every config field, every TUI keybind." />
+  <Card href="/docs/examples" title="Examples" description="Three complete annotated yoink.yaml configs: hobby tool, polyglot stack, production." />
+  <Card href="/docs/troubleshooting" title="Troubleshooting" description="Error message → likely cause → fix." />
+</Cards>

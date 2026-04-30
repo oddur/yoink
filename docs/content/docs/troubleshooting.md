@@ -52,7 +52,7 @@ Add the key with `ssh-add ~/.ssh/id_ed25519` (or whichever) and re-run.
 
 For the "host is provisioning right now and Docker isn't installed yet" race (common on `cloud-init`-driven first boots), `yoink preflight --wait 90s` polls each host on backoff (2s → 15s capped) until Docker responds or the budget lapses. Saves writing your own `until ssh … cloud-init status --wait` loop before the first `yoink up`.
 
-## `` `<command>` exited with status N: <stderr> ``
+## `<command> exited with status N: <stderr>`
 
 `provider: command` ran your secrets binary and it failed. The captured stderr is included in the error — start there.
 
@@ -62,7 +62,7 @@ Common causes:
 - The CLI is missing on the deploy runner (operator's laptop has it via Homebrew; CI doesn't). Install it in the workflow before `yoink up`.
 - The configured project / vault / secret name has changed. Re-check the argv against your secret manager's UI.
 
-## `parse secrets bundle from \`<command>\` (treated as <format>)`
+## `parse secrets bundle from <command> (treated as <format>)`
 
 The command exited 0 but yoink couldn't parse stdout. Either:
 
