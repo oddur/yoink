@@ -46,10 +46,14 @@ services:
     networks: [docs]
     run:
       port: 80
+      replicas: 4                     # cax11 has 2 cores; 4 × 0.5 = full utilization
       healthcheck_path: /
       healthcheck_timeout: 30s
+      drain_timeout: 10s
       options:
-        memory: "128Mi"
+        # cax11: 4096 MiB RAM split into 5 shares (4 replicas + OS reservation).
+        # 4096 / 5 ≈ 819 MiB; round down to 768 MiB for headroom during rolling swap.
+        memory: "768Mi"
         cpus: "0.5"
         # nginx:alpine writes to /var/cache/nginx + /var/run + /tmp;
         # all three must be tmpfs because rootfs is read-only by default.
