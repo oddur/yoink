@@ -22,23 +22,23 @@ Yoink treats **where the image is built** and **how it gets to the host** as ind
 The four cells share a deploy engine — drift detection, healthcheck-gated rolling swap, dependency-ordered waves work the same regardless of how the image arrived. Mixed configs (some services pull from a registry, others ship from local) work out of the box: yoink detects which is which from the `build:` blocks and runs both paths in parallel under a single `yoink up`.
 
 ```mermaid
-flowchart TB
+flowchart LR
     subgraph CI ["CI-built (registry)"]
-        direction LR
+        direction TB
         C1[CI builds image] --> C2[push to registry]
         C2 --> C3["yoink up --tag api=sha"]
         C3 --> C4[host pulls from registry]
     end
     subgraph Local ["Local-build + push"]
-        direction LR
+        direction TB
         L1["yoink build --push"] --> L2[image in registry]
         L2 --> L3[yoink up]
         L3 --> L4[host pulls from registry]
     end
     subgraph Standalone ["Standalone (no registry)"]
-        direction LR
+        direction TB
         S1["yoink up --build"] --> S2[docker build local]
-        S2 --> S3[ship via unregistry over SSH]
+        S2 --> S3[ship via unregistry]
         S3 --> S4[host loads image]
     end
     CI --> Deploy([rolling deploy])
