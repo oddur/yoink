@@ -631,15 +631,11 @@ fn render_route(svc: &ServiceConfig, containers: &[String], tls_active: bool) ->
         matchers.insert("path".into(), json!([prefix]));
     }
 
-    let mut route = json!({
+    let route = json!({
         "match": [Value::Object(matchers)],
         "handle": handle,
         "terminal": true,
     });
-
-    if matches!(svc.tls, TlsMode::Off) {
-        route["@yoink_tls_off"] = json!(true);
-    }
 
     Ok(route)
 }
