@@ -800,9 +800,12 @@ enum SecretsAction {
         reveal: bool,
     },
     /// One-shot: read a plaintext dotenv from `--in` (or stdin) OR
-    /// individual `--as KEY=...` pairs, merge into a single bundle,
-    /// seal against the recipients in `yoink.yaml`, write to
-    /// `secrets.age` (or `--out`).
+    /// individual `--as KEY=...` pairs, **merge** into the existing
+    /// sealed bundle (matching `secrets ssh-key generate --seal-as`'s
+    /// behavior), seal against the recipients in `yoink.yaml`, write
+    /// to `secrets.age` (or `--out`). Use `--replace` to opt into
+    /// the wholesale-rewrite mode for the rare cases where you want
+    /// to start from scratch.
     Seal {
         /// Plaintext dotenv input. `-` (or unset) reads from stdin.
         /// Mutually exclusive with `--as`.
@@ -818,6 +821,17 @@ enum SecretsAction {
         /// (or `secrets.age` next to `yoink.yaml`).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Wholesale-rewrite the sealed bundle with only the input
+        /// keys. Default behavior is to merge — you almost never
+        /// want this unless you're deliberately starting fresh.
+        /// When the rewrite would remove keys, the operator is
+        /// asked to confirm; pass `--yes` to skip the prompt.
+        #[arg(long)]
+        replace: bool,
+        /// Skip confirmation prompts (currently used by `--replace`
+        /// when it would drop existing keys).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Generate a new identity and re-seal `secrets.age` against
     /// both the existing recipients AND the new public key. Prints
@@ -3976,7 +3990,9 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
             r#in,
             as_pairs,
             out,
-        } => cmd_secrets_seal(config, r#in.as_deref(), &as_pairs, out),
+            replace,
+            yes,
+        } => cmd_secrets_seal(config, r#in.as_deref(), &as_pairs, out, replace, yes),
         SecretsAction::Rotate => cmd_secrets_rotate(config),
         SecretsAction::SshKey { action } => match action {
             SshKeyAction::Generate { seal_as, comment } => {
@@ -4192,6 +4208,8 @@ fn cmd_secrets_seal(
     input: Option<&Path>,
     as_pairs: &[String],
     out: Option<PathBuf>,
+    replace: bool,
+    yes: bool,
 ) -> Result<()> {
     use yoink::sealed;
     let (file_override, recipients) = expect_age_block(config)?;
@@ -4199,7 +4217,7 @@ fn cmd_secrets_seal(
     // a wrong-file paste (a 5GB image) just as much as an unbounded
     // stdin stream. Real secrets bundles are kilobytes.
     const SEAL_INPUT_CAP: u64 = 10 * 1024 * 1024;
-    let parsed = if !as_pairs.is_empty() {
+    let new_entries = if !as_pairs.is_empty() {
         parse_as_pairs(as_pairs, SEAL_INPUT_CAP)?
     } else {
         let plaintext = match input {
@@ -4235,14 +4253,93 @@ fn cmd_secrets_seal(
         };
         sealed::parse_dotenv(&plaintext)?
     };
-    let canonical = sealed::render_dotenv(&parsed);
-    let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
+
     let target = match out {
         Some(p) => p,
         None => sealed::resolve_sealed_path(config, file_override.as_deref())?,
     };
+
+    // Load existing bundle (if any). On the first seal — when
+    // `secrets.age` doesn't exist yet — there's nothing to merge
+    // with, so an empty existing map is fine.
+    let existing: std::collections::BTreeMap<String, String> = if target.exists() {
+        let identity = sealed::load_identity(recipients).context(
+            "decrypt existing sealed bundle to merge new keys (use --replace to skip the merge \
+             and wholesale-rewrite the bundle)",
+        )?;
+        let bytes = std::fs::read(&target)
+            .with_context(|| format!("read sealed file {}", target.display()))?;
+        let plaintext = sealed::unseal(&bytes, &identity)?;
+        sealed::parse_dotenv(&plaintext)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    let (final_map, summary) = if replace {
+        // Wholesale-rewrite. If the rewrite would drop existing keys,
+        // confirm — losing sealed values silently is the footgun this
+        // change exists to prevent.
+        let dropped: Vec<&String> = existing
+            .keys()
+            .filter(|k| !new_entries.contains_key(k.as_str()))
+            .collect();
+        if !dropped.is_empty() && !yes {
+            eprintln!(
+                "--replace will drop {} existing key(s) from {}: {}",
+                dropped.len(),
+                target.display(),
+                dropped
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            eprint!("Proceed? [y/N] ");
+            use std::io::Write;
+            io::stderr().flush().ok();
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                return Err(anyhow::anyhow!("aborted"));
+            }
+        }
+        let summary = format!(
+            "wrote {} key(s) to {} (replaced; was {})",
+            new_entries.len(),
+            target.display(),
+            existing.len()
+        );
+        (new_entries, summary)
+    } else {
+        // Merge: new entries overlay existing ones.
+        let mut merged = existing.clone();
+        let added: Vec<String> = new_entries
+            .keys()
+            .filter(|k| !existing.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        let updated: Vec<String> = new_entries
+            .keys()
+            .filter(|k| existing.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        merged.extend(new_entries);
+        let summary = format!(
+            "sealed {} key(s) to {} ({} added, {} updated, {} preserved; total {})",
+            added.len() + updated.len(),
+            target.display(),
+            added.len(),
+            updated.len(),
+            existing.len() - updated.len(),
+            merged.len(),
+        );
+        (merged, summary)
+    };
+
+    let canonical = sealed::render_dotenv(&final_map);
+    let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
     sealed::write_atomically_secret(&target, &sealed_bytes)?;
-    println!("sealed {} key(s) to {}", parsed.len(), target.display());
+    println!("{summary}");
     Ok(())
 }
 
