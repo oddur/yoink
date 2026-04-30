@@ -1988,17 +1988,32 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
 /// If any host has `address_secret:` set, eagerly load the secrets
 /// bundle and populate `host.address` from it. Idempotent — calling
 /// twice is safe. Skipped (no work, no bundle access) when no host
-/// is sealed, so configs that don't use the feature pay nothing.
+/// is sealed.
+///
+/// Best-effort: if the bundle fails to load (sealed file missing,
+/// identity unavailable, decrypt error), the function logs a debug
+/// trace and returns Ok with `host.address` left empty. Bootstrap
+/// commands (`yoink secrets …`, `yoink hosts …`, `yoink init`) need
+/// to run before the bundle exists; making the resolver hard-fail
+/// here would block them. Deploy commands that actually consume
+/// `host.address` surface a clear error when it's empty.
 async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
     if !config.any_host_address_sealed() {
         return Ok(());
     }
-    let bundle = secrets::load_bundle(config)
-        .await
-        .context("load secrets bundle to resolve hosts[].address_secret")?;
-    config
-        .resolve_host_addresses(bundle.as_ref())
-        .context("resolve hosts[].address_secret against the sealed bundle")?;
+    let bundle = match secrets::load_bundle(config).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "skipping address_secret resolution: secrets bundle unavailable",
+            );
+            return Ok(());
+        }
+    };
+    if let Err(e) = config.resolve_host_addresses(bundle.as_ref()) {
+        tracing::debug!(error = %e, "skipping address_secret resolution");
+    }
     Ok(())
 }
 
