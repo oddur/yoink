@@ -20,8 +20,8 @@ export const Route = createFileRoute('/')({
 const features = [
   {
     icon: <Server className="size-5" />,
-    title: 'Bare-metal simple',
-    description: 'SSH key + yoink up. No control plane, no agents on the host, no registry account required.',
+    title: 'SSH is the only dependency',
+    description: 'Key-based SSH access to any host is all yoink needs. No agent on the server, no registry account required.',
   },
   {
     icon: <ShieldCheck className="size-5" />,
@@ -55,23 +55,16 @@ function Home() {
     <HomeLayout {...baseOptions()}>
       {/* ── Hero ─────────────────────────────────────────────────────── */}
       <section className="flex flex-col items-center justify-center text-center py-20 px-4">
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-fd-border text-fd-muted-foreground text-sm mb-6">
-          <span className="size-1.5 rounded-full bg-green-500 animate-pulse" />
-          Open source · MIT
-        </div>
-
         <h1 className="text-5xl sm:text-6xl font-bold tracking-tight mb-4">
           🪝 yoink
         </h1>
 
         <p className="text-2xl sm:text-3xl font-semibold text-fd-foreground mb-3">
-          Deploy containers to bare metal.
-          <br />
-          <span className="text-fd-muted-foreground">No Kubernetes.</span>
+          Container deploys for the servers you run.
         </p>
 
         <p className="text-fd-muted-foreground text-lg mb-8 max-w-lg">
-          A small, opinionated container deploy CLI + TUI for people who run a handful of services on a handful of bare-metal hosts.
+          A small, opinionated deploy CLI + TUI for people who run a handful of services on a handful of VPS or bare-metal hosts.
         </p>
 
         <div className="flex flex-wrap gap-3 justify-center mb-10">
