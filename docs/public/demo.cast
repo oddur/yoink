@@ -1,61 +1,61 @@
 {"version":3,"term":{"cols":80,"rows":24},"timestamp":1777582247,"command":"yoink up --build --tag docs=5d26e1f","env":{"SHELL":"/bin/zsh"}}
-"[0.013, \"o\", \"yoink build docs: docker build \u2192 yoink-docs:5d26e1f (context: .)\\r\\n\"]\n"
+[0.013, "o", "yoink build docs: docker build \u2192 yoink-docs:5d26e1f (context: .)\r\n"]
 [1.5, "o", "\r\n"]
-"[0.867, \"o\", \"\\u001b[32m\u2801\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.000, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2801\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.105, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2809\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.105, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2819\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.102, \"o\", \"\\r\\u001b[2K\\u001b[32m\u281a\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.104, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2812\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.104, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2802\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.103, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2802\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.103, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2812\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.103, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2832\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.104, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2834\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.100, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2824\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.100, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2804\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.104, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2804\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.101, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2824\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.105, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2820\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.105, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2820\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.104, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2824\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.104, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2826\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.101, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2816\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.103, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2812\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.105, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2810\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.101, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2810\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.104, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2812\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.100, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2813\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.103, \"o\", \"\\r\\u001b[2K\\u001b[32m\u280b\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.105, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2809\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.105, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2808\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.106, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2808\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.102, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2801\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.101, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2801\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.105, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2809\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.104, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2819\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.101, \"o\", \"\\r\\u001b[2K\\u001b[32m\u281a\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.101, \"o\", \"\\r\\u001b[2K\\u001b[32m\u2812\\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     \"]\n"
-"[0.079, \"o\", \"\\r\\u001b[2K\\u001b[32m \\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s  done \u00b7 unregistry  \"]\n"
-"[1.588, \"o\", \"[203.0.113.10] pulling caddy:2\\r\\n\"]\n"
-"[1.035, \"o\", \"[203.0.113.10] pull complete\\r\\n\"]\n"
-"[0.027, \"o\", \"[203.0.113.10] network docs ready (exists)\\r\\n\"]\n"
-"[0.025, \"o\", \"[203.0.113.10] network yoink-ingress ready (exists)\\r\\n\"]\n"
-"[0.022, \"o\", \"[203.0.113.10] network yoink-proxy-admin ready (exists)\\r\\n\"]\n"
-"[0.166, \"o\", \"[yoink-proxy] [203.0.113.10] yoink-proxy-ae548533 already at spec \u2014 no-op\\r\\n\"]\n"
-"[0.000, \"o\", \"[docs] [203.0.113.10] deploying docs:5d26e1f\\r\\n\"]\n"
-"[0.980, \"o\", \"[docs] [203.0.113.10] started docs-c1d70c8a-0\\r\\n\"]\n"
-"[0.490, \"o\", \"[docs] [203.0.113.10] docs-c1d70c8a-0 healthy (1 attempt(s))\\r\\n\"]\n"
-"[0.273, \"o\", \"[docs] [203.0.113.10] started docs-c1d70c8a-1\\r\\n\"]\n"
-"[0.470, \"o\", \"[docs] [203.0.113.10] docs-c1d70c8a-1 healthy (1 attempt(s))\\r\\n\"]\n"
-"[0.245, \"o\", \"[docs] [203.0.113.10] started docs-c1d70c8a-2\\r\\n\"]\n"
-"[0.442, \"o\", \"[docs] [203.0.113.10] docs-c1d70c8a-2 healthy (1 attempt(s))\\r\\n\"]\n"
-"[0.248, \"o\", \"[docs] [203.0.113.10] started docs-c1d70c8a-3\\r\\n\"]\n"
-"[0.504, \"o\", \"[docs] [203.0.113.10] docs-c1d70c8a-3 healthy (1 attempt(s))\\r\\n\"]\n"
-"[0.877, \"o\", \"[docs] [203.0.113.10] stopped old docs-61b702f9-3\\r\\n\"]\n"
-"[0.316, \"o\", \"[docs] [203.0.113.10] stopped old docs-61b702f9-2\\r\\n\"]\n"
-"[0.420, \"o\", \"[docs] [203.0.113.10] stopped old docs-61b702f9-1\\r\\n\"]\n"
-"[0.355, \"o\", \"[docs] [203.0.113.10] stopped old docs-61b702f9-0\\r\\n[docs] [203.0.113.10] done \u2014 docs-c1d70c8a-0\\r\\n\"]\n"
-"[0.038, \"o\", \"\u2713 reconciled 2 service(s)\\r\\n  yoink-proxy:2\\r\\n    203.0.113.10: yoink-proxy-ae548533 (healthy after 0 attempt(s); stopped 0 old)\\r\\n  docs:5d26e1f\\r\\n    203.0.113.10: docs-c1d70c8a-0 (healthy after 1 attempt(s); stopped 4 old)\\r\\n\"]\n"
-"[0.026, \"x\", \"0\"]\n"
-"[10.0, \"o\", \"\"]\n"
+[0.867, "o", "\u001b[32m\u2801\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.0, "o", "\r\u001b[2K\u001b[32m\u2801\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.105, "o", "\r\u001b[2K\u001b[32m\u2809\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.105, "o", "\r\u001b[2K\u001b[32m\u2819\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.102, "o", "\r\u001b[2K\u001b[32m\u281a\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.104, "o", "\r\u001b[2K\u001b[32m\u2812\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.104, "o", "\r\u001b[2K\u001b[32m\u2802\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.103, "o", "\r\u001b[2K\u001b[32m\u2802\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.103, "o", "\r\u001b[2K\u001b[32m\u2812\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.103, "o", "\r\u001b[2K\u001b[32m\u2832\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.104, "o", "\r\u001b[2K\u001b[32m\u2834\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.1, "o", "\r\u001b[2K\u001b[32m\u2824\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.1, "o", "\r\u001b[2K\u001b[32m\u2804\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.104, "o", "\r\u001b[2K\u001b[32m\u2804\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.101, "o", "\r\u001b[2K\u001b[32m\u2824\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.105, "o", "\r\u001b[2K\u001b[32m\u2820\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.105, "o", "\r\u001b[2K\u001b[32m\u2820\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.104, "o", "\r\u001b[2K\u001b[32m\u2824\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.104, "o", "\r\u001b[2K\u001b[32m\u2826\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.101, "o", "\r\u001b[2K\u001b[32m\u2816\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.103, "o", "\r\u001b[2K\u001b[32m\u2812\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.105, "o", "\r\u001b[2K\u001b[32m\u2810\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.101, "o", "\r\u001b[2K\u001b[32m\u2810\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.104, "o", "\r\u001b[2K\u001b[32m\u2812\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.1, "o", "\r\u001b[2K\u001b[32m\u2813\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.103, "o", "\r\u001b[2K\u001b[32m\u280b\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.105, "o", "\r\u001b[2K\u001b[32m\u2809\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.105, "o", "\r\u001b[2K\u001b[32m\u2808\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.106, "o", "\r\u001b[2K\u001b[32m\u2808\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.102, "o", "\r\u001b[2K\u001b[32m\u2801\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.101, "o", "\r\u001b[2K\u001b[32m\u2801\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.105, "o", "\r\u001b[2K\u001b[32m\u2809\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.104, "o", "\r\u001b[2K\u001b[32m\u2819\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.101, "o", "\r\u001b[2K\u001b[32m\u281a\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.101, "o", "\r\u001b[2K\u001b[32m\u2812\u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s                     "]
+[0.079, "o", "\r\u001b[2K\u001b[32m \u001b[0m yoink-docs:5d26e1f \u2192 203.0.113.10        0 B @      0 B/s  done \u00b7 unregistry  "]
+[1.588, "o", "[203.0.113.10] pulling caddy:2\r\n"]
+[1.035, "o", "[203.0.113.10] pull complete\r\n"]
+[0.027, "o", "[203.0.113.10] network docs ready (exists)\r\n"]
+[0.025, "o", "[203.0.113.10] network yoink-ingress ready (exists)\r\n"]
+[0.022, "o", "[203.0.113.10] network yoink-proxy-admin ready (exists)\r\n"]
+[0.166, "o", "[yoink-proxy] [203.0.113.10] yoink-proxy-ae548533 already at spec \u2014 no-op\r\n"]
+[0.0, "o", "[docs] [203.0.113.10] deploying docs:5d26e1f\r\n"]
+[0.98, "o", "[docs] [203.0.113.10] started docs-c1d70c8a-0\r\n"]
+[0.49, "o", "[docs] [203.0.113.10] docs-c1d70c8a-0 healthy (1 attempt(s))\r\n"]
+[0.273, "o", "[docs] [203.0.113.10] started docs-c1d70c8a-1\r\n"]
+[0.47, "o", "[docs] [203.0.113.10] docs-c1d70c8a-1 healthy (1 attempt(s))\r\n"]
+[0.245, "o", "[docs] [203.0.113.10] started docs-c1d70c8a-2\r\n"]
+[0.442, "o", "[docs] [203.0.113.10] docs-c1d70c8a-2 healthy (1 attempt(s))\r\n"]
+[0.248, "o", "[docs] [203.0.113.10] started docs-c1d70c8a-3\r\n"]
+[0.504, "o", "[docs] [203.0.113.10] docs-c1d70c8a-3 healthy (1 attempt(s))\r\n"]
+[0.877, "o", "[docs] [203.0.113.10] stopped old docs-61b702f9-3\r\n"]
+[0.316, "o", "[docs] [203.0.113.10] stopped old docs-61b702f9-2\r\n"]
+[0.42, "o", "[docs] [203.0.113.10] stopped old docs-61b702f9-1\r\n"]
+[0.355, "o", "[docs] [203.0.113.10] stopped old docs-61b702f9-0\r\n[docs] [203.0.113.10] done \u2014 docs-c1d70c8a-0\r\n"]
+[0.038, "o", "\u2713 reconciled 2 service(s)\r\n  yoink-proxy:2\r\n    203.0.113.10: yoink-proxy-ae548533 (healthy after 0 attempt(s); stopped 0 old)\r\n  docs:5d26e1f\r\n    203.0.113.10: docs-c1d70c8a-0 (healthy after 1 attempt(s); stopped 4 old)\r\n"]
+[0.026, "x", "0"]
+[10.0, "o", ""]
