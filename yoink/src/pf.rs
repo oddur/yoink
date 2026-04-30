@@ -439,6 +439,24 @@ pub struct SidecarHandle {
 }
 
 impl SidecarHandle {
+    /// Construct a handle for an already-running sidecar container.
+    /// Used by sibling commands (`yoink fs`) that spin up their own
+    /// sidecars but want the same Drop / `close()` lifecycle.
+    pub(crate) fn from_running(
+        container_name: String,
+        host: Host,
+        host_port: u16,
+        ops: Arc<dyn DockerOps>,
+    ) -> Self {
+        Self {
+            container_name,
+            host,
+            host_port,
+            ops,
+            cleanup_done: false,
+        }
+    }
+
     /// Host-side port the sidecar listens on. Pass to `ssh -L
     /// laptop:CONTAINER_HOST_PORT` to reach the target.
     #[must_use]
@@ -635,7 +653,7 @@ async fn spawn_sidecar(
     })
 }
 
-async fn wait_for_host_port(
+pub(crate) async fn wait_for_host_port(
     ops: &dyn DockerOps,
     host: &Host,
     container_name: &str,
