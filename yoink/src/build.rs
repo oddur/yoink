@@ -96,6 +96,7 @@ pub fn resolve_service_tag(
 }
 
 /// Return whether a tag can be resolved without building first.
+#[must_use]
 pub fn has_tag(svc: &ServiceConfig, overrides: &BTreeMap<String, String>) -> bool {
     overrides.contains_key(&svc.name) || svc.tag.is_some()
 }
@@ -105,7 +106,7 @@ pub fn has_tag(svc: &ServiceConfig, overrides: &BTreeMap<String, String>) -> boo
 /// computes, extracts the first 12 hex chars of the SHA256, and retags
 /// the image under that short digest. The tag is deterministic: the same
 /// Dockerfile + context produces the same hash, so unchanged images cause
-/// no spec_hash diff and yoink skips the container restart automatically.
+/// no `spec_hash` diff and yoink skips the container restart automatically.
 pub async fn build_and_capture_tag(
     config: &Config,
     service: &ServiceConfig,

@@ -19,6 +19,7 @@ pub enum IncludePlan {
 
 /// Decide whether the given dests are already covered by the config's
 /// existing `include:` entries. Doesn't mutate the file.
+#[must_use]
 pub fn plan(config: &Config, desired_glob: Option<&str>, dests: &[PathBuf]) -> IncludePlan {
     let Some(glob) = desired_glob else {
         return IncludePlan::AlreadyCovered;
@@ -95,6 +96,7 @@ fn has_flow_style_include(text: &str) -> bool {
 
 /// Pure helper: produce the new file text given the old text and the
 /// glob to add. Exposed for testing.
+#[must_use]
 pub fn render_with_glob(text: &str, glob: &str) -> String {
     let bullet = format!("\"{glob}\"");
     if let Some(updated) = append_to_existing_block(text, &bullet) {

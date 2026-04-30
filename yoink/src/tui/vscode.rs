@@ -41,7 +41,7 @@ pub struct ActiveSession {
     /// code-server sidecar: drop / `close()` force-removes the
     /// container. `Option` so tests can build sessions without
     /// spawning real docker calls.
-    _sidecar: Option<SidecarHandle>,
+    sidecar: Option<SidecarHandle>,
 }
 
 impl ActiveSession {
@@ -59,7 +59,7 @@ impl ActiveSession {
             },
             url,
             _tunnel: Some(tunnel),
-            _sidecar: Some(sidecar),
+            sidecar: Some(sidecar),
         }
     }
 
@@ -72,7 +72,7 @@ impl ActiveSession {
             },
             url: format!("http://localhost:{port}/?folder=/proc/1/root"),
             _tunnel: None,
-            _sidecar: None,
+            sidecar: None,
         }
     }
 }
@@ -115,7 +115,7 @@ impl VscodeSessionState {
         self.refresh_footer();
         let closes: Vec<_> = drained
             .into_iter()
-            .filter_map(|s| s._sidecar.map(SidecarHandle::close))
+            .filter_map(|s| s.sidecar.map(SidecarHandle::close))
             .collect();
         if !closes.is_empty() {
             futures_util::future::join_all(closes).await;

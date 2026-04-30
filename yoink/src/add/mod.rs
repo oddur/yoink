@@ -349,7 +349,7 @@ fn render_connection_block(c: &manifest::ConnectionSpec) -> Vec<String> {
         let list = c
             .depends_on
             .iter()
-            .map(|s| s.as_str())
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join(", ");
         out.push(format!("depends_on: [{list}]"));
@@ -376,7 +376,7 @@ fn render_connection_block(c: &manifest::ConnectionSpec) -> Vec<String> {
 fn quote_if_needed(v: &str) -> String {
     let needs_quote = v.is_empty()
         || v.chars().next().is_some_and(|c| c.is_ascii_digit())
-        || v.contains(|c: char| matches!(c, ':' | '#' | '@' | '\'' | '"' | '\\'));
+        || v.contains([':', '#', '@', '\'', '"', '\\']);
     if needs_quote {
         format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
     } else {

@@ -221,6 +221,7 @@ fn check_relative_path(p: &str, field: &str) -> Result<(), ManifestError> {
 /// outermost `(...)` grouping. Sufficient for service-name and
 /// boolean-choice validation; richer patterns can move to a real
 /// regex crate later.
+#[must_use]
 pub fn regex_match(pat: &str, value: &str) -> bool {
     // Strip optional anchors. Rebind through a `let` between strips
     // — the previous `unwrap_or(pat)` form fell back to the original

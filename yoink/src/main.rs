@@ -878,7 +878,7 @@ enum SshKeyAction {
     /// SSH-key-upload commands without re-extracting the public half:
     ///
     ///   hcloud ssh-key create --name yoink-scratch \
-    ///     --public-key-from-file <(yoink secrets ssh-key public --name DEPLOY_SSH_KEY)
+    ///     --public-key-from-file <(yoink secrets ssh-key public --name `DEPLOY_SSH_KEY`)
     Public {
         /// Name of the sealed SSH private key to derive the public from.
         #[arg(long, value_name = "NAME")]
@@ -1056,6 +1056,7 @@ fn confirm_destructive(prompt: &str) -> Result<()> {
 }
 
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::large_futures)]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let is_tui = matches!(cli.command, Command::Tui { .. });
@@ -1132,7 +1133,7 @@ fn log_file_path() -> PathBuf {
     PathBuf::from("/tmp/yoink-tui.log")
 }
 
-#[allow(clippy::too_many_lines)] // one big match dispatch; splitting buys nothing
+#[allow(clippy::too_many_lines, clippy::large_futures)] // one big match dispatch; splitting buys nothing
 async fn run(cli: Cli) -> Result<()> {
     if let Some(result) = run_bootstrap(&cli.command) {
         return result;
@@ -1366,6 +1367,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_preflight(config: &Config, wait: Option<Duration>) -> Result<()> {
     config.require_hosts()?;
     let ops = build_real_ops(config, None).await?;
@@ -1469,6 +1471,7 @@ struct UpOptions<'a> {
     config_path: &'a std::path::Path,
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
     config.require_hosts()?;
     config.require_services()?;
@@ -1540,7 +1543,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
 
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[allow(clippy::too_many_lines)] // single linear up-once flow; splitting fragments the build → push → reconcile sequence
+#[allow(clippy::too_many_lines, clippy::large_futures)] // single linear up-once flow; splitting fragments the build → push → reconcile sequence
 async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Result<()> {
     use yoink::docker_ops::Host;
     use yoink::lock::HostLock;
@@ -1880,6 +1883,7 @@ async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_status(config: &Config, json: bool) -> Result<()> {
     let ops = build_real_ops(config, None).await?;
     let report = StatusReport::collect(&ops, config)
@@ -1896,6 +1900,7 @@ async fn cmd_status(config: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> Result<()> {
     use yoink::docker_ops::Host;
     let ops = build_real_ops(config, None).await?;
@@ -1975,6 +1980,7 @@ async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> 
     .await
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
     use yoink::prune::{self, PruneReason};
     let ops = build_real_ops(config, None).await?;
@@ -2003,6 +2009,7 @@ async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
     secrets::load_bundle(config)
         .await
@@ -2021,6 +2028,7 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
 /// to run before the bundle exists; making the resolver hard-fail
 /// here would block them. Deploy commands that actually consume
 /// `host.address` surface a clear error when it's empty.
+#[allow(clippy::large_futures)]
 async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
     if !config.any_host_address_sealed() {
         return Ok(());
@@ -2049,6 +2057,7 @@ async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
 /// already loads it for service-level secrets). Pass `None` when the
 /// caller doesn't otherwise need the bundle — it'll be loaded on
 /// demand only if a host actually declares `ssh_key_secret:`.
+#[allow(clippy::large_futures)]
 async fn build_real_ops(config: &Config, bundle: Option<&SecretsBundle>) -> Result<RealDockerOps> {
     // Fast path: no host needs a managed key. Skip bundle access
     // entirely so commands that don't otherwise touch secrets pay
@@ -2168,6 +2177,7 @@ fn pick_healthy_replica(
     candidates.into_iter().next()
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_exec(
     config: &Config,
     service: &str,
@@ -2192,6 +2202,7 @@ async fn cmd_exec(
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_logs(
     config: &Config,
     service: &str,
@@ -2305,6 +2316,7 @@ async fn cmd_logs_tail(
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_version(config: &Config, service: &str) -> Result<()> {
     let ops = build_real_ops(config, None).await?;
     let report = StatusReport::collect_for_service(&ops, config, service)
@@ -2341,7 +2353,11 @@ enum PtyMode {
 /// services that don't expose host ports — the secure-by-default
 /// shape (api/web behind Caddy in production).
 #[allow(clippy::fn_params_excessive_bools)] // operator-facing flags, explicit at the CLI; bundling into a struct hides them.
-#[allow(clippy::too_many_arguments)] // mirrors the CLI surface 1:1; struct would force a noop builder.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::large_futures
+)] // mirrors the CLI surface 1:1; struct would force a noop builder.
 async fn cmd_pf(
     config: &Config,
     service_name: &str,
@@ -2418,10 +2434,9 @@ async fn cmd_pf(
         .map_err(|e| anyhow::anyhow!("ssh probe to {}: {e}", host.address))?;
 
     // Resolve the path: published host endpoint OR sidecar handle.
-    // `_sidecar` is bound here so its Drop fires after SIGINT even
-    // though the variable is otherwise unused.
+    // `sidecar` is bound here so its Drop fires after SIGINT.
     let resolved = pf::resolve_target(ops.clone(), &host, service, container_port, mode).await?;
-    let (remote_dial_host, remote_port, mode_label, _sidecar) = match resolved {
+    let (remote_dial_host, remote_port, mode_label, sidecar) = match resolved {
         pf::ResolvedTarget::Published(ep) => (ep.host_ip, ep.host_port, "published", None),
         pf::ResolvedTarget::Sidecar(handle) => {
             let port = handle.host_port();
@@ -2487,7 +2502,7 @@ async fn cmd_pf(
     tokio::signal::ctrl_c()
         .await
         .context("install SIGINT handler")?;
-    if let Some(sc) = _sidecar {
+    if let Some(sc) = sidecar {
         sc.close().await;
     }
     drop(tunnel);
@@ -2521,6 +2536,7 @@ fn parse_pf_port_arg(arg: &str) -> Result<(Option<u16>, u16)> {
     Ok((local, container))
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_pty(
     config: &Config,
     service: &str,
@@ -2691,6 +2707,7 @@ async fn pty_session(
     Ok(())
 }
 
+#[allow(clippy::large_futures, clippy::needless_pass_by_value)]
 async fn cmd_tui(config: &Config, config_path: PathBuf, mode: Mode, mouse: bool) -> Result<()> {
     let mut config = config.clone();
     config.push_local_host_if_socket();
@@ -2752,6 +2769,7 @@ impl From<DryRunFormat> for yoink::diff::Format {
     }
 }
 
+#[allow(clippy::large_futures)]
 async fn run_dry_run(
     ops: &dyn DockerOps,
     config: &Config,
@@ -2767,6 +2785,7 @@ async fn run_dry_run(
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_restart(config: &Config, service: &str, host_filter: Option<&str>) -> Result<()> {
     let ops = build_real_ops(config, None).await?;
     let (host, container) = resolve_running_container(&ops, config, service, host_filter).await?;
@@ -2783,6 +2802,7 @@ async fn cmd_restart(config: &Config, service: &str, host_filter: Option<&str>) 
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_kill(
     config: &Config,
     service: &str,
@@ -2804,6 +2824,7 @@ async fn cmd_kill(
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_pull(
     config: &Config,
     service: &str,
@@ -2865,6 +2886,7 @@ async fn cmd_pull(
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_history(
     config: &Config,
     service: &str,
@@ -2957,6 +2979,7 @@ struct TopRow {
     created: Option<i64>,
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<()> {
     use yoink::output::{format_bytes, format_relative_time};
     let ops = build_real_ops(config, None).await?;
@@ -3062,6 +3085,7 @@ async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<(
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> {
     let ops = build_real_ops(config, None).await?;
     let probes = config
@@ -3097,6 +3121,7 @@ async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_volumes(config: &Config, host_filter: Option<&str>) -> Result<()> {
     let ops = build_real_ops(config, None).await?;
     let probes = config
@@ -3178,7 +3203,7 @@ fn redact_value(value: &str) -> String {
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::large_futures)]
 async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
     use serde_json::json;
     use yoink::deploy;
@@ -3430,6 +3455,7 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
     // `Config::load_from_path` (called from `run`) already ran the
     // structural checks — duplicate names/addresses, missing fields,
@@ -3453,6 +3479,7 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
     use yoink::doctor::{Severity, run_doctor, tally};
 
@@ -3491,6 +3518,7 @@ async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn validate_proxy_render(config: &Config) -> Result<()> {
     let bundle = load_secrets_bundle(config).await?;
     let mut config = config.clone();
@@ -3608,6 +3636,7 @@ fn cmd_proxy_dockerfile(config: &Config) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_proxy_render(config: &Config) -> Result<()> {
     if !yoink::proxy::proxy_enabled(config) {
         anyhow::bail!(
@@ -3629,6 +3658,7 @@ async fn cmd_proxy_render(config: &Config) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
     use yoink::lock::LOCK_NAME;
     let ops = build_real_ops(config, None).await?;
@@ -3682,6 +3712,7 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::large_futures)]
 async fn cmd_diff(config: &Config, service: &str, tag_override: Option<&str>) -> Result<()> {
     let svc_cfg = config
         .services
@@ -3857,6 +3888,7 @@ fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Resu
     }
 }
 
+#[allow(clippy::needless_pass_by_value, clippy::items_after_statements)]
 fn cmd_hosts_add(
     config_path: PathBuf,
     address: Option<&str>,
@@ -3903,8 +3935,7 @@ fn cmd_hosts_add(
     // regardless of where the operator runs the command from.
     let config_dir = config_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let absolute_dir = if dest_dir.is_absolute() {
         dest_dir.to_path_buf()
     } else {
@@ -3920,20 +3951,22 @@ fn cmd_hosts_add(
         ));
     }
 
+    use std::fmt::Write as FmtWrite;
     let mut body = String::new();
-    body.push_str(&format!(
-        "# {derived_name} — generated by `yoink hosts add` {date}\n",
+    let _ = writeln!(
+        body,
+        "# {derived_name} — generated by `yoink hosts add` {date}",
         date = chrono_like_date()
-    ));
+    );
     body.push_str("hosts:\n");
     if let Some(addr) = address {
-        body.push_str(&format!("  - address: {addr}\n"));
+        let _ = writeln!(body, "  - address: {addr}");
     } else if let Some(secret) = address_secret {
-        body.push_str(&format!("  - address_secret: {secret}\n"));
+        let _ = writeln!(body, "  - address_secret: {secret}");
     }
-    body.push_str(&format!("    user: {user}\n"));
+    let _ = writeln!(body, "    user: {user}");
     if let Some(secret) = ssh_key_secret {
-        body.push_str(&format!("    ssh_key_secret: {secret}\n"));
+        let _ = writeln!(body, "    ssh_key_secret: {secret}");
     }
 
     std::fs::write(&fragment_path, &body)
@@ -3971,6 +4004,7 @@ fn cmd_hosts_remove(dest_dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::cast_possible_wrap)]
 fn chrono_like_date() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -3987,6 +4021,11 @@ fn chrono_like_date() -> String {
 /// Days since 1970-01-01 → (year, month, day). Pure proleptic-Gregorian
 /// arithmetic; correct for any positive day count well beyond what yoink
 /// needs.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
     days += 719_468;
     let era = days.div_euclid(146_097);
@@ -4131,13 +4170,12 @@ fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool, print: bool) -> R
     // public recipient lets `load_identity` find it cheaply (and lets
     // multiple projects coexist — one identity per project, no
     // collisions). `--out` overrides the destination.
-    let path = match out {
-        Some(p) => p,
-        None => {
-            let dir = sealed::keys_dir()?;
-            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            sealed::keys_dir_path_for(&public)?
-        }
+    let path = if let Some(p) = out {
+        p
+    } else {
+        let dir = sealed::keys_dir()?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        sealed::keys_dir_path_for(&public)?
     };
     if path.exists() && !force {
         return Err(anyhow::anyhow!(
@@ -4228,6 +4266,7 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
 fn cmd_secrets_seal(
     config: &Config,
     input: Option<&Path>,
@@ -4242,9 +4281,7 @@ fn cmd_secrets_seal(
     // a wrong-file paste (a 5GB image) just as much as an unbounded
     // stdin stream. Real secrets bundles are kilobytes.
     const SEAL_INPUT_CAP: u64 = 10 * 1024 * 1024;
-    let new_entries = if !as_pairs.is_empty() {
-        parse_as_pairs(as_pairs, SEAL_INPUT_CAP)?
-    } else {
+    let new_entries = if as_pairs.is_empty() {
         let plaintext = match input {
             Some(p) if p.as_os_str() != "-" => {
                 use std::io::Read;
@@ -4277,6 +4314,8 @@ fn cmd_secrets_seal(
             }
         };
         sealed::parse_dotenv(&plaintext)?
+    } else {
+        parse_as_pairs(as_pairs, SEAL_INPUT_CAP)?
     };
 
     let target = match out {

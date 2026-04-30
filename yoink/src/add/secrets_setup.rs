@@ -49,6 +49,7 @@ pub struct BootstrapResult {
     pub gitignore_updated: bool,
 }
 
+#[must_use]
 pub fn assess(config: &Config, manifest: &TemplateManifest) -> SetupNeed {
     if manifest.secrets.is_empty() {
         return SetupNeed::NotApplicable;
@@ -62,6 +63,7 @@ pub fn assess(config: &Config, manifest: &TemplateManifest) -> SetupNeed {
 
 /// Default location for the generated age private key. Project-local
 /// to mirror `cmd_secrets_key_generate`'s no-global-default convention.
+#[must_use]
 pub fn default_key_path(config_path: &Path) -> PathBuf {
     config_path
         .parent()

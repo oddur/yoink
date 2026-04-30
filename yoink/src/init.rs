@@ -39,6 +39,7 @@ const DEFAULT_SSH_USER: &str = "deploy";
 
 /// Args from clap.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct InitOpts {
     pub host: Option<String>,
     pub force: bool,

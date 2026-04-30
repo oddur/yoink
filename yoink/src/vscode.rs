@@ -134,7 +134,7 @@ pub async fn resolve_target(
 
     let target = containers
         .into_iter()
-        .find(|c| c.is_running())
+        .find(super::docker_ops::ContainerInfo::is_running)
         .ok_or_else(|| VscodeError::TargetNotRunning {
             service: service.name.clone(),
             host: host.address.clone(),
@@ -305,6 +305,7 @@ pub async fn wait_for_local_tcp(local_port: u16) -> std::result::Result<(), Vsco
 
 /// Resolve service → host → SSH probe → spawn sidecar → SSH-tunnel →
 /// open browser. Holds open until SIGINT.
+#[allow(clippy::too_many_lines)]
 pub async fn cmd_vscode(
     config: &Config,
     service_name: &str,
@@ -421,10 +422,10 @@ pub async fn cmd_vscode(
         return Err(e.into());
     }
 
-    if options.open {
-        if let Err(e) = pf::open_in_browser(&url) {
-            eprintln!("✗ failed to open browser: {e}\n  paste into one yourself: {url}");
-        }
+    if options.open
+        && let Err(e) = pf::open_in_browser(&url)
+    {
+        eprintln!("✗ failed to open browser: {e}\n  paste into one yourself: {url}");
     }
 
     tokio::signal::ctrl_c()

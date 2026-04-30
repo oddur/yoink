@@ -1248,6 +1248,7 @@ pub async fn ensure_host_networks(
 /// image would 404 on every registry. The parameter is preserved
 /// rather than hardcoded for the rare caller that has separately
 /// pushed their builds and prefers to pull-everything.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn prefetch_images(
     ops: Arc<dyn DockerOps>,
     config: &Config,

@@ -139,8 +139,6 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         }
     }
 
-    let proxy_has_inline_cert = cfg.proxy.as_ref().and_then(|p| p.tls.as_ref()).is_some();
-
     // Validation: any service using `tls: cert` must name both
     // `tls_cert_secret` and `tls_key_secret` (or inherit from
     // `proxy.tls`); reject early so the operator gets a config-time
@@ -377,6 +375,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
 }
 
 /// JSON shapes accepted by `validate_json_shape`.
+#[derive(Clone, Copy)]
 enum JsonShape {
     /// Top-level Caddy config block (`apps`, `storage`, `admin`, ...).
     ObjectOnly,
