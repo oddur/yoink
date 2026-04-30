@@ -4,3 +4,4 @@ target/
 /dist/
 .devbox/
 .direnv/
+.claude/worktrees/
