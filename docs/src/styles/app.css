@@ -7,6 +7,12 @@ html {
   scrollbar-gutter: stable;
 }
 
+/* Mermaid diagrams: scale down on narrow viewports, never overflow */
+.mermaid-diagram > svg {
+  max-width: 100%;
+  height: auto;
+}
+
 html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
