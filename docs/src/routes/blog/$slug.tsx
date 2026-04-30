@@ -1,6 +1,7 @@
 import { createFileRoute, notFound } from '@tanstack/react-router';
 import { createServerFn } from '@tanstack/react-start';
 import { DocsLayout } from 'fumadocs-ui/layouts/docs';
+import { DocsBody, DocsPage } from 'fumadocs-ui/layouts/docs/page';
 import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { useFumadocsLoader } from 'fumadocs-core/source/client';
 import { blogSource, source } from '@/lib/source';
@@ -34,21 +35,23 @@ const loadPost = createServerFn({ method: 'GET' })
 const clientLoader = browserCollections.blog.createClientLoader({
   component({ default: MDX, frontmatter }) {
     return (
-      <article className="container max-w-2xl mx-auto px-4 py-12">
-        <h1 className="text-3xl font-bold mb-2">{frontmatter.title as string}</h1>
-        {frontmatter.date && (
-          <time className="text-sm text-fd-muted-foreground block mb-8">
-            {new Date(frontmatter.date as string).toLocaleDateString('en-US', {
-              year: 'numeric',
-              month: 'long',
-              day: 'numeric',
-            })}
-          </time>
-        )}
-        <div className="prose max-w-none">
-          <MDX components={useMDXComponents()} />
-        </div>
-      </article>
+      <DocsPage toc={[]}>
+        <DocsBody>
+          <h1 className="text-3xl font-bold mb-2">{frontmatter.title as string}</h1>
+          {frontmatter.date && (
+            <time className="text-sm text-fd-muted-foreground block mb-8">
+              {new Date(frontmatter.date as string).toLocaleDateString('en-US', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+              })}
+            </time>
+          )}
+          <div className="prose max-w-none">
+            <MDX components={useMDXComponents()} />
+          </div>
+        </DocsBody>
+      </DocsPage>
     );
   },
 });

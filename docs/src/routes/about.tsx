@@ -1,6 +1,7 @@
 import { createFileRoute, notFound } from '@tanstack/react-router';
 import { createServerFn } from '@tanstack/react-start';
 import { DocsLayout } from 'fumadocs-ui/layouts/docs';
+import { DocsBody, DocsPage } from 'fumadocs-ui/layouts/docs/page';
 import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { useFumadocsLoader } from 'fumadocs-core/source/client';
 import { aboutSource, source } from '@/lib/source';
@@ -32,11 +33,11 @@ const loadAbout = createServerFn({ method: 'GET' })
 const clientLoader = browserCollections.about.createClientLoader({
   component({ default: MDX }) {
     return (
-      <div className="container max-w-2xl mx-auto px-4 py-12">
-        <div className="prose max-w-none">
+      <DocsPage toc={[]}>
+        <DocsBody className="prose">
           <MDX components={useMDXComponents()} />
-        </div>
-      </div>
+        </DocsBody>
+      </DocsPage>
     );
   },
 });

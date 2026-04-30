@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { createServerFn } from '@tanstack/react-start';
 import { DocsLayout } from 'fumadocs-ui/layouts/docs';
+import { DocsBody, DocsPage } from 'fumadocs-ui/layouts/docs/page';
 import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { deserializePageTree } from 'fumadocs-core/source/client';
 import { blogSource, source } from '@/lib/source';
@@ -34,32 +35,34 @@ function BlogIndex() {
 
   return (
     <DocsLayout {...baseOptions()} tree={deserializePageTree(pageTree)}>
-      <div className="container max-w-2xl mx-auto px-4 py-12">
-        <h1 className="text-3xl font-bold mb-8">Blog</h1>
-        <div className="flex flex-col gap-6">
-          {posts.map((post) => (
-            <article key={post.slug}>
-              <Link to="/blog/$slug" params={{ slug: post.slug }}>
-                <h2 className="text-xl font-semibold hover:text-fd-primary transition-colors">
-                  {post.title}
-                </h2>
-              </Link>
-              {post.date && (
-                <time className="text-sm text-fd-muted-foreground mt-1 block">
-                  {new Date(post.date).toLocaleDateString('en-US', {
-                    year: 'numeric',
-                    month: 'long',
-                    day: 'numeric',
-                  })}
-                </time>
-              )}
-              {post.description && (
-                <p className="text-fd-muted-foreground mt-2">{post.description}</p>
-              )}
-            </article>
-          ))}
-        </div>
-      </div>
+      <DocsPage toc={[]}>
+        <DocsBody>
+          <h1 className="text-3xl font-bold mb-8">Blog</h1>
+          <div className="flex flex-col gap-6">
+            {posts.map((post) => (
+              <article key={post.slug}>
+                <Link to="/blog/$slug" params={{ slug: post.slug }}>
+                  <h2 className="text-xl font-semibold hover:text-fd-primary transition-colors">
+                    {post.title}
+                  </h2>
+                </Link>
+                {post.date && (
+                  <time className="text-sm text-fd-muted-foreground mt-1 block">
+                    {new Date(post.date).toLocaleDateString('en-US', {
+                      year: 'numeric',
+                      month: 'long',
+                      day: 'numeric',
+                    })}
+                  </time>
+                )}
+                {post.description && (
+                  <p className="text-fd-muted-foreground mt-2">{post.description}</p>
+                )}
+              </article>
+            ))}
+          </div>
+        </DocsBody>
+      </DocsPage>
     </DocsLayout>
   );
 }
