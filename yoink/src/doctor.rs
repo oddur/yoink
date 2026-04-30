@@ -650,8 +650,7 @@ fn check_sshfs_for_yoink_fs() -> Vec<Finding> {
         return vec![Finding::pass("yoink-fs", "`sshfs` is on PATH")];
     }
     let install_hint = if cfg!(target_os = "macos") {
-        "install via macFUSE (https://macfuse.io) or FUSE-T (https://www.fuse-t.org), \
-         then `brew install sshfs`"
+        "`brew install --cask fuse-t-sshfs` (kext-free; pulls FUSE-T as a dep)"
     } else if cfg!(target_os = "linux") {
         "install via your package manager: `apt install sshfs` / `dnf install fuse-sshfs` / etc"
     } else {

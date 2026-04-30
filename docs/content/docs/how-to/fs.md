@@ -25,9 +25,18 @@ yoink fs api -r 1 --to ./fs      # replica 1, custom mountpoint
 
 ## Prerequisites
 
-- **`sshfs` on your laptop.** `apt install sshfs` (Linux), or [macFUSE](https://macfuse.io) / [FUSE-T](https://www.fuse-t.org) plus `brew install sshfs` on macOS. `yoink doctor` flags this when missing.
-- **`overlay2` on the docker host.** Yoink reads `GraphDriver.Data.MergedDir` for the host-side path that mirrors the container's rootfs. Other drivers (`btrfs`, `zfs`, `vfs`) don't expose a single host path; `yoink fs` errors loudly on them.
-- **The deploy user in the `docker` group on the host.** Already true for any host you've deployed through yoink — `MergedDir` lives under `/var/lib/docker/overlay2/` and the docker group has read access.
+One operator-side install on macOS:
+
+```sh
+brew install --cask fuse-t-sshfs
+```
+
+This is the kext-free path — pulls [FUSE-T](https://www.fuse-t.org) as a dependency, no kernel extensions, no reboot. `yoink doctor` flags this when missing. On Linux, `apt install sshfs` (or your distro's equivalent).
+
+Two host-side conditions, both true for any standard yoink host:
+
+- **`overlay2` storage driver.** Yoink reads `GraphDriver.Data.MergedDir` for the host-side path that mirrors the container's rootfs. Other drivers (`btrfs`, `zfs`, `vfs`) don't expose a single host path; `yoink fs` errors out on them.
+- **The deploy user in the `docker` group.** `MergedDir` lives under `/var/lib/docker/overlay2/` and the docker group has read access. Required for any yoink host already.
 
 ## Read-only by default
 

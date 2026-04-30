@@ -73,7 +73,8 @@ pub enum FsError {
     )]
     NoMergedDir { container: String, host: String },
     #[error(
-        "`sshfs` not found on PATH — install macFUSE / FUSE-T (macOS) or `apt install sshfs` (Linux)"
+        "`sshfs` not found on PATH — `brew install --cask fuse-t-sshfs` on macOS, \
+         `apt install sshfs` (or distro equivalent) on Linux"
     )]
     SshfsMissing,
     #[error("sshfs exited with status {status}{stderr}", stderr = if .stderr.is_empty() { String::new() } else { format!(":\n{}", .stderr) })]
