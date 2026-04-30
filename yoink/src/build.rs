@@ -136,7 +136,8 @@ pub async fn build_and_capture_tag(
         .arg(iidfile.path());
 
     if let Some(df) = &build.dockerfile {
-        cmd.arg("--file").arg(resolve_relative_to_config(config, df));
+        cmd.arg("--file")
+            .arg(resolve_relative_to_config(config, df));
     }
     for (k, v) in &build.args {
         cmd.arg("--build-arg").arg(format!("{k}={v}"));
