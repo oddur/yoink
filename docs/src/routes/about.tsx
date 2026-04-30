@@ -1,9 +1,9 @@
 import { createFileRoute, notFound } from '@tanstack/react-router';
 import { createServerFn } from '@tanstack/react-start';
-import { HomeLayout } from 'fumadocs-ui/layouts/home';
+import { DocsLayout } from 'fumadocs-ui/layouts/docs';
 import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { useFumadocsLoader } from 'fumadocs-core/source/client';
-import { aboutSource } from '@/lib/source';
+import { aboutSource, source } from '@/lib/source';
 import { baseOptions } from '@/lib/layout.shared';
 import { useMDXComponents } from '@/components/mdx';
 import { Suspense } from 'react';
@@ -23,11 +23,14 @@ const loadAbout = createServerFn({ method: 'GET' })
   .handler(async () => {
     const page = aboutSource.getPage(['about']);
     if (!page) throw notFound();
-    return { path: page.path };
+    return {
+      path: page.path,
+      pageTree: await source.serializePageTree(source.getPageTree()),
+    };
   });
 
 const clientLoader = browserCollections.about.createClientLoader({
-  component({ default: MDX, frontmatter }) {
+  component({ default: MDX }) {
     return (
       <div className="container max-w-2xl mx-auto px-4 py-12">
         <div className="prose max-w-none">
@@ -39,10 +42,10 @@ const clientLoader = browserCollections.about.createClientLoader({
 });
 
 function AboutPage() {
-  const { path } = useFumadocsLoader(Route.useLoaderData());
+  const { path, pageTree } = useFumadocsLoader(Route.useLoaderData());
   return (
-    <HomeLayout {...baseOptions()}>
+    <DocsLayout {...baseOptions()} tree={pageTree}>
       <Suspense>{clientLoader.useContent(path, {})}</Suspense>
-    </HomeLayout>
+    </DocsLayout>
   );
 }

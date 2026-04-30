@@ -1,8 +1,9 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { createServerFn } from '@tanstack/react-start';
-import { HomeLayout } from 'fumadocs-ui/layouts/home';
+import { DocsLayout } from 'fumadocs-ui/layouts/docs';
 import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
-import { blogSource } from '@/lib/source';
+import { deserializePageTree } from 'fumadocs-core/source/client';
+import { blogSource, source } from '@/lib/source';
 import { baseOptions } from '@/lib/layout.shared';
 
 export const Route = createFileRoute('/blog/')({
@@ -14,7 +15,7 @@ const listPosts = createServerFn({ method: 'GET' })
   .middleware([staticFunctionMiddleware])
   .handler(async () => {
     const pages = blogSource.getPages();
-    return pages
+    const posts = pages
       .map((p) => ({
         slug: p.slugs.join('/'),
         title: p.data.title as string,
@@ -22,13 +23,17 @@ const listPosts = createServerFn({ method: 'GET' })
         date: (p.data.date ?? '') as string,
       }))
       .sort((a, b) => b.date.localeCompare(a.date));
+    return {
+      posts,
+      pageTree: await source.serializePageTree(source.getPageTree()),
+    };
   });
 
 function BlogIndex() {
-  const posts = Route.useLoaderData();
+  const { posts, pageTree } = Route.useLoaderData();
 
   return (
-    <HomeLayout {...baseOptions()}>
+    <DocsLayout {...baseOptions()} tree={deserializePageTree(pageTree)}>
       <div className="container max-w-2xl mx-auto px-4 py-12">
         <h1 className="text-3xl font-bold mb-8">Blog</h1>
         <div className="flex flex-col gap-6">
@@ -55,6 +60,6 @@ function BlogIndex() {
           ))}
         </div>
       </div>
-    </HomeLayout>
+    </DocsLayout>
   );
 }

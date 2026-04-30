@@ -1,9 +1,9 @@
 import { createFileRoute, notFound } from '@tanstack/react-router';
 import { createServerFn } from '@tanstack/react-start';
-import { HomeLayout } from 'fumadocs-ui/layouts/home';
+import { DocsLayout } from 'fumadocs-ui/layouts/docs';
 import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { useFumadocsLoader } from 'fumadocs-core/source/client';
-import { blogSource } from '@/lib/source';
+import { blogSource, source } from '@/lib/source';
 import { baseOptions } from '@/lib/layout.shared';
 import { useMDXComponents } from '@/components/mdx';
 import { Suspense } from 'react';
@@ -25,7 +25,10 @@ const loadPost = createServerFn({ method: 'GET' })
     const slugs = slug.split('/');
     const page = blogSource.getPage(slugs);
     if (!page) throw notFound();
-    return { path: page.path };
+    return {
+      path: page.path,
+      pageTree: await source.serializePageTree(source.getPageTree()),
+    };
   });
 
 const clientLoader = browserCollections.blog.createClientLoader({
@@ -51,10 +54,10 @@ const clientLoader = browserCollections.blog.createClientLoader({
 });
 
 function BlogPost() {
-  const { path } = useFumadocsLoader(Route.useLoaderData());
+  const { path, pageTree } = useFumadocsLoader(Route.useLoaderData());
   return (
-    <HomeLayout {...baseOptions()}>
+    <DocsLayout {...baseOptions()} tree={pageTree}>
       <Suspense>{clientLoader.useContent(path, {})}</Suspense>
-    </HomeLayout>
+    </DocsLayout>
   );
 }
