@@ -34,7 +34,7 @@ use crate::sealed;
 const COMMAND_OUTPUT_CAP: usize = 10 * 1024 * 1024;
 /// Cap on stderr / parser-detail bytes embedded in error variants.
 /// A misconfigured upstream can echo secret values into its error
-/// output ("failed to read secret 'DB_PASS' = '<value>'"); capping
+/// output ("failed to read secret '`DB_PASS`' = '<value>'"); capping
 /// the slice we surface to the operator (and to any deploy-log
 /// archive) bounds that leak. The tail is kept rather than the
 /// head — error tails are usually more diagnostic.
@@ -212,6 +212,7 @@ impl fmt::Debug for SecretsBundle {
 /// rather than "you legitimately have zero secrets". `provider:
 /// command` returns its own `CommandEmpty` (we have the command
 /// string for the error message); the age path returns `SealedEmpty`.
+#[allow(clippy::large_futures)]
 pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, SecretsError> {
     let Some(cfg) = &config.secrets else {
         return Ok(None);
@@ -280,6 +281,7 @@ fn load_age_bundle(
     Ok(SecretsBundle::new(map))
 }
 
+#[allow(clippy::large_futures)]
 async fn load_command_bundle(
     command: &[String],
     format: SecretsFormat,
@@ -341,44 +343,41 @@ async fn load_command_bundle(
     // process::Child doesn't kill-on-drop by default; if we returned
     // here without wait()-ing we'd leak a zombie + (in the cap/timeout
     // cases) a still-running process blocked on closed pipes.
-    let (stdout_buf, stderr_buf, status) = match drain_result {
-        Ok((stdout_res, stderr_res)) => {
-            // If either drain hit the cap, kill the child before
-            // wait()ing — for natural producers (head -c) the
-            // process is exiting on its own, but a slow producer
-            // that drip-feeds bytes after exceeding the cap would
-            // otherwise block our wait() until COMMAND_TIMEOUT.
-            // Symmetric with the timeout branch below.
-            if stdout_res.is_err() || stderr_res.is_err() {
-                let _ = child.start_kill();
-            }
-            let status = child
-                .wait()
-                .await
-                .map_err(|source| SecretsError::CommandSpawn {
-                    command: pretty.clone(),
-                    source,
-                })?;
-            let stdout_buf = stdout_res.map_err(|()| SecretsError::CommandOutputCap {
-                command: pretty.clone(),
-                stream: "stdout",
-                cap: COMMAND_OUTPUT_CAP,
-            })?;
-            let stderr_buf = stderr_res.map_err(|()| SecretsError::CommandOutputCap {
-                command: pretty.clone(),
-                stream: "stderr",
-                cap: COMMAND_OUTPUT_CAP,
-            })?;
-            (stdout_buf, stderr_buf, status)
-        }
-        Err(_) => {
+    let (stdout_buf, stderr_buf, status) = if let Ok((stdout_res, stderr_res)) = drain_result {
+        // If either drain hit the cap, kill the child before
+        // wait()ing — for natural producers (head -c) the
+        // process is exiting on its own, but a slow producer
+        // that drip-feeds bytes after exceeding the cap would
+        // otherwise block our wait() until COMMAND_TIMEOUT.
+        // Symmetric with the timeout branch below.
+        if stdout_res.is_err() || stderr_res.is_err() {
             let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(SecretsError::CommandTimeout {
-                command: pretty,
-                timeout: COMMAND_TIMEOUT,
-            });
         }
+        let status = child
+            .wait()
+            .await
+            .map_err(|source| SecretsError::CommandSpawn {
+                command: pretty.clone(),
+                source,
+            })?;
+        let stdout_buf = stdout_res.map_err(|()| SecretsError::CommandOutputCap {
+            command: pretty.clone(),
+            stream: "stdout",
+            cap: COMMAND_OUTPUT_CAP,
+        })?;
+        let stderr_buf = stderr_res.map_err(|()| SecretsError::CommandOutputCap {
+            command: pretty.clone(),
+            stream: "stderr",
+            cap: COMMAND_OUTPUT_CAP,
+        })?;
+        (stdout_buf, stderr_buf, status)
+    } else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(SecretsError::CommandTimeout {
+            command: pretty,
+            timeout: COMMAND_TIMEOUT,
+        });
     };
 
     if !status.success() {

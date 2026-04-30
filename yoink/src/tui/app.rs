@@ -1450,6 +1450,7 @@ impl App {
     /// don't block startup on it — the column shows `?` for the few
     /// seconds the loader takes, then resolves to ✓/⚠ once the
     /// bundle lands.
+    #[allow(clippy::large_futures)]
     fn spawn_secrets_loader(&self) {
         let config = self.config.clone();
         let slot = self.secrets.clone();
@@ -1869,27 +1870,27 @@ impl App {
             // Pane nav: digits are canonical (printed on each tab),
             // letters are aliases. `R` is uppercase because lowercase
             // `r` is universally "refresh" inside panes.
-            KeyCode::Char('1') | KeyCode::Char('d') => {
+            KeyCode::Char('1' | 'd') => {
                 self.transition(View::Dashboard).await;
                 return false;
             }
-            KeyCode::Char('2') | KeyCode::Char('h') => {
+            KeyCode::Char('2' | 'h') => {
                 self.transition(View::Hosts).await;
                 return false;
             }
-            KeyCode::Char('3') | KeyCode::Char('s') => {
+            KeyCode::Char('3' | 's') => {
                 self.transition(View::Services).await;
                 return false;
             }
-            KeyCode::Char('4') | KeyCode::Char('l') => {
+            KeyCode::Char('4' | 'l') => {
                 self.transition(View::Logs).await;
                 return false;
             }
-            KeyCode::Char('5') | KeyCode::Char('R') => {
+            KeyCode::Char('5' | 'R') => {
                 self.transition(View::Resources).await;
                 return false;
             }
-            KeyCode::Char('6') | KeyCode::Char('e') => {
+            KeyCode::Char('6' | 'e') => {
                 self.transition(View::Secrets).await;
                 return false;
             }
@@ -1956,7 +1957,7 @@ impl App {
                 }
                 return false;
             }
-            KeyCode::Char('o') | KeyCode::Char('O') => {
+            KeyCode::Char('o' | 'O') => {
                 // 1. Try to resolve a focused service in the current view
                 //    (Dashboard / Services / ServiceDetail / HostDetail /
                 //    ContainerDetail). 2. Fall back to "any active forward"
@@ -2939,6 +2940,7 @@ impl App {
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_update(&mut self, update: Update) {
         match update {
             Update::Hosts(rows) => {
@@ -3077,6 +3079,7 @@ impl App {
     /// land via `Update::Doctor`; the modal renders Loading until
     /// they arrive. Idempotent — re-pressing `D` (or `r` while
     /// open) just kicks off another run.
+    #[allow(clippy::large_futures)]
     fn open_doctor(&mut self) {
         self.doctor.mark_loading();
         let ops = self.ops.clone();
@@ -3096,6 +3099,7 @@ impl App {
     /// services where `service.tag` is absent — otherwise
     /// `compute` would error with `TagMissing`, which is correct
     /// for `yoink up` but useless for "what changed".
+    #[allow(clippy::large_futures)]
     fn open_drift(&mut self, host: Host, service: String) {
         self.drift.set_target(host.clone(), service.clone());
         let ops = self.ops.clone();
@@ -3169,6 +3173,7 @@ impl App {
     /// published-port fast path when available, sidecar fallback for
     /// secure-by-default services with no `publish:` block (api/web).
     /// No-op when an active forward already exists for the same key.
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn open_port_forward(
         &mut self,
         host: Host,
@@ -3301,6 +3306,7 @@ impl App {
     /// Spawn a code-server sidecar for the focused (host, service)
     /// and open VS Code in the browser. No-op when a session is
     /// already up for that pair (the toast says so).
+    #[allow(clippy::needless_pass_by_value)]
     fn open_vscode_session(&mut self, host: Host, service_name: String) {
         if let Some(existing) = self.vscode.get(&host.address, &service_name) {
             self.push_toast(format!("◊ already up: {}", existing.url));
@@ -3530,7 +3536,7 @@ impl App {
         let footer_rows: u16 =
             u16::from(!self.forwards.is_empty()) + u16::from(!self.vscode.is_empty());
         let (pf_footer_area, vscode_footer_area) =
-            if footer_rows > 0 && pane_area.height >= footer_rows + 1 {
+            if footer_rows > 0 && pane_area.height > footer_rows {
                 let mut constraints = vec![ratatui::layout::Constraint::Min(0)];
                 for _ in 0..footer_rows {
                     constraints.push(ratatui::layout::Constraint::Length(1));
@@ -3541,17 +3547,17 @@ impl App {
                     .split(pane_area);
                 pane_area = split[0];
                 let mut idx = 1;
-                let pf = if !self.forwards.is_empty() {
+                let pf = if self.forwards.is_empty() {
+                    None
+                } else {
                     let a = Some(split[idx]);
                     idx += 1;
                     a
-                } else {
-                    None
                 };
-                let vs = if !self.vscode.is_empty() {
-                    Some(split[idx])
-                } else {
+                let vs = if self.vscode.is_empty() {
                     None
+                } else {
+                    Some(split[idx])
                 };
                 (pf, vs)
             } else {

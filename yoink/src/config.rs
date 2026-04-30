@@ -244,7 +244,7 @@ pub struct ProxyConfig {
     /// single shared middleware chain — the natural place for
     /// proxy-wide concerns:
     ///
-    /// - CrowdSec bouncer (deny based on IP decisions before the
+    /// - `CrowdSec` bouncer (deny based on IP decisions before the
     ///   request hits app-level handlers).
     /// - Coraza WAF / OWASP CRS (signature-based payload inspection
     ///   on every request, not just the ones a particular service

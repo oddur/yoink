@@ -57,6 +57,7 @@ pub struct TemplateRef {
 }
 
 impl TemplateRef {
+    #[must_use]
     pub fn display_short(&self, sha: &str) -> String {
         let short = sha.chars().take(7).collect::<String>();
         if self.is_default_source() {

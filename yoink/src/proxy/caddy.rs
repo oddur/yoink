@@ -260,20 +260,19 @@ where
 /// `handle` chain is
 /// `proxy.global_handlers...,subroute(routes),proxy.global_handlers_after...`.
 /// Pre-handlers run on every request before any service route matches
-/// (CrowdSec, Coraza, fleet-wide rate-limit); post-handlers run after
+/// (`CrowdSec`, Coraza, fleet-wide rate-limit); post-handlers run after
 /// the matched service route's per-service handlers complete. No-op
 /// when both lists are empty.
 fn apply_global_handlers(routes: &mut Vec<Value>, cfg: &Config) -> Result<()> {
-    let (pre_snips, post_snips) = cfg
-        .proxy
-        .as_ref()
-        .map(|p| {
-            (
-                p.global_handlers.as_slice(),
-                p.global_handlers_after.as_slice(),
-            )
-        })
-        .unwrap_or((&[], &[]));
+    let (pre_snips, post_snips) =
+        cfg.proxy
+            .as_ref()
+            .map_or((&[] as &[String], &[] as &[String]), |p| {
+                (
+                    p.global_handlers.as_slice(),
+                    p.global_handlers_after.as_slice(),
+                )
+            });
     if pre_snips.is_empty() && post_snips.is_empty() {
         return Ok(());
     }

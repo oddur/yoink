@@ -10,6 +10,7 @@
 //! across runs short-circuits via `image_present`. Edit the plugin
 //! list and the hash flips, triggering a rebuild on next `up`.
 
+use std::fmt::Write as _;
 use std::io::Write as _;
 
 use bytes::Bytes;
@@ -60,14 +61,11 @@ pub fn render_dockerfile(cfg: &XcaddyConfig) -> String {
     let replace = cfg.sorted_replace();
     let mut s = String::new();
     s.push_str("# syntax=docker/dockerfile:1\n");
-    s.push_str(&format!(
-        "FROM {} AS builder\n",
-        cfg.resolved_builder_image()
-    ));
+    let _ = writeln!(s, "FROM {} AS builder", cfg.resolved_builder_image());
     // `BTreeMap` iter is already key-sorted; emit one ENV per entry so
     // GOPRIVATE/GOPROXY/NETRC overrides reach the `xcaddy build` shell.
     for (k, v) in &cfg.env {
-        s.push_str(&format!("ENV {k}={v}\n"));
+        let _ = writeln!(s, "ENV {k}={v}");
     }
     // `xcaddy build` takes the Caddy version (a git tag like `v2.8.4`)
     // as a positional arg. Omitted → xcaddy uses the latest tagged
@@ -87,19 +85,16 @@ pub fn render_dockerfile(cfg: &XcaddyConfig) -> String {
         s.push_str(entry);
     }
     s.push_str("\n\n");
-    s.push_str(&format!("FROM {}\n", cfg.resolved_base_image()));
+    let _ = writeln!(s, "FROM {}", cfg.resolved_base_image());
     s.push_str("COPY --from=builder /usr/bin/caddy /usr/bin/caddy\n");
-    s.push_str(&format!("LABEL yoink.caddy.xcaddy_hash={}\n", cfg.hash()));
-    s.push_str(&format!(
-        "LABEL yoink.caddy.plugins=\"{}\"\n",
-        plugins.join(",")
-    ));
+    let _ = writeln!(s, "LABEL yoink.caddy.xcaddy_hash={}", cfg.hash());
+    let _ = writeln!(s, "LABEL yoink.caddy.plugins=\"{}\"", plugins.join(","));
     s
 }
 
 /// Pack a single-entry tar of `Dockerfile` for `bollard::build_image`.
 /// The context is small (a few hundred bytes), so a sync `Vec<u8>` is
-/// fine on the tokio executor — no spawn_blocking needed.
+/// fine on the tokio executor — no `spawn_blocking` needed.
 fn build_tar_context(dockerfile: &str) -> Bytes {
     let mut buf = Vec::with_capacity(dockerfile.len() + 1024);
     {

@@ -506,7 +506,7 @@ impl SecretsState {
     /// the value (add); or typing the value directly (edit).
     fn render_input_modal(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        let modal_width = area.width.saturating_sub(8).min(72).max(40);
+        let modal_width = area.width.saturating_sub(8).clamp(40, 72);
         let modal_height: u16 = 9;
         let x = area.width.saturating_sub(modal_width) / 2;
         let y = area.height.saturating_sub(modal_height) / 2;

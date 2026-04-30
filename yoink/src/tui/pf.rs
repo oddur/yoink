@@ -6,7 +6,7 @@
 //!
 //! Lifecycle: each `ActiveForward` owns its `SshTunnel` child, so
 //! Drop on the App (TUI exit, panic) tears every tunnel down. Per-
-//! tunnel keys (host, service, container_port) are unique — `f` on
+//! tunnel keys (host, service, `container_port`) are unique — `f` on
 //! the same row twice is a no-op (the toast notes it's already up).
 
 use std::collections::BTreeMap;
@@ -22,7 +22,7 @@ use crate::pf::PublishedEndpoint;
 use crate::transport::tunnel::SshTunnel;
 
 /// In-app collection of live forwards. Lookups are by `(host_address,
-/// service, container_port)`; the BTreeMap ordering gives us a stable
+/// service, container_port)`; the `BTreeMap` ordering gives us a stable
 /// render order in the footer.
 ///
 /// No hard cap on the map size — fd / SSH child-process exhaustion
@@ -70,10 +70,11 @@ pub struct ActiveForward {
     /// Drop force-removes the alpine/socat container; auto-remove on
     /// docker handles the case where Drop runs after the runtime has
     /// already torn down.
-    _sidecar: Option<crate::pf::SidecarHandle>,
+    sidecar: Option<crate::pf::SidecarHandle>,
 }
 
 impl ActiveForward {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: &Host,
         service: &str,
@@ -95,7 +96,7 @@ impl ActiveForward {
             url,
             target_container,
             _tunnel: Some(tunnel),
-            _sidecar: sidecar,
+            sidecar,
         }
     }
 
@@ -127,7 +128,7 @@ impl ActiveForward {
             url: format!("http://localhost:{local}"),
             target_container: target_container.map(str::to_string),
             _tunnel: None,
-            _sidecar: None,
+            sidecar: None,
         }
     }
 }
@@ -161,7 +162,7 @@ impl PortForwardState {
 
     /// Any active forward at all — fallback for the global `o` key
     /// when the operator is on a view without a clear "focused
-    /// service" (Hosts list, Logs, Resources). Picks the BTreeMap-
+    /// service" (Hosts list, Logs, Resources). Picks the `BTreeMap`-
     /// first forward (deterministic; matches the footer's first
     /// entry).
     #[must_use]
@@ -225,14 +226,14 @@ impl PortForwardState {
     /// Like `clear`, but awaits each sidecar's force-remove before
     /// returning so the operator never sees stranded `yoink-pf-*`
     /// containers in `docker ps`. Drains the map first to release
-    /// the SshTunnel children, then awaits sidecar close() calls
+    /// the `SshTunnel` children, then awaits sidecar `close()` calls
     /// in parallel.
     pub async fn close_all_async(&mut self) {
         let drained: Vec<_> = std::mem::take(&mut self.forwards).into_values().collect();
         self.refresh_footer();
         let closes: Vec<_> = drained
             .into_iter()
-            .filter_map(|fwd| fwd._sidecar.map(crate::pf::SidecarHandle::close))
+            .filter_map(|fwd| fwd.sidecar.map(crate::pf::SidecarHandle::close))
             .collect();
         if !closes.is_empty() {
             futures_util::future::join_all(closes).await;

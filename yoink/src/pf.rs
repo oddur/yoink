@@ -189,7 +189,7 @@ pub enum PfError {
     Sidecar(#[from] SidecarError),
 }
 
-/// Resolved publish entry for a single (service, container_port) pair.
+/// Resolved publish entry for a single (service, `container_port`) pair.
 /// `host_ip` defaults to `127.0.0.1` when the publish doesn't specify
 /// one — that's the docker-cli default and the address `docker-proxy`
 /// binds to under `0.0.0.0` publishes too on most kernels.
@@ -202,6 +202,7 @@ pub struct PublishedEndpoint {
 
 /// Look up the host-side endpoint for `(service, container_port)`.
 /// Pure function; the caller wires the SSH connection separately.
+#[allow(clippy::result_large_err)]
 pub fn resolve_endpoint(
     service: &ServiceConfig,
     container_port: u16,
@@ -299,6 +300,7 @@ fn parse_publish_spec(spec: &str) -> Result<PublishedEndpoint, String> {
 /// invocation. Returns the host the service actually runs on (single-
 /// host configs are a no-op; multi-host needs the operator to disambiguate
 /// via `--host` later if/when that flag lands).
+#[allow(clippy::result_large_err)]
 pub fn resolve_service<'a>(config: &'a Config, name: &str) -> Result<&'a ServiceConfig, PfError> {
     config
         .services
@@ -689,6 +691,7 @@ pub(crate) async fn wait_for_host_port(
 /// `internal_port`. Entries are `[ip:]host:container/proto` strings
 /// (yoink's `parse_inspect` flattens bollard's port map). Pure fn,
 /// unit-tested.
+#[allow(clippy::similar_names)]
 fn host_port_from_detail(ports: &[String], internal_port: u16) -> Option<u16> {
     for entry in ports {
         let mapping = entry.split('/').next().unwrap_or(entry);
@@ -722,7 +725,7 @@ pub(crate) fn unique_sidecar_name_with_prefix(prefix: &str, qualifier: &str) -> 
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     let suffix = format!("{pid:x}{:x}", nanos & 0xff_ffff);
     format!("{prefix}-{qualifier}-{suffix}")
 }
