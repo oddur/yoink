@@ -45,6 +45,9 @@ menu:
     - name: Reference
       pageRef: /docs/reference
       weight: 5
+    - name: About
+      pageRef: /about
+      weight: 6
     - name: Search
       weight: 9
       params:
