@@ -9,9 +9,8 @@ Best for "I want a registry but I don't want to pay for one and I don't want to 
 
 ## Setup
 
-<Steps>
 
-### Declare the registry as just another service in your `yoink.yaml`
+### Declare the registry as just another service in your `yoink.yaml` [step]
 
 ```yaml
 services:
@@ -27,13 +26,13 @@ services:
         memory: "256Mi"
 ```
 
-### Bring it up
+### Bring it up [step]
 
 ```sh
 yoink up --service registry
 ```
 
-### Point your app's `image:` at the tailnet hostname
+### Point your app's `image:` at the tailnet hostname [step]
 
 ```yaml
 services:
@@ -44,14 +43,13 @@ services:
       context: .
 ```
 
-### Use it like any registry
+### Use it like any registry [step]
 
 ```sh
 yoink build api --push          # docker build → docker push to your tailnet registry
 yoink up --service api          # docker pull from the tailnet registry on each host
 ```
 
-</Steps>
 
 ## Why this works
 

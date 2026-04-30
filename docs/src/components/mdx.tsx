@@ -2,7 +2,6 @@ import defaultMdxComponents from 'fumadocs-ui/mdx';
 import { Callout } from 'fumadocs-ui/components/callout';
 import { Card, Cards } from 'fumadocs-ui/components/card';
 import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
-import { Step, Steps } from 'fumadocs-ui/components/steps';
 import { File, Files, Folder } from 'fumadocs-ui/components/files';
 import { ImageZoom } from 'fumadocs-ui/components/image-zoom';
 import { InlineTOC } from 'fumadocs-ui/components/inline-toc';
@@ -31,8 +30,6 @@ export function getMDXComponents(components?: MDXComponents) {
     Folder,
     InlineTOC,
     Mermaid,
-    Step,
-    Steps,
     Tab,
     Tabs,
     ...components,

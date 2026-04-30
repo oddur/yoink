@@ -16,15 +16,14 @@ The downside: only Cloudflare-fronted clients trust the cert. That's the point �
 
 ## Setup
 
-<Steps>
 
-### Issue the cert in the Cloudflare dashboard
+### Issue the cert in the Cloudflare dashboard [step]
 
 1. Log into Cloudflare → your zone → SSL/TLS → Origin Server.
 2. Click **Create Certificate**. Defaults are fine: ECC, 15 years, hostnames `*.example.com` + `example.com` (or list each host explicitly).
 3. Copy the **Origin Certificate** (PEM, full chain) and the **Private Key**.
 
-### Add the cert + key to `secrets.age`
+### Add the cert + key to `secrets.age` [step]
 
 ```sh
 yoink secrets edit
@@ -43,7 +42,7 @@ MIIE...
 
 Save and exit. The values land in `secrets.age` (committed to the repo, encrypted).
 
-### Wire it up in `yoink.yaml`
+### Wire it up in `yoink.yaml` [step]
 
 **Single service, single cert** — per-service:
 
@@ -84,15 +83,13 @@ Every routed service inherits the proxy-level cert. Per-service `tls_cert_secret
 
 Note: `proxy.email:` isn't required when no service uses `tls: auto`. ACME is implicitly off when `proxy.tls.cert_secret` is set.
 
-</Steps>
 
 ## Origin-pull mTLS (lock your origin to Cloudflare's edge)
 
 By default, anyone who knows your origin IP can hit it directly with a `Host:` header — bypassing Cloudflare's WAF, rate limits, bot blocks, etc. **Origin-pull mTLS** fixes that: the origin requires every request to present a Cloudflare-signed client certificate. Anything else gets a TLS handshake error.
 
-<Steps>
 
-### Add the Origin Pull CA bundle to `secrets.age`
+### Add the Origin Pull CA bundle to `secrets.age` [step]
 
 Cloudflare provides a static CA bundle that signs every cert their edge presents to your origin. Download it and seal it:
 
@@ -107,11 +104,11 @@ CF_ORIGIN_PULL_CA=-----BEGIN CERTIFICATE-----
 -----END CERTIFICATE-----
 ```
 
-### Enable Authenticated Origin Pulls in the Cloudflare dashboard
+### Enable Authenticated Origin Pulls in the Cloudflare dashboard [step]
 
 SSL/TLS → Origin Server → **Authenticated Origin Pulls** → toggle on.
 
-### Add `client_auth:` to `proxy.tls:` in `yoink.yaml`
+### Add `client_auth:` to `proxy.tls:` in `yoink.yaml` [step]
 
 ```yaml
 proxy:
@@ -132,23 +129,22 @@ That applies to **every** routed service. From now on, requests that don't come 
 - `verify_if_given` — accept anonymous; verify if present. Mixed-mode.
 - `request` — request but don't enforce. Almost never useful.
 
-### Verify
+### Verify [step]
 
 After `yoink up`, this should fail (no client cert):
 
 ```sh
 curl -v https://your-origin-ip/health -H 'Host: api.example.com'
-# → tls: handshake failure
+# → tls: handshake failure [step]
 ```
 
 This should succeed (through Cloudflare's edge):
 
 ```sh
 curl https://api.example.com/health
-# → 200 OK
+# → 200 OK [step]
 ```
 
-</Steps>
 
 ## Real client IP from `CF-Connecting-IP`
 
@@ -195,17 +191,16 @@ Make sure the zone's SSL mode is **Full (strict)** (Cloudflare → SSL/TLS → O
 
 Origin certs are good for 15 years, but you'll probably want to rotate every 1–3 years anyway. When the time comes:
 
-<Steps>
 
-### Generate a new cert in Cloudflare's dashboard
+### Generate a new cert in Cloudflare's dashboard [step]
 
 Same flow as the original issuance.
 
-### Paste the new values
+### Paste the new values [step]
 
 `yoink secrets edit`, replace `CF_ORIGIN_CERT` + `CF_ORIGIN_KEY` with the new ones.
 
-### Commit and redeploy
+### Commit and redeploy [step]
 
 ```sh
 git commit -am 'rotate cf origin cert'
@@ -214,7 +209,6 @@ yoink up
 
 Yoink notices the cert bytes have changed, redeploys the proxy container (~10s), and the new cert is live.
 
-</Steps>
 
 For zero-downtime rotation, use `yoink up --service yoink-proxy` from one host at a time if you're multi-host.
 

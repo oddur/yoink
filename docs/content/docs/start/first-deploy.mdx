@@ -32,9 +32,8 @@ That's it. Yoink uses your operating system's SSH client, so anything you've set
 
 ## Walkthrough
 
-<Steps>
 
-### Generate `yoink.yaml`
+### Generate `yoink.yaml` [step]
 
 ```sh
 yoink init root@1.2.3.4
@@ -77,7 +76,7 @@ services:
       port: 8080
 ```
 
-### Run one command
+### Run one command [step]
 
 ```sh
 yoink up --build
@@ -85,7 +84,7 @@ yoink up --build
 
 Builds the image locally, ships it directly to the host over SSH, runs it through a healthcheck-gated rolling deploy. See [deploy modes](/docs/guide/deploy-modes) for how yoink picks per-service between local-ship and registry-pull.
 
-### Iterate
+### Iterate [step]
 
 Edit code or Dockerfile. Re-run the same command:
 
@@ -95,7 +94,7 @@ yoink up --build
 
 Only changed layers cross the wire. Healthcheck-gated swap — the old container only stops after the new one is healthy.
 
-### Inspect what's running
+### Inspect what's running [step]
 
 ```sh
 yoink status                              # snapshot table
@@ -103,7 +102,6 @@ yoink tui                                 # k9s-style dashboard with logs / shel
 yoink logs my-tool -f | hl                # live tail, optional `hl` highlighting
 ```
 
-</Steps>
 
 ## Add HTTPS routing
 

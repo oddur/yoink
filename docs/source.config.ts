@@ -1,5 +1,5 @@
 import { defineConfig, defineDocs, remarkInclude } from 'fumadocs-mdx/config';
-import { remarkCodeTab, remarkMdxMermaid } from 'fumadocs-core/mdx-plugins';
+import { remarkCodeTab, remarkMdxMermaid, remarkSteps } from 'fumadocs-core/mdx-plugins';
 
 export const docs = defineDocs({
   dir: 'content/docs',
@@ -22,6 +22,6 @@ export const about = defineDocs({
 
 export default defineConfig({
   mdxOptions: {
-    remarkPlugins: [remarkInclude, remarkCodeTab, remarkMdxMermaid],
+    remarkPlugins: [remarkInclude, remarkCodeTab, remarkSteps, remarkMdxMermaid],
   },
 });

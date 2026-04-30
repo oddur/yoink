@@ -16,9 +16,8 @@ This is the "indie one-shot" pattern — single laptop, single host, no CI, no D
 
 ## Walkthrough
 
-<Steps>
 
-### Scaffold the app
+### Scaffold the app [step]
 
 ```sh
 npm create @tanstack/start@latest my-app
@@ -82,12 +81,12 @@ function App() {
 }
 ```
 
-### Dockerfile
+### Dockerfile [step]
 
 Multi-stage build. Nitro bundles all server-side deps into `.output/server/_libs/`, so the runtime image needs no `node_modules`:
 
 ```dockerfile
-# Dockerfile
+# Dockerfile [step]
 FROM node:22-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
@@ -114,7 +113,7 @@ yoink.yaml
 services/
 ```
 
-### Run `yoink init`
+### Run `yoink init` [step]
 
 ```sh
 yoink init root@your-host
@@ -137,7 +136,7 @@ inferred:
 
 **Back up the key now** (paste into a password manager) — see [Sealed secrets](/docs/guide/secrets) for backup options. Lose it and the sealed values in this repo are gone.
 
-### Drop in postgres
+### Drop in postgres [step]
 
 ```sh
 yoink add postgres
@@ -165,7 +164,7 @@ The keys are the accessory's suggestion — neutral, conventional. If your app r
 
 > **Need redis, meilisearch, …?** Same shape: `yoink add redis` (or `yoink add meilisearch`) prints its own connection block. Paste alongside this one, merging the `depends_on:` lists.
 
-### Wire the app to the accessory
+### Wire the app to the accessory [step]
 
 Paste the `connect another service to …` block into your app's `services[]` entry. The keys are conventional but not magic — drop any your app doesn't read (the demo `db.server.ts` ignores `POSTGRES_PORT` since the port is hard-coded).
 
@@ -206,7 +205,7 @@ include:
 
 `yoink validate` confirms the config parses; `yoink doctor` checks deploy-readiness (unreachable host, missing identity, etc.).
 
-### Deploy
+### Deploy [step]
 
 ```sh
 yoink up --build
@@ -216,7 +215,7 @@ One command. The host pulls postgres from Docker Hub; the app (with its `build:`
 
 First deploy is the slow one — pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry ships only changed layers.
 
-### Verify
+### Verify [step]
 
 The app is reachable on the host's docker network at `my-app:3000` but isn't bound to a host port — that's the secure default. To open it on your laptop:
 
@@ -228,7 +227,6 @@ yoink pf my-app -o
 
 The page should render JSON with `ok: true` and a postgres version string.
 
-</Steps>
 
 ## Re-deploys
 
