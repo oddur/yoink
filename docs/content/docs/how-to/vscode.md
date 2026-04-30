@@ -1,5 +1,6 @@
 ---
 title: Edit container files with `yoink vscode`
+description: Open VS Code in the browser rooted in a running container's live filesystem — no operator install, just SSH and a browser.
 weight: 9
 ---
 

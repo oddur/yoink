@@ -1,0 +1,17 @@
+---
+title: Examples
+description: Three complete annotated yoink.yaml configs to lift and adapt to your stack.
+weight: 6
+sidebar:
+  open: true
+---
+
+Complete annotated `yoink.yaml`s — three real shapes. Lift them, edit until they fit your stack.
+
+<Cards>
+  <Card href="/docs/examples/hobby-tool" title="Hobby tool / utility" description="Single host, single service, build locally, no registry. The 5-line yoink.yaml." />
+  <Card href="/docs/examples/polyglot-stack" title="Polyglot stack" description="Rust API + Node web + Caddy + Redis on a single host with per-tier networks." />
+  <Card href="/docs/examples/production" title="Production-shape" description="Multi-host, replicas, secrets, pre-deploy hooks, drift detection, the works." />
+</Cards>
+
+For a single fully-commented config naming every field, see [`examples/yoink.yaml` in the repo](https://github.com/oddur/yoink/blob/main/examples/yoink.yaml). The [sealed-secrets fixture](https://github.com/oddur/yoink/tree/main/examples/sealed-secrets) is a self-contained walkthrough that runs against your laptop's docker daemon — no remote host required.

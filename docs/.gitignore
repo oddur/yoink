@@ -1,4 +1,6 @@
-# Hugo build outputs + caches — regenerated on every build.
-public/
-resources/_gen/
-.hugo_build.lock
+# Vite / Node build outputs + caches — regenerated on every build.
+.output/
+node_modules/
+.cache/
+.tanstack/
+.source/

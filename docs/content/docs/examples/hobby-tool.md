@@ -1,5 +1,6 @@
 ---
 title: Hobby tool / utility
+description: A single-host, single-service yoink.yaml built locally with no registry — the minimal five-line config.
 weight: 1
 ---
 
@@ -49,3 +50,9 @@ This shape stays fine for hobby / utility / internal-tool deployments. Outgrow i
 - **Replicas** — single-container swap downtime is your downtime. Add `replicas: 2` for rolling swap (capacity N-1).
 - **Multiple hosts** — yoink ships the build artifact from your daemon to every host on every deploy. Once painful, add a [self-hosted tailnet registry](/docs/how-to/self-hosted-registry) so hosts pull from a shared cache.
 - **CI-triggered deploys** — keep `build:`, add a real registry, switch to `yoink build --push` + `yoink up`.
+
+## See also
+
+- [First deploy](/docs/start/first-deploy) — the tutorial form of the same standalone deploy pattern.
+- [Standalone (no-registry) deploys](/docs/how-to/standalone-mode) — how `--build` ships images over SSH without a registry.
+- [Polyglot stack](/docs/examples/polyglot-stack) — the next shape up: multiple services, networks, and a reverse proxy.

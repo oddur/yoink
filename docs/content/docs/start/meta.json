@@ -1,0 +1,8 @@
+{
+  "title": "Start",
+  "icon": "Rocket",
+  "pages": [
+    "install",
+    "first-deploy"
+  ]
+}

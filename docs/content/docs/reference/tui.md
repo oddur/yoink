@@ -1,5 +1,6 @@
 ---
 title: TUI
+description: Keybind table for every TUI pane, log piping, and how drift is shown in the cell view.
 weight: 3
 ---
 

@@ -1,5 +1,6 @@
 ---
 title: Configuration
+description: Complete yoink.yaml schema reference — every field, its type, and its default.
 weight: 5
 ---
 

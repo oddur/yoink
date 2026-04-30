@@ -1,0 +1,9 @@
+{
+  "title": "Examples",
+  "icon": "LayoutTemplate",
+  "pages": [
+    "hobby-tool",
+    "polyglot-stack",
+    "production"
+  ]
+}

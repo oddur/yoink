@@ -1594,7 +1594,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         .chain(here_overrides.iter())
         .cloned()
         .collect();
-    let tag_overrides = parse_tag_overrides(&tag_args, services, allow_dirty)?;
+    let mut tag_overrides = parse_tag_overrides(&tag_args, services, allow_dirty)?;
 
     let services_filter = services_filter(services);
 
@@ -1637,10 +1637,20 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             );
         }
         for svc in buildable {
-            let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
-            yoink::build::build_service(config, svc, &tag, false, false)
-                .await
-                .with_context(|| format!("build {}", svc.name))?;
+            if yoink::build::has_tag(svc, &tag_overrides) {
+                let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
+                yoink::build::build_service(config, svc, &tag, false, false)
+                    .await
+                    .with_context(|| format!("build {}", svc.name))?;
+            } else {
+                // No tag in config and no --tag override: derive the tag from
+                // the built image's content digest so yoink can detect changes
+                // automatically without a nonce or explicit tag management.
+                let tag = yoink::build::build_and_capture_tag(config, svc, false)
+                    .await
+                    .with_context(|| format!("build {}", svc.name))?;
+                tag_overrides.insert(svc.name.clone(), tag);
+            }
         }
     }
 

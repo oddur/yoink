@@ -1,11 +1,23 @@
 ---
 title: How it works
+description: "How yoink works internally: spec_hash drift detection, the deploy lock, healthcheck-gated rolling swaps, and wave-ordered deploys."
 weight: 4
 ---
 
 `docker compose up`, `ssh && docker run`, and hand-rolled bash share four failure modes: they re-create containers that haven't changed (or skip re-creating ones that did); they swap atomically only if you wire the healthcheck flags; they keep no audit trail; and two concurrent runs corrupt host state silently.
 
 Yoink addresses each: **a content hash on every container** for drift detection, **a deploy lock** for concurrent runs, **a healthcheck-gated swap** so a broken build can't replace a working one, and **an audit trail with one-key rollback**. This page covers each.
+
+```mermaid
+flowchart TB
+    A([yoink up]) --> B{spec_hash\nchanged?}
+    B -- no --> Z([skip — no-op])
+    B -- yes --> C[lock · resolve secrets · ship]
+    C --> D[start new container]
+    D --> E{healthcheck\npasses?}
+    E -- yes --> F[stop old · unlock · done]
+    E -- no --> G[keep old running · unlock]
+```
 
 ## Drift detection
 

@@ -1,5 +1,6 @@
 ---
 title: Deploy modes
+description: "The three ways to ship an image: CI-built from a registry, local-build shipped directly, and mixed."
 weight: 2
 ---
 
@@ -19,6 +20,14 @@ Yoink treats **where the image is built** and **how it gets to the host** as ind
 | **Direct to host (no registry)** | Less common, but valid: CI builds then runs `yoink up --transport=unregistry --tag api=<sha>` on a config whose service has a `build:` block (or pass `--no-registry` to force local shipping for non-build services too). | `yoink up --build`, one command. The standalone loop. |
 
 The four cells share a deploy engine — drift detection, healthcheck-gated rolling swap, dependency-ordered waves work the same regardless of how the image arrived. Mixed configs (some services pull from a registry, others ship from local) work out of the box: yoink detects which is which from the `build:` blocks and runs both paths in parallel under a single `yoink up`.
+
+```mermaid
+flowchart LR
+    Deploy([rolling deploy])
+    CI["CI-built\nyoink up --tag api=sha"] --> Deploy
+    Local["Local-build\nyoink build --push + yoink up"] --> Deploy
+    Standalone["Standalone\nyoink up --build"] --> Deploy
+```
 
 ## CI-built — the default
 

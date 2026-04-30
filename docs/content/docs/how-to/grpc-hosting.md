@@ -1,5 +1,6 @@
 ---
 title: gRPC hosting
+description: Expose a native gRPC backend (Tonic, grpc-go, grpc-java) via upstream_h2c — works for REST too.
 weight: 14
 ---
 

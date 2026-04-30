@@ -1,7 +1,8 @@
-# Hugo build artifacts — regenerated inside the builder stage.
-public/
-resources/_gen/
-.hugo_build.lock
+# Vite / Node build artifacts — regenerated inside the builder stage.
+.output/
+node_modules/
+.cache/
+.tanstack/
 
 # Yoink deploy artifacts that sit alongside the docs source — must not
 # end up in the container image.

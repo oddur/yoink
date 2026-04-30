@@ -1,0 +1,20 @@
+---
+title: Guide
+description: "The mental model behind yoink: read once, then come back to how-to and reference for specifics."
+weight: 3
+sidebar:
+  open: true
+---
+
+The mental model. Read this once; come back to how-to / reference for the rest.
+
+<Cards>
+  <Card href="/docs/guide/architecture" title="How it works" description="Drift detection, deploy lock, spec_hash, dependency-ordered waves, healthcheck-gated rolling swap." />
+  <Card href="/docs/guide/deploy-modes" title="Three deploy modes" description="CI-built, local-build push-then-deploy, registry-less standalone." />
+  <Card href="/docs/guide/security" title="Security" description="Hardened defaults — cap_drop=ALL, read-only rootfs, no-new-privileges. Plus the `devices:` escape hatch for GPUs / FUSE / USB." />
+  <Card href="/docs/guide/proxy" title="Reverse proxy" description="Bundled Caddy. One field exposes a service over HTTPS with Let's Encrypt or sealed Cloudflare origin certs. Caddy snippets cookbook included." />
+  <Card href="/docs/guide/networking" title="Networking" description="Tailscale + SSH connectivity, multi-host distribution (`replicas` + pinned hosts), and `yoink pf` for debugging without publishing ports." />
+  <Card href="/docs/guide/secrets" title="Secrets" description="age-sealed secrets in the repo (the default) plus `provider: command` recipes for sops / Doppler / Vault / 1Password / AWS SM / Infisical / Bitwarden." />
+  <Card href="/docs/guide/templates" title="Templates (`yoink add`)" description="Drop-in service fragments with sealed secrets. How to use the bundled set, and how to author your own." />
+  <Card href="/docs/guide/ai-agents" title="Driving yoink from an AI agent" description="CLI + YAML, no GUI, deterministic exit codes. Patterns for Claude Code, Cursor, Aider, GitHub Copilot Workspace." />
+</Cards>

@@ -1,5 +1,6 @@
 ---
 title: Driving yoink from an AI agent
+description: CLI and YAML-driven, deterministic exit codes, and patterns for driving yoink from Claude Code, Cursor, Aider, and GitHub Copilot Workspace.
 weight: 8
 ---
 

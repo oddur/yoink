@@ -1,0 +1,30 @@
+{
+  "title": "How-to",
+  "icon": "Wrench",
+  "pages": [
+    "---Quickstarts---",
+    "hetzner-quickstart",
+    "tanstack-stack",
+    "---Secrets & Security---",
+    "sealed-secrets-workflow",
+    "age-in-github-actions",
+    "cloudflare-origin-certs",
+    "defense-in-depth",
+    "---Deploy Patterns---",
+    "standalone-mode",
+    "staging-alongside-prod",
+    "watch-mode",
+    "pr-comment-dry-run",
+    "using-templates",
+    "self-hosted-registry",
+    "---Networking & Proxy---",
+    "grpc-hosting",
+    "caddy-plugins",
+    "caddy-snippets",
+    "---Storage & Backup---",
+    "volume-backups",
+    "multi-host-redis-storage",
+    "---Developer Tooling---",
+    "vscode"
+  ]
+}

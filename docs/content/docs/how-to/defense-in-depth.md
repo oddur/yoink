@@ -1,5 +1,6 @@
 ---
 title: Defense-in-depth web serving (Cloudflare + CrowdSec + Coraza)
+description: A no-license-fee hardened web stack combining Cloudflare Free, CrowdSec, Coraza WAF, and sealed origin certs.
 weight: 14
 ---
 
@@ -10,12 +11,12 @@ This isn't a yoink default — it requires plugins, secrets, a CrowdSec sidecar,
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
     Client([Client])
     CF["Cloudflare Free<br/>DDoS · IP rep · Bot Fight<br/>free WAF · mTLS origin-pull"]
     subgraph Caddy["Caddy proxy on origin"]
-        direction LR
-        CS["CrowdSec bouncer<br/><i>cheap IP block</i>"] --> Cor["Coraza<br/><i>full CRS scan</i>"]
+        direction TB
+        CS["CrowdSec bouncer<br/>cheap IP block"] --> Cor["Coraza<br/>full CRS scan"]
     end
     App([App])
     Client --> CF --> CS

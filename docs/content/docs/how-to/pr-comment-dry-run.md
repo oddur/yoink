@@ -1,5 +1,6 @@
 ---
 title: Pre-merge dry-run on every PR
+description: Post a sticky GitHub PR comment showing exactly what yoink up would change before the merge.
 weight: 7
 ---
 

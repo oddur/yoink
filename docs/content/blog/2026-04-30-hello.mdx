@@ -1,0 +1,29 @@
+---
+title: Hello from yoink
+date: 2026-04-30
+description: Introducing the yoink docs site, now running on Fumadocs + TanStack Start — and still serving off a $4/mo VPS.
+---
+
+yoink has had documentation for a while. Today we're giving it a proper home.
+
+The site is built with [Fumadocs](https://fumadocs.vercel.app/) running on [TanStack Start](https://tanstack.com/start), compiled to a fully static SPA via Vite, and served by nginx on a single Hetzner cax11 (4 vCPU ARM, 8 GB RAM, €3.99/mo).
+
+The deploy pipeline is exactly what you'd use to ship your own service with yoink — a `Dockerfile`, a `yoink.yaml`, and `yoink up --build`. The source is in the repo at [`docs/`](https://github.com/oddur/yoink/tree/main/docs) if you're curious.
+
+## What's in the docs
+
+The docs cover the full surface of yoink:
+
+- **[Intro](/docs/intro/what-and-why)** — the 30-second pitch and the longer explanation of why this tool exists.
+- **[Start](/docs/start/install)** — install and your first deploy in five minutes.
+- **[Guide](/docs/guide/architecture)** — the mental model: drift detection, the deploy lock, healthcheck-gated rolling swaps, the three deploy modes.
+- **[How-to](/docs/how-to)** — task-oriented walkthroughs for specific scenarios: Hetzner quickstart, staging alongside prod, sealed secrets, Cloudflare origin certs, gRPC hosting, and more.
+- **[Reference](/docs/reference/cli)** — every CLI flag, every config field, every TUI keybind.
+- **[Examples](/docs/examples)** — three complete annotated `yoink.yaml` configs to lift and adapt.
+- **[Troubleshooting](/docs/troubleshooting)** — common error messages with causes and fixes.
+
+## This blog
+
+This space is for release notes, design notes, and anything else worth writing down. If you're interested in how yoink is built and why certain decisions were made, this is where that will live.
+
+The source is at [github.com/oddur/yoink](https://github.com/oddur/yoink). Issues and PRs welcome.

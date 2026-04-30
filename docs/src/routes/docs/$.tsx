@@ -1,0 +1,108 @@
+import { createFileRoute, Link, notFound } from '@tanstack/react-router';
+import { DocsLayout } from 'fumadocs-ui/layouts/docs';
+import { createServerFn } from '@tanstack/react-start';
+import { getPageMarkdownUrl, source } from '@/lib/source';
+import browserCollections from 'collections/browser';
+import {
+  DocsBody,
+  DocsDescription,
+  DocsPage,
+  DocsTitle,
+  MarkdownCopyButton,
+  ViewOptionsPopover,
+} from 'fumadocs-ui/layouts/docs/page';
+import { baseOptions } from '@/lib/layout.shared';
+import { gitConfig } from '@/lib/shared';
+import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
+import { useFumadocsLoader } from 'fumadocs-core/source/client';
+import { InlineTOC } from 'fumadocs-ui/components/inline-toc';
+import { Suspense } from 'react';
+import { useMDXComponents } from '@/components/mdx';
+
+const BASE_URL = 'https://yoink.is';
+
+export const Route = createFileRoute('/docs/$')({
+  head: ({ loaderData }) => {
+    if (!loaderData) return {};
+    const { title, description, url } = loaderData;
+    const fullTitle = `${title} — yoink`;
+    return {
+      links: [{ rel: 'canonical', href: `${BASE_URL}${url}` }],
+      meta: [
+        { title: fullTitle },
+        { name: 'description', content: description },
+        { property: 'og:title', content: fullTitle },
+        { property: 'og:description', content: description },
+        { property: 'og:url', content: `${BASE_URL}${url}` },
+      ].filter((m) => 'content' in m ? Boolean(m.content) : true),
+    };
+  },
+  component: Page,
+  loader: async ({ params }) => {
+    const slugs = params._splat?.split('/') ?? [];
+    const data = await loader({ data: slugs });
+    await clientLoader.preload(data.path);
+    return data;
+  },
+});
+
+const loader = createServerFn({
+  method: 'GET',
+})
+  .inputValidator((slugs: string[]) => slugs)
+  .middleware([staticFunctionMiddleware])
+  .handler(async ({ data: slugs }) => {
+    const page = source.getPage(slugs);
+    if (!page) throw notFound();
+
+    return {
+      path: page.path,
+      markdownUrl: getPageMarkdownUrl(page).url,
+      pageTree: await source.serializePageTree(source.getPageTree()),
+      title: page.data.title as string,
+      description: (page.data.description ?? '') as string,
+      url: page.url,
+    };
+  });
+
+const clientLoader = browserCollections.docs.createClientLoader({
+  component(
+    { toc, frontmatter, default: MDX },
+    {
+      markdownUrl,
+      path,
+    }: {
+      markdownUrl: string;
+      path: string;
+    },
+  ) {
+    return (
+      <DocsPage toc={toc}>
+        <DocsTitle>{frontmatter.title}</DocsTitle>
+        <DocsDescription>{frontmatter.description}</DocsDescription>
+        <div className="flex flex-row gap-2 items-center border-b -mt-4 pb-6">
+          <MarkdownCopyButton markdownUrl={markdownUrl} />
+          <ViewOptionsPopover
+            markdownUrl={markdownUrl}
+            githubUrl={`https://github.com/${gitConfig.user}/${gitConfig.repo}/blob/${gitConfig.branch}/content/docs/${path}`}
+          />
+        </div>
+        <DocsBody>
+          {toc.length > 0 && <InlineTOC items={toc} className="lg:hidden mb-6" />}
+          <MDX components={useMDXComponents()} />
+        </DocsBody>
+      </DocsPage>
+    );
+  },
+});
+
+function Page() {
+  const { pageTree, path, markdownUrl } = useFumadocsLoader(Route.useLoaderData());
+
+  return (
+    <DocsLayout {...baseOptions()} tree={pageTree}>
+      <Link to={markdownUrl} hidden />
+      <Suspense>{clientLoader.useContent(path, { markdownUrl, path })}</Suspense>
+    </DocsLayout>
+  );
+}
