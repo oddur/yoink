@@ -1,5 +1,6 @@
 ---
 title: Adding a service via `yoink add`
+description: Pick a vetted template (postgres, redis, meilisearch, …), answer prompts, get a sealed-secret-ready service fragment.
 weight: 16
 ---
 

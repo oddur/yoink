@@ -1,5 +1,6 @@
 ---
 title: Edit-save-deploy with `--watch`
+description: Poll the config for changes and redeploy automatically on every save — hot-reload for prod-like local dev.
 weight: 8
 ---
 

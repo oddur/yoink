@@ -1,5 +1,6 @@
 ---
 title: Deploy modes
+description: "The three ways to ship an image: CI-built from a registry, local-build shipped directly, and mixed."
 weight: 2
 ---
 

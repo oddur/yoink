@@ -1,5 +1,6 @@
 ---
 title: Troubleshooting
+description: Common error messages, their causes, and step-by-step fixes.
 weight: 6
 ---
 

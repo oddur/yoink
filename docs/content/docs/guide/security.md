@@ -1,5 +1,6 @@
 ---
 title: Security
+description: Hardened container defaults — cap_drop=ALL, read-only rootfs, no-new-privileges — and the escape hatches for GPUs, FUSE, and USB.
 weight: 3
 ---
 

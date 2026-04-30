@@ -1,9 +1,10 @@
 {
   "title": "Reference",
+  "icon": "BookMarked",
   "pages": [
-    "tui",
-    "glossary",
+    "cli",
     "config",
-    "cli"
+    "tui",
+    "glossary"
   ]
 }

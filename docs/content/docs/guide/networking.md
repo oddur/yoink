@@ -1,5 +1,6 @@
 ---
 title: Networking
+description: Tailscale and SSH connectivity, multi-host distribution via replicas and pinned hosts, and yoink pf for debugging without publishing ports.
 weight: 5
 ---
 

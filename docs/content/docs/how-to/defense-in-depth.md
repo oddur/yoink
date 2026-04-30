@@ -1,5 +1,6 @@
 ---
 title: Defense-in-depth web serving (Cloudflare + CrowdSec + Coraza)
+description: A no-license-fee hardened web stack combining Cloudflare Free, CrowdSec, Coraza WAF, and sealed origin certs.
 weight: 14
 ---
 

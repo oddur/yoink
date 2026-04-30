@@ -1,5 +1,6 @@
 ---
 title: Caddy plugins (xcaddy, no registry)
+description: Build a custom Caddy binary with rate-limit, l4, redis-storage, and third-party DNS providers on each host — no registry required.
 weight: 6
 ---
 

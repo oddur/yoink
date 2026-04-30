@@ -1,5 +1,6 @@
 ---
 title: Hobby tool / utility
+description: A single-host, single-service yoink.yaml built locally with no registry — the minimal five-line config.
 weight: 1
 ---
 

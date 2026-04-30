@@ -1,5 +1,6 @@
 ---
 title: How it works
+description: "How yoink works internally: spec_hash drift detection, the deploy lock, healthcheck-gated rolling swaps, and wave-ordered deploys."
 weight: 4
 ---
 

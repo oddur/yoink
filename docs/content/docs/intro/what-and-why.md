@@ -1,5 +1,6 @@
 ---
 title: What & why
+description: A plain-language explanation of what yoink does, why it exists, and who it is for.
 weight: 1
 ---
 

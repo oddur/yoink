@@ -1,5 +1,6 @@
 ---
 title: CLI
+description: Every subcommand, flag, and tag-resolution rule, including diagnostic commands like yoink doctor and yoink status.
 weight: 6
 ---
 

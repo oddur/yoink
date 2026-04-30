@@ -1,5 +1,6 @@
 ---
 title: Glossary
+description: "Definitions for cross-cutting terms: spec_hash, unregistry, provider:age, yoink-ingress, and more."
 weight: 4
 ---
 

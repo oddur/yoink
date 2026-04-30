@@ -1,5 +1,6 @@
 ---
 title: Run staging alongside prod
+description: Run a staging environment on the same hosts as production using separate configs with namespaced services and networks.
 weight: 10
 ---
 

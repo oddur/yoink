@@ -1,5 +1,6 @@
 ---
 title: Polyglot stack
+description: A Rust API, Node web frontend, Caddy, and Redis running on a single host with per-tier networks.
 weight: 2
 ---
 

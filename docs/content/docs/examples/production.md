@@ -1,5 +1,6 @@
 ---
 title: Production-shape
+description: "A full production-shape config: multi-host, replicas, sealed secrets, pre-deploy hooks, and drift detection."
 weight: 3
 ---
 
