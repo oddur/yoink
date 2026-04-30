@@ -307,3 +307,10 @@ Rules:
 - Missing variables are a hard error rather than silent empty substitution — a quietly-empty `address:` produces baffling failures further down the deploy.
 - The POSIX `${NAME:-default}` form supplies a fallback when `NAME` is unset. Useful for commands that parse the full config but don't actually use the value (e.g. `yoink secrets seal` against a config whose hosts/domains reference `${HOST_IP}`). Set the var explicitly when you do mean to use it.
 - For long-lived secrets, prefer `secrets:` (sealed or `provider: command`) over passing values via env. The substitution path is intended for routing parameters (host IPs, hostnames, port numbers), not credentials.
+
+## See also
+
+- [CLI reference](/docs/reference/cli) — every subcommand and flag.
+- [Examples](/docs/examples) — three complete annotated `yoink.yaml`s (hobby, polyglot, production).
+- [Secrets](/docs/guide/secrets) — the mental model behind the `secrets:` block.
+- [Reverse proxy](/docs/guide/proxy) — the schema and behavior of the `proxy:` block.

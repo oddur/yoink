@@ -130,3 +130,9 @@ yoink up --tag api=$SHA --tag web=$SHA
 - **Pre-deploy hooks**: `api-migrate` runs once per `up` (not per replica) before the api swap starts. Ships the same image as the runtime container so migrations match the code shape.
 - **Replicas**: `api` and `web` each have 2 — rolling swap keeps 1 alive while the new one healthchecks.
 - **Surgical security opt-out**: `caddy` re-adds `NET_BIND_SERVICE` only. `read_only` and `cap_drop=ALL` and `no-new-privileges` all stay default-on for it. `binds` for the docker socket is `:ro`; the data dir is explicit `:rw`.
+
+## See also
+
+- [Production-shape example](/docs/examples/production) — same patterns scaled to multi-host with secrets, pre-deploy hooks, and a fragmented config.
+- [Reverse proxy](/docs/guide/proxy) — the schema behind the bundled Caddy.
+- [Networking](/docs/guide/networking) — per-tier networks, multi-host distribution, port-forward.

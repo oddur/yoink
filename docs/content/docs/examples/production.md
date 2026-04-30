@@ -213,3 +213,10 @@ See [PR-comment dry-run](/docs/how-to/pr-comment-dry-run) for the complete workf
 - **Surgical security opt-outs** — `otel` opts out of the hardened defaults (with a comment explaining why); everything else inherits the defaults.
 - **Config fragmentation** — one file per service, glob-included. Each fragment is independent; renaming a service is a one-file operation.
 - **Staging alongside prod** — see [the recipe](/docs/how-to/staging-alongside-prod) for the same hosts running a `yoink.staging.yaml` with `name: api-staging` etc.
+
+## See also
+
+- [Polyglot-stack example](/docs/examples/polyglot-stack) — single-host version of the same patterns.
+- [Architecture](/docs/guide/architecture) — drift detection, deploy lock, healthcheck-gated swap.
+- [Sealed secrets workflow](/docs/how-to/sealed-secrets-workflow) — operator-side commands for the `secrets:` block this example uses.
+- [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run) — wire the `dry_run.yaml` snippet into a real CI workflow.

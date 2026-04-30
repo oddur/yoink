@@ -342,3 +342,9 @@ yoink -c <TAB>                    # all yoink configs in this repo
 yoink shell <TAB>                 # services from the default config
 yoink -c staging.yoink.yaml shell <TAB>   # services from staging
 ```
+
+## See also
+
+- [Configuration reference](/docs/reference/config) — schema for `yoink.yaml`.
+- [TUI reference](/docs/reference/tui) — keybinds for the terminal dashboard.
+- [Troubleshooting](/docs/troubleshooting) — error messages, likely causes, fixes.
