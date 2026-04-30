@@ -112,6 +112,7 @@ impl ServicesState {
         area: ratatui::layout::Rect,
         config: &Config,
         forwards: &super::pf::PortForwardState,
+        vscode: &super::vscode::VscodeSessionState,
         throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         let layout = pane_layout(area);
@@ -146,6 +147,7 @@ impl ServicesState {
                         config,
                         self.report.as_ref(),
                         forwards,
+                        vscode,
                     )
                 })
                 .collect()
@@ -176,6 +178,7 @@ fn build_service_row<'a>(
     config: &'a Config,
     report: Option<&StatusReport>,
     forwards: &super::pf::PortForwardState,
+    vscode: &super::vscode::VscodeSessionState,
 ) -> Row<'a> {
     let cfg_service = config.services.iter().find(|s| s.name == name);
     let image_tag = cfg_service.map_or_else(
@@ -220,12 +223,7 @@ fn build_service_row<'a>(
     } else {
         hosts.join(", ")
     };
-    let name_cell = if forwards.is_service_forwarded(name) {
-        Cell::from(format!("↦ {name}"))
-            .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan))
-    } else {
-        Cell::from(name.to_string())
-    };
+    let name_cell = build_service_marker_cell(name, forwards, vscode);
     Row::new(vec![
         name_cell,
         Cell::from(image_tag),
@@ -233,6 +231,59 @@ fn build_service_row<'a>(
         Cell::from(health.to_string()).style(health_style(health)),
         Cell::from(hosts_str),
     ])
+}
+
+/// Build the marker-prefixed cell for a service / container row.
+/// `↦` = port-forward active, `◊` = vscode session active. Markers
+/// stack when both are up. Cyan-colored when any marker is present
+/// so the row catches the eye.
+pub(super) fn build_service_marker_cell(
+    service: &str,
+    forwards: &super::pf::PortForwardState,
+    vscode: &super::vscode::VscodeSessionState,
+) -> Cell<'static> {
+    let pf = forwards.is_service_forwarded(service);
+    let vs = vscode.is_service_active(service);
+    if !pf && !vs {
+        return Cell::from(service.to_string());
+    }
+    let mut prefix = String::with_capacity(4);
+    if pf {
+        prefix.push('↦');
+    }
+    if vs {
+        prefix.push('◊');
+    }
+    Cell::from(format!("{prefix} {service}"))
+        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan))
+}
+
+/// Variant of `build_service_marker_cell` that respects pf's
+/// container-scoped `↦` (only the specific replica the operator
+/// pressed `f` on lights up). Vscode sessions don't carry replica
+/// scope today, so `◊` is per-service for every container row.
+pub(super) fn build_container_marker_cell(
+    service: &str,
+    host: &str,
+    container: &str,
+    forwards: &super::pf::PortForwardState,
+    vscode: &super::vscode::VscodeSessionState,
+) -> Cell<'static> {
+    let pf = forwards.is_container_forwarded(host, container)
+        || forwards.is_service_forwarded_unscoped(service);
+    let vs = vscode.is_service_active(service);
+    if !pf && !vs {
+        return Cell::from(service.to_string());
+    }
+    let mut prefix = String::with_capacity(4);
+    if pf {
+        prefix.push('↦');
+    }
+    if vs {
+        prefix.push('◊');
+    }
+    Cell::from(format!("{prefix} {service}"))
+        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan))
 }
 
 /// Reduce a service's container set to one of: `healthy`, `unhealthy`,

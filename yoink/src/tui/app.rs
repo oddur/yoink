@@ -3599,6 +3599,7 @@ impl App {
                     secrets.as_deref(),
                     &self.container_history,
                     &self.forwards,
+                    &self.vscode,
                     &self.throbber_state,
                 );
             }
@@ -3619,6 +3620,7 @@ impl App {
                     &events,
                     &self.container_history,
                     &self.forwards,
+                    &self.vscode,
                     &self.throbber_state,
                 );
             }
@@ -3643,6 +3645,7 @@ impl App {
                 pane_area,
                 &self.config,
                 &self.forwards,
+                &self.vscode,
                 &self.throbber_state,
             ),
             View::ServiceDetail(_) => {

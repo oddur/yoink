@@ -92,10 +92,8 @@ impl VscodeSessionState {
     }
 
     /// Predicate for the row marker (`◊`) on service rows that have
-    /// an active vscode session. Unused today; row-marker plumbing
-    /// lands in a follow-up.
+    /// an active vscode session.
     #[must_use]
-    #[allow(dead_code)]
     pub fn is_service_active(&self, service: &str) -> bool {
         self.sessions.values().any(|s| s.key.service == service)
     }
