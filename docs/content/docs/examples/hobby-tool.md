@@ -3,9 +3,9 @@ title: Hobby tool / utility
 weight: 1
 ---
 
-You wrote a small utility — a Slack bot, an admin CLI, an internal status board, a cron-job-as-container. It needs to run somewhere. Setting up CI, a container registry, and a Kubernetes cluster for a single container that doesn't take real traffic feels absurd.
+A Slack bot, admin CLI, internal status board, cron-as-container — one container that needs a host but doesn't justify CI + a registry + Kubernetes.
 
-This is the shape for that case: **the minimum viable `yoink.yaml`** — one host, one service, `Dockerfile` next to the config, no registry. Drop in a repo, `yoink up --build`, done.
+**The minimum `yoink.yaml`**: one host, one service, `Dockerfile` next to the config, no registry. `yoink up --build`.
 
 ```yaml
 # yoink.yaml — sits alongside the Dockerfile
@@ -26,13 +26,13 @@ services:
 yoink up --build
 ```
 
-That's it. ~15 seconds for a small image. The `build:` block tells yoink the image is local-only, so it ships from your docker daemon to the host over SSH (via [unregistry](https://github.com/psviderski/unregistry) by default — only changed layers cross the wire).
+~15 seconds for a small image. The `build:` block makes the image local-only, so yoink ships it from your docker daemon to the host over SSH via [unregistry](https://github.com/psviderski/unregistry) — only changed layers cross the wire.
 
-## What yoink does for you (without you asking)
+## What yoink does without you asking
 
-Even at this minimum size your container inherits yoink's hardened defaults — read-only rootfs, no Linux caps, no setuid escalation, fork-bomb bound, tini as PID 1, healthcheck-gated swap. See [secure by default](/docs/guide/security) for the full list and per-field rationale.
+The container inherits yoink's hardened defaults: read-only rootfs, no Linux caps, no setuid escalation, fork-bomb bound, tini as PID 1, healthcheck-gated swap. See [secure by default](/docs/guide/security) for the full list.
 
-If your `my-tool` actually needs to write somewhere, give it a tmpfs:
+If `my-tool` needs to write somewhere, give it a tmpfs:
 
 ```yaml
 run:
@@ -44,8 +44,8 @@ run:
 
 ## When to graduate
 
-This shape works fine forever for hobby / utility / internal-tool deployments. You'd outgrow it when:
+This shape stays fine for hobby / utility / internal-tool deployments. Outgrow it when:
 
-- **You need replicas** — a single container's downtime during the swap is your downtime. Add `replicas: 2` (yoink does a rolling swap, capacity stays N-1).
-- **You need multiple hosts** — yoink ships the build artifact from your local daemon to every host on every deploy. Once that's painful, set up a [self-hosted tailnet registry](/docs/how-to/self-hosted-registry) so the hosts pull from a shared cache instead.
-- **You need deploys triggered from CI** — keep the `build:` block + add a real registry, switch to `yoink build --push` + `yoink up`.
+- **Replicas** — single-container swap downtime is your downtime. Add `replicas: 2` for rolling swap (capacity N-1).
+- **Multiple hosts** — yoink ships the build artifact from your daemon to every host on every deploy. Once painful, add a [self-hosted tailnet registry](/docs/how-to/self-hosted-registry) so hosts pull from a shared cache.
+- **CI-triggered deploys** — keep `build:`, add a real registry, switch to `yoink build --push` + `yoink up`.

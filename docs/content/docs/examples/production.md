@@ -3,9 +3,9 @@ title: Production-shape
 weight: 3
 ---
 
-Once your deploy graduates from "one container on a VPS" to "this is what the team ships against", you start needing more: secrets that aren't in the repo as plaintext, a config you can split across files instead of one wall, pre-deploy migrations, an environment for QA that mirrors prod without paying for separate hardware, and a way for reviewers to see what a PR will change before it merges.
+Once a deploy is what the team ships against, you need more than `compose up`: secrets out of the repo, config split across files, pre-deploy migrations, a staging environment on the same hardware, and a PR-time diff for reviewers.
 
-This is the shape for that case: **a real prod-shape `yoink.yaml`** with multiple hosts (you can run on one and scale out later), age-sealed secrets committed to the repo, registry-pulled images that CI builds, fragmented across files for sanity, plus a separate staging entry that runs alongside prod on the same hosts.
+**A prod-shape `yoink.yaml`**: multiple hosts (start with one, scale later), age-sealed secrets in git, CI-built registry images, config fragmented across files, and a staging entry running alongside prod on the same hosts.
 
 ## Layout
 
@@ -142,7 +142,7 @@ services:
 
 ## Reverse proxy
 
-There is no `caddy.yaml` fragment in this layout. Yoink's bundled proxy is synthesized from the top-level `proxy:` block plus each service's `domain:` field — no explicit Caddy service to declare, no Caddyfile to maintain, no `caddy_data` volume to babysit. See [the proxy guide](/docs/guide/proxy) for the full surface (mTLS, h2c, multi-domain canonical redirects, snippets).
+No `caddy.yaml` fragment. The bundled proxy is synthesized from the top-level `proxy:` block plus each service's `domain:`. See [the proxy guide](/docs/guide/proxy) for the full surface (mTLS, h2c, multi-domain canonical redirects, snippets).
 
 ## `services/prod/otel.yaml`
 
@@ -207,14 +207,14 @@ See [PR-comment dry-run](/docs/how-to/pr-comment-dry-run) for the complete workf
 
 ## What this exercises
 
-- **Multi-tier networks** — `redis` only on `redis`; otel isolated on `otel`; api joined to `api/redis/otel` per its dial-out needs. Per-service blast radius.
-- **Bundled reverse proxy** — `domain:` on api/web, `proxy.tls` block once at the top, no `caddy.yaml` fragment to maintain. The proxy auto-joins `yoink-ingress` along with every routed service.
-- **Pre-deploy hooks** — `api-migrate` runs once per up, before the api swap, with the same image as the runtime.
-- **`env_from_secrets`** — secret stored under one name, exposed under a different env-var name on the container. Pattern for legacy env-var conventions.
-- **`files:` mounts** — content-hashed bind that feeds into `spec_hash`. Edit the otel config, redeploy → the otel container reroles automatically because its hash changed.
-- **Surgical security opt-outs** — `otel` opts out of the hardened defaults (with a comment explaining why); everything else inherits the defaults.
-- **Config fragmentation** — one file per service, glob-included. Each fragment is independent; renaming a service is a one-file operation.
-- **Staging alongside prod** — see [the recipe](/docs/how-to/staging-alongside-prod) for the same hosts running a `yoink.staging.yaml` with `name: api-staging` etc.
+- **Multi-tier networks** — `redis` only on `redis`; otel isolated on `otel`; api joined to `api/redis/otel` per its dial-out needs.
+- **Bundled reverse proxy** — `domain:` on api/web, one `proxy.tls` block at the top, no `caddy.yaml`. Auto-joins `yoink-ingress` with each routed service.
+- **Pre-deploy hooks** — `api-migrate` runs once per up before the api swap, same image as the runtime.
+- **`env_from_secrets`** — store under one name, expose under a different env-var name. For legacy env-var conventions.
+- **`files:` mounts** — content-hashed bind that feeds into `spec_hash`. Edit the otel config, redeploy, the otel container rerolls.
+- **Surgical security opt-outs** — `otel` opts out of the hardened defaults (with a comment); everything else inherits.
+- **Config fragmentation** — one file per service, glob-included. Renaming a service is a one-file operation.
+- **Staging alongside prod** — see [the recipe](/docs/how-to/staging-alongside-prod) for `yoink.staging.yaml` with `name: api-staging` on the same hosts.
 
 ## See also
 
