@@ -5,7 +5,7 @@ weight: 16
 
 When you run yoink across multiple hosts that serve the same domain, **each host's Caddy independently asks Let's Encrypt for a cert and you hit rate limits within a week**. The fix: share ACME state across all proxies via a small Redis instance reachable on a private network.
 
-If you're using Cloudflare's edge, the simpler answer is [Origin Certificates](/docs/recipes/cloudflare-origin-certs) — no ACME at all. This recipe is for the LE-direct case.
+If you're using Cloudflare's edge, the simpler answer is [Origin Certificates](/docs/how-to/cloudflare-origin-certs) — no ACME at all. This recipe is for the LE-direct case.
 
 ## Architecture
 
@@ -46,7 +46,7 @@ proxy:
 
 That gets the storage *module* compiled into the caddy binary on each host. Wiring caddy to actually *use* Redis as its storage backend takes one more step — see the [Wire caddy's storage backend](#wire-caddys-storage-backend) section below.
 
-See [Caddy plugins (xcaddy, no registry)](/docs/recipes/caddy-plugins) for the full xcaddy story (build cost, idempotency, debugging).
+See [Caddy plugins (xcaddy, no registry)](/docs/how-to/caddy-plugins) for the full xcaddy story (build cost, idempotency, debugging).
 
 ### Run Redis as a yoink service
 
@@ -107,5 +107,5 @@ For the proxies on `prod-2` and `prod-3` to reach `redis:6379` on `prod-1`'s tai
 ## See also
 
 - [Reverse proxy guide](/docs/guide/proxy)
-- [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs) — simpler path if you're already on Cloudflare's edge.
+- [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs) — simpler path if you're already on Cloudflare's edge.
 - [`caddy-storage-redis`](https://github.com/pberkel/caddy-storage-redis) — the upstream plugin.

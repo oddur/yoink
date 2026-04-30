@@ -60,7 +60,7 @@ The agent edits the file, runs the dry-run, you skim the diff, the agent applies
 
 ## CI is just an agent that doesn't talk back
 
-The GitHub Actions workflows yoink documents (see [Pre-merge dry-run on every PR](/docs/recipes/pr-comment-dry-run)) are the same shape: an automated runner edits / reads `yoink.yaml`, calls `yoink up --dry-run`, posts the diff back to the PR, and on merge calls `yoink up` for real. Anything an AI agent does locally, you can graduate to CI by copying the same commands into a workflow file.
+The GitHub Actions workflows yoink documents (see [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run)) are the same shape: an automated runner edits / reads `yoink.yaml`, calls `yoink up --dry-run`, posts the diff back to the PR, and on merge calls `yoink up` for real. Anything an AI agent does locally, you can graduate to CI by copying the same commands into a workflow file.
 
 ## What doesn't work yet
 
@@ -74,5 +74,5 @@ These are tractable; if you hit a friction point that an agent can't work around
 
 ## See also
 
-- [Pre-merge dry-run on every PR](/docs/recipes/pr-comment-dry-run) — agent-readable plan output via `yoink up --dry-run --format=markdown`.
+- [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run) — agent-readable plan output via `yoink up --dry-run --format=markdown`.
 - [CLI reference](/docs/reference/cli) — every subcommand surface an agent might drive.

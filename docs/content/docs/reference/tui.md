@@ -280,3 +280,9 @@ A consistent set of letters has the same meaning everywhere they appear:
 | `q` / `Ctrl-C` | quit |
 
 Letters are case-sensitive — capital letters generally mean "destructive or expensive" (kill, restart, reconcile-all, prune-all-images, …) and require a `y`/Enter confirmation when state-changing, while lowercase letters are read-only navigation / refreshes.
+
+## See also
+
+- [CLI reference](/docs/reference/cli) — the same commands the TUI binds to keys, in scriptable form.
+- [Driving yoink from an AI agent](/docs/guide/ai-agents) — the CLI surface the TUI mirrors, suitable for non-interactive driving.
+- [Troubleshooting](/docs/troubleshooting) — when the TUI shows something surprising.

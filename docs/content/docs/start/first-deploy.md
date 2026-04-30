@@ -181,8 +181,8 @@ If you're on Tailscale, point `address:` at the tailnet hostname. See [Pairing](
 | If you want to… | Read |
 |---|---|
 | Add HTTPS routing | [Reverse proxy guide](/docs/guide/proxy) |
-| Use Cloudflare origin certs (no Let's Encrypt) | [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs) |
-| Host a gRPC backend | [gRPC hosting](/docs/recipes/grpc-hosting) |
+| Use Cloudflare origin certs (no Let's Encrypt) | [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs) |
+| Host a gRPC backend | [gRPC hosting](/docs/how-to/grpc-hosting) |
 | Deploy from CI instead of locally | [Deploy modes](/docs/guide/deploy-modes) |
 | Understand the rolling deploy + drift detection | [Architecture](/docs/guide/architecture) |
 | See every CLI flag and config field | [CLI](/docs/reference/cli) and [Configuration](/docs/reference/config) |

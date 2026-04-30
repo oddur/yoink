@@ -46,7 +46,7 @@ A high-level cross-section before the per-tool deep dives. ✓ = built-in, ◐ =
 | Auto-scaling | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
 | Multi-tenancy / RBAC | ✗ | ✗ | ✓ | ◐ | ✓ | ✗ | ✗ | ✓ |
 
-The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, standalone (no-registry) mode, port-forwarding to services that don't publish host ports** (a kubectl-style affordance only Kubernetes itself otherwise offers in this peer group), **and one-line templates** (`yoink add postgres`, `yoink add openclaw`, `yoink add gh:acme/templates/foo` — see the [recipe](/docs/guide/templates)). The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
+The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, standalone (no-registry) mode, port-forwarding to services that don't publish host ports** (a kubectl-style affordance only Kubernetes itself otherwise offers in this peer group), **and one-line templates** (`yoink add postgres`, `yoink add openclaw`, `yoink add gh:acme/templates/foo` — see the [templates guide](/docs/guide/templates)). The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
 
 ## vs. [Kamal](https://kamal-deploy.org)
 
@@ -223,3 +223,9 @@ The honest baseline. Many small deployments are exactly this and that's fine.
 **Pick "just ssh + docker run" when**: you have one container, you only need to deploy occasionally, and you don't mind that `docker run` doesn't roll, doesn't healthcheck, doesn't drain, doesn't track who deployed what when.
 
 **Pick yoink when**: you've started writing shell scripts wrapping `ssh + docker run` and you'd like to stop. The yoink config is roughly the shape of those scripts but declarative, and the tool gives you the rolling/healthcheck/drift/history pieces you'd otherwise build yourself.
+
+## See also
+
+- [What and why](/docs/intro/what-and-why) — the design philosophy in one page.
+- [Start: first deploy](/docs/start/first-deploy) — five-minute hands-on if the matrix above lands you on yoink.
+- [Architecture](/docs/guide/architecture) — drift detection, deploy lock, healthcheck-gated swap.

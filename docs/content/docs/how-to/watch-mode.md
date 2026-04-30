@@ -56,6 +56,6 @@ The reconcile itself is cheap when nothing changed: yoink computes a [`yoink.spe
 
 ## See also
 
-- [TanStack Start + postgres](/docs/recipes/tanstack-stack) — uses `--build` as the deploy loop; pair with `--watch` for save-to-deploy.
+- [TanStack Start + postgres](/docs/how-to/tanstack-stack) — uses `--build` as the deploy loop; pair with `--watch` for save-to-deploy.
 - [Three deploy modes](/docs/guide/deploy-modes) — when local-build vs. CI-build vs. standalone fits.
 - [CLI reference: up](/docs/reference/cli) — `--watch` and the rest of the `yoink up` flag surface.

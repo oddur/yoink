@@ -149,7 +149,7 @@ caddy_extra_caddyfile: |
 
 ### Deploy and hit the public domain
 
-After `yoink up`, `https://assets.example.com/foo.png` serves the object from the `public-assets` bucket — TLS via Let's Encrypt by default (or sealed origin certs — see [Cloudflare origin certs](/docs/recipes/cloudflare-origin-certs)). The path-rewrite scopes the public endpoint to one bucket so the rest of your S3 endpoint (other buckets, the admin API) stays internal-only — but use this only for genuinely public assets, since the bucket policy is the sole access control on objects under `public-assets/*`. Add a method matcher (`@get method GET HEAD` + `respond 405` for everything else) if you want defense-in-depth against rogue PUT attempts.
+After `yoink up`, `https://assets.example.com/foo.png` serves the object from the `public-assets` bucket — TLS via Let's Encrypt by default (or sealed origin certs — see [Cloudflare origin certs](/docs/how-to/cloudflare-origin-certs)). The path-rewrite scopes the public endpoint to one bucket so the rest of your S3 endpoint (other buckets, the admin API) stays internal-only — but use this only for genuinely public assets, since the bucket policy is the sole access control on objects under `public-assets/*`. Add a method matcher (`@get method GET HEAD` + `respond 405` for everything else) if you want defense-in-depth against rogue PUT attempts.
 
 {{% /steps %}}
 

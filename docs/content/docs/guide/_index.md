@@ -5,7 +5,7 @@ sidebar:
   open: true
 ---
 
-The mental model. Read this once; come back to recipes / reference for the rest.
+The mental model. Read this once; come back to how-to / reference for the rest.
 
 {{< cards cols="2" >}}
   {{< card link="/docs/guide/architecture" title="How it works" subtitle="Drift detection, deploy lock, spec_hash, dependency-ordered waves, healthcheck-gated rolling swap." icon="information-circle" >}}

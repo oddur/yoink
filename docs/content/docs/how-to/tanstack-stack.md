@@ -278,7 +278,7 @@ Two things to check before deploying:
 
 Re-deploy and the app is live at `https://app.example.com`. `yoink doctor` confirms ahead of `yoink up` that the host is reachable, the domain resolves, and the email isn't a placeholder.
 
-For Cloudflare-fronted setups (so you don't need an open `:80` for ACME), see [Cloudflare Origin Certificates](/docs/recipes/cloudflare-origin-certs). For multi-host shared ACME storage, see [Multi-host Let's Encrypt with Redis](/docs/recipes/multi-host-redis-storage).
+For Cloudflare-fronted setups (so you don't need an open `:80` for ACME), see [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs). For multi-host shared ACME storage, see [Multi-host Let's Encrypt with Redis](/docs/how-to/multi-host-redis-storage).
 
 ## Multiple projects on one host
 
@@ -307,4 +307,4 @@ Coordination cost: every project's CI runner needs the host config's age identit
 - [Drop-in templates with `yoink add`](/docs/guide/templates) — adding redis / meilisearch alongside postgres.
 - [Port-forward to any service](/docs/guide/networking#port-forward) — full background on the `yoink pf` verify step.
 - [Sealed secrets (age)](/docs/guide/secrets) — what `yoink init` set up, and how to back up the key.
-- [Edit-save-deploy with `--watch`](/docs/recipes/watch-mode) — turn the redeploy command into a save-triggered loop.
+- [Edit-save-deploy with `--watch`](/docs/how-to/watch-mode) — turn the redeploy command into a save-triggered loop.

@@ -47,7 +47,7 @@ Single-host PaaS tools are wonderful for "one app, one host" but creak the momen
   - binds default `:ro`
 
   Override per service when an image genuinely needs root or specific file ownership.
-- **Port-forward without weakening the deploy posture.** `yoink pf <service>` opens a kubectl-style tunnel to any container — published or not — so the locked-down "no `publish:` for backends" default stops fighting with the on-call's need to point a browser at something. Same one-key UX in the TUI. See [port-forward recipe](/docs/guide/networking#port-forward).
+- **Port-forward without weakening the deploy posture.** `yoink pf <service>` opens a kubectl-style tunnel to any container — published or not — so the locked-down "no `publish:` for backends" default stops fighting with the on-call's need to point a browser at something. Same one-key UX in the TUI. See [port-forward](/docs/guide/networking#port-forward).
 - **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI) or — on a laptop — auto-discovered from `~/.config/yoink/keys/<recipient>.key` (where `yoink secrets key generate` saves by default; one identity per project, no env var to set). No remote vault required. For teams that prefer a managed store, `provider: command` shells out to whatever CLI you already use (Doppler, 1Password, Vault, AWS Secrets Manager, the Infisical CLI, …) — no first-party SDK to vendor.
 - **Bundled reverse proxy.** Set `domain:` on a service and yoink's bundled Caddy fronts it with HTTPS — automatic Let's Encrypt or sealed Cloudflare origin certs (with optional origin-pull mTLS). h2c for gRPC, HSTS, compression, multi-host canonical redirects — all one-line opt-ins.
 - **CLI + YAML, no GUI.** The entire control surface is the `yoink` binary plus `yoink.yaml`. No web dashboard to click, no API to script. The same workflow that you run by hand drives CI runners and AI coding agents identically — yoink is happy to be driven by Claude Code, Cursor, or a GitHub Actions job.
@@ -78,3 +78,9 @@ The same shape applies elsewhere: registry credentials, CI integrations, host-le
 - **No web dashboard or REST API.** Everything happens through the CLI and YAML. The TUI is a keyboard-driven inspector, not a control plane.
 - **No multi-cluster, HA failover, or geo-distribution.** One operator, one config, one deploy at a time. For multi-region, run separate yoink configs per region.
 - **No load balancer or geo-routing.** Yoink ships a [bundled Caddy reverse proxy](/docs/guide/proxy) for HTTPS + per-host routing, but it does not coordinate traffic across hosts. [Tailscale](/docs/guide/networking) is a clean way to bridge several hosts into one network.
+
+## See also
+
+- [Is this for me?](/docs/intro/compared) — side-by-side matrix vs Kamal, Coolify, Dokku, Komodo, Kubernetes, plain compose.
+- [Start: first deploy](/docs/start/first-deploy) — five-minute hands-on against a real host.
+- [Architecture](/docs/guide/architecture) — the deploy engine in detail.

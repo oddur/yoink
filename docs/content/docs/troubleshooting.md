@@ -128,3 +128,9 @@ Working as intended. [`spec_hash`](/docs/guide/architecture#drift-detection) mat
 labels:
   redeploy_nonce: "2026-04-26"
 ```
+
+## See also
+
+- [Architecture](/docs/guide/architecture) — drift detection, deploy lock, healthcheck-gated swap.
+- [CLI reference](/docs/reference/cli) — every flag and subcommand, including the diagnostic ones (`yoink doctor`, `yoink validate`, `yoink status`).
+- [Configuration reference](/docs/reference/config) — schema for everything in `yoink.yaml`.

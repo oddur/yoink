@@ -39,8 +39,8 @@ menu:
     - name: Guide
       pageRef: /docs/guide
       weight: 3
-    - name: Recipes
-      pageRef: /docs/recipes
+    - name: How-to
+      pageRef: /docs/how-to
       weight: 4
     - name: Reference
       pageRef: /docs/reference

@@ -3,7 +3,9 @@ title: How it works
 weight: 4
 ---
 
-The mental model for what yoink does under the hood. Useful when an output surprises you and you want to understand why.
+`docker compose up`, `ssh && docker run`, and hand-rolled bash share four failure modes: they re-create containers that haven't changed (or skip re-creating ones that did); they swap atomically only if you wire the healthcheck flags; they keep no audit trail; and two concurrent runs corrupt host state silently.
+
+Yoink addresses each: **a content hash on every container** for drift detection, **a deploy lock** for concurrent runs, **a healthcheck-gated swap** so a broken build can't replace a working one, and **an audit trail with one-key rollback**. This page covers each.
 
 ## Drift detection
 
@@ -134,3 +136,10 @@ For each replica of each service, yoink does:
 6. On healthcheck failure: leave the new container running but exited, leave the old one running, surface the error. The operator inspects via `yoink logs` / `yoink shell` and either fixes config or rolls back.
 
 Replicas run sequentially (one container at a time per replica index) so capacity stays at N-1 during the swap. Across services in the same wave, swaps run concurrently.
+
+## See also
+
+- [Deploy modes](/docs/guide/deploy-modes) — how the build origin and distribution axes interact.
+- [Networking](/docs/guide/networking) — multi-host distribution patterns + the no-publish default.
+- [Configuration reference](/docs/reference/config) — every field that flows into `spec_hash`.
+- [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run) — see drift detection in action via PR comments.

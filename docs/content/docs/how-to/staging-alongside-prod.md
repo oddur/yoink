@@ -113,4 +113,4 @@ Rotation, recipients, and the `YOINK_AGE_KEY` env var are independent per enviro
 
 - [Sealed secrets (age)](/docs/guide/secrets) — per-environment recipients and rotation.
 - [Multi-host distribution](/docs/guide/networking#multi-host-distribution) — when staging-vs-prod isn't enough and you need fine-grained host pinning.
-- [Pre-merge dry-run on every PR](/docs/recipes/pr-comment-dry-run) — catch staging/prod diffs at review time.
+- [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run) — catch staging/prod diffs at review time.

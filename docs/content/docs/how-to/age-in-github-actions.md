@@ -153,4 +153,4 @@ Recipients (who can decrypt) and values (what's stored) are independent — an i
 ## See also
 
 - [Secrets guide](/docs/guide/secrets) — full mental model for the keypair shape and the `provider: command` escape hatch when GitHub Secrets isn't where your secrets live.
-- [Pre-merge dry-run on every PR](/docs/recipes/pr-comment-dry-run) — same `YOINK_AGE_KEY` setup, applied to PR-time validation.
+- [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run) — same `YOINK_AGE_KEY` setup, applied to PR-time validation.

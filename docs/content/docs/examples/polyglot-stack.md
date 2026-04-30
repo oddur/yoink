@@ -3,7 +3,9 @@ title: Polyglot stack
 weight: 2
 ---
 
-A single host running a Rust API + Node web + Caddy reverse proxy + Redis cache. Per-tier networks isolate the blast radius. Image references are CI-built, deployed via `yoink up` after the registry already has the SHA-tagged images.
+A real app is usually a backend, a frontend, a cache, and something fronting them with TLS. `docker-compose up` on a VPS works until a deploy half-rolls and you're SSHing in to figure out which container is in what state.
+
+The same stack under yoink: **single host, Rust API + Node web + Caddy + Redis**, each tier on its own docker network so a compromise of one doesn't reach the others. Images from a registry (CI-built); `yoink up` rolls with healthcheck-gated swaps in dependency-ordered waves. Scales to multiple hosts via `hosts:` — see [Production-shape](/docs/examples/production).
 
 ```yaml
 # yoink.yaml
@@ -112,7 +114,7 @@ services:
 
 ## Reverse proxy
 
-No `services/caddy.yaml` needed — the moment any service has `domain:` set, yoink synthesizes a `yoink-proxy` service running `caddy:2`, joins it to the right networks, and pushes the routing config via Caddy's admin API on every deploy. ACME for Let's Encrypt happens in-container; certs persist across redeploys in a managed volume. See [Reverse proxy](/docs/guide/proxy) for the full schema (forward_auth, basic_auth, h2c for gRPC, etc.).
+No `services/caddy.yaml`. Any service with `domain:` set triggers yoink to synthesize a `yoink-proxy` service running `caddy:2`, join it to the right networks, and push routing config via Caddy's admin API on every deploy. ACME runs in-container; certs persist across redeploys in a managed volume. See [Reverse proxy](/docs/guide/proxy) for the full schema (forward_auth, basic_auth, h2c for gRPC).
 
 ## Deploying
 
@@ -121,12 +123,18 @@ SHA=$(git rev-parse HEAD)
 yoink up --tag api=$SHA --tag web=$SHA
 ```
 
-`redis` and `caddy` use literal tags from their config, so no `--tag` needed. `api` + `web` get `--tag` overrides at deploy time (typical CI pattern: pass the just-built SHA).
+`redis` and `caddy` use literal tags from their config. `api` and `web` get `--tag` overrides at deploy (CI passes the just-built SHA).
 
 ## What this exercises
 
-- **Per-tier networks**: `redis` only on the `redis` network; `caddy` only sees `api` and `web` because it joins those nets, never `redis` directly. A compromised `caddy` can't enumerate redis via docker DNS.
-- **`depends_on` waves**: `redis` first, then `api`, then `web`, then `caddy`. Independent services in the same wave run concurrently.
-- **Pre-deploy hooks**: `api-migrate` runs once per `up` (not per replica) before the api swap starts. Ships the same image as the runtime container so migrations match the code shape.
-- **Replicas**: `api` and `web` each have 2 — rolling swap keeps 1 alive while the new one healthchecks.
-- **Surgical security opt-out**: `caddy` re-adds `NET_BIND_SERVICE` only. `read_only` and `cap_drop=ALL` and `no-new-privileges` all stay default-on for it. `binds` for the docker socket is `:ro`; the data dir is explicit `:rw`.
+- **Per-tier networks**: `redis` only on `redis`; `caddy` joins `api` and `web` but never `redis`. A compromised `caddy` can't enumerate redis via docker DNS.
+- **`depends_on` waves**: `redis` → `api` → `web` → `caddy`. Independent services in the same wave run concurrently.
+- **Pre-deploy hooks**: `api-migrate` runs once per `up` (not per replica) before the api swap. Same image as the runtime container.
+- **Replicas**: `api` and `web` each at 2 — rolling swap keeps 1 alive while the new one healthchecks.
+- **Surgical security opt-out**: `caddy` re-adds `NET_BIND_SERVICE` only; `read_only`, `cap_drop=ALL`, and `no-new-privileges` stay default-on. Docker socket bind is `:ro`; data dir is explicit `:rw`.
+
+## See also
+
+- [Production-shape example](/docs/examples/production) — same patterns scaled to multi-host with secrets, pre-deploy hooks, and a fragmented config.
+- [Reverse proxy](/docs/guide/proxy) — the schema behind the bundled Caddy.
+- [Networking](/docs/guide/networking) — per-tier networks, multi-host distribution, port-forward.
