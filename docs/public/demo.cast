@@ -845,7 +845,6 @@
 [0.442, "o", "[docs] [203.0.113.10] docs-c1d70c8a-2 healthy (1 attempt(s))\r\n"]
 [0.248, "o", "[docs] [203.0.113.10] started docs-c1d70c8a-3\r\n"]
 [0.504, "o", "[docs] [203.0.113.10] docs-c1d70c8a-3 healthy (1 attempt(s))\r\n"]
-[0.101, "o", "2026-04-30T20:51:12.245152Z  WARN yoink::lock: lock heartbeat exec failed host=203.0.113.10 error=docker error on 203.0.113.10: Docker responded with status code 409: container d6bacd0351b0404a264d9f839d1797d6a94e649a8e6400aa1d9599aff3bc9428 is not running\r\n"]
 [0.877, "o", "[docs] [203.0.113.10] stopped old docs-61b702f9-3\r\n"]
 [0.316, "o", "[docs] [203.0.113.10] stopped old docs-61b702f9-2\r\n"]
 [0.420, "o", "[docs] [203.0.113.10] stopped old docs-61b702f9-1\r\n"]
