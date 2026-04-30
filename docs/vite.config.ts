@@ -27,6 +27,7 @@ export default defineConfig({
         { path: '/about' },
         { path: '/blog' },
         { path: '/api/search' },
+        { path: '/sitemap.xml' },
         { path: 'llms-full.txt' },
         { path: 'llms.txt' },
       ],

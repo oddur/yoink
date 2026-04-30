@@ -17,6 +17,11 @@ export const Route = createRootRoute({
       {
         title: 'yoink — docs',
       },
+      { property: 'og:title', content: 'yoink — docs' },
+      { property: 'og:description', content: 'A small, opinionated container deploy CLI + TUI for bare-metal hosts.' },
+      { property: 'og:image', content: 'https://yoink.is/og.png' },
+      { property: 'og:url', content: 'https://yoink.is' },
+      { name: 'twitter:card', content: 'summary_large_image' },
     ],
     links: [
       { rel: 'stylesheet', href: appCss },

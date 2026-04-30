@@ -15,6 +15,7 @@ import { baseOptions } from '@/lib/layout.shared';
 import { gitConfig } from '@/lib/shared';
 import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { useFumadocsLoader } from 'fumadocs-core/source/client';
+import { InlineTOC } from 'fumadocs-ui/components/inline-toc';
 import { Suspense } from 'react';
 import { useMDXComponents } from '@/components/mdx';
 
@@ -68,6 +69,7 @@ const clientLoader = browserCollections.docs.createClientLoader({
           />
         </div>
         <DocsBody>
+          {toc.length > 0 && <InlineTOC items={toc} className="lg:hidden mb-6" />}
           <MDX components={useMDXComponents()} />
         </DocsBody>
       </DocsPage>

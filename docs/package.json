@@ -5,6 +5,7 @@
   "sideEffects": false,
   "scripts": {
     "dev": "vite dev",
+    "prebuild": "node scripts/generate-og.mjs",
     "build": "vite build",
     "start": "serve .output/public --config serve.json",
     "preview": "vite preview",
@@ -27,6 +28,8 @@
     "vite": "^8.0.10"
   },
   "devDependencies": {
+    "@fontsource/inter": "^5.2.8",
+    "@resvg/resvg-js": "^2.6.2",
     "@tailwindcss/vite": "^4.2.4",
     "@types/mdx": "^2.0.13",
     "@types/node": "^25.6.0",
@@ -35,6 +38,7 @@
     "@vitejs/plugin-react": "^6.0.1",
     "hast-util-from-html": "^2.0.3",
     "nitro": "3.0.260415-beta",
+    "satori": "^0.26.0",
     "serve": "^14.2.6",
     "srvx": "^0.11.15",
     "tailwindcss": "^4.2.4",
