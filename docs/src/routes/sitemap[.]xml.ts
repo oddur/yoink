@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { source } from '@/lib/source';
+import { source, blogSource } from '@/lib/source';
 
 const BASE_URL = 'https://yoink.is';
 
@@ -7,12 +7,12 @@ export const Route = createFileRoute('/sitemap.xml')({
   server: {
     handlers: {
       GET() {
-        const pages = source.getPages();
         const urls = [
           BASE_URL,
           `${BASE_URL}/about`,
           `${BASE_URL}/blog`,
-          ...pages.map((p) => `${BASE_URL}${p.url}`),
+          ...blogSource.getPages().map((p) => `${BASE_URL}${p.url}`),
+          ...source.getPages().map((p) => `${BASE_URL}${p.url}`),
         ];
 
         const xml = `<?xml version="1.0" encoding="UTF-8"?>

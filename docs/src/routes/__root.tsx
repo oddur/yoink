@@ -33,12 +33,15 @@ export const Route = createRootRoute({
 
 function RootComponent() {
   return (
-    <html suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning>
       <head>
         <HeadContent />
       </head>
       <body className="flex flex-col min-h-screen">
-        <RootProvider search={{ SearchDialog }}>
+        <RootProvider
+          search={{ SearchDialog }}
+          theme={{ attribute: 'class', defaultTheme: 'system', disableTransitionOnChange: true }}
+        >
           <Outlet />
         </RootProvider>
         <Scripts />

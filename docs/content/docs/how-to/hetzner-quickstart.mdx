@@ -231,3 +231,10 @@ Hetzner billing is hourly capped at the monthly price; `hcloud server list` is w
 - **Move from `<ip>.nip.io` to a real hostname** — replace the `domain:` value, point an A record at `$IP`. Nothing else changes.
 - **Tighten TLS** with [Cloudflare Origin Certificates + origin-pull mTLS](/docs/how-to/cloudflare-origin-certs) once you have a real domain.
 - **Scale to multiple hosts** sharing one ACME state pool: [Multi-host Let's Encrypt with Redis](/docs/how-to/multi-host-redis-storage).
+
+## See also
+
+- [Reverse proxy guide](/docs/guide/proxy) — the bundled Caddy proxy and how to add HTTPS to any service.
+- [Sealed secrets workflow](/docs/how-to/sealed-secrets-workflow) — managing the AGE identity and sealed SSH key this quickstart generates.
+- [Standalone (no-registry) deploys](/docs/how-to/standalone-mode) — how `--build` ships the image to the host without a registry.
+- [First deploy](/docs/start/first-deploy) — the minimal version of this flow without the Hetzner provisioning steps.
