@@ -17,7 +17,7 @@ There are good tools in this neighborhood already — Kamal, Dokku, Coolify, pla
 
 It was originally meant for small side projects, sharing a prototype, running an experiment cheaply on a VPS without spinning up a registry and a CI pipeline first. It still is. But the same primitives — healthcheck-gated swaps, pre-deploy migrations, sealed secrets, multi-host fan-out — also operate a production-quality setup if you wield it that way.
 
-In fact, we dogfood it to feed this very site off a $4/mo VPS — [check out how](https://github.com/oddur/yoink/blob/main/docs/yoink.yaml).
+In fact, we dogfood it to serve this very site off a $4/mo VPS — [check out how](https://github.com/oddur/yoink/blob/main/docs/yoink.yaml).
 
 If yoink ends up useful to you, I'd love to hear about it — [oddur.me](https://oddur.me).
 
