@@ -495,10 +495,10 @@ enum Command {
     /// the target's live rootfs — over an SSH tunnel.
     ///
     /// Usage:
-    ///   yoink fs api                       # open in browser
-    ///   yoink fs api --no-open             # print URL, don't open
-    ///   yoink fs api --port 8080           # pin local port
-    Fs {
+    ///   yoink vscode api                   # open in browser
+    ///   yoink vscode api --no-open         # print URL, don't open
+    ///   yoink vscode api --port 8080       # pin local port
+    Vscode {
         /// Service name as declared in the config.
         service: String,
         /// Pin to a specific host when the service runs on multiple.
@@ -1288,7 +1288,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Command::Fs {
+        Command::Vscode {
             service,
             host,
             replica,
@@ -1297,10 +1297,10 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let ops: std::sync::Arc<dyn DockerOps> =
                 std::sync::Arc::new(build_real_ops(&config, None).await?);
-            yoink::fs::cmd_fs(
+            yoink::vscode::cmd_vscode(
                 &config,
                 &service,
-                yoink::fs::FsOptions {
+                yoink::vscode::VscodeOptions {
                     host_filter: host,
                     replica,
                     open: !no_open,

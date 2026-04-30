@@ -1,4 +1,4 @@
-//! `yoink fs` — VS Code in your browser, rooted in a running container's
+//! `yoink vscode` — VS Code in your browser, rooted in a running container's
 //! filesystem.
 //!
 //! Pattern: spawn a `codercom/code-server` sidecar on the host, share the
@@ -55,7 +55,7 @@ const HTTP_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_READY_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
-pub struct FsOptions {
+pub struct VscodeOptions {
     pub host_filter: Option<String>,
     pub replica: usize,
     pub open: bool,
@@ -63,17 +63,17 @@ pub struct FsOptions {
 }
 
 #[derive(Debug, Error)]
-pub enum FsError {
+pub enum VscodeError {
     #[error("no service named {0:?} in this config")]
     ServiceNotFound(String),
     #[error(
-        "service {service:?} declares no `networks:` — `yoink fs` needs a docker network to join \
+        "service {service:?} declares no `networks:` — `yoink vscode` needs a docker network to join \
          (so code-server can resolve service DNS in its terminal). Add a `networks:` entry to the \
          service or `deploy.networks:`."
     )]
     NoNetwork { service: String },
     #[error(
-        "service {service:?} runs on `address: local` — `yoink fs` needs an SSH endpoint to tunnel \
+        "service {service:?} runs on `address: local` — `yoink vscode` needs an SSH endpoint to tunnel \
          through. Run against a remote host."
     )]
     LocalHost { service: String },
@@ -114,13 +114,13 @@ pub async fn resolve_target(
     ops: &dyn DockerOps,
     host: &Host,
     service: &ServiceConfig,
-) -> std::result::Result<(String, String), FsError> {
+) -> std::result::Result<(String, String), VscodeError> {
     let label = format!("yoink.service={}", service.name);
     let containers = ops
         .list_containers_by_label(host, &label)
         .await
         .map_err(|e| {
-            FsError::Sidecar(SidecarError::Inspect {
+            VscodeError::Sidecar(SidecarError::Inspect {
                 host: host.address.clone(),
                 name: format!("label:{label}"),
                 source: e,
@@ -130,7 +130,7 @@ pub async fn resolve_target(
     let target = containers
         .into_iter()
         .find(|c| c.is_running())
-        .ok_or_else(|| FsError::TargetNotRunning {
+        .ok_or_else(|| VscodeError::TargetNotRunning {
             service: service.name.clone(),
             host: host.address.clone(),
         })?;
@@ -144,7 +144,7 @@ pub async fn resolve_target(
         .as_ref()
         .and_then(|v| v.first().cloned())
         .or_else(|| target.networks.first().cloned())
-        .ok_or_else(|| FsError::NoNetwork {
+        .ok_or_else(|| VscodeError::NoNetwork {
             service: service.name.clone(),
         })?;
 
@@ -159,10 +159,10 @@ pub async fn spawn_codeserver_sidecar(
     target_service: &str,
     target_container: &str,
     network: &str,
-) -> std::result::Result<SidecarHandle, FsError> {
+) -> std::result::Result<SidecarHandle, VscodeError> {
     use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
 
-    let container_name = unique_fs_sidecar_name(target_service);
+    let container_name = unique_vscode_sidecar_name(target_service);
 
     let cached = ops
         .image_present(&host, CODE_SERVER_IMAGE, CODE_SERVER_TAG)
@@ -192,8 +192,8 @@ pub async fn spawn_codeserver_sidecar(
 
     let mut labels = HashMap::new();
     labels.insert("yoink.managed".into(), "true".into());
-    labels.insert("yoink.kind".into(), "fs-sidecar".into());
-    labels.insert("yoink.fs.target_service".into(), target_service.into());
+    labels.insert("yoink.kind".into(), "vscode-sidecar".into());
+    labels.insert("yoink.vscode.target_service".into(), target_service.into());
 
     // /proc/1 inside the sidecar is the *target's* PID 1 because we share
     // the target's PID namespace; /proc/1/root is the magic symlink to
@@ -272,20 +272,20 @@ pub async fn spawn_codeserver_sidecar(
     ))
 }
 
-fn unique_fs_sidecar_name(target_service: &str) -> String {
+fn unique_vscode_sidecar_name(target_service: &str) -> String {
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
     let suffix = format!("{pid:x}{:x}", nanos & 0xff_ffff);
-    format!("yoink-fs-{target_service}-{suffix}")
+    format!("yoink-vscode-{target_service}-{suffix}")
 }
 
 /// Poll `http://127.0.0.1:<local_port>/` after the SSH tunnel is up,
 /// return when code-server answers anything (any HTTP status — the
 /// "ready" signal is "Express has bound and is responding", not a
 /// specific status code).
-pub async fn wait_for_http(local_port: u16) -> std::result::Result<(), FsError> {
+pub async fn wait_for_http(local_port: u16) -> std::result::Result<(), VscodeError> {
     let deadline = std::time::Instant::now() + HTTP_READY_TIMEOUT;
     loop {
         if let Ok(stream) = tokio::time::timeout(
@@ -302,7 +302,7 @@ pub async fn wait_for_http(local_port: u16) -> std::result::Result<(), FsError> 
             }
         }
         if std::time::Instant::now() >= deadline {
-            return Err(FsError::HttpNotReady {
+            return Err(VscodeError::HttpNotReady {
                 host_port: local_port,
                 timeout: HTTP_READY_TIMEOUT,
             });
@@ -313,10 +313,10 @@ pub async fn wait_for_http(local_port: u16) -> std::result::Result<(), FsError> 
 
 /// Resolve service → host → SSH probe → spawn sidecar → SSH-tunnel →
 /// open browser. Mirrors `cmd_pf` shape.
-pub async fn cmd_fs(
+pub async fn cmd_vscode(
     config: &Config,
     service_name: &str,
-    options: FsOptions,
+    options: VscodeOptions,
     ops: Arc<dyn DockerOps>,
 ) -> anyhow::Result<()> {
     use crate::transport::tunnel::SshTunnel;
@@ -325,7 +325,7 @@ pub async fn cmd_fs(
         .services
         .iter()
         .find(|s| s.name == service_name)
-        .ok_or_else(|| FsError::ServiceNotFound(service_name.to_string()))?;
+        .ok_or_else(|| VscodeError::ServiceNotFound(service_name.to_string()))?;
 
     let applicable: Vec<_> = service
         .applicable_hosts(&config.hosts)
@@ -339,7 +339,7 @@ pub async fn cmd_fs(
         .collect();
     let host_cfg = match applicable.as_slice() {
         [] => {
-            return Err(FsError::NoApplicableHost {
+            return Err(VscodeError::NoApplicableHost {
                 service: service_name.to_string(),
                 matched: options
                     .host_filter
@@ -356,7 +356,7 @@ pub async fn cmd_fs(
                 .map(|h| format!("  {}", h.address))
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Err(FsError::AmbiguousHost {
+            return Err(VscodeError::AmbiguousHost {
                 service: service_name.to_string(),
                 n: many.len(),
                 listing,
@@ -366,14 +366,14 @@ pub async fn cmd_fs(
     };
 
     if host_cfg.address == "local" {
-        return Err(FsError::LocalHost {
+        return Err(VscodeError::LocalHost {
             service: service_name.to_string(),
         }
         .into());
     }
 
     if u32::try_from(options.replica).map_or(true, |r| r >= service.run.replicas) {
-        return Err(FsError::ReplicaOutOfRange {
+        return Err(VscodeError::ReplicaOutOfRange {
             service: service_name.to_string(),
             replicas: service.run.replicas,
             replica: options.replica,
@@ -449,31 +449,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unique_fs_sidecar_name_is_unique_across_calls() {
-        let a = unique_fs_sidecar_name("api");
+    fn unique_vscode_sidecar_name_is_unique_across_calls() {
+        let a = unique_vscode_sidecar_name("api");
         // Sleep a nanosecond-resolution tick so the suffix changes.
         std::thread::sleep(std::time::Duration::from_micros(1));
-        let b = unique_fs_sidecar_name("api");
+        let b = unique_vscode_sidecar_name("api");
         assert_ne!(a, b);
-        assert!(a.starts_with("yoink-fs-api-"));
-        assert!(b.starts_with("yoink-fs-api-"));
+        assert!(a.starts_with("yoink-vscode-api-"));
+        assert!(b.starts_with("yoink-vscode-api-"));
     }
 
     #[test]
     fn fs_error_messages_actionable() {
-        let e = FsError::NoNetwork {
+        let e = VscodeError::NoNetwork {
             service: "api".into(),
         };
         let s = e.to_string();
         assert!(s.contains("networks:"), "got: {s}");
 
-        let e = FsError::LocalHost {
+        let e = VscodeError::LocalHost {
             service: "api".into(),
         };
         let s = e.to_string();
         assert!(s.contains("SSH"), "got: {s}");
 
-        let e = FsError::TargetNotRunning {
+        let e = VscodeError::TargetNotRunning {
             service: "api".into(),
             host: "h1".into(),
         };

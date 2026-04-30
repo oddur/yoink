@@ -25,5 +25,5 @@ Task-oriented walkthroughs. Each how-to takes you from "I want X" to "X is runni
   {{< card link="/docs/how-to/self-hosted-registry" title="Self-hosted registry on a yoink host" subtitle="Run registry:2 as a yoink service, expose via tailnet, push to it." icon="cube" >}}
   {{< card link="/docs/how-to/pr-comment-dry-run" title="Pre-merge dry-run on every PR" subtitle="Sticky GitHub PR comment showing what `yoink up` would change before the merge." icon="annotation" >}}
   {{< card link="/docs/how-to/watch-mode" title="Edit-save-deploy with --watch" subtitle="`yoink up --watch --build` polls the config and redeploys on save. Hot-reload for prod-like dev without CI." icon="refresh" >}}
-  {{< card link="/docs/how-to/fs" title="Edit container files with `yoink fs`" subtitle="VS Code in your browser, rooted in a running container's live filesystem. No operator install — just SSH and a browser." icon="code" >}}
+  {{< card link="/docs/how-to/vscode" title="Edit container files with `yoink vscode`" subtitle="VS Code in your browser, rooted in a running container's live filesystem. No operator install — just SSH and a browser." icon="code" >}}
 {{< /cards >}}
