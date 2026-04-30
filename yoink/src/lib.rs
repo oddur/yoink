@@ -8,6 +8,7 @@ pub mod docker;
 pub mod docker_ops;
 pub mod doctor;
 pub mod files;
+pub mod fs;
 pub mod git;
 pub mod healthcheck;
 pub mod init;

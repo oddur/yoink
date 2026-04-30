@@ -163,6 +163,7 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
         &host_versions,
     ));
     findings.extend(dns_findings);
+    findings.extend(check_sshfs_for_yoink_fs());
 
     findings
 }
@@ -638,6 +639,30 @@ fn check_provider_command(config: &Config) -> Vec<Finding> {
             )),
         ]
     }
+}
+
+/// `yoink fs` shells out to `sshfs` for the FUSE mount. Soft-warn when
+/// it isn't on PATH so the operator finds out before they try the
+/// command and hit an opaque "executable not found" error. Pass-quiet
+/// when present so the doctor output stays tight on the common case.
+fn check_sshfs_for_yoink_fs() -> Vec<Finding> {
+    if which_on_path("sshfs").is_some() {
+        return vec![Finding::pass("yoink-fs", "`sshfs` is on PATH")];
+    }
+    let install_hint = if cfg!(target_os = "macos") {
+        "`brew install --cask fuse-t-sshfs` (kext-free; pulls FUSE-T as a dep)"
+    } else if cfg!(target_os = "linux") {
+        "install via your package manager: `apt install sshfs` / `dnf install fuse-sshfs` / etc"
+    } else {
+        "install sshfs for your OS — required for `yoink fs`"
+    };
+    vec![
+        Finding::warn(
+            "yoink-fs",
+            "`sshfs` not found on PATH — `yoink fs` will refuse to mount",
+        )
+        .with_fix(install_hint),
+    ]
 }
 
 /// Lightweight `which` — walk `PATH` and return the first match. We

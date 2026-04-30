@@ -21,6 +21,7 @@ Task-oriented walkthroughs. Each how-to takes you from "I want X" to "X is runni
   {{< card link="/docs/how-to/caddy-snippets" title="Caddy snippets cookbook" subtitle="Forward auth, basic auth, IP allowlist, custom headers, body-size limit, redirects, maintenance page — both Caddyfile and JSON forms." icon="document-duplicate" >}}
   {{< card link="/docs/how-to/age-in-github-actions" title="AGE secrets in GitHub Actions" subtitle="Generate a CI-only identity, paste into a GitHub secret, deploy. One env var." icon="key" >}}
   {{< card link="/docs/how-to/multi-host-redis-storage" title="Multi-host Let's Encrypt with Redis" subtitle="Share ACME state across hosts to avoid Let's Encrypt rate limits." icon="database" >}}
+  {{< card link="/docs/how-to/fs" title="Mount a container's filesystem" subtitle="`yoink fs <service>` mounts a running container at `/tmp/yoink-fs/<service>/` via SSH+FUSE. Like `yoink pf` but for files. Read-only by default; `--rw` opts in." icon="folder-open" >}}
   {{< card link="/docs/how-to/staging-alongside-prod" title="Run staging alongside prod" subtitle="Same hosts, two configs, namespaced services + networks." icon="duplicate" >}}
   {{< card link="/docs/how-to/self-hosted-registry" title="Self-hosted registry on a yoink host" subtitle="Run registry:2 as a yoink service, expose via tailnet, push to it." icon="cube" >}}
   {{< card link="/docs/how-to/pr-comment-dry-run" title="Pre-merge dry-run on every PR" subtitle="Sticky GitHub PR comment showing what `yoink up` would change before the merge." icon="annotation" >}}
