@@ -385,6 +385,27 @@ pub struct ContainerDetail {
     pub security_opt: Vec<String>,
     /// `--read-only` (immutable rootfs).
     pub read_only: bool,
+    /// Storage-driver state: `name` is the docker storage driver
+    /// (`overlay2`, `btrfs`, `zfs`, `vfs`, …) and `data` is its
+    /// driver-specific key/value map. For overlay2 this includes the
+    /// host paths `MergedDir`, `LowerDir`, `UpperDir`, `WorkDir` —
+    /// `MergedDir` is the union view that mirrors the container's
+    /// running rootfs. `yoink fs` reads it for the host-side
+    /// sshfs source. `None` when bollard didn't return the field
+    /// (older daemons or non-overlay drivers that don't populate it).
+    pub graph_driver: Option<GraphDriverInfo>,
+}
+
+/// Storage-driver state for a single container, as reported by
+/// `docker inspect` under `.GraphDriver`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GraphDriverInfo {
+    /// Driver name, e.g. `overlay2`, `btrfs`, `zfs`, `vfs`.
+    pub name: String,
+    /// Driver-specific data. For overlay2: `MergedDir`, `LowerDir`,
+    /// `UpperDir`, `WorkDir`. Empty for drivers that don't expose
+    /// host paths.
+    pub data: BTreeMap<String, String>,
 }
 
 impl ContainerDetail {
@@ -2233,6 +2254,15 @@ fn parse_inspect(name: &str, resp: &bollard::models::ContainerInspectResponse) -
         .into_iter()
         .collect();
 
+    let graph_driver = resp.graph_driver.as_ref().map(|gd| GraphDriverInfo {
+        name: gd.name.clone(),
+        data: gd
+            .data
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    });
+
     ContainerDetail {
         name: name.into(),
         image: config.and_then(|c| c.image.clone()),
@@ -2274,6 +2304,7 @@ fn parse_inspect(name: &str, resp: &bollard::models::ContainerInspectResponse) -
             .unwrap_or_default(),
         read_only: host_config.and_then(|h| h.readonly_rootfs).unwrap_or(false),
         labels,
+        graph_driver,
     }
 }
 

@@ -489,6 +489,45 @@ enum Command {
         #[arg(long, value_enum, default_value_t = PfMode::Auto)]
         mode: PfMode,
     },
+    /// Mount a running container's filesystem on your laptop via
+    /// SSH+FUSE. Like `pf` but for files: ctrl-c unmounts cleanly,
+    /// replica selection mirrors `pf`'s.
+    ///
+    /// Read-only by default — writes through the merged-fs view
+    /// race with the running app's writes (file locks, log rotation,
+    /// truncation). Pass `--rw` to opt in (with a loud warning).
+    ///
+    /// Requires `sshfs` on the operator's machine and the host's
+    /// docker storage driver to be `overlay2`. Other storage drivers
+    /// fail loudly — see `yoink doctor` for the install hint.
+    ///
+    /// Examples:
+    ///   yoink fs api                     # /tmp/yoink-fs/api/  (ro)
+    ///   yoink fs api --to ./api-fs       # explicit mountpoint
+    ///   yoink fs api --rw                # rw, with warning
+    ///   yoink fs api -r 1                # replica 1
+    Fs {
+        /// Service name as declared in the config.
+        service: String,
+        /// Pin to a specific host when the service runs on multiple.
+        #[arg(long)]
+        host: Option<String>,
+        /// Replica index (0-based) for services with `replicas: > 1`.
+        #[arg(short = 'r', long, default_value_t = 0)]
+        replica: usize,
+        /// Mountpoint on your laptop. Defaults to
+        /// `/tmp/yoink-fs/<service>/`. Created if missing; must be
+        /// empty if it exists (or contain only a stale FUSE mount,
+        /// which we'll reap before remounting).
+        #[arg(long)]
+        to: Option<std::path::PathBuf>,
+        /// Mount read-write. Default is read-only — writes through
+        /// `merged` mutate the running container's filesystem and
+        /// can corrupt running app state. Yoink prints a warning
+        /// before the mount completes when this is set.
+        #[arg(long)]
+        rw: bool,
+    },
     /// Like `shell` but spawns an `alpine` debug sidecar in the
     /// target's pid+net namespaces — for distroless / shell-less
     /// images. The sidecar is `--rm` and is force-removed on exit.
@@ -1248,6 +1287,28 @@ async fn run(cli: Cli) -> Result<()> {
                 scheme.into(),
                 json,
                 mode.into(),
+            )
+            .await
+        }
+        Command::Fs {
+            service,
+            host,
+            replica,
+            to,
+            rw,
+        } => {
+            let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
+                std::sync::Arc::new(build_real_ops(&config, None).await?);
+            yoink::fs::cmd_fs(
+                &config,
+                &service,
+                yoink::fs::FsOptions {
+                    host_filter: host,
+                    replica,
+                    to,
+                    rw,
+                },
+                ops,
             )
             .await
         }
