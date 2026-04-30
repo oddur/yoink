@@ -211,7 +211,8 @@ impl HistoryState {
         frame.render_stateful_widget(table, layout[1], &mut self.table);
 
         let footer_text = if self.errors.is_empty() {
-            "↑↓/jk navigate · r rollback to selected (running rows are skipped) · R refresh · esc back".to_string()
+            "↑↓/jk navigate · r rollback to selected (running rows are skipped) · esc back"
+                .to_string()
         } else {
             format!(
                 "⚠ {} host(s) unreachable: {}",

@@ -83,6 +83,9 @@ impl HostDetailState {
         // larger unfiltered count would let `selected` point past the
         // filtered list for a frame.
         let n = self.visible_indices().len();
+        // `clamp_selection` already picks row 0 when none was set, so
+        // per-row actions (`f` port-forward, `v` vscode, `S`/`X`/`T`/`K`
+        // lifecycle) are usable on first apply without nudging j/k.
         clamp_selection(&mut self.table, n);
     }
 
@@ -295,7 +298,7 @@ impl HostDetailState {
         }
         let footer = filter_footer(
             &self.filter,
-            "↑↓ select · enter logs · i inspect · ! shell · D debug · S start · X stop · R restart · K kill · U reconcile · r refresh",
+            "↑↓ select · enter logs · i inspect · ! shell · f forward · v vscode · D debug · S start · X stop · T restart · K kill · U reconcile · r refresh",
         );
         frame.render_widget(footer, footer_area);
 

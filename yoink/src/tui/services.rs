@@ -330,6 +330,8 @@ impl ServiceDetailState {
             self.rows = rows;
             // Clamp against the *filtered* count — `table.selected()`
             // indexes into `visible_indices()`, not `self.rows`.
+            // `clamp_selection` also picks row 0 when none was set,
+            // so per-row actions work on first apply.
             let n = self.visible_indices().len();
             clamp_selection(&mut self.table, n);
         }
@@ -496,7 +498,7 @@ impl ServiceDetailState {
 
         let footer = filter_footer(
             &self.filter,
-            "q quit · esc back · ↑↓ select · enter logs · ! shell · D debug",
+            "q quit · esc back · ↑↓ select · enter logs · ! shell · f forward · v vscode · D debug",
         );
         frame.render_widget(footer, layout[2]);
     }

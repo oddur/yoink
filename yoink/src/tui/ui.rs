@@ -418,24 +418,33 @@ pub fn inline_gauge(ratio: f32, width: usize, color: Color) -> Vec<Span<'static>
     ]
 }
 
-/// Substring-filter state shared by every list/table pane. Same
-/// lifecycle as `LogsState`'s filter:
-///   `/` enters input mode → `filter_push_char` / `filter_backspace`
-///   build the buffer → Enter applies → Esc cancels.
-/// `matches(text)` returns true when there's no filter, or when
-/// `text` (case-insensitive) contains the active filter.
+/// Substring-filter state shared by every list/table pane.
+///
+/// Filters live incrementally (vim-`/` style): every keystroke
+/// updates `filter` immediately, so the visible rows shrink as the
+/// operator types. `Enter` commits the filter and exits input mode;
+/// `Esc` cancels and restores whatever was active before `/` was
+/// pressed. `matches(text)` returns true when there's no filter, or
+/// when `text` (case-insensitive) contains the active filter.
 #[derive(Default, Debug, Clone)]
 pub struct FilterState {
     /// Currently-applied filter; rows whose searched text doesn't
-    /// contain this (case-insensitive) are hidden.
+    /// contain this (case-insensitive) are hidden. Updated on every
+    /// keystroke while in input mode so the table re-filters live.
     filter: Option<String>,
     /// Lowercased copy of `filter` — cached so per-row `matches()`
     /// during a render doesn't have to lowercase the (constant)
-    /// filter every time. Set together with `filter` and cleared on
-    /// `apply`/`clear`.
+    /// filter every time. Kept in lockstep with `filter`.
     filter_lc: Option<String>,
     /// `Some(buf)` while the user is typing a new filter via `/`.
+    /// Mirrors `filter` while typing — split out so the footer can
+    /// render the literal buffer (with cursor) regardless of the
+    /// applied state.
     input_buffer: Option<String>,
+    /// Snapshot of `filter` taken when `/` was pressed — restored on
+    /// `cancel` so Esc abandons the in-progress search and reverts to
+    /// the prior view.
+    prev_filter: Option<String>,
 }
 
 impl FilterState {
@@ -444,41 +453,73 @@ impl FilterState {
     }
 
     pub fn begin_input(&mut self) {
+        self.prev_filter = self.filter.clone();
         self.input_buffer = Some(self.filter.clone().unwrap_or_default());
     }
 
     pub fn push_char(&mut self, c: char) {
         if let Some(buf) = self.input_buffer.as_mut() {
             buf.push(c);
+            self.sync_filter_from_buffer();
         }
     }
 
     pub fn backspace(&mut self) {
         if let Some(buf) = self.input_buffer.as_mut() {
             buf.pop();
+            self.sync_filter_from_buffer();
         }
     }
 
+    /// Commit the typed filter — exit input mode; `filter` is already
+    /// up to date (each keystroke synced it). Drops the prev-filter
+    /// snapshot so a subsequent Esc on a fresh `/` doesn't restore
+    /// stale state.
     pub fn apply(&mut self) {
-        if let Some(buf) = self.input_buffer.take() {
-            if buf.is_empty() {
-                self.filter = None;
-                self.filter_lc = None;
-            } else {
-                self.filter_lc = Some(buf.to_ascii_lowercase());
-                self.filter = Some(buf);
-            }
-        }
+        self.input_buffer = None;
+        self.prev_filter = None;
     }
 
+    /// Abandon the in-progress search — restore whatever filter was
+    /// active before `/` was pressed.
     pub fn cancel(&mut self) {
         self.input_buffer = None;
+        let prev = self.prev_filter.take();
+        self.set_filter(prev);
     }
 
     pub fn clear(&mut self) {
         self.filter = None;
         self.filter_lc = None;
         self.input_buffer = None;
+        self.prev_filter = None;
+    }
+
+    /// Re-derive `filter` + `filter_lc` from the current input buffer.
+    /// Empty buffer means "no filter" so the user typing `/` then
+    /// backspacing back to empty restores the unfiltered view.
+    fn sync_filter_from_buffer(&mut self) {
+        let buf = self.input_buffer.as_deref().unwrap_or("");
+        if buf.is_empty() {
+            self.filter = None;
+            self.filter_lc = None;
+        } else {
+            self.filter_lc = Some(buf.to_ascii_lowercase());
+            self.filter = Some(buf.to_string());
+        }
+    }
+
+    fn set_filter(&mut self, value: Option<String>) {
+        match value {
+            None => {
+                self.filter = None;
+                self.filter_lc = None;
+            }
+            Some(s) => {
+                self.filter_lc = Some(s.to_ascii_lowercase());
+                self.filter = Some(s);
+            }
+        }
     }
 
     #[must_use]
@@ -508,7 +549,7 @@ impl FilterState {
 #[must_use]
 pub fn filter_footer(filter: &FilterState, default_help: &str) -> Paragraph<'static> {
     if let Some(buf) = filter.input_buffer() {
-        Paragraph::new(format!("/{buf}_  (enter apply · esc cancel)"))
+        Paragraph::new(format!("/{buf}_  (live · enter keep · esc revert)"))
             .style(Style::default().fg(Color::Yellow))
     } else if let Some(f) = filter.current() {
         Paragraph::new(format!(

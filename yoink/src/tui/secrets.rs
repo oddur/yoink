@@ -27,9 +27,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 
 use crate::config::{Config, SecretsConfig};
 use crate::sealed;
@@ -407,6 +408,12 @@ impl SecretsState {
             None => filter_footer(&self.filter, &footer_help),
         };
         frame.render_widget(footer, layout[2]);
+
+        // Add / view-edit modal renders on top of the table when
+        // input mode is active.
+        if self.input_mode() {
+            self.render_input_modal(frame);
+        }
     }
 
     fn flash_text(&self) -> Option<String> {
@@ -428,7 +435,7 @@ impl SecretsState {
         }
         let mut parts = vec!["q quit", "↑↓ select", "/ filter", "r reveal"];
         if writable {
-            parts.extend_from_slice(&["a add", "e edit", "d delete"]);
+            parts.extend_from_slice(&["a add", "Enter view/edit", "x delete"]);
         }
         parts.push("esc back");
         parts.join(" · ")
@@ -483,16 +490,6 @@ impl SecretsState {
             }
         }
 
-        // Append an "input row" while editing — gives the operator a
-        // visual anchor for what they're typing without a separate
-        // overlay.
-        if let Some((label, buffer)) = self.input_buffer_view() {
-            rows.push(Row::new(vec![
-                Cell::from(label).style(Style::default().fg(Color::Yellow)),
-                Cell::from(format!("{buffer}_")).style(Style::default().fg(Color::Yellow)),
-            ]));
-        }
-
         let table = Table::new(rows, widths)
             .header(Row::new(vec![
                 Cell::from("KEY").style(bold()),
@@ -504,17 +501,80 @@ impl SecretsState {
         frame.render_stateful_widget(table, area, &mut self.table);
     }
 
-    fn input_buffer_view(&self) -> Option<(String, &str)> {
-        match &self.edit {
-            EditState::AddingKey { buffer } => Some(("(new key)".into(), buffer.as_str())),
+    /// Centered input modal for the add / edit flows. The state
+    /// machine drives which field is focused: typing the key, then
+    /// the value (add); or typing the value directly (edit).
+    fn render_input_modal(&self, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        let modal_width = area.width.saturating_sub(8).min(72).max(40);
+        let modal_height: u16 = 9;
+        let x = area.width.saturating_sub(modal_width) / 2;
+        let y = area.height.saturating_sub(modal_height) / 2;
+        let modal_area = Rect {
+            x,
+            y,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        let (title, key_text, key_focused, value_text, value_focused) = match &self.edit {
+            EditState::AddingKey { buffer } => ("Add secret", buffer.as_str(), true, "", false),
             EditState::AddingValue { key, buffer } => {
-                Some((format!("(new value for {key})"), buffer.as_str()))
+                ("Add secret", key.as_str(), false, buffer.as_str(), true)
             }
-            EditState::EditingValue { key, buffer } => {
-                Some((format!("(editing {key})"), buffer.as_str()))
+            EditState::EditingValue { key, buffer } => (
+                "View / edit secret",
+                key.as_str(),
+                false,
+                buffer.as_str(),
+                true,
+            ),
+            _ => return,
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {title} "))
+            .style(Style::default().fg(Color::Cyan));
+        frame.render_widget(Clear, modal_area);
+        frame.render_widget(block, modal_area);
+
+        let inner = Rect {
+            x: modal_area.x + 2,
+            y: modal_area.y + 1,
+            width: modal_area.width.saturating_sub(4),
+            height: modal_area.height.saturating_sub(2),
+        };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // KEY label
+                Constraint::Length(1), // KEY field
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // VALUE label
+                Constraint::Length(1), // VALUE field
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // hint
+            ])
+            .split(inner);
+
+        let label_style = Style::default().add_modifier(Modifier::BOLD);
+        frame.render_widget(Paragraph::new("KEY").style(label_style), rows[0]);
+        frame.render_widget(render_field(key_text, key_focused), rows[1]);
+        frame.render_widget(Paragraph::new("VALUE").style(label_style), rows[3]);
+        frame.render_widget(render_field(value_text, value_focused), rows[4]);
+
+        let hint = match &self.edit {
+            EditState::AddingKey { .. } => "enter → next field · esc cancel",
+            EditState::AddingValue { .. } | EditState::EditingValue { .. } => {
+                "enter apply · esc cancel"
             }
-            _ => None,
-        }
+            _ => "",
+        };
+        frame.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            rows[6],
+        );
     }
 
     /// Lines for the confirmation-modal renderer (`render_modal`).
@@ -535,6 +595,26 @@ impl SecretsState {
             "[any]         cancel".into(),
         ];
         Some(("remove secret?", body))
+    }
+}
+
+/// One input field row inside the add/edit modal. Focused field
+/// renders the buffer + blinking cursor in yellow; unfocused field
+/// renders the value (or `(empty)` placeholder) in default style.
+fn render_field(buffer: &str, focused: bool) -> Paragraph<'_> {
+    let focused_style = Style::default().fg(Color::Yellow);
+    if focused {
+        Paragraph::new(Line::from(vec![
+            Span::styled(buffer, focused_style),
+            Span::styled("_", focused_style.add_modifier(Modifier::SLOW_BLINK)),
+        ]))
+    } else if buffer.is_empty() {
+        Paragraph::new(Span::styled(
+            "(empty)",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Paragraph::new(Span::raw(buffer))
     }
 }
 

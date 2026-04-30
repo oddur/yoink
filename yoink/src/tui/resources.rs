@@ -363,10 +363,10 @@ impl ResourcesState {
         // Footer: filter line + per-tab help on the right.
         let help = match self.current_tab() {
             ResourceTab::Images => {
-                "Tab cycle · d remove · P prune dangling · A prune all · r refresh · ?"
+                "Tab cycle · x remove · P prune dangling · A prune all · r refresh · ?"
             }
             ResourceTab::Volumes | ResourceTab::Networks => {
-                "Tab cycle · d remove · P prune unused · r refresh · ?"
+                "Tab cycle · x remove · P prune unused · r refresh · ?"
             }
         };
         frame.render_widget(filter_footer(&self.filter, help), footer);
