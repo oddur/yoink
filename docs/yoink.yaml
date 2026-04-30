@@ -1,0 +1,62 @@
+# Dogfood deploy of the yoink docs site to a Hetzner cx22, fronted by
+# Cloudflare with Authenticated Origin Pulls. The whole docs project
+# (Hugo source, Dockerfile, deploy config, sealed secrets) lives under
+# `docs/` so this is a self-contained tree — `cd docs && yoink up
+# --build` from anywhere.
+#
+# Every secret value (host IP, deploy SSH key, CF origin cert + key,
+# CF AOP CA bundle) is sealed in secrets.age. The only thing that
+# unseals it is the docs-scoped age identity, kept off this repo
+# (operator's keys-dir + 1Password recovery copy).
+deploy:
+  networks: [docs]
+
+hosts:
+  - address_secret: YOINK_DOCS_HOST   # box public IP, sealed
+    user: deploy
+    ssh_key_secret: DEPLOY_SSH_KEY    # ed25519 private, sealed
+
+secrets:
+  provider: age
+  recipients:
+    - age1ppua5ele3d2n3ndhmr96khyuljensrcjycm7c04nntht62vf49wsku64wq
+  file: secrets.age                   # resolved relative to this yaml's dir
+
+# Bundled Caddy fronts the nginx service.
+# - cert + key: Cloudflare Origin Certificate (15-year, sealed)
+# - client_auth: Cloudflare Authenticated Origin Pulls — the box rejects
+#   any TLS handshake whose client cert isn't signed by Cloudflare's AOP
+#   CA. Direct hits to the box IP fail at the handshake.
+# - no `email:` because there's no ACME (origin cert is the cert).
+proxy:
+  tls:
+    cert_secret: CF_ORIGIN_CERT
+    key_secret:  CF_ORIGIN_KEY
+    client_auth:
+      mode: require_and_verify
+      trust_pool_secret: CF_ORIGIN_PULL_CA
+
+services:
+  - name: docs
+    image: yoink-docs                 # bare name — `build:` makes it local-only
+    tag: latest
+    build:
+      context: .                      # docs/ — same dir as this yaml
+    domain: yoink.is
+    networks: [docs]
+    run:
+      port: 80
+      healthcheck_path: /
+      healthcheck_timeout: 30s
+      options:
+        memory: "128Mi"
+        cpus: "0.5"
+        # nginx:alpine writes to /var/cache/nginx + /var/run + /tmp;
+        # all three must be tmpfs because rootfs is read-only by default.
+        tmpfs:
+          /var/cache/nginx: "size=16m,mode=1777"
+          /var/run: "size=2m,mode=1777"
+          /tmp: "size=16m,mode=1777"
+        # Bind low port (80) — re-add the one cap, drop the rest.
+        cap_add: [NET_BIND_SERVICE]
+        network_aliases: [docs]
