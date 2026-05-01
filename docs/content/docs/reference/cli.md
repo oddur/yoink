@@ -113,6 +113,23 @@ yoink rollback <SERVICE>                 redeploy the previous spec_hash
 yoink history <SERVICE>                  list past deploys (when, version, state, deployed-by)
   --limit <N>                            cap the row count
 
+yoink audit log                          stream the on-host JSONL audit log across the fleet
+                                         (every state-changing op yoink performed on each host;
+                                         survives `docker rm`)
+  --host <ADDR>                          restrict to one host
+  --service <NAME>                       restrict to one service
+  --deploy-id <ID>                       only events from this run
+  --event <NAME>                         filter by event name (repeatable)
+  --since <DURATION>                     window relative to now (default 7d)
+  --limit <N>                            cap the row count (default 100)
+  --format text|json                     `json` emits raw JSONL — pipes cleanly into jq
+yoink audit run <DEPLOY_ID>              every event for one run, ordered, across all hosts.
+                                         Useful for reconstructing what one `yoink up` did.
+yoink audit gc [--keep <DURATION>]       remove rotated audit files older than --keep
+                                         (default 90d). Active events.jsonl is never touched.
+  --host <ADDR>                          restrict to one host
+  --dry-run                              preview what would be removed
+
 yoink prune                              remove yoink-managed containers no longer in config
   --dry-run                              show what would be removed
 

@@ -1,0 +1,842 @@
+//! On-host audit log. Each yoink-managed host gets an append-only
+//! JSONL file at `/var/lib/yoink/audit/events.jsonl` recording every
+//! state-changing operation yoink performs there. Surfaced via
+//! `yoink audit log|run|gc`.
+//!
+//! ## Why on-host, not a central store
+//!
+//! Yoink's bet is "no daemon, no DB". Pushing audit events to a remote
+//! aggregator at deploy time would tie operators to a piece of infra
+//! they don't otherwise need. Writing to the host filesystem follows
+//! the same shape as `/var/lib/yoink/files/` and survives the operator
+//! disconnecting mid-deploy.
+//!
+//! ## Hybrid flush policy
+//!
+//! - **Per-event flush** for forensic events (`RunStarted`/`RunFinished`,
+//!   `ContainerCreated`/`ContainerRemoved`, `Rollback*`, `SecretsRotated`,
+//!   `HookFinished`, `LockAcquired`/`LockReleased`, `FileUploaded`). One
+//!   SSH `tee -a` per event; tolerates partial runs.
+//! - **Batched flush** for progress events (`PullStarted`/`PullFinished`,
+//!   `NetworkReady`, `HealthcheckHealthy`, `HookStarted`,
+//!   `OldContainerStopped`, `ContainerStarted`, `AlreadyAtSpec`).
+//!   Buffered in a per-host ring, flushed at end-of-run (and
+//!   explicitly on `flush()`).
+//!
+//! Audit-write failures never block deploys — they warn to stderr and
+//! continue. Forensic events that fail are logged loudly so the
+//! operator notices; progress events fail in stderr noise.
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
+use tokio::sync::Mutex;
+
+use crate::docker_ops::Host;
+
+/// Where we keep the audit log on each host. Same parent directory as
+/// `/var/lib/yoink/files/` so all yoink host-side state sits in one
+/// predictable place.
+pub const AUDIT_DIR: &str = "/var/lib/yoink/audit";
+pub const AUDIT_FILE: &str = "/var/lib/yoink/audit/events.jsonl";
+/// Active file size at which a flush triggers a rotation. 5 MiB ≈
+/// thousands of events; a busy host's audit file rotates every few
+/// weeks at most.
+pub const ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Audit-event payload variants. Discriminated on the `event` JSON
+/// field; serde tag = "event" keeps the wire shape flat: every field
+/// at the top level, no nested `payload: { ... }`. This matches what
+/// JSONL consumers (jq, awk, vector) expect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "PascalCase")]
+pub enum AuditEventKind {
+    /// Envelope: a `yoink up` / rollback / prune / secrets-rotate run
+    /// has begun. One per command invocation, before any host work.
+    RunStarted {
+        command: String,
+        services: Vec<String>,
+    },
+    /// Envelope: same run finished. `ok: false` carries the operator-
+    /// visible error message so a tail of the audit log shows why a
+    /// deploy died without grepping terminal scrollback.
+    RunFinished {
+        command: String,
+        ok: bool,
+        error: Option<String>,
+    },
+    /// Lock sentinel created on this host. `LockReleased` always pairs
+    /// with this — the gap between them is the deploy-lock hold time.
+    LockAcquired,
+    LockReleased,
+    /// A pre-/post-deploy hook started running. Best-effort.
+    HookStarted { name: String },
+    /// Hook finished. Forensic — the exit code matters for triage.
+    HookFinished { name: String },
+    /// Image pull began on this host. Best-effort progress event.
+    PullStarted { image: String, tag: String },
+    PullFinished { image: String, tag: String },
+    /// Docker network ensured (created if missing). Progress event.
+    NetworkReady { network: String, created: bool },
+    /// New container started. Progress (the forensic
+    /// "this is the container we'll keep" event is `ContainerCreated`,
+    /// emitted after the healthcheck passes).
+    ContainerStarted {
+        service: String,
+        container: String,
+        spec_hash: String,
+        tag: String,
+    },
+    HealthcheckHealthy {
+        service: String,
+        container: String,
+        attempts: u32,
+    },
+    /// New container at the target spec passed its healthcheck and was
+    /// promoted into routing — this is the "we did the deploy" event.
+    ContainerCreated {
+        service: String,
+        container: String,
+        spec_hash: String,
+        tag: String,
+    },
+    /// Service was already at the desired spec — no work done. The
+    /// operator can use this to verify a redeploy was a no-op.
+    AlreadyAtSpec {
+        service: String,
+        container: String,
+        spec_hash: String,
+    },
+    /// Old replica stopped after a successful swap. Progress.
+    OldContainerStopped { service: String, container: String },
+    /// Old replica removed. Forensic — pairs with `ContainerCreated` to
+    /// reconstruct a swap.
+    ContainerRemoved { service: String, container: String },
+    /// Healthcheck never passed; the deploy aborted and this is the
+    /// container's last log lines for triage.
+    DeployFailed {
+        service: String,
+        container: String,
+        log_tail: Vec<String>,
+    },
+    /// `yoink rollback <SERVICE>` started.
+    RollbackStarted { service: String, target_tag: String },
+    /// `yoink rollback <SERVICE>` finished.
+    RollbackFinished {
+        service: String,
+        ok: bool,
+        error: Option<String>,
+    },
+    /// `yoink prune` removed an orphaned container.
+    ContainerPruned {
+        service: Option<String>,
+        container: String,
+    },
+    /// `yoink secrets rotate` re-sealed against a new recipient.
+    SecretsRotated { new_recipient: String },
+    /// File uploaded into `/var/lib/yoink/files/` for a service mount.
+    FileUploaded {
+        service: String,
+        sha256: String,
+        remote_path: String,
+    },
+}
+
+impl AuditEventKind {
+    /// Forensic events bypass the ring buffer and SSH-flush
+    /// immediately. Progress events buffer up and flush in batches.
+    #[must_use]
+    pub const fn is_forensic(&self) -> bool {
+        matches!(
+            self,
+            AuditEventKind::RunStarted { .. }
+                | AuditEventKind::RunFinished { .. }
+                | AuditEventKind::LockAcquired
+                | AuditEventKind::LockReleased
+                | AuditEventKind::HookFinished { .. }
+                | AuditEventKind::ContainerCreated { .. }
+                | AuditEventKind::ContainerRemoved { .. }
+                | AuditEventKind::DeployFailed { .. }
+                | AuditEventKind::RollbackStarted { .. }
+                | AuditEventKind::RollbackFinished { .. }
+                | AuditEventKind::ContainerPruned { .. }
+                | AuditEventKind::SecretsRotated { .. }
+                | AuditEventKind::FileUploaded { .. }
+        )
+    }
+}
+
+/// One line in the JSONL log. The envelope (timestamp, `deploy_id`,
+/// actor, version) is held flat alongside the variant fields so a
+/// `jq '.deploy_id' < events.jsonl` works for every event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    /// Schema version. Bumped on backward-incompatible changes; older
+    /// readers can refuse newer lines instead of misreading them.
+    pub v: u32,
+    /// RFC 3339 wall-clock timestamp with millisecond precision.
+    pub ts: String,
+    /// One per `yoink up` / rollback / prune / secrets-rotate run.
+    /// `UUIDv7` — time-sortable, so a lexicographic sort on this column
+    /// orders events by run.
+    pub deploy_id: String,
+    /// `$USER@$HOSTNAME` of the operator (or `?@?` when unset, e.g. in
+    /// stripped-down CI containers).
+    pub actor: String,
+    pub yoink_version: String,
+    /// Short git SHA of the operator's working tree, if known.
+    pub git_sha: Option<String>,
+    /// Resolves to one of the hosts in `yoink.yaml`.
+    pub host: String,
+    #[serde(flatten)]
+    pub kind: AuditEventKind,
+}
+
+/// Per-run envelope passed into every event built by the sink. Carries
+/// the fields that don't change between events (`deploy_id`, actor,
+/// version, `git_sha`, command name).
+#[derive(Debug, Clone)]
+pub struct RunContext {
+    pub deploy_id: String,
+    pub actor: String,
+    pub yoink_version: String,
+    pub git_sha: Option<String>,
+    pub command: String,
+}
+
+impl RunContext {
+    /// Build a run context with a fresh `UUIDv7` `deploy_id`, the current
+    /// operator, the running yoink version, and the short git SHA of
+    /// `cwd` if any.
+    pub fn new(command: impl Into<String>) -> Self {
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "?".into());
+        let host = std::env::var("HOSTNAME")
+            .ok()
+            .or_else(|| hostname_via_uname().ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "?".into());
+        let actor = format!("{user}@{host}");
+        let git_sha = crate::git::current_short_sha(std::path::Path::new(".")).ok();
+        Self {
+            deploy_id: uuid::Uuid::now_v7().to_string(),
+            actor,
+            yoink_version: env!("CARGO_PKG_VERSION").to_string(),
+            git_sha,
+            command: command.into(),
+        }
+    }
+}
+
+fn hostname_via_uname() -> std::io::Result<String> {
+    // No portable std API; fall back to `uname -n` which exists on
+    // every POSIX system we deploy from.
+    let out = std::process::Command::new("uname").arg("-n").output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// RFC 3339 timestamp with millisecond precision. We hand-format
+/// instead of pulling in `chrono` because nothing else needs it.
+#[must_use]
+pub fn now_rfc3339_millis() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    let (y, mo, d, h, mi, s) = unix_to_components(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+}
+
+/// RFC 3339 timestamp from a Unix-seconds value (no millisecond
+/// component). Used by callers that want to compare an event's `ts`
+/// string against a `since` cutoff lexicographically.
+#[must_use]
+pub fn ts_string_for(unix_secs: u64) -> String {
+    let (y, mo, d, h, mi, s) = unix_to_components(unix_secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.000Z")
+}
+
+/// Civil time from Unix seconds (UTC). Shamelessly inlined to avoid a
+/// chrono dep — the algorithm is Hinnant's "`days_from_civil`" inverse.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::many_single_char_names,
+)]
+fn unix_to_components(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let s = secs % 86_400;
+    let h = (s / 3600) as u32;
+    let mi = ((s % 3600) / 60) as u32;
+    let sec = (s % 60) as u32;
+    let days = (secs / 86_400) as i64;
+    // Hinnant: civil_from_days, with epoch at 1970-01-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y_final = if mo <= 2 { y + 1 } else { y };
+    (y_final as i32, mo, d, h, mi, sec)
+}
+
+/// Sink an `AuditEvent` lands in. The deploy code holds an
+/// `Arc<dyn AuditSink>` — concrete impls write to a host file, an
+/// in-memory ring (tests), or `/dev/null` (when audit is disabled).
+#[async_trait]
+pub trait AuditSink: Send + Sync {
+    /// Record one event. Forensic events flush immediately; progress
+    /// events buffer until `flush()`.
+    async fn record(&self, event: AuditEvent);
+    /// Drain any buffered progress events to durable storage.
+    async fn flush(&self);
+}
+
+/// No-op sink — used when audit is intentionally disabled (no hosts in
+/// the config; tests that don't care).
+pub struct NullSink;
+
+#[async_trait]
+impl AuditSink for NullSink {
+    async fn record(&self, _event: AuditEvent) {}
+    async fn flush(&self) {}
+}
+
+/// In-memory sink for unit tests. Captures every event in order.
+pub struct MemorySink {
+    inner: Mutex<Vec<AuditEvent>>,
+}
+
+impl Default for MemorySink {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl MemorySink {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn events(&self) -> Vec<AuditEvent> {
+        self.inner.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl AuditSink for MemorySink {
+    async fn record(&self, event: AuditEvent) {
+        self.inner.lock().await.push(event);
+    }
+    async fn flush(&self) {}
+}
+
+/// Writes audit events to `/var/lib/yoink/audit/events.jsonl` on each
+/// host via raw SSH (same transport as `files::upload`). Forensic
+/// events flush per-event; progress events buffer per-host and flush
+/// in one SSH call on `flush()` or wave-end.
+pub struct HostAuditSink {
+    /// Host descriptors keyed by address. Populated by `register()`
+    /// before any event for that host is recorded.
+    hosts: Mutex<std::collections::HashMap<String, Host>>,
+    /// One pending-line buffer per host.
+    buffers: Mutex<std::collections::HashMap<String, Vec<String>>>,
+}
+
+impl HostAuditSink {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            hosts: Mutex::new(std::collections::HashMap::new()),
+            buffers: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Register a host so its buffer slot exists. Required before any
+    /// event for that host can flush — without the descriptor we don't
+    /// know which user/address to SSH to.
+    pub async fn register(&self, host: Host) {
+        self.hosts.lock().await.insert(host.address.clone(), host);
+    }
+
+    /// Drain one host's buffer to disk via a single SSH invocation.
+    /// Failure is logged to stderr; lines are dropped (deploy must not
+    /// block on audit).
+    async fn flush_host(&self, host_addr: &str) {
+        let lines = {
+            let mut bufs = self.buffers.lock().await;
+            match bufs.get_mut(host_addr) {
+                Some(b) if !b.is_empty() => std::mem::take(b),
+                _ => return,
+            }
+        };
+        let Some(host) = self.hosts.lock().await.get(host_addr).cloned() else {
+            eprintln!(
+                "yoink audit: no host descriptor registered for {host_addr}; \
+                 dropping {} event(s)",
+                lines.len()
+            );
+            return;
+        };
+        if host.is_local() {
+            // Synthetic local host — no SSH; write directly to the
+            // local filesystem.
+            if let Err(e) = append_local(&lines).await {
+                eprintln!("yoink audit: local append failed: {e}");
+            }
+            return;
+        }
+        let count = lines.len();
+        if let Err(e) = append_via_ssh(&host, &lines).await {
+            eprintln!(
+                "yoink audit: failed to flush {count} event(s) to {}: {e}",
+                host.address
+            );
+        }
+    }
+}
+
+impl Default for HostAuditSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl AuditSink for HostAuditSink {
+    async fn record(&self, event: AuditEvent) {
+        let host_addr = event.host.clone();
+        let line = match serde_json::to_string(&event) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("yoink audit: serialize failed: {e}");
+                return;
+            }
+        };
+        let is_forensic = event.kind.is_forensic();
+        {
+            let mut bufs = self.buffers.lock().await;
+            bufs.entry(host_addr.clone()).or_default().push(line);
+        }
+        if is_forensic {
+            self.flush_host(&host_addr).await;
+        }
+    }
+
+    async fn flush(&self) {
+        let addrs: Vec<String> = {
+            let bufs = self.buffers.lock().await;
+            bufs.keys().cloned().collect()
+        };
+        for addr in addrs {
+            self.flush_host(&addr).await;
+        }
+    }
+}
+
+/// Pipe `lines` (newline-joined) through `ssh user@host sh -c "…"`.
+/// Single roundtrip: mkdir + tee + size-based rotate, all in one
+/// shell.
+async fn append_via_ssh(host: &Host, lines: &[String]) -> std::io::Result<()> {
+    let payload = lines.join("\n") + "\n";
+    let script = format!(
+        "set -e; \
+         mkdir -p {AUDIT_DIR}; \
+         cat >> {AUDIT_FILE}; \
+         chmod 0640 {AUDIT_FILE} 2>/dev/null || true; \
+         sz=$(wc -c < {AUDIT_FILE} 2>/dev/null || echo 0); \
+         if [ $sz -gt {ROTATE_BYTES} ]; then \
+           mv {AUDIT_FILE} {AUDIT_DIR}/events-$(date -u +%Y%m%dT%H%M%SZ).jsonl; \
+         fi"
+    );
+    let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(format!("{}@{}", host.user, host.address))
+        .arg(script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(payload.as_bytes()).await?;
+        stdin.shutdown().await?;
+    }
+    let out = child.wait_with_output().await?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "ssh exit {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+/// Append directly to the local filesystem (the `local` synthetic
+/// host). Writes through the same path layout as remote hosts so a
+/// `yoink audit log --host local` reads back consistently.
+async fn append_local(lines: &[String]) -> std::io::Result<()> {
+    use tokio::fs::OpenOptions;
+    use tokio::io::AsyncWriteExt;
+    tokio::fs::create_dir_all(AUDIT_DIR).await?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(AUDIT_FILE)
+        .await?;
+    let payload = lines.join("\n") + "\n";
+    f.write_all(payload.as_bytes()).await?;
+    if let Ok(meta) = f.metadata().await
+        && meta.len() > ROTATE_BYTES
+    {
+        drop(f);
+        let stamp: String = now_rfc3339_millis()
+            .chars()
+            .filter(|c| !matches!(c, ':' | '-' | '.'))
+            .collect();
+        let rotated = format!("{AUDIT_DIR}/events-{stamp}.jsonl");
+        tokio::fs::rename(AUDIT_FILE, &rotated).await?;
+    }
+    Ok(())
+}
+
+/// Helper for sites that build events from a `RunContext`. Saves the
+/// caller from typing the envelope four times.
+#[must_use]
+pub fn build_event(ctx: &RunContext, host: impl Into<String>, kind: AuditEventKind) -> AuditEvent {
+    AuditEvent {
+        v: 1,
+        ts: now_rfc3339_millis(),
+        deploy_id: ctx.deploy_id.clone(),
+        actor: ctx.actor.clone(),
+        yoink_version: ctx.yoink_version.clone(),
+        git_sha: ctx.git_sha.clone(),
+        host: host.into(),
+        kind,
+    }
+}
+
+/// Convenience used by `cmd_up` and friends: wrap an `Arc<dyn AuditSink>`
+/// and fire an event through it without forcing every call site to
+/// build the envelope by hand.
+pub async fn emit(sink: &Arc<dyn AuditSink>, ctx: &RunContext, host: &str, kind: AuditEventKind) {
+    sink.record(build_event(ctx, host, kind)).await;
+}
+
+/// Translate a `deploy::DeployEvent` into the host + audit kind to
+/// record. Returns `None` for events we don't audit at this stage
+/// (e.g. `Started`, which is a per-host announcement subsumed by the
+/// later `ContainerStarted` / `ContainerCreated` events).
+///
+/// Some payload fields (`tag`, `spec_hash`) aren't carried in
+/// `DeployEvent` — we derive `spec_hash` from the container name's
+/// trailing short hash and leave `tag` empty for now. Callers that
+/// know the tag (e.g. `cmd_up`'s `tag_overrides`) can patch it in via
+/// the `tag_for` parameter, keyed by service name.
+#[must_use]
+pub fn map_deploy_event(
+    service: Option<&str>,
+    event: &crate::deploy::DeployEvent,
+    tag_for: &dyn Fn(&str) -> String,
+) -> Option<(String, AuditEventKind)> {
+    use crate::deploy::DeployEvent;
+    let svc = || service.unwrap_or("").to_string();
+    let tag = || service.map(tag_for).unwrap_or_default();
+    match event {
+        DeployEvent::HookStarted { name } => Some((
+            String::new(),
+            AuditEventKind::HookStarted { name: name.clone() },
+        )),
+        DeployEvent::HookFinished { name } => Some((
+            String::new(),
+            AuditEventKind::HookFinished { name: name.clone() },
+        )),
+        DeployEvent::PullStarted { host, image, tag: t } => Some((
+            host.clone(),
+            AuditEventKind::PullStarted {
+                image: image.clone(),
+                tag: t.clone(),
+            },
+        )),
+        DeployEvent::NetworkReady {
+            host,
+            network,
+            created,
+        } => Some((
+            host.clone(),
+            AuditEventKind::NetworkReady {
+                network: network.clone(),
+                created: *created,
+            },
+        )),
+        DeployEvent::ContainerStarted { host, container } => Some((
+            host.clone(),
+            AuditEventKind::ContainerStarted {
+                service: svc(),
+                container: container.clone(),
+                spec_hash: short_hash_from_name(container),
+                tag: tag(),
+            },
+        )),
+        DeployEvent::HealthcheckHealthy {
+            host,
+            container,
+            attempts,
+        } => Some((
+            host.clone(),
+            AuditEventKind::HealthcheckHealthy {
+                service: svc(),
+                container: container.clone(),
+                attempts: *attempts,
+            },
+        )),
+        DeployEvent::OldContainerStopped { host, container } => Some((
+            host.clone(),
+            AuditEventKind::OldContainerStopped {
+                service: svc(),
+                container: container.clone(),
+            },
+        )),
+        DeployEvent::AlreadyAtSpec { host, container } => Some((
+            host.clone(),
+            AuditEventKind::AlreadyAtSpec {
+                service: svc(),
+                container: container.clone(),
+                spec_hash: short_hash_from_name(container),
+            },
+        )),
+        DeployEvent::ContainerLogTail {
+            host,
+            container,
+            lines,
+        } => Some((
+            host.clone(),
+            AuditEventKind::DeployFailed {
+                service: svc(),
+                container: container.clone(),
+                log_tail: lines.clone(),
+            },
+        )),
+        DeployEvent::Done { host, container } => Some((
+            host.clone(),
+            AuditEventKind::ContainerCreated {
+                service: svc(),
+                container: container.clone(),
+                spec_hash: short_hash_from_name(container),
+                tag: tag(),
+            },
+        )),
+        // Skip: `Started` (announcement-only; the rest of the wave
+        // makes the same point), `PullFinished` (needs image/tag we
+        // didn't keep), `HealthcheckSkipped` (low-signal).
+        DeployEvent::Started { .. }
+        | DeployEvent::PullFinished { .. }
+        | DeployEvent::HealthcheckSkipped { .. } => None,
+    }
+}
+
+/// Container names are `<service>-<short_hash>` or
+/// `<service>-<short_hash>-<replica_index>`. Pick the short hash by
+/// looking at the last hyphen-separated segment: if it's all digits,
+/// the hash is one segment back; otherwise it's the last segment.
+fn short_hash_from_name(container: &str) -> String {
+    let parts: Vec<&str> = container.rsplit('-').collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    let trailing_is_index =
+        parts[0].chars().all(|c| c.is_ascii_digit()) && !parts[0].is_empty();
+    if trailing_is_index && parts.len() > 1 {
+        parts[1].to_string()
+    } else {
+        parts[0].to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_ctx() -> RunContext {
+        RunContext {
+            deploy_id: "01HFE9TESTTESTTESTTESTTEST".into(),
+            actor: "alice@laptop".into(),
+            yoink_version: "0.18.0".into(),
+            git_sha: Some("abc1234".into()),
+            command: "up".into(),
+        }
+    }
+
+    #[test]
+    fn jsonl_round_trip_preserves_kind() {
+        let ev = build_event(
+            &fixture_ctx(),
+            "h1.example.com",
+            AuditEventKind::ContainerCreated {
+                service: "api".into(),
+                container: "api-ab12cd34".into(),
+                spec_hash: "ab12cd34".into(),
+                tag: "sha-3fdc075".into(),
+            },
+        );
+        let line = serde_json::to_string(&ev).unwrap();
+        let back: AuditEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn jsonl_serializes_event_field_at_top_level() {
+        let ev = build_event(&fixture_ctx(), "h1", AuditEventKind::LockAcquired);
+        let line = serde_json::to_string(&ev).unwrap();
+        // The serde tag puts `event` at top level — required for jq
+        // `.event` to work without descending into a wrapper.
+        assert!(line.contains(r#""event":"LockAcquired""#));
+        assert!(line.contains(r#""deploy_id":"01HFE9"#));
+    }
+
+    #[test]
+    fn forensic_classification_matches_plan() {
+        assert!(AuditEventKind::LockAcquired.is_forensic());
+        assert!(AuditEventKind::ContainerCreated {
+            service: "s".into(),
+            container: "c".into(),
+            spec_hash: "h".into(),
+            tag: "t".into(),
+        }
+        .is_forensic());
+        assert!(!AuditEventKind::HookStarted { name: "n".into() }.is_forensic());
+        assert!(!AuditEventKind::PullStarted {
+            image: "i".into(),
+            tag: "t".into(),
+        }
+        .is_forensic());
+        assert!(!AuditEventKind::HealthcheckHealthy {
+            service: "s".into(),
+            container: "c".into(),
+            attempts: 1,
+        }
+        .is_forensic());
+    }
+
+    #[tokio::test]
+    async fn memory_sink_records_in_order() {
+        let sink = MemorySink::new();
+        let ctx = fixture_ctx();
+        sink.record(build_event(&ctx, "h1", AuditEventKind::LockAcquired))
+            .await;
+        sink.record(build_event(&ctx, "h1", AuditEventKind::LockReleased))
+            .await;
+        let events = sink.events().await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].kind, AuditEventKind::LockAcquired));
+        assert!(matches!(events[1].kind, AuditEventKind::LockReleased));
+    }
+
+    #[tokio::test]
+    async fn host_sink_buffers_progress_until_flush() {
+        // Without a registered host, flush silently drops buffered
+        // events and the test verifies that record() doesn't panic
+        // and that the buffer accumulates.
+        let sink = HostAuditSink::new();
+        let ctx = fixture_ctx();
+        sink.record(build_event(
+            &ctx,
+            "h1",
+            AuditEventKind::PullStarted {
+                image: "alpine".into(),
+                tag: "3.20".into(),
+            },
+        ))
+        .await;
+        sink.record(build_event(
+            &ctx,
+            "h1",
+            AuditEventKind::PullFinished {
+                image: "alpine".into(),
+                tag: "3.20".into(),
+            },
+        ))
+        .await;
+        let buf = sink.buffers.lock().await;
+        assert_eq!(buf.get("h1").map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn short_hash_from_name_handles_replicas() {
+        assert_eq!(short_hash_from_name("api-ab12cd34"), "ab12cd34");
+        assert_eq!(short_hash_from_name("api-ab12cd34-0"), "ab12cd34");
+        assert_eq!(short_hash_from_name("api-ab12cd34-15"), "ab12cd34");
+        assert_eq!(short_hash_from_name("nodash"), "nodash");
+        assert_eq!(short_hash_from_name(""), "");
+    }
+
+    #[test]
+    fn map_deploy_event_translates_done_to_container_created() {
+        use crate::deploy::DeployEvent;
+        let ev = DeployEvent::Done {
+            host: "h1".into(),
+            container: "api-ab12cd34".into(),
+        };
+        let (host, kind) = map_deploy_event(Some("api"), &ev, &|_| "v1".into()).unwrap();
+        assert_eq!(host, "h1");
+        match kind {
+            AuditEventKind::ContainerCreated {
+                service,
+                container,
+                spec_hash,
+                tag,
+            } => {
+                assert_eq!(service, "api");
+                assert_eq!(container, "api-ab12cd34");
+                assert_eq!(spec_hash, "ab12cd34");
+                assert_eq!(tag, "v1");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_deploy_event_skips_low_signal_variants() {
+        use crate::deploy::DeployEvent;
+        let started = DeployEvent::Started {
+            service: "api".into(),
+            tag: "v1".into(),
+            host: "h1".into(),
+        };
+        assert!(map_deploy_event(Some("api"), &started, &|_| String::new()).is_none());
+    }
+
+    #[test]
+    fn now_rfc3339_millis_has_correct_shape() {
+        let s = now_rfc3339_millis();
+        assert_eq!(s.len(), 24);
+        assert_eq!(&s[10..11], "T");
+        assert_eq!(&s[19..20], ".");
+        assert!(s.ends_with('Z'));
+    }
+
+    #[test]
+    fn unix_to_components_known_value() {
+        // 1_777_999_321 → 2026-05-05T16:42:01Z. Sanity-check Hinnant.
+        let t = 1_777_999_321_u64;
+        let (y, mo, d, h, mi, s) = unix_to_components(t);
+        assert_eq!((y, mo, d, h, mi, s), (2026, 5, 5, 16, 42, 1));
+        // Epoch itself: 1970-01-01T00:00:00Z.
+        let (y, mo, d, h, mi, s) = unix_to_components(0);
+        assert_eq!((y, mo, d, h, mi, s), (1970, 1, 1, 0, 0, 0));
+    }
+}

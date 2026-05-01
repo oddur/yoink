@@ -5,6 +5,7 @@
     "cli",
     "config",
     "tui",
+    "audit-event-schema",
     "glossary"
   ]
 }

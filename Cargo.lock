@@ -5232,6 +5232,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-term",
+ "uuid",
  "vt100",
  "yaml_serde",
  "zeroize",

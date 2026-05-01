@@ -1,0 +1,94 @@
+---
+title: Read the on-host audit log
+description: Stream `/var/lib/yoink/audit/events.jsonl` across the fleet to see every state-changing op yoink performed, including deploys whose containers no longer exist.
+---
+
+`yoink history` reads container labels — once a container is `docker rm`'d, that line is gone. The audit log is yoink's durable record: every state-changing run (`up`, `rollback`, `prune`, `secrets rotate`) appends JSONL events to `/var/lib/yoink/audit/events.jsonl` on each managed host. Failed deploys whose containers got swept stay on record; lock contention is observable; secret rotations leave a timestamp.
+
+## Read everything from the last week
+
+```sh
+yoink audit log
+```
+
+Default window is `7d`, default limit is 100 rows, sorted newest-first. The output looks like:
+
+```text
+ts                        host                    deploy_id                 event                         details
+2026-05-01T15:42:01.317Z  cax11.example.com       0190f0c7-c5b1-7c98-…      RunFinished                   up ok
+2026-05-01T15:42:01.299Z  cax11.example.com       0190f0c7-c5b1-7c98-…      LockReleased
+2026-05-01T15:41:58.612Z  cax11.example.com       0190f0c7-c5b1-7c98-…      ContainerCreated              docs docs-3fdc075b tag=sha-3fdc075
+2026-05-01T15:41:42.005Z  cax11.example.com       0190f0c7-c5b1-7c98-…      LockAcquired
+2026-05-01T15:41:42.005Z  cax11.example.com       0190f0c7-c5b1-7c98-…      RunStarted                    up services=[docs]
+```
+
+`deploy_id` is a `UUIDv7` — one per `yoink up` invocation. Lexicographic sort orders runs by start time.
+
+## Reconstruct one run
+
+```sh
+yoink audit log --deploy-id 0190f0c7-c5b1-7c98-aa92-1d77b8e91f10
+# or, since the prefix is unique:
+yoink audit run 0190f0c7
+```
+
+Returns every event tagged with that run, across every host, ordered by timestamp. Use it after a deploy to confirm what actually happened, or when triaging a failure.
+
+## Filter by host, service, or event type
+
+```sh
+yoink audit log --host docs.example.com
+yoink audit log --service api --event ContainerCreated --event DeployFailed
+yoink audit log --since 30m --format json | jq 'select(.event == "DeployFailed")'
+```
+
+`--format json` emits one event per line (raw JSONL — no pretty-printing) so it pipes cleanly into `jq`, `vector`, or whatever else.
+
+## Find failed deploys
+
+```sh
+yoink audit log --event DeployFailed --since 30d
+```
+
+`DeployFailed` events carry the failed container's last log lines under `log_tail`, captured at the moment yoink gave up. The container is usually long gone from `docker ps`; the audit log is the only thing that still has the diagnosis.
+
+## Retention and rotation
+
+The active `events.jsonl` rotates when it exceeds 5 MiB — the file is renamed to `events-<UTC-timestamp>.jsonl` and a fresh one starts. `yoink audit log` reads both the active and rotated files when `--since` reaches further back than 24 hours.
+
+To prune rotated files past a retention window:
+
+```sh
+yoink audit gc --keep 90d           # default retention
+yoink audit gc --keep 30d --dry-run # preview before deleting
+yoink audit gc --keep 30d --host docs.example.com
+```
+
+The active file is never touched. Schedule `yoink audit gc` from cron / a deploy hook if you have a strict retention requirement.
+
+## What's recorded vs. not
+
+Recorded (every state-changing op):
+
+- `RunStarted` / `RunFinished` envelope on every `yoink up`, `rollback`, `prune`, `secrets rotate`.
+- `LockAcquired` / `LockReleased` per host — the gap between them is your hold time.
+- `ContainerCreated` / `ContainerRemoved` per replica — the forensic record of swaps.
+- `DeployFailed` with `log_tail` when a healthcheck never passes.
+- `HookFinished` with the exit code.
+- Progress events (`PullStarted`, `NetworkReady`, `HealthcheckHealthy`, …) for richer triage.
+
+Not recorded:
+
+- Read commands (`status`, `history`, `doctor`, `diff`, `tui`, `audit log` itself, `secrets show`, `secrets env`). They emit nothing — your `audit log` invocation does not show up in its own output.
+- Operator identity beyond `$USER@$HOSTNAME`. There's no central identity provider; the field is informational only.
+- Secret values. Event payloads carry names (`SecretsRotated.new_recipient`), never values.
+
+## Schema
+
+See [Audit event schema](/docs/reference/audit-event-schema) for the per-variant fields and JSON shape. The schema is versioned via the per-event `v` field; older readers can refuse newer lines instead of misreading them.
+
+## See also
+
+- [Audit event schema](/docs/reference/audit-event-schema) — every event variant and its payload.
+- [CLI reference: `yoink audit`](/docs/reference/cli) — every flag.
+- [Sealed secrets workflow](/docs/how-to/sealed-secrets-workflow) — `secrets rotate` shows up in the audit log too.

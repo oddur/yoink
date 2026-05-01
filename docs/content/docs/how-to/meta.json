@@ -24,6 +24,8 @@
     "---Storage & Backup---",
     "volume-backups",
     "multi-host-redis-storage",
+    "---Operations---",
+    "audit-log",
     "---Developer Tooling---",
     "vscode"
   ]
