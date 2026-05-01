@@ -6,7 +6,7 @@ description: How putting yoink behind Tailscale let me stop managing SSH keys fo
 
 I don't like managing SSH keys. New host, new keypair, paste the pubkey into `authorized_keys`, commit it somewhere, deploy. Six months later I rotate my laptop and have to remember which boxes still trust the old key. Bring up a second host and the dance starts over. The trust list on every machine grows like a junk drawer and nobody is keeping a real inventory.
 
-CI is where this gets actively bad. CI has to deploy, so CI has a key, and that key is long-lived and machine-held and one of the more attractive credentials in the whole setup. Rotating it is annoying enough that I put it off, revoking it during an incident is annoying enough that I'd hesitate, and auditing what reads it requires me to actually go look.
+CI is where this gets actively annoying. CI has to deploy, so CI has a key, and that key is long-lived and machine-held and the most attractive credential in the whole setup. Rotating it is annoying enough that I put it off, and the longer it sits there the worse the eventual cleanup feels.
 
 Yoink does the secret distribution part well. Sealed secrets live in the repo, get decrypted at deploy time from whatever store you point them at, and never sit on disk in plaintext. That solves the "private key in a GitHub Actions secret" problem cleanly, and for a while I thought that was the answer. Sealed secrets are still secrets, though, and the right number of secrets to manage for a thing like this is zero.
 
@@ -57,4 +57,4 @@ This works across providers and across continents, and it works for the box in m
 
 Each tool stays small by leaning on the other. Yoink hands off identity to Tailscale, Tailscale hands off orchestration to yoink, and neither has to grow features to cover what the other already does. Sealed secrets still earn their keep, because there are plenty of secrets in any deploy that aren't SSH keys, but the credential that used to sit at the center of the whole pipeline isn't there to manage anymore.
 
-When I sat down to write the SSH section of my runbook for this setup, I didn't have anything to put in it.
+This is a hobby setup, and that's the whole point. The combination takes a class of fiddly, low-grade headache off the table so I can spend my evenings on the actual project instead of on key hygiene.
