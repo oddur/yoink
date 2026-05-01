@@ -597,6 +597,15 @@ enum Command {
         #[arg(long, value_enum, default_value_t = TableFormat::Text)]
         format: TableFormat,
     },
+    /// Read or prune the on-host audit log — the JSONL stream yoink
+    /// appends to `/var/lib/yoink/audit/events.jsonl` on each managed
+    /// host on every state-changing run (`up`, `rollback`, `prune`,
+    /// `secrets rotate`). Survives `docker rm`, so it remembers
+    /// containers no longer on the host.
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
     /// `htop`-style snapshot of every running yoink-managed container
     /// across all hosts, sorted by CPU% descending. Single shot —
     /// wrap in \`watch -n 2 yoink top\` for a live display.
@@ -975,6 +984,67 @@ enum LockAction {
         /// Skip the "are you sure?" confirmation.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// Subcommands for `yoink audit`. Read-only: nothing under `audit`
+/// emits new audit events.
+#[derive(clap::Subcommand)]
+enum AuditAction {
+    /// Merge events from the operator-side log
+    /// (`$XDG_STATE_HOME/yoink/audit/events.jsonl`) with each host's
+    /// on-host log, dedupe on `event_id`, sort newest-first.
+    Log {
+        /// Restrict to one host's events. Skips the operator log too;
+        /// pass `--origin operator` to keep just the operator side.
+        #[arg(long)]
+        host: Option<String>,
+        /// Restrict to one service.
+        #[arg(long)]
+        service: Option<String>,
+        /// Show only events tagged with this `deploy_id`.
+        #[arg(long, value_name = "ID")]
+        deploy_id: Option<String>,
+        /// Filter by event name (e.g. `ContainerCreated`). Repeatable.
+        #[arg(long, value_name = "NAME", action = clap::ArgAction::Append)]
+        event: Vec<String>,
+        /// Restrict to events written on the operator side
+        /// (`RunStarted`/`RunFinished`, validation/build failures) or
+        /// host side (per-host container ops, lock acquire/release).
+        #[arg(long, value_name = "operator|host")]
+        origin: Option<String>,
+        /// Window relative to now: `30m`, `24h`, `7d`. Default: `7d`.
+        #[arg(long, value_name = "DURATION", default_value = "7d")]
+        since: String,
+        /// Cap on rows printed (after filter + sort).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Output format. `text` is human-readable; `json` is the raw
+        /// JSONL (one event per line, no pretty-printing).
+        #[arg(long, value_enum, default_value_t = TableFormat::Text)]
+        format: TableFormat,
+    },
+    /// Show every event for one run, ordered by timestamp, across all
+    /// hosts. Useful for reconstructing what a single `yoink up` did.
+    Run {
+        /// The `deploy_id` from `yoink audit log`.
+        deploy_id: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = TableFormat::Text)]
+        format: TableFormat,
+    },
+    /// Remove rotated audit files (`events-*.jsonl`) older than
+    /// `--keep`. The active `events.jsonl` is never touched.
+    Gc {
+        /// Retention window. Defaults to 90 days.
+        #[arg(long, value_name = "DURATION", default_value = "90d")]
+        keep: String,
+        /// Restrict to one host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Print what would be removed without actually deleting.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1383,6 +1453,7 @@ async fn run(cli: Cli) -> Result<()> {
             limit,
             format,
         } => cmd_history(&config, &service, limit, format).await,
+        Command::Audit { action } => cmd_audit(&config, action).await,
         Command::Top { limit, format } => cmd_top(&config, limit, format).await,
         Command::Networks { host } => cmd_networks(&config, host.as_deref()).await,
         Command::Volumes { host } => cmd_volumes(&config, host.as_deref()).await,
@@ -1753,8 +1824,81 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         lock.spawn_heartbeat(ops.clone());
     }
 
-    let mut sink = |service: Option<&str>, event: deploy::DeployEvent| {
+    // Audit log: two sinks per run. The operator sink writes locally
+    // and records run-level facts that aren't host-specific
+    // (`RunStarted`, `RunFinished`, plus operator-only failures that
+    // never reach a host). The host sink writes via SSH and records
+    // per-host events (lock acquire/release, container ops). Read-time
+    // dedup on `event_id` keeps the merged view safe even if a future
+    // change starts double-writing.
+    let host_audit = std::sync::Arc::new(yoink::audit::HostAuditSink::new());
+    for host_cfg in &config.hosts {
+        host_audit.register(Host::from(host_cfg)).await;
+    }
+    let audit_sink: std::sync::Arc<dyn yoink::audit::AuditSink> = host_audit.clone();
+    let operator_sink: std::sync::Arc<dyn yoink::audit::AuditSink> =
+        std::sync::Arc::new(yoink::audit::OperatorAuditSink::new());
+    let run_ctx = yoink::audit::RunContext::new("up");
+    let selected_service_names: Vec<String> = config
+        .selected_services(services_filter)
+        .map(|s| s.name.clone())
+        .collect();
+    // RunStarted is a fleet-wide fact — one operator-side line per
+    // run, not per host. LockAcquired is per-host (the lock is on the
+    // host's docker daemon) so it stays on each host's log.
+    yoink::audit::emit_operator(
+        &operator_sink,
+        &run_ctx,
+        "",
+        yoink::audit::AuditEventKind::RunStarted {
+            command: "up".into(),
+            services: selected_service_names.clone(),
+        },
+    )
+    .await;
+    for host_cfg in &config.hosts {
+        let host = Host::from(host_cfg);
+        yoink::audit::emit(
+            &audit_sink,
+            &run_ctx,
+            &host.address,
+            yoink::audit::AuditEventKind::LockAcquired,
+        )
+        .await;
+    }
+
+    // Bridge the synchronous `on_event` closure to the async audit
+    // sink: the closure pushes to an unbounded mpsc; a drain task
+    // owns the sink and awaits each event in order.
+    let (audit_tx, mut audit_rx) =
+        tokio::sync::mpsc::unbounded_channel::<yoink::audit::AuditEvent>();
+    let drain_sink = audit_sink.clone();
+    let drain_task = tokio::spawn(async move {
+        while let Some(ev) = audit_rx.recv().await {
+            drain_sink.record(ev).await;
+        }
+    });
+    // For audit events that need a `tag` field: prefer a CLI override
+    // (`--tag service=xyz`), fall back to the service's `tag:` in
+    // yoink.yaml. `tag_overrides` already shadows yaml tags during the
+    // deploy itself; we mirror that resolution here.
+    let mut tag_lookup: std::collections::BTreeMap<String, String> = config
+        .services
+        .iter()
+        .filter_map(|s| s.tag.clone().map(|t| (s.name.clone(), t)))
+        .collect();
+    for (k, v) in &tag_overrides {
+        tag_lookup.insert(k.clone(), v.clone());
+    }
+    let run_ctx_for_closure = run_ctx.clone();
+    let mut sink = move |service: Option<&str>, event: deploy::DeployEvent| {
         eprintln!("{}", output::format_deploy_event(service, &event));
+        if let Some((host, kind)) = yoink::audit::map_deploy_event(service, &event, &|svc| {
+            tag_lookup.get(svc).cloned().unwrap_or_default()
+        }) {
+            let ev = yoink::audit::build_event(&run_ctx_for_closure, host, kind);
+            let _ = audit_tx.send(ev);
+        }
     };
 
     // Phase 0: prefetch all registry-hosted service images in parallel
@@ -1798,12 +1942,50 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     )
     .await;
 
+    // Drop the synchronous closure (and its tx) so the drain task can
+    // notice the channel is closed, drain pending events, and exit.
+    drop(sink);
+    // Wait for the drain to complete so all DeployEvent-derived audit
+    // events are recorded before we emit the run-ending envelope.
+    let _ = drain_task.await;
+
     // Always release the locks, even on reconcile failure — keeping
     // them around blocks the operator's next attempt until the
     // sentinel self-exits.
     for lock in locks {
         lock.release(&*ops).await;
     }
+
+    // LockReleased is per-host (mirrors LockAcquired). RunFinished is
+    // a fleet-wide fact and lands once, operator-side.
+    let ok = reconcile_result.is_ok();
+    let err_msg = reconcile_result
+        .as_ref()
+        .err()
+        .map(std::string::ToString::to_string);
+    for host_cfg in &config.hosts {
+        let host = Host::from(host_cfg);
+        yoink::audit::emit(
+            &audit_sink,
+            &run_ctx,
+            &host.address,
+            yoink::audit::AuditEventKind::LockReleased,
+        )
+        .await;
+    }
+    yoink::audit::emit_operator(
+        &operator_sink,
+        &run_ctx,
+        "",
+        yoink::audit::AuditEventKind::RunFinished {
+            command: "up".into(),
+            ok,
+            error: err_msg.clone(),
+        },
+    )
+    .await;
+    audit_sink.flush().await;
+    operator_sink.flush().await;
 
     let reports = reconcile_result.context("reconcile")?;
     eprintln!("{}", output::format_deploy_summary(&reports));
@@ -3115,6 +3297,270 @@ async fn cmd_history(
         }
     }
     Ok(())
+}
+
+async fn cmd_audit(config: &Config, action: AuditAction) -> Result<()> {
+    match action {
+        AuditAction::Log {
+            host,
+            service,
+            deploy_id,
+            event,
+            origin,
+            since,
+            limit,
+            format,
+        } => {
+            cmd_audit_log(
+                config,
+                host.as_deref(),
+                service.as_deref(),
+                deploy_id.as_deref(),
+                &event,
+                origin.as_deref(),
+                &since,
+                limit,
+                format,
+            )
+            .await
+        }
+        AuditAction::Run { deploy_id, format } => cmd_audit_run(config, &deploy_id, format).await,
+        AuditAction::Gc {
+            keep,
+            host,
+            dry_run,
+        } => cmd_audit_gc(config, &keep, host.as_deref(), dry_run).await,
+    }
+}
+
+/// Read the operator-side JSONL log + every host's on-host JSONL log,
+/// merge, dedupe on `event_id`, filter, sort newest-first, format.
+/// Per-host fetch failures print a stderr warning but don't abort.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_audit_log(
+    config: &Config,
+    host_filter: Option<&str>,
+    service_filter: Option<&str>,
+    deploy_id_filter: Option<&str>,
+    event_filter: &[String],
+    origin_filter: Option<&str>,
+    since: &str,
+    limit: usize,
+    format: TableFormat,
+) -> Result<()> {
+    use yoink::audit::{FetchOptions, event_name, event_service, event_summary, fetch_events};
+    use yoink::docker_ops::{DockerOps as _, Host};
+
+    if let Some(o) = origin_filter
+        && !matches!(o, "operator" | "host")
+    {
+        anyhow::bail!("--origin must be 'operator' or 'host', got {o:?}");
+    }
+    let hosts: Vec<Host> = config.hosts.iter().map(Host::from).collect();
+    if hosts.is_empty() && origin_filter == Some("host") {
+        anyhow::bail!("no hosts match the filter (or no hosts configured)");
+    }
+
+    let opts = FetchOptions {
+        host_filter: host_filter.map(str::to_string),
+        since_secs: parse_since(since)?,
+        origin: origin_filter.map(str::to_string),
+    };
+    // Resolve `ssh_key_secret:` keypair tempfiles only when we'll
+    // actually SSH out — `--origin operator` reads the local file
+    // and never touches a host, so skip the bundle load entirely.
+    let ops = if origin_filter == Some("operator") {
+        None
+    } else {
+        Some(build_real_ops(config, None).await?)
+    };
+    let outcome = fetch_events(&hosts, &opts, |h| {
+        ops.as_ref().and_then(|o| o.ssh_keyfile(h))
+    })
+    .await;
+    for (source, msg) in &outcome.errors {
+        eprintln!("yoink audit: {source}: {msg}");
+    }
+
+    let event_set: std::collections::HashSet<&str> =
+        event_filter.iter().map(String::as_str).collect();
+    let mut events = outcome.events;
+    events.retain(|ev| {
+        if let Some(svc) = service_filter
+            && event_service(ev).is_none_or(|s| s != svc)
+        {
+            return false;
+        }
+        if let Some(id) = deploy_id_filter
+            && !ev.deploy_id.starts_with(id)
+        {
+            return false;
+        }
+        if !event_set.is_empty() && !event_set.contains(event_name(&ev.kind)) {
+            return false;
+        }
+        true
+    });
+    events.truncate(limit);
+
+    if events.is_empty() {
+        eprintln!("no audit events match the filters");
+        return Ok(());
+    }
+
+    match format {
+        TableFormat::Json => {
+            for ev in &events {
+                println!("{}", serde_json::to_string(ev)?);
+            }
+        }
+        TableFormat::Text => {
+            use std::fmt::Write as _;
+            let mut buf = String::new();
+            writeln!(
+                buf,
+                "{:<24}  {:<8}  {:<22}  {:<24}  {:<28}  details",
+                "ts", "origin", "host", "deploy_id", "event"
+            )?;
+            for ev in &events {
+                let name = event_name(&ev.kind);
+                let details = event_summary(&ev.kind);
+                let id_short: String = ev.deploy_id.chars().take(24).collect();
+                let host_display = if ev.host.is_empty() { "—" } else { &ev.host };
+                writeln!(
+                    buf,
+                    "{:<24}  {:<8}  {:<22}  {:<24}  {:<28}  {}",
+                    ev.ts, ev.origin, host_display, id_short, name, details
+                )?;
+            }
+            page_output(&buf);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_audit_run(config: &Config, deploy_id: &str, format: TableFormat) -> Result<()> {
+    cmd_audit_log(
+        config,
+        None,
+        None,
+        Some(deploy_id),
+        &[],
+        None,
+        // Pulling rotated files too: a run from weeks ago could have
+        // landed in a rotated file already.
+        "365d",
+        usize::MAX,
+        format,
+    )
+    .await
+}
+
+async fn cmd_audit_gc(
+    config: &Config,
+    keep: &str,
+    host_filter: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    use yoink::docker_ops::{DockerOps as _, Host};
+    let secs = parse_since(keep)?;
+    let cutoff_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_sub(secs);
+
+    let hosts: Vec<Host> = config
+        .hosts
+        .iter()
+        .filter(|h| host_filter.is_none_or(|f| h.address == f))
+        .map(Host::from)
+        .collect();
+    if hosts.is_empty() {
+        anyhow::bail!("no hosts match the filter (or no hosts configured)");
+    }
+
+    // Resolve sealed SSH keys for hosts that need them. `build_real_ops`
+    // short-circuits to a no-key handle when no host declares one, so
+    // the common path doesn't pay for sealed-bundle decryption.
+    let ops = build_real_ops(config, None).await?;
+
+    let mut removed = 0_usize;
+    for host in hosts {
+        let key_path = ops.ssh_keyfile(&host);
+        let result = audit_gc_one(&host, key_path.as_deref(), cutoff_unix, dry_run).await;
+        match result {
+            Ok(n) => {
+                removed += n;
+                if n > 0 {
+                    eprintln!(
+                        "[{}] {} {n} rotated audit file(s)",
+                        host.address,
+                        if dry_run { "would remove" } else { "removed" }
+                    );
+                }
+            }
+            Err(e) => eprintln!("[{}] gc failed: {e}", host.address),
+        }
+    }
+    if removed == 0 {
+        eprintln!("no rotated audit files older than {keep}");
+    }
+    Ok(())
+}
+
+async fn audit_gc_one(
+    host: &yoink::docker_ops::Host,
+    key_path: Option<&std::path::Path>,
+    cutoff_unix: u64,
+    dry_run: bool,
+) -> Result<usize> {
+    use yoink::audit::{AUDIT_DIR, run_audit_shell};
+    // POSIX-portable enough for the fleet we target. `-printf '%T@ %f'`
+    // gives `<float-mtime> <basename>` per line.
+    let list_script = format!(
+        "cd {AUDIT_DIR} 2>/dev/null && \
+         find . -maxdepth 1 -type f -name 'events-*.jsonl' -printf '%T@ %f\\n' 2>/dev/null \
+         || true"
+    );
+    let listing = run_audit_shell(host, key_path, &list_script).await?;
+
+    let mut to_remove: Vec<String> = Vec::new();
+    for line in listing.lines() {
+        let mut parts = line.trim().splitn(2, char::is_whitespace);
+        let Some(mtime_str) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.next() else { continue };
+        // `find -printf '%T@'` emits a float "<seconds>.<nanos>"; we
+        // only need second-resolution for the retention compare. Cast
+        // is safe: mtimes are non-negative, and 2^64 seconds is ~5.8e11
+        // years past the heat death of the universe.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let mtime_secs = mtime_str.parse::<f64>().unwrap_or(0.0) as u64;
+        if mtime_secs < cutoff_unix {
+            to_remove.push(name.trim_start_matches("./").to_string());
+        }
+    }
+    if to_remove.is_empty() || dry_run {
+        return Ok(to_remove.len());
+    }
+
+    let names = to_remove
+        .iter()
+        .map(|n| format!("'{}'", n.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rm_script = format!("cd {AUDIT_DIR} && rm -f {names}");
+    run_audit_shell(host, key_path, &rm_script).await?;
+    Ok(to_remove.len())
+}
+
+/// Whole-second view of [`parse_humantime`], for the audit-side
+/// `--since` / `--keep` flags that operate on epoch seconds.
+fn parse_since(s: &str) -> Result<u64> {
+    parse_humantime(s)
+        .map(|d| d.as_secs())
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 struct TopRow {

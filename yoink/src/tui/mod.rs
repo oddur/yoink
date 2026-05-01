@@ -2,6 +2,7 @@
 //! rendering.
 
 mod app;
+mod audit;
 mod chrome;
 mod container_detail;
 mod dashboard;
