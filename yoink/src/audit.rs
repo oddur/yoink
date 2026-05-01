@@ -177,6 +177,16 @@ pub struct AuditEvent {
     /// Schema version. Bumped on backward-incompatible changes; older
     /// readers can refuse newer lines instead of misreading them.
     pub v: u32,
+    /// `UUIDv7` per individual event. Stable across re-reads; lets a
+    /// merge view dedupe lines that landed in both the operator log and
+    /// a host log (e.g. through SSH retry double-writes), and gives the
+    /// TUI a stable row identifier.
+    pub event_id: String,
+    /// Where this line was written: `"operator"` for the local file
+    /// under `$XDG_STATE_HOME/yoink/audit/`, `"host"` for the on-host
+    /// file under `/var/lib/yoink/audit/`. The merge view in
+    /// `yoink audit log` reads both and tags rows accordingly.
+    pub origin: String,
     /// RFC 3339 wall-clock timestamp with millisecond precision.
     pub ts: String,
     /// One per `yoink up` / rollback / prune / secrets-rotate run.
@@ -189,7 +199,10 @@ pub struct AuditEvent {
     pub yoink_version: String,
     /// Short git SHA of the operator's working tree, if known.
     pub git_sha: Option<String>,
-    /// Resolves to one of the hosts in `yoink.yaml`.
+    /// Resolves to one of the hosts in `yoink.yaml`. Empty string for
+    /// `origin: "operator"` events that aren't host-specific (e.g. a
+    /// `RunStarted` that fans out to multiple hosts; the operator log
+    /// records it once with `host: ""`).
     pub host: String,
     #[serde(flatten)]
     pub kind: AuditEventKind,
@@ -445,6 +458,114 @@ impl AuditSink for HostAuditSink {
     }
 }
 
+/// Resolve the operator-side audit directory:
+/// `$XDG_STATE_HOME/yoink/audit/` if set, else
+/// `$HOME/.local/state/yoink/audit/`. The same lookup is done by
+/// readers (`yoink audit log`) so write and read paths agree.
+#[must_use]
+pub fn operator_audit_dir() -> std::path::PathBuf {
+    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+        let mut p = std::path::PathBuf::from(state);
+        p.push("yoink");
+        p.push("audit");
+        return p;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".local/state/yoink/audit");
+        return p;
+    }
+    // Fallback for environments without HOME (rare; CI containers
+    // sometimes strip it). Lands events under the cwd so they're at
+    // least not silently dropped.
+    std::path::PathBuf::from(".yoink-audit")
+}
+
+/// `<operator_audit_dir>/events.jsonl`.
+#[must_use]
+pub fn operator_audit_file() -> std::path::PathBuf {
+    let mut p = operator_audit_dir();
+    p.push("events.jsonl");
+    p
+}
+
+/// Operator-side audit sink. Writes to a local JSONL file under
+/// `$XDG_STATE_HOME/yoink/audit/` (or `~/.local/state/...`). All
+/// writes flush per-event — local file I/O is fast enough that the
+/// hybrid policy adds no value, and we want the line on disk before
+/// `cmd_up` proceeds in case the operator's process gets killed.
+///
+/// Rotation: the active file rotates at 5 MiB to
+/// `events-<UTC-stamp>.jsonl`, same shape as the on-host log.
+pub struct OperatorAuditSink;
+
+impl OperatorAuditSink {
+    /// Build a sink rooted at the resolved operator audit dir. Failure
+    /// to create the directory is reported lazily on the first write —
+    /// audit must never block command construction.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for OperatorAuditSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl AuditSink for OperatorAuditSink {
+    async fn record(&self, event: AuditEvent) {
+        let line = match serde_json::to_string(&event) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("yoink audit: serialize failed: {e}");
+                return;
+            }
+        };
+        if let Err(e) = append_to_operator_log(&line).await {
+            eprintln!("yoink audit: operator log write failed: {e}");
+        }
+    }
+    async fn flush(&self) {}
+}
+
+/// Append `line\n` to `operator_audit_file()`, creating the parent
+/// directory if needed. Rotates when the active file exceeds
+/// `ROTATE_BYTES`. Best-effort: any error is returned to the caller,
+/// which warns but never aborts the run.
+async fn append_to_operator_log(line: &str) -> std::io::Result<()> {
+    use tokio::fs::OpenOptions;
+    use tokio::io::AsyncWriteExt;
+    let dir = operator_audit_dir();
+    tokio::fs::create_dir_all(&dir).await?;
+    let path = operator_audit_file();
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    let payload = format!("{line}\n");
+    f.write_all(payload.as_bytes()).await?;
+    if let Ok(meta) = f.metadata().await
+        && meta.len() > ROTATE_BYTES
+    {
+        drop(f);
+        let stamp: String = now_rfc3339_millis()
+            .chars()
+            .filter(|c| !matches!(c, ':' | '-' | '.'))
+            .collect();
+        let mut rotated = dir;
+        rotated.push(format!("events-{stamp}.jsonl"));
+        // Failure to rotate is non-fatal — next append continues to
+        // grow the active file. The operator can rotate manually.
+        let _ = tokio::fs::rename(&path, &rotated).await;
+    }
+    Ok(())
+}
+
 /// Pipe `lines` (newline-joined) through `ssh user@host sh -c "…"`.
 /// Single roundtrip: mkdir + tee + size-based rotate, all in one
 /// shell.
@@ -514,12 +635,40 @@ async fn append_local(lines: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Helper for sites that build events from a `RunContext`. Saves the
-/// caller from typing the envelope four times.
+/// Build a host-origin event — destined for the on-host JSONL log.
+/// Generates a fresh `event_id` and stamps `origin: "host"`. Use
+/// `build_operator_event` for events that go to the local operator log.
 #[must_use]
 pub fn build_event(ctx: &RunContext, host: impl Into<String>, kind: AuditEventKind) -> AuditEvent {
     AuditEvent {
         v: 1,
+        event_id: uuid::Uuid::now_v7().to_string(),
+        origin: "host".into(),
+        ts: now_rfc3339_millis(),
+        deploy_id: ctx.deploy_id.clone(),
+        actor: ctx.actor.clone(),
+        yoink_version: ctx.yoink_version.clone(),
+        git_sha: ctx.git_sha.clone(),
+        host: host.into(),
+        kind,
+    }
+}
+
+/// Build an operator-origin event — destined for the local
+/// `$XDG_STATE_HOME/yoink/audit/events.jsonl`. `host` is empty for
+/// fleet-wide events (`RunStarted`, `RunFinished`); it can be set when
+/// the operator log records something host-targeted but doesn't reach
+/// the host (DNS failure, lock contention).
+#[must_use]
+pub fn build_operator_event(
+    ctx: &RunContext,
+    host: impl Into<String>,
+    kind: AuditEventKind,
+) -> AuditEvent {
+    AuditEvent {
+        v: 1,
+        event_id: uuid::Uuid::now_v7().to_string(),
+        origin: "operator".into(),
         ts: now_rfc3339_millis(),
         deploy_id: ctx.deploy_id.clone(),
         actor: ctx.actor.clone(),
@@ -535,6 +684,16 @@ pub fn build_event(ctx: &RunContext, host: impl Into<String>, kind: AuditEventKi
 /// build the envelope by hand.
 pub async fn emit(sink: &Arc<dyn AuditSink>, ctx: &RunContext, host: &str, kind: AuditEventKind) {
     sink.record(build_event(ctx, host, kind)).await;
+}
+
+/// Same as [`emit`] but for operator-origin events.
+pub async fn emit_operator(
+    sink: &Arc<dyn AuditSink>,
+    ctx: &RunContext,
+    host: &str,
+    kind: AuditEventKind,
+) {
+    sink.record(build_operator_event(ctx, host, kind)).await;
 }
 
 /// Translate a `deploy::DeployEvent` into the host + audit kind to
@@ -699,13 +858,56 @@ mod tests {
     }
 
     #[test]
+    fn build_event_stamps_host_origin_and_unique_event_id() {
+        let ctx = fixture_ctx();
+        let a = build_event(&ctx, "h1", AuditEventKind::LockAcquired);
+        let b = build_event(&ctx, "h1", AuditEventKind::LockAcquired);
+        assert_eq!(a.origin, "host");
+        assert_eq!(b.origin, "host");
+        assert_ne!(a.event_id, b.event_id, "every event gets a fresh id");
+    }
+
+    #[test]
+    fn build_operator_event_stamps_operator_origin() {
+        let ctx = fixture_ctx();
+        let ev = build_operator_event(
+            &ctx,
+            "",
+            AuditEventKind::RunStarted {
+                command: "up".into(),
+                services: vec!["api".into()],
+            },
+        );
+        assert_eq!(ev.origin, "operator");
+        assert_eq!(ev.host, "");
+    }
+
+    #[test]
     fn jsonl_serializes_event_field_at_top_level() {
         let ev = build_event(&fixture_ctx(), "h1", AuditEventKind::LockAcquired);
         let line = serde_json::to_string(&ev).unwrap();
         // The serde tag puts `event` at top level — required for jq
-        // `.event` to work without descending into a wrapper.
+        // `.event` to work without descending into a wrapper. Same for
+        // event_id and origin.
         assert!(line.contains(r#""event":"LockAcquired""#));
         assert!(line.contains(r#""deploy_id":"01HFE9"#));
+        assert!(line.contains(r#""origin":"host""#));
+        assert!(line.contains(r#""event_id":""#));
+    }
+
+    #[test]
+    fn operator_audit_dir_ends_with_yoink_audit() {
+        // Don't mutate process env (that's `unsafe` and racy across
+        // parallel tests). Just confirm the resolved dir ends in the
+        // expected suffix — covers the HOME and XDG_STATE_HOME branches
+        // since both append `yoink/audit` and the `.yoink-audit`
+        // fallback isn't a path we'd actually hit on the test machine.
+        let dir = operator_audit_dir();
+        let s = dir.to_string_lossy();
+        assert!(
+            s.ends_with("yoink/audit") || s.ends_with(".yoink-audit"),
+            "unexpected dir: {s}"
+        );
     }
 
     #[test]

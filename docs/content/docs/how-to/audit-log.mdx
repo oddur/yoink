@@ -1,9 +1,14 @@
 ---
-title: Read the on-host audit log
-description: Stream `/var/lib/yoink/audit/events.jsonl` across the fleet to see every state-changing op yoink performed, including deploys whose containers no longer exist.
+title: Read the audit log
+description: Merge the operator-side and on-host JSONL logs to see every state-changing op yoink performed, including deploys whose containers no longer exist.
 ---
 
-`yoink history` reads container labels — once a container is `docker rm`'d, that line is gone. The audit log is yoink's durable record: every state-changing run (`up`, `rollback`, `prune`, `secrets rotate`) appends JSONL events to `/var/lib/yoink/audit/events.jsonl` on each managed host. Failed deploys whose containers got swept stay on record; lock contention is observable; secret rotations leave a timestamp.
+`yoink history` reads container labels — once a container is `docker rm`'d, that line is gone. The audit log is yoink's durable record. Two files, one merged read path:
+
+- **Operator side** (`$XDG_STATE_HOME/yoink/audit/events.jsonl`, defaults to `~/.local/state/yoink/audit/`) — fleet-wide events: `RunStarted`, `RunFinished`, validation/build failures that never reach a host.
+- **Host side** (`/var/lib/yoink/audit/events.jsonl` on each managed host) — per-host events: `LockAcquired`, `LockReleased`, `ContainerStarted`, `ContainerCreated`, `DeployFailed`, …
+
+Each line carries an `event_id` (`UUIDv7`) so the merge view dedupes safely, and an `origin` field (`"operator"` or `"host"`) so a glance at the table shows where each line came from.
 
 ## Read everything from the last week
 
@@ -11,18 +16,27 @@ description: Stream `/var/lib/yoink/audit/events.jsonl` across the fleet to see 
 yoink audit log
 ```
 
-Default window is `7d`, default limit is 100 rows, sorted newest-first. The output looks like:
+Default window is `7d`, default limit is 100 rows, sorted newest-first. The output:
 
 ```text
-ts                        host                    deploy_id                 event                         details
-2026-05-01T15:42:01.317Z  cax11.example.com       0190f0c7-c5b1-7c98-…      RunFinished                   up ok
-2026-05-01T15:42:01.299Z  cax11.example.com       0190f0c7-c5b1-7c98-…      LockReleased
-2026-05-01T15:41:58.612Z  cax11.example.com       0190f0c7-c5b1-7c98-…      ContainerCreated              docs docs-3fdc075b tag=sha-3fdc075
-2026-05-01T15:41:42.005Z  cax11.example.com       0190f0c7-c5b1-7c98-…      LockAcquired
-2026-05-01T15:41:42.005Z  cax11.example.com       0190f0c7-c5b1-7c98-…      RunStarted                    up services=[docs]
+ts                        origin    host                    deploy_id                 event                         details
+2026-05-01T15:42:01.317Z  operator  —                       0190f0c7-c5b1-7c98-…      RunFinished                   up ok
+2026-05-01T15:42:01.299Z  host      cax11.example.com       0190f0c7-c5b1-7c98-…      LockReleased
+2026-05-01T15:41:58.612Z  host      cax11.example.com       0190f0c7-c5b1-7c98-…      ContainerCreated              docs docs-3fdc075b tag=sha-3fdc075
+2026-05-01T15:41:42.005Z  host      cax11.example.com       0190f0c7-c5b1-7c98-…      LockAcquired
+2026-05-01T15:41:42.005Z  operator  —                       0190f0c7-c5b1-7c98-…      RunStarted                    up services=[docs]
 ```
 
 `deploy_id` is a `UUIDv7` — one per `yoink up` invocation. Lexicographic sort orders runs by start time.
+
+## Filter by side
+
+```sh
+yoink audit log --origin operator   # only the local file
+yoink audit log --origin host       # only the on-host SSH fetches
+```
+
+Use `--origin host` together with `--host <ADDR>` to focus on one host's local view of a deploy.
 
 ## Reconstruct one run
 
@@ -54,7 +68,7 @@ yoink audit log --event DeployFailed --since 30d
 
 ## Retention and rotation
 
-The active `events.jsonl` rotates when it exceeds 5 MiB — the file is renamed to `events-<UTC-timestamp>.jsonl` and a fresh one starts. `yoink audit log` reads both the active and rotated files when `--since` reaches further back than 24 hours.
+Both the operator-side and per-host active files rotate at 5 MiB — renamed to `events-<UTC-timestamp>.jsonl` while a fresh one starts. `yoink audit log` reads both the active and rotated files when `--since` reaches further back than 24 hours.
 
 To prune rotated files past a retention window:
 

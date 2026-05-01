@@ -10,12 +10,14 @@ Every line in the on-host audit log is a single JSON object. Top-level fields ar
 | field | type | notes |
 |---|---|---|
 | `v` | int | Schema version. Currently `1`. Bumped on backward-incompatible changes; older readers can refuse newer lines. |
+| `event_id` | string | `UUIDv7` per individual line. The merge view dedupes on this; the TUI uses it as a stable row identifier. |
+| `origin` | string | `"operator"` (line written to `$XDG_STATE_HOME/yoink/audit/events.jsonl` on the operator's machine) or `"host"` (line written to `/var/lib/yoink/audit/events.jsonl` on the managed host). |
 | `ts` | string | RFC 3339 wall-clock with millisecond precision (`2026-05-01T15:42:01.317Z`). |
 | `deploy_id` | string | `UUIDv7` — one per `yoink up` / `rollback` / `prune` / `secrets rotate` run. Lexicographic sort orders by start time. |
 | `actor` | string | `$USER@$HOSTNAME` of the operator. `?@?` when not resolvable. |
 | `yoink_version` | string | Operator's yoink version. |
 | `git_sha` | string \| null | Short git SHA of the operator's working tree at the time of the run. `null` when not a git repo or `--allow-dirty` was set. |
-| `host` | string | The host the event applies to. Empty for envelope events that aren't host-specific (rare). |
+| `host` | string | The host the event applies to. Empty for `origin: "operator"` events that aren't host-specific (e.g. a `RunStarted` that fans out to multiple hosts). |
 | `event` | string | Discriminator — picks the variant below. |
 
 ## Envelope events
@@ -172,9 +174,15 @@ The flush policy is per-variant. **Forensic** events bypass the per-host buffer 
 
 ## Storage
 
-- **Active file**: `/var/lib/yoink/audit/events.jsonl`. Permissions `0640`, owned by the SSH deploy user.
-- **Rotation**: when the active file exceeds 5 MiB, atomically renamed to `events-<UTC-timestamp>.jsonl`; a fresh active file starts.
-- **Retention**: yoink does not enforce one. Run `yoink audit gc --keep <DURATION>` from cron to prune.
+Two files; same line shape, different paths:
+
+| origin | path | who writes |
+|---|---|---|
+| `operator` | `$XDG_STATE_HOME/yoink/audit/events.jsonl` (defaults to `~/.local/state/yoink/audit/`) | the operator's `yoink` process — local file write |
+| `host` | `/var/lib/yoink/audit/events.jsonl` on each managed host | operator over SSH (`tee -a`); permissions `0640`, owned by the SSH deploy user |
+
+- **Rotation**: each active file rotates at 5 MiB into `events-<UTC-timestamp>.jsonl`; a fresh active file starts.
+- **Retention**: yoink does not enforce one. Run `yoink audit gc --keep <DURATION>` from cron to prune (host-side only currently; operator-side rotated files accumulate until you delete them manually).
 
 ## See also
 

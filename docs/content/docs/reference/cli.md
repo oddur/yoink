@@ -113,13 +113,15 @@ yoink rollback <SERVICE>                 redeploy the previous spec_hash
 yoink history <SERVICE>                  list past deploys (when, version, state, deployed-by)
   --limit <N>                            cap the row count
 
-yoink audit log                          stream the on-host JSONL audit log across the fleet
-                                         (every state-changing op yoink performed on each host;
-                                         survives `docker rm`)
-  --host <ADDR>                          restrict to one host
+yoink audit log                          merge operator-side log
+                                         ($XDG_STATE_HOME/yoink/audit/events.jsonl) with each
+                                         host's /var/lib/yoink/audit/events.jsonl, dedupe on
+                                         `event_id`, sort newest-first
+  --host <ADDR>                          restrict the host fetch to one host
   --service <NAME>                       restrict to one service
-  --deploy-id <ID>                       only events from this run
+  --deploy-id <ID>                       only events from this run (prefix-match)
   --event <NAME>                         filter by event name (repeatable)
+  --origin operator|host                 only one side of the merge
   --since <DURATION>                     window relative to now (default 7d)
   --limit <N>                            cap the row count (default 100)
   --format text|json                     `json` emits raw JSONL — pipes cleanly into jq
