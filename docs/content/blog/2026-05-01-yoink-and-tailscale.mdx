@@ -29,11 +29,11 @@ ListenAddress 100.64.0.0/10
 
 Port 22 isn't open on the public IP. The provider firewall blocks it, the host firewall blocks it, and `sshd` isn't listening on it anyway. The constant brute-force noise that used to fill `auth.log` stops, because there's nothing on the public internet to attack.
 
-If I want to retire a device I remove it from the tailnet and it can't reach anything. If I want to rotate CI's auth I rotate the OAuth client and old tokens die on next use. I haven't touched an `authorized_keys` file in months.
+If I want to retire a device I remove it from the tailnet and it can't reach anything. If I want to rotate CI's auth I rotate the OAuth client and old tokens die on next use. I haven't had to open an `authorized_keys` file since.
 
 ## A shout-out to Depot
 
-The CI side of this is much nicer if your runners join the tailnet without you wiring it up by hand. I run CI on [Depot](https://depot.dev), which has native Tailscale integration. Flip a switch in project settings and every runner joins the tailnet for the duration of a job as an ephemeral device, then leaves when the job ends. There's no bootstrap auth key to plumb through, no `tailscaled` install step in a workflow, no auth keys to forget about and find lying around six months later.
+The CI side of this is much nicer if your runners join the tailnet without you wiring it up by hand. I run CI on [Depot](https://depot.dev), which has native Tailscale integration. Flip a switch in project settings and every runner joins the tailnet for the duration of a job as an ephemeral device, then leaves when the job ends. There's no bootstrap auth key to plumb through, no `tailscaled` install step in a workflow, no auth keys hanging around in a secret store waiting to be forgotten about.
 
 Runners come up tagged `tag:ci`, and one line in my tailnet ACLs lets `tag:ci` SSH into hosts tagged `tag:prod`. That's the whole authorization model. With yoink the deploy step is:
 
@@ -57,4 +57,4 @@ This works across providers and across continents, and it works for the box in m
 
 Each tool stays small by leaning on the other. Yoink hands off identity to Tailscale, Tailscale hands off orchestration to yoink, and neither has to grow features to cover what the other already does. Sealed secrets still earn their keep, because there are plenty of secrets in any deploy that aren't SSH keys, but the credential that used to sit at the center of the whole pipeline isn't there to manage anymore.
 
-I noticed this when I went to update the SSH section of my runbook and realized I'd deleted it months ago and hadn't missed it.
+When I sat down to write the SSH section of my runbook for this setup, I didn't have anything to put in it.
