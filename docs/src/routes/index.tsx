@@ -1,4 +1,6 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
+import { createServerFn } from '@tanstack/react-start';
+import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { HomeLayout } from 'fumadocs-ui/layouts/home';
 import { Card, Cards } from 'fumadocs-ui/components/card';
 import { baseOptions } from '@/lib/layout.shared';
@@ -14,9 +16,9 @@ import {
 } from 'lucide-react';
 import { Suspense } from 'react';
 
-export const Route = createFileRoute('/')({
-  component: Home,
-  loader: () => {
+const getLatestPost = createServerFn({ method: 'GET' })
+  .middleware([staticFunctionMiddleware])
+  .handler(async () => {
     const pages = blogSource.getPages();
     if (!pages.length) return null;
     const withDates = pages.map((p) => {
@@ -32,6 +34,16 @@ export const Route = createFileRoute('/')({
     });
     withDates.sort((a, b) => b.date.localeCompare(a.date));
     return withDates[0] ?? null;
+  });
+
+export const Route = createFileRoute('/')({
+  component: Home,
+  loader: async () => {
+    try {
+      return await getLatestPost();
+    } catch {
+      return null;
+    }
   },
 });
 
