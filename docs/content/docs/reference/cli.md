@@ -13,7 +13,7 @@ Every subcommand accepts:
 -v, --verbose         Increase log verbosity (-v info, -vv debug, -vvv trace).
                       Repeatable.
 -q, --quiet           Suppress informational stderr (-q most, -qq all but errors).
-                      Repeatable. Doesn't affect stdout — primary results stay
+                      Repeatable. Doesn't affect stdout; primary results stay
                       readable.
     --color <COLOR>   When to colour output: auto (default; detects TTY) /
                       always / never. Honours NO_COLOR regardless.
@@ -25,7 +25,7 @@ Env vars yoink reads: `YOINK_AGE_KEY` / `YOINK_AGE_KEY_FILE` (sealed-secrets
 identity), `YOINK_ALLOW_REVEAL_IN_CI` (override `secrets show --reveal`'s CI
 guard), `EDITOR` / `VISUAL` (`secrets edit`), `PAGER` (long output),
 `NO_COLOR` (disable colour), `CI` (triggers the reveal guard above), `RUST_LOG`
-(fine-grained per-module logging — overrides `-v`).
+(fine-grained per-module logging; overrides `-v`).
 
 ## Subcommand reference
 
@@ -119,7 +119,7 @@ yoink prune                              remove yoink-managed containers no long
 yoink diff <SERVICE>                     show what would change between running and target
   --tag <value>                          diff against a specific image tag
 
-yoink dump                               dense JSON of everything yoink can observe — config,
+yoink dump                               dense JSON of everything yoink can observe: config,
                                          per-host docker info, every yoink container with
                                          inspect + stats + log tail + drift status. Pipe into
                                          an LLM/agent for diagnosis. Secret-ish env values
@@ -252,18 +252,18 @@ yoink up --here                                             # shorthand for "eve
 yoink up --service api --here                               # one service at HEAD
 ```
 
-`--here` resolves the current `git rev-parse --short HEAD` and applies it as a per-service override — equivalent to typing the SHA out for every service. Conflicts with `--tag` (use one or the other).
+`--here` resolves the current `git rev-parse --short HEAD` and applies it as a per-service override, equivalent to typing the SHA out for every service. Conflicts with `--tag` (use one or the other).
 
 ## Force redeploy (`--force`)
 
-Bypasses the at-spec early-return so every selected service runs the full prepare → finalize loop, including the Caddy admin push for routed services. The recovery gesture for cases where proxy-side state has drifted from container reality — e.g. Caddy's upstream pool still references containers that were swapped out in a prior reconcile. Pair with `--service <name>` to limit blast radius:
+Bypasses the at-spec early-return so every selected service runs the full prepare → finalize loop, including the Caddy admin push for routed services. The recovery gesture for cases where proxy-side state has drifted from container reality; e.g. Caddy's upstream pool still references containers that were swapped out in a prior reconcile. Pair with `--service <name>` to limit blast radius:
 
 ```sh
 yoink up --service yoink-proxy --force          # re-push Caddy admin config
 yoink up --service api --force                  # re-create + healthcheck all api replicas
 ```
 
-Tradeoff: for multi-replica services the prep phase removes the old replicas before finalize starts the new ones, so there's a brief service-level downtime window (≈ healthcheck timeout). Use sparingly. Routine deploys never need this — drift detection + the rolling-swap loop handle the normal case automatically.
+Tradeoff: for multi-replica services the prep phase removes the old replicas before finalize starts the new ones, so there's a brief service-level downtime window (≈ healthcheck timeout). Use sparingly. Routine deploys never need this; drift detection + the rolling-swap loop handle the normal case automatically.
 
 ## Watch mode (`--watch`)
 
@@ -275,7 +275,7 @@ yoink up --watch --build --service my-tool
 # Ctrl-C to exit
 ```
 
-The 2 s cadence matches the TUI's reload tick. Reconcile errors are reported to stderr but don't abort the loop — fix the config and the next save kicks off another attempt.
+The 2 s cadence matches the TUI's reload tick. Reconcile errors are reported to stderr but don't abort the loop; fix the config and the next save kicks off another attempt.
 
 ## Boolean-flag conventions
 
@@ -284,16 +284,16 @@ yoink uses three deliberately distinct shapes for boolean flags:
 | Shape | Meaning | Examples |
 |---|---|---|
 | `--<verb>` | Enable an additive behavior. Off by default. | `--build`, `--watch`, `--push`, `--json`, `--force` |
-| `--no-<thing>` | Suppress a default-on behavior. | `--no-registry` (force local-only mode — ship every service's image from local instead of pulling), `--no-port` (skip port/healthcheck inference), `--no-secrets` (skip identity bootstrap), `--no-cache` (skip docker build cache) |
+| `--no-<thing>` | Suppress a default-on behavior. | `--no-registry` (force local-only mode, ships every service's image from local instead of pulling), `--no-port` (skip port/healthcheck inference), `--no-secrets` (skip identity bootstrap), `--no-cache` (skip docker build cache) |
 | `--allow-<safety>` | Override a safety guard. The default refuses; `--allow-X` opts in. | `--allow-dirty` (deploy with a dirty git tree) |
 
-Same rules for new flags: `--allow-X` only when there's a guard to bypass; `--no-X` only when the default is on; otherwise plain `--<verb>`. Avoid `--skip-X` / `--without-X` — they overlap with `--no-X`.
+Same rules for new flags: `--allow-X` only when there's a guard to bypass; `--no-X` only when the default is on; otherwise plain `--<verb>`. Avoid `--skip-X` / `--without-X`; they overlap with `--no-X`.
 
 `--yes` is the standard non-interactive override for confirmation prompts; it does not enable destructive behavior on its own (the action is what enables it).
 
 ## Dynamic shell completion
 
-`yoink completions <shell>` emits static completions (subcommand names, flag names, value enums). For *dynamic* values — service names, host addresses, config file paths — yoink ships a hidden `__complete` helper that prints one value per line:
+`yoink completions <shell>` emits static completions (subcommand names, flag names, value enums). For *dynamic* values (service names, host addresses, config file paths), yoink ships a hidden `__complete` helper that prints one value per line:
 
 | Subcommand | Source | Needs config loaded? |
 |---|---|---|
@@ -339,7 +339,7 @@ _yoink_dynamic() {
 complete -F _yoink_dynamic -o default yoink
 ```
 
-Zsh: drop the `compdef` snippet from `yoink completions zsh` into your `fpath`, then layer a wrapper that calls `yoink __complete <kind>` for the values you want described. The helper itself just prints `\n`-separated paths/names — wire it into whatever completion shape your shell prefers.
+Zsh: drop the `compdef` snippet from `yoink completions zsh` into your `fpath`, then layer a wrapper that calls `yoink __complete <kind>` for the values you want described. The helper itself just prints `\n`-separated paths/names; wire it into whatever completion shape your shell prefers.
 
 After sourcing the snippet, every `<TAB>` works the way you'd hope:
 

@@ -4,7 +4,7 @@ description: Ship images directly to hosts over SSH with no registry — layer-l
 weight: 15
 ---
 
-Build and ship a service in one `yoink up --build` — no CI, no registry. Default transport is [unregistry](https://github.com/psviderski/unregistry) (layer-level dedup over SSH); tarball fallback handles air-gapped hosts. For the build-origin × distribution mental model, see [Deploy modes](/docs/guide/deploy-modes).
+Build and ship a service in one `yoink up --build`: no CI, no registry. Default transport is [unregistry](https://github.com/psviderski/unregistry) (layer-level dedup over SSH); tarball fallback handles air-gapped hosts. For the build-origin × distribution mental model, see [Deploy modes](/docs/guide/deploy-modes).
 
 ## The minimum config
 
@@ -49,14 +49,14 @@ The local-shipping path uses the **unregistry transport** by default; `--transpo
 
 For each host:
 
-1. yoink starts an ephemeral [`ghcr.io/psviderski/unregistry`](https://github.com/psviderski/unregistry) sidecar. Unregistry is an OCI registry that reads/writes the host's image store via the containerd socket — no separate blob storage, images land in `docker images` immediately on push.
+1. yoink starts an ephemeral [`ghcr.io/psviderski/unregistry`](https://github.com/psviderski/unregistry) sidecar. Unregistry is an OCI registry that reads/writes the host's image store via the containerd socket with no separate blob storage; images land in `docker images` immediately on push.
 2. yoink opens an SSH-tunnelled local port to the sidecar.
-3. yoink reads the image bytes from the operator's docker daemon and pushes blob-by-blob over the SSH tunnel — `HEAD` first, `PUT` only if missing. **Layer-level dedup: redeploys ship only the changed layers.**
+3. yoink reads the image bytes from the operator's docker daemon and pushes blob-by-blob over the SSH tunnel: `HEAD` first, `PUT` only if missing. **Layer-level dedup: redeploys ship only the changed layers.**
 4. The sidecar is `--rm` and force-removed by name on the next `up` via a label sweep.
 
 The push runs from the operator process, not via `docker push` on the operator's daemon. On macOS Docker Desktop (and Rancher Desktop / Colima) the daemon lives in a Linux VM, so a `docker push 127.0.0.1:<port>/...` from the daemon would hit the VM's loopback rather than the operator's. Pushing from the operator process avoids any `insecure-registries` config.
 
-Multi-host fan-out is concurrent across services — deploy time is max(per-host), not sum(per-host).
+Multi-host fan-out is concurrent across services: deploy time is max(per-host), not sum(per-host).
 
 ```
 ✓ api:dev → host-1     done · unregistry
@@ -72,7 +72,7 @@ If the unregistry setup fails (host can't pull the image, ssh forward refused), 
 yoink up --build --transport tarball
 ```
 
-For each (service, host), streams `docker save <image>:<tag>` from the operator's docker daemon into the host's docker daemon via the same SSH-tunnelled Docker API connection `up` uses (`POST /images/load`). Whole image crosses the wire every deploy — no dedup. Slower than unregistry on redeploy. No host dependencies beyond docker. For air-gapped hosts that can't pull the unregistry image, or for debugging transport issues.
+For each (service, host), streams `docker save <image>:<tag>` from the operator's docker daemon into the host's docker daemon via the same SSH-tunnelled Docker API connection `up` uses (`POST /images/load`). The whole image crosses the wire every deploy with no dedup. Slower than unregistry on redeploy. No host dependencies beyond docker. For air-gapped hosts that can't pull the unregistry image, or for debugging transport issues.
 
 Per-host progress bars track bytes transferred + rate live in tarball mode:
 

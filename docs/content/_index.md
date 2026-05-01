@@ -38,15 +38,15 @@ yoink rollback api        # roll back to the previous version
 
 ## Why it exists
 
-Single-host PaaS tools (Kamal, Dokku) are wonderful for "one app, one host" but creak when you want multiple services on the same box, replicas behind a proxy, or network isolation between tiers. Kubernetes solves all that — and a hundred other problems you don't have, in exchange for a control plane to operate, a YAML schema with a learning curve, and a vocabulary you have to teach every new operator.
+Single-host PaaS tools (Kamal, Dokku) are wonderful for "one app, one host" but creak when you want multiple services on the same box, replicas behind a proxy, or network isolation between tiers. Kubernetes solves all that, and a hundred other problems you don't have, in exchange for a control plane to operate, a YAML schema with a learning curve, and a vocabulary you have to teach every new operator.
 
 `yoink` is the thinnest tool that gives you the few Kubernetes ideas that actually matter at small scale, while keeping the "one binary, ssh into the host, drive Docker directly" simplicity of the single-host PaaS world:
 
 - **Multiple services per host** with replicas + dependency-ordered deploys (`depends_on:` topo-sort)
 - **Per-service network tiers** for blast-radius isolation without a CNI plugin
-- **Bundled Caddy reverse proxy** — one `domain:` field exposes a service over HTTPS with automatic Let's Encrypt or sealed Cloudflare origin certs. mTLS, h2c (gRPC), HSTS, all defaults
+- **Bundled Caddy reverse proxy**: one `domain:` field exposes a service over HTTPS with automatic Let's Encrypt or sealed Cloudflare origin certs. mTLS, h2c (gRPC), HSTS, all defaults
 - **Drift detection.** Every effective spec hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
-- **Three deploy modes**: CI-built (the default), local-build with `yoink build --push`, or fully standalone with `yoink up --build` (no CI, no registry — drop a `yoink.yaml` next to your Dockerfile and go)
+- **Three deploy modes**: CI-built (the default), local-build with `yoink build --push`, or fully standalone with `yoink up --build` (no CI, no registry, just drop a `yoink.yaml` next to your Dockerfile and go)
 - **Secure by default.** Every container yoink creates is hardened up front:
   - Non-root uid (`65534` / nobody)
   - `cap_drop=ALL`
@@ -58,7 +58,7 @@ Single-host PaaS tools (Kamal, Dokku) are wonderful for "one app, one host" but 
 
   Override per service when an image genuinely needs root.
 - **Sealed secrets out of the box**: commit a single `secrets.age` file, decrypt with one key from `YOINK_AGE_KEY` (env in CI, file on your laptop). No remote vault needed. For teams that prefer a managed store, `provider: command` shells out to whatever CLI you already use — Doppler, 1Password, Vault, AWS Secrets Manager, the Infisical CLI — no first-party SDK to vendor.
-- **CLI + YAML, no GUI**. Everything is a `yoink` subcommand or a `yoink.yaml` field — no web dashboard, no clicking. Identical experience on your laptop, in CI, and inside an AI coding agent like Claude Code or Cursor.
+- **CLI + YAML, no GUI**. Everything is a `yoink` subcommand or a `yoink.yaml` field, no web dashboard, no clicking. Identical experience on your laptop, in CI, and inside an AI coding agent like Claude Code or Cursor.
 - **k9s-style TUI** with deploy history, one-press rollback, drift cells, logs auto-piped through `hl`
 
 Read more in the [intro](/docs/intro), or skip ahead to [first deploy](/docs/start/first-deploy).

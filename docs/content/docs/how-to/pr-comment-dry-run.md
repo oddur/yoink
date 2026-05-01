@@ -96,11 +96,11 @@ jobs:
 
 - **Fast feedback.** Reviewers see the deploy plan in the PR thread itself, no need to mentally simulate.
 - **Catches the silent-redeploy class of bugs.** A v0.5.0-style change that flips a default and reroles every service is impossible to miss when the dry-run says "6 to update."
-- **Composes with the deploy.** The same `yoink up --dry-run` powers the local `yoink diff <service>` command — operators can rerun the same check at their terminal before merging.
+- **Composes with the deploy.** The same `yoink up --dry-run` powers the local `yoink diff <service>` command; operators can rerun the same check at their terminal before merging.
 
 ## Limitations
 
-- Dry-run reads from the host (it computes the diff against running containers), so the PR runner needs the same auth path your deploy runner does — tailnet membership + whatever secret-resolution your `provider:` setup needs (`YOINK_AGE_KEY` for age, the configured manager's CLI + token for `command`).
+- Dry-run reads from the host (it computes the diff against running containers), so the PR runner needs the same auth path your deploy runner does: tailnet membership + whatever secret-resolution your `provider:` setup needs (`YOINK_AGE_KEY` for age, the configured manager's CLI + token for `command`).
 - The `--tag` overrides have to match what your deploy workflow will pass. If staging/prod diverge, run two dry-runs against the right host set.
 
 ## See also

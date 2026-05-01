@@ -61,7 +61,7 @@ yoink up --service api          # docker pull from the tailnet registry on each 
 ## Caveats
 
 - The registry host is a single point of failure for image pulls. If it dies during a deploy, every host that doesn't already have the image cached locally fails to pull. Mitigation: pin to a real cloud registry for prod-critical workloads, use the self-hosted registry for staging / hobby / non-critical.
-- No replication. If you need image distribution across regions, this isn't the right answer — use a real registry (Depot, ghcr.io, ECR).
+- No replication. If you need image distribution across regions, this isn't the right answer; use a real registry (Depot, ghcr.io, ECR).
 - No automatic garbage collection. Old image layers accumulate; periodically run the [registry's GC](https://distribution.github.io/distribution/about/garbage-collection/) inside the container.
 
 ## See also

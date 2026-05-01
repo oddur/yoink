@@ -11,9 +11,9 @@ If you're already on Cloudflare's edge, **Origin Certificates** are the simplest
 - **No rate limits.** LE caps you to 5 duplicate certs / week / domain. With multi-host and forgetful redeploys, hitting that is easy.
 - **No port-80 / DNS-01 dance.** Origin certs are issued out-of-band from Cloudflare's dashboard.
 - **15-year validity.** Set a calendar reminder, rotate quarterly, never think about it.
-- **Works with locked-down origins.** Your origin can be on a private network, behind WAF rules, etc. — only Cloudflare's edge needs to reach it, and it does so via TLS on port 443 using the origin cert.
+- **Works with locked-down origins.** Your origin can be on a private network, behind WAF rules, etc. Only Cloudflare's edge needs to reach it, and it does so via TLS on port 443 using the origin cert.
 
-The downside: only Cloudflare-fronted clients trust the cert. That's the point — origin certs are not for direct browser access.
+The downside: only Cloudflare-fronted clients trust the cert. Origin certs are not for direct browser access.
 
 ## Setup
 
@@ -45,7 +45,7 @@ Save and exit. The values land in `secrets.age` (committed to the repo, encrypte
 
 ### Wire it up in `yoink.yaml` [step]
 
-**Single service, single cert** — per-service:
+**Single service, single cert** (per-service):
 
 ```yaml
 services:
@@ -60,7 +60,7 @@ services:
       port: 8080
 ```
 
-**Many services, one wildcard cert** (the common case — `*.example.com` covers everything) — proxy-level:
+**Many services, one wildcard cert** (`*.example.com` covers everything) via proxy-level config:
 
 ```yaml
 proxy:
@@ -87,7 +87,7 @@ Note: `proxy.email:` isn't required when no service uses `tls: auto`. ACME is im
 
 ## Origin-pull mTLS (lock your origin to Cloudflare's edge)
 
-By default, anyone who knows your origin IP can hit it directly with a `Host:` header — bypassing Cloudflare's WAF, rate limits, bot blocks, etc. **Origin-pull mTLS** fixes that: the origin requires every request to present a Cloudflare-signed client certificate. Anything else gets a TLS handshake error.
+By default, anyone who knows your origin IP can hit it directly with a `Host:` header, bypassing Cloudflare's WAF, rate limits, bot blocks, etc. **Origin-pull mTLS** fixes that: the origin requires every request to present a Cloudflare-signed client certificate. Anything else gets a TLS handshake error.
 
 
 ### Add the Origin Pull CA bundle to `secrets.age` [step]
@@ -121,14 +121,14 @@ proxy:
       trust_pool_secret: CF_ORIGIN_PULL_CA
 ```
 
-That applies to **every** routed service. From now on, requests that don't come through Cloudflare are dropped at the TLS layer — your origin simply doesn't appear to exist for them.
+That applies to **every** routed service. From now on, requests that don't come through Cloudflare are dropped at the TLS layer; your origin simply doesn't appear to exist for them.
 
 `mode:` options (default `require_and_verify`):
 
-- `require_and_verify` — strict; reject anything without a valid client cert. **Recommended.**
-- `require` — require a cert but skip verification (don't use this).
-- `verify_if_given` — accept anonymous; verify if present. Mixed-mode.
-- `request` — request but don't enforce. Almost never useful.
+- `require_and_verify`: strict; reject anything without a valid client cert. **Recommended.**
+- `require`: require a cert but skip verification (don't use this).
+- `verify_if_given`: accept anonymous; verify if present. Mixed-mode.
+- `request`: request but don't enforce. Almost never useful.
 
 ### Verify [step]
 
@@ -149,7 +149,7 @@ curl https://api.example.com/health
 
 ## Real client IP from `CF-Connecting-IP`
 
-Cloudflare proxies, so by default your origin (and Caddy access logs, Coraza, any rate-limit handler) sees Cloudflare's edge IPs in `RemoteAddr`. That's almost never what you want — log analytics, geo-IP, app-side rate limits, and any IP-based abuse handling all collapse to "every request is from Cloudflare." The fix is two lines: a caddy plugin that auto-refreshes Cloudflare's IP ranges, plus a `proxy.config_extra:` block telling Caddy to trust those ranges as proxies and read the real IP from `CF-Connecting-IP`.
+Cloudflare proxies, so by default your origin (and Caddy access logs, Coraza, any rate-limit handler) sees Cloudflare's edge IPs in `RemoteAddr`. That's almost never what you want; log analytics, geo-IP, app-side rate limits, and any IP-based abuse handling all collapse to "every request is from Cloudflare." The fix is two lines: a caddy plugin that auto-refreshes Cloudflare's IP ranges, plus a `proxy.config_extra:` block telling Caddy to trust those ranges as proxies and read the real IP from `CF-Connecting-IP`.
 
 ```yaml
 proxy:
@@ -215,7 +215,7 @@ For zero-downtime rotation, use `yoink up --service yoink-proxy` from one host a
 
 ## Multi-host
 
-Each host serves the same domain with the same cert — no Let's Encrypt rate-limit problem because no ACME is happening. Origin certs work the same on every host.
+Each host serves the same domain with the same cert. No Let's Encrypt rate-limit problem because no ACME is happening. Origin certs work the same on every host.
 
 The cert + key live in `secrets.age` (one copy in the repo). Every host's proxy reads it from the same source. No Redis, no shared storage needed.
 

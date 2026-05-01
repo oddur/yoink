@@ -24,11 +24,11 @@ Cross-cutting terms. Each entry is one paragraph with a link to the page that co
 
 ## Build origin and distribution
 
-**`build:` block.** A service with `build:` is built on the operator's machine before deploy. Without it, the image is pulled from a registry. Mixed configs work — some services build, others pull. See [Deploy modes](/docs/guide/deploy-modes).
+**`build:` block.** A service with `build:` is built on the operator's machine before deploy. Without it, the image is pulled from a registry. Mixed configs work: some services build, others pull. See [Deploy modes](/docs/guide/deploy-modes).
 
 **Standalone mode.** `yoink up --build` ships an image from the operator's docker daemon to each host over SSH. Default transport is unregistry (layer dedup); falls back to tarball on hosts that can't pull the unregistry sidecar. See [Standalone (no-registry) deploys](/docs/how-to/standalone-mode).
 
-**Unregistry.** An ephemeral [OCI registry sidecar](https://github.com/psviderski/unregistry) yoink starts on each host during standalone deploys. Reads/writes the host's image store directly via the containerd socket — no separate blob storage, layer-level dedup over the SSH tunnel. Removed on the next deploy.
+**Unregistry.** An ephemeral [OCI registry sidecar](https://github.com/psviderski/unregistry) yoink starts on each host during standalone deploys. Reads/writes the host's image store directly via the containerd socket with no separate blob storage and layer-level dedup over the SSH tunnel. Removed on the next deploy.
 
 **Tarball transport.** Standalone fallback when unregistry can't run on the host (air-gapped). Streams `docker save` from operator to host's docker daemon over SSH. No layer dedup.
 
@@ -38,7 +38,7 @@ Cross-cutting terms. Each entry is one paragraph with a link to the page that co
 
 **`provider: command`.** Bring-your-own-tool secrets path. Yoink invokes the configured command, parses dotenv or JSON from stdout, feeds the result to the same machinery `provider: age` uses. Wire any secret manager (sops, Doppler, Infisical, Vault, AWS SM, 1Password, Bitwarden). See [External secrets via CLI](/docs/guide/secrets#external-secrets-via-cli-provider-command).
 
-**Recipient vs. identity.** The two halves of an age keypair. The **recipient** (`age1…`, public) lives in `secrets.recipients:` and seals new values — safe to commit. The **identity** (`AGE-SECRET-KEY-1…`, private) lives in your secret manager and unseals at deploy time — never commit.
+**Recipient vs. identity.** The two halves of an age keypair. The **recipient** (`age1…`, public) lives in `secrets.recipients:` and seals new values; safe to commit. The **identity** (`AGE-SECRET-KEY-1…`, private) lives in your secret manager and unseals at deploy time; never commit it.
 
 **`YOINK_AGE_KEY`.** The env var yoink reads at deploy time to find the age identity. Set it in CI as a secret; on a laptop, yoink discovers the key from `~/.config/yoink/keys/<recipient>.key`. See [Identity resolution](/docs/guide/secrets#identity-resolution).
 
@@ -50,7 +50,7 @@ Cross-cutting terms. Each entry is one paragraph with a link to the page that co
 
 **`domain:`.** The field that puts a service behind the proxy. `domain: api.example.com` injects `yoink-proxy` into the deploy and routes the hostname to the container.
 
-**`tls: auto` / `cert` / `off`.** Per-service TLS mode. `auto` (default) provisions a Let's Encrypt cert via HTTP-01. `cert` uses an inline cert from a sealed-secret pair (`tls_cert_secret` + `tls_key_secret`) — typical for Cloudflare Origin Certificates. `off` serves on `:80` only.
+**`tls: auto` / `cert` / `off`.** Per-service TLS mode. `auto` (default) provisions a Let's Encrypt cert via HTTP-01. `cert` uses an inline cert from a sealed-secret pair (`tls_cert_secret` + `tls_key_secret`), typical for Cloudflare Origin Certificates. `off` serves on `:80` only.
 
 **`proxy.xcaddy:`.** A list of Caddy plugins (Go modules) yoink compiles into a custom Caddy binary on each proxy host via an `xcaddy` build sidecar. Used for rate-limiting, the L4 module, third-party DNS providers, shared ACME storage. See [Caddy plugins](/docs/how-to/caddy-plugins).
 
@@ -60,7 +60,7 @@ Cross-cutting terms. Each entry is one paragraph with a link to the page that co
 
 ## Networking
 
-**`publish:` (and the no-publish default).** Yoink never adds `publish:` automatically. A service without `publish:` is reachable only on its docker networks — never bound to a host port. See [Networking → Port-forward](/docs/guide/networking#port-forward).
+**`publish:` (and the no-publish default).** Yoink never adds `publish:` automatically. A service without `publish:` is reachable only on its docker networks; never bound to a host port. See [Networking → Port-forward](/docs/guide/networking#port-forward).
 
 **`yoink pf <service>`.** Tunnels from your laptop to a container port over the SSH connection yoink already uses. Works regardless of `publish:`.
 

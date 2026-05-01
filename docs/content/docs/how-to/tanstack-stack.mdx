@@ -4,16 +4,16 @@ description: Scaffold a TanStack Start app, add postgres via yoink add, deploy, 
 weight: 2
 ---
 
-A TanStack Start app deploying alongside a managed postgres, built locally and shipped without a registry. Five files, three commands, working stack on the host in about ten minutes. Adding more accessories (redis, meilisearch, …) is the same shape — `yoink add <name>`, paste the connection block.
+A TanStack Start app deploying alongside a managed postgres, built locally and shipped without a registry. Five files, three commands, working stack on the host in about ten minutes. Adding more accessories (redis, meilisearch, …) follows the same shape: `yoink add <name>`, paste the connection block.
 
-This is the "indie one-shot" pattern — single laptop, single host, no CI, no Docker Hub account, no Vault. Public exposure (HTTPS, domains) is intentionally out of scope here; the [port-forward recipe](/docs/guide/networking#port-forward) covers reaching the deployed stack from your laptop.
+This is the "indie one-shot" pattern: single laptop, single host, no CI, no Docker Hub account, no Vault. Public exposure (HTTPS, domains) is intentionally out of scope here; the [port-forward recipe](/docs/guide/networking#port-forward) covers reaching the deployed stack from your laptop.
 
 ## What you need
 
 - A host with Docker installed and key-based ssh login. A fresh Hetzner / DigitalOcean / Linode box qualifies.
 - yoink, node, and docker on your laptop.
 
-> **Local-only iteration?** yoink is a remote-deploy tool by design — destructive commands target ssh hosts, not your laptop's docker daemon (read-only commands like `yoink tui` / `yoink status` do work locally). For pure local development loops, reach for Docker Compose; come back to yoink when you have a host to ship to. If you genuinely want yoink against a "local" VM, expose its docker daemon over SSH (Colima, OrbStack) and treat it as a remote host — no special syntax.
+> **Local-only iteration?** yoink is a remote-deploy tool by design; destructive commands target ssh hosts, not your laptop's docker daemon (read-only commands like `yoink tui` / `yoink status` do work locally). For pure local development loops, reach for Docker Compose; come back to yoink when you have a host to ship to. If you genuinely want yoink against a "local" VM, expose its docker daemon over SSH (Colima, OrbStack) and treat it as a remote host; no special syntax.
 
 ## Walkthrough
 
@@ -135,7 +135,7 @@ inferred:
   identity: ~/.config/yoink/keys/age1….key
 ```
 
-**Back up the key now** (paste into a password manager) — see [Sealed secrets](/docs/guide/secrets) for backup options. Lose it and the sealed values in this repo are gone.
+**Back up the key now** (paste into a password manager); see [Sealed secrets](/docs/guide/secrets) for backup options. Lose it and the sealed values in this repo are gone.
 
 ### Drop in postgres [step]
 
@@ -161,15 +161,15 @@ connect another service to postgres:
     POSTGRES_PASSWORD: POSTGRES_PASSWORD
 ```
 
-The keys are the accessory's suggestion — neutral, conventional. If your app reads a different shape (e.g. `DATABASE_URL`, `PG_HOST`), rename them in the paste; yoink doesn't care which env names the consuming service uses, only that they're present.
+The keys are the accessory's suggestion, neutral and conventional. If your app reads a different shape (e.g. `DATABASE_URL`, `PG_HOST`), rename them in the paste; yoink doesn't care which env names the consuming service uses, only that they're present.
 
 > **Need redis, meilisearch, …?** Same shape: `yoink add redis` (or `yoink add meilisearch`) prints its own connection block. Paste alongside this one, merging the `depends_on:` lists.
 
 ### Wire the app to the accessory [step]
 
-Paste the `connect another service to …` block into your app's `services[]` entry. The keys are conventional but not magic — drop any your app doesn't read (the demo `db.server.ts` ignores `POSTGRES_PORT` since the port is hard-coded).
+Paste the `connect another service to …` block into your app's `services[]` entry. The keys are conventional but not magic; drop any your app doesn't read (the demo `db.server.ts` ignores `POSTGRES_PORT` since the port is hard-coded).
 
-Then add the `build:` block. The whole file ends up looking like:
+Then add the `build:` block:
 
 ```yaml
 hosts:
@@ -212,13 +212,13 @@ include:
 yoink up --build
 ```
 
-One command. The host pulls postgres from Docker Hub; the app (with its `build:` block) is built locally and shipped to the host via [unregistry](https://github.com/psviderski/unregistry) over SSH — no registry account required for the app. Both containers come up on the `yoink` network, the app's healthcheck gates the swap.
+One command. The host pulls postgres from Docker Hub; the app (with its `build:` block) is built locally and shipped to the host via [unregistry](https://github.com/psviderski/unregistry) over SSH with no registry account required for the app. Both containers come up on the `yoink` network, the app's healthcheck gates the swap.
 
-First deploy is the slow one — pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry ships only changed layers.
+First deploy is the slow one; pulling Docker Hub's `node:22-alpine` and the npm install. Re-deploys are fast: unregistry ships only changed layers.
 
 ### Verify [step]
 
-The app is reachable on the host's docker network at `my-app:3000` but isn't bound to a host port — that's the secure default. To open it on your laptop:
+The app is reachable on the host's docker network at `my-app:3000` but isn't bound to a host port; that's the secure default. To open it on your laptop:
 
 ```sh
 yoink pf my-app -o
@@ -253,7 +253,7 @@ Five files (`Dockerfile`, `.dockerignore`, `src/lib/db.server.ts`, `src/routes/i
 - [Architecture](/docs/guide/architecture) — drift detection, healthcheck-gated swap.
 - [CLI reference](/docs/reference/cli) — every `yoink up` flag.
 
-## Going public — HTTPS with Let's Encrypt
+## Going public: HTTPS with Let's Encrypt
 
 The recipe above stays internal so you can verify the stack without owning a domain. Once you have one and an A record pointing at the host, swapping `yoink pf` for public HTTPS is a two-line edit:
 
@@ -268,12 +268,12 @@ services:
     domain: app.example.com        # ← the new line
 ```
 
-`yoink up` notices a `domain:`-tagged service and synthesizes a `yoink-proxy` running `caddy:2` alongside your app. Caddy joins the same docker network, requests a Let's Encrypt cert (HTTP-01 against `app.example.com`), and routes incoming traffic to `my-app:3000` automatically. No `publish:` on the app — only the proxy binds host ports `:80` / `:443`.
+`yoink up` notices a `domain:`-tagged service and synthesizes a `yoink-proxy` running `caddy:2` alongside your app. Caddy joins the same docker network, requests a Let's Encrypt cert (HTTP-01 against `app.example.com`), and routes incoming traffic to `my-app:3000` automatically. No `publish:` on the app; only the proxy binds host ports `:80` / `:443`.
 
 Two things to check before deploying:
 
-1. **DNS** — `dig +short A app.example.com` must resolve to the host's public IP. Let's Encrypt validates over HTTP-01; an unpointed record produces self-signed certs and a permanent browser warning.
-2. **`proxy.email:`** — yoink doctor warns when this is the docs placeholder. Use a real address you read; LE expiry warnings go there.
+1. **DNS**: `dig +short A app.example.com` must resolve to the host's public IP. Let's Encrypt validates over HTTP-01; an unpointed record produces self-signed certs and a permanent browser warning.
+2. **`proxy.email:`**: yoink doctor warns when this is the docs placeholder. Use a real address you read; LE expiry warnings go there.
 
 Re-deploy and the app is live at `https://app.example.com`. `yoink doctor` confirms ahead of `yoink up` that the host is reachable, the domain resolves, and the email isn't a placeholder.
 
@@ -297,7 +297,7 @@ include:
   - "../project-b/services/*.yaml"   # alongside its own repo
 ```
 
-Each project's repo keeps its `services/<project>.yaml` fragment alongside its code; the host config aggregates them. `yoink up` from the host config sees every project's services as one cluster. Per-project deploys are still possible — `yoink up --service project-a-app` from inside the host config — they just need to run from the directory with the central `yoink.yaml`.
+Each project's repo keeps its `services/<project>.yaml` fragment alongside its code; the host config aggregates them. `yoink up` from the host config sees every project's services as one cluster. Per-project deploys are still possible (`yoink up --service project-a-app` from inside the host config); they just need to run from the directory with the central `yoink.yaml`.
 
 Coordination cost: every project's CI runner needs the host config's age identity (or the per-project services need to ship their own `provider: command` entry that the host config inherits).
 

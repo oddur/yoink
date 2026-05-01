@@ -4,9 +4,7 @@ description: CLI and YAML-driven, deterministic exit codes, and patterns for dri
 weight: 8
 ---
 
-Yoink is unusually well-suited to being driven by AI coding agents (Claude Code, Cursor, Aider, OpenAI Codex, GitHub Copilot Workspace, Devin, …) because **its entire control surface is a CLI binary plus YAML files in your repo** — no web dashboard, no REST API to learn, no interactive prompts to navigate. Anything an agent can do at a terminal, it can do with yoink.
-
-This page is the short pitch + a few patterns that work well in practice.
+Yoink is unusually well-suited to being driven by AI coding agents (Claude Code, Cursor, Aider, OpenAI Codex, GitHub Copilot Workspace, Devin, …) because **its entire control surface is a CLI binary plus YAML files in your repo**: no web dashboard, no REST API to learn, no interactive prompts to navigate. Anything an agent can do at a terminal, it can do with yoink.
 
 ## Why it works
 
@@ -25,10 +23,10 @@ This page is the short pitch + a few patterns that work well in practice.
 The pattern that works:
 
 1. **Describe the change in YAML.** Edit `yoink.yaml` to add a service, change an image tag, bump a replica count, etc.
-2. **Preview the diff.** `yoink up --dry-run --format=markdown` — output is a markdown table the agent can paste into the chat or a PR comment.
+2. **Preview the diff.** `yoink up --dry-run --format=markdown`: output is a markdown table the agent can paste into the chat or a PR comment.
 3. **Apply.** `yoink up` (or scoped: `yoink up --service api`).
 4. **Verify.** `yoink status` (one-shot table) and `curl` the public endpoint. The exit code on a failed healthcheck-gated swap is non-zero, so the agent knows immediately if rollout failed.
-5. **Roll back if needed.** `yoink rollback api` — atomic, no human in the loop required.
+5. **Roll back if needed.** `yoink rollback api`: atomic, no human in the loop required.
 
 Every step in this loop is a single shell command with predictable output. No screen-scraping, no waiting for a UI to render.
 
@@ -49,7 +47,7 @@ yoink pf api --json &                   # Tunnel to a (possibly non-published) s
                                         # the agent can read to drive a follow-up curl
 ```
 
-The full surface is in the [CLI reference](/docs/reference/cli) — all flags, all subcommands, no hidden state.
+The full surface is in the [CLI reference](/docs/reference/cli): all flags, all subcommands, no hidden state.
 
 ## A tip for prompt design
 
@@ -57,9 +55,9 @@ When asking an agent to make a deploy change, anchor it on the **YAML diff** rat
 
 > Add a new `worker` service to `yoink.yaml`: image `ghcr.io/me/worker:v1`, depends on `redis`, runs on the `api` and `redis` networks, healthcheck on `/health`. Then run `yoink up --dry-run` and show me the diff before applying.
 
-The agent edits the file, runs the dry-run, you skim the diff, the agent applies. This is the same loop a human would follow — yoink doesn't ask the agent to do anything fundamentally different.
+The agent edits the file, runs the dry-run, you skim the diff, the agent applies. This is the same loop a human would follow; yoink doesn't ask the agent to do anything fundamentally different.
 
-## CI is just an agent that doesn't talk back
+## CI runs the same loop
 
 The GitHub Actions workflows yoink documents (see [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run)) are the same shape: an automated runner edits / reads `yoink.yaml`, calls `yoink up --dry-run`, posts the diff back to the PR, and on merge calls `yoink up` for real. Anything an AI agent does locally, you can graduate to CI by copying the same commands into a workflow file.
 
@@ -75,5 +73,5 @@ These are tractable; if you hit a friction point that an agent can't work around
 
 ## See also
 
-- [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run) — agent-readable plan output via `yoink up --dry-run --format=markdown`.
-- [CLI reference](/docs/reference/cli) — every subcommand surface an agent might drive.
+- [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run): agent-readable plan output via `yoink up --dry-run --format=markdown`.
+- [CLI reference](/docs/reference/cli): every subcommand surface an agent might drive.

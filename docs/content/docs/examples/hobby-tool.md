@@ -4,7 +4,7 @@ description: A single-host, single-service yoink.yaml built locally with no regi
 weight: 1
 ---
 
-A Slack bot, admin CLI, internal status board, cron-as-container — one container that needs a host but doesn't justify CI + a registry + Kubernetes.
+A Slack bot, admin CLI, internal status board, cron-as-container: one container that needs a host but doesn't justify CI + a registry + Kubernetes.
 
 **The minimum `yoink.yaml`**: one host, one service, `Dockerfile` next to the config, no registry. `yoink up --build`.
 
@@ -27,7 +27,7 @@ services:
 yoink up --build
 ```
 
-~15 seconds for a small image. The `build:` block makes the image local-only, so yoink ships it from your docker daemon to the host over SSH via [unregistry](https://github.com/psviderski/unregistry) — only changed layers cross the wire.
+~15 seconds for a small image. The `build:` block makes the image local-only, so yoink ships it from your docker daemon to the host over SSH via [unregistry](https://github.com/psviderski/unregistry); only changed layers cross the wire.
 
 ## What yoink does without you asking
 
@@ -47,9 +47,9 @@ run:
 
 This shape stays fine for hobby / utility / internal-tool deployments. Outgrow it when:
 
-- **Replicas** — single-container swap downtime is your downtime. Add `replicas: 2` for rolling swap (capacity N-1).
-- **Multiple hosts** — yoink ships the build artifact from your daemon to every host on every deploy. Once painful, add a [self-hosted tailnet registry](/docs/how-to/self-hosted-registry) so hosts pull from a shared cache.
-- **CI-triggered deploys** — keep `build:`, add a real registry, switch to `yoink build --push` + `yoink up`.
+- **Replicas**: single-container swap downtime is your downtime. Add `replicas: 2` for rolling swap (capacity N-1).
+- **Multiple hosts**: yoink ships the build artifact from your daemon to every host on every deploy. Once painful, add a [self-hosted tailnet registry](/docs/how-to/self-hosted-registry) so hosts pull from a shared cache.
+- **CI-triggered deploys**: keep `build:`, add a real registry, switch to `yoink build --push` + `yoink up`.
 
 ## See also
 

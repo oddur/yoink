@@ -143,7 +143,7 @@ One command does several things in sequence:
 - Generates an ed25519 SSH keypair and seals its private half into a new `secrets.age` under `DEPLOY_SSH_KEY`.
 - Writes `yoink.yaml` with: an empty `hosts:` list (populated by `yoink hosts add` after provisioning), an empty `services:` list (populated by your service fragment in step 1b), `proxy.email:` for ACME, and a wide `include:` glob covering both `hosts/*.yaml` and `services/*.yaml`.
 
-The empty `hosts:` and `services:` lists are by design — yoink accepts them at load time so commands run cleanly between init and the first deploy. `yoink up` is the boundary that requires both to be populated. Let's Encrypt rejects emails on `example.com` — use a real address.
+The empty `hosts:` and `services:` lists are by design: yoink accepts them at load time so commands run cleanly between init and the first deploy. `yoink up` is the boundary that requires both to be populated. Let's Encrypt rejects emails on `example.com`; use a real address.
 
 ### Provision the cx23 [step]
 
@@ -157,9 +157,9 @@ hcloud server create --name bt-scratch-01 --type cx23 \
   --user-data-from-file cloud-init.yaml
 ```
 
-`yoink secrets ssh-key public` derives the OpenSSH-format public key from the sealed private — no plaintext PEM ever touches `/tmp`. The `<(…)` process substitution feeds it to hcloud as a file without an intermediate write.
+`yoink secrets ssh-key public` derives the OpenSSH-format public key from the sealed private; no plaintext PEM ever touches `/tmp`. The `<(…)` process substitution feeds it to hcloud as a file without an intermediate write.
 
-`cx23` is `nbg1`-only at the time of writing — `hcloud server-type describe cx23` is the source of truth. ARM `cax11` is €4.49/mo (Helsinki / Falkenstein) for multi-arch workloads.
+`cx23` is `nbg1`-only at the time of writing; `hcloud server-type describe cx23` is the source of truth. ARM `cax11` is €4.49/mo (Helsinki / Falkenstein) for multi-arch workloads.
 
 ### Register the freshly-provisioned host with yoink [step]
 
@@ -168,7 +168,7 @@ IP=$(hcloud server ip bt-scratch-01)
 yoink hosts add --address $IP --user root --ssh-key-secret DEPLOY_SSH_KEY
 ```
 
-`yoink hosts add` writes a fragment under `hosts/<derived>.yaml` and re-parses the fleet to catch address collisions. The fragment is the sole source of truth for the new host — the operator's `yoink.yaml` is never edited in place.
+`yoink hosts add` writes a fragment under `hosts/<derived>.yaml` and re-parses the fleet to catch address collisions. The fragment is the sole source of truth for the new host; the operator's `yoink.yaml` is never edited in place.
 
 ### Deploy [step]
 

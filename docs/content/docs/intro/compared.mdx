@@ -14,7 +14,7 @@ Yoink lives in a populated neighborhood. Pick the tool that fits your scale, you
 1+ hosts, want a full self-hosted PaaS with a web UI + build pipelines → **[Coolify](https://coolify.io)**.
 1–10 hosts, multi-service, want a web UI + agents on each host → **[Komodo](https://komo.do)**.
 1–10 hosts, multi-service, want a built-in WireGuard mesh + per-host daemon → **[Uncloud](https://uncloud.run)**.
-1–10 hosts, multi-service, want a single binary with no control plane and no agents — driven equally well by humans, CI, or AI agents → **yoink**.
+1–10 hosts, multi-service, want a single binary with no control plane and no agents, driven equally well by humans, CI, or AI agents → **yoink**.
 Many hosts, autoscaling, multi-tenant, "real" infrastructure team → **Kubernetes**.
 </Callout>
 
@@ -47,11 +47,11 @@ A high-level cross-section before the per-tool deep dives. ✓ = built-in, ◐ =
 | Auto-scaling | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
 | Multi-tenancy / RBAC | ✗ | ✗ | ✓ | ◐ | ✓ | ✗ | ✗ | ✓ |
 
-The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, standalone (no-registry) mode, port-forwarding to services that don't publish host ports** (a kubectl-style affordance only Kubernetes itself otherwise offers in this peer group), **and one-line templates** (`yoink add postgres`, `yoink add openclaw`, `yoink add gh:acme/templates/foo` — see the [templates guide](/docs/guide/templates)). The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
+The columns yoink wins on: **single-binary operation, drift detection, sealed in-repo secrets, hardened container defaults, pre-merge diff, standalone (no-registry) mode, port-forwarding to services that don't publish host ports** (a kubectl-style affordance only Kubernetes itself otherwise offers in this peer group), **and one-line templates** (`yoink add postgres`, `yoink add openclaw`, `yoink add gh:acme/templates/foo`; see the [templates guide](/docs/guide/templates)). The columns it deliberately doesn't fight on: auto-scaling, multi-tenancy, web UIs.
 
 ## vs. [Kamal](https://kamal-deploy.org)
 
-Kamal is the closest neighbor — both are "ship a Rust/Ruby binary, ssh into hosts, drive Docker." The differences:
+Kamal is the closest neighbor. Both ship a Rust/Ruby binary over SSH into hosts and drive Docker. The differences:
 
 | Feature | **yoink** | **Kamal** |
 |---|---|---|
@@ -65,12 +65,12 @@ Kamal is the closest neighbor — both are "ship a Rust/Ruby binary, ssh into ho
 | TUI dashboard | ✓ (k9s-style) | ✗ (CLI only) |
 | Service deploy history + one-press rollback | ✓ (TUI `H` then `r`) | ✓ (CLI `kamal rollback <version>`) |
 | Secrets store | age-sealed `secrets.age` in the repo (default, no external service); `provider: command` shells out to any CLI (1Password `op`, Doppler, Vault, AWS Secrets Manager, Infisical CLI, Bitwarden) | 1Password / Bitwarden / LastPass / generic shell command |
-| Accessory / app templates | `yoink add postgres`, `yoink add openclaw`, `yoink add gh:owner/repo/path` — fetched from GitHub, sealed secrets generated, fragment dropped in (poor-man's-helm) | First-class `accessories:` block |
+| Accessory / app templates | `yoink add postgres`, `yoink add openclaw`, `yoink add gh:owner/repo/path` (fetched from GitHub, sealed secrets generated, fragment dropped in; poor-man's-helm) | First-class `accessories:` block |
 | Resource limits | k8s-style (`"500m"`, `"2Gi"`) | docker-style (`cpus: 2`, `memory: 1g`) |
 | Per-service `pids_limit` | ✓ | ✗ |
 | Secure-by-default RunOptions | ✓ (cap_drop=ALL, no-new-privileges, read_only=true, pids_limit=1024, init=tini, tmpfs noexec, binds default :ro) | ✗ (docker defaults) |
 | Port-forward to non-published services | ✓ (`yoink pf <svc>`, auto-spawns socat sidecar so the locked-down "no `publish:`" default doesn't make debugging awkward) | ✗ (operator BYO `ssh -L`) |
-| No-registry deploy | ✓ (`yoink up --build` ships any service with a `build:` block via an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar — only the missing layers cross the SSH wire; no registry account needed for those services; tarball fallback) | ✗ (registry required) |
+| No-registry deploy | ✓ (`yoink up --build` ships any service with a `build:` block via an ephemeral [unregistry](https://github.com/psviderski/unregistry) sidecar; only the missing layers cross the SSH wire, no registry account needed, tarball fallback) | ✗ (registry required) |
 | Driven by AI agents / CI scripts | ✓ (CLI + YAML, identical local & remote) | ✓ (CLI + YAML) |
 | Maturity | New (born 2026) | Mature (born 2023, used at 37signals scale) |
 | Ecosystem | Rust-built, opinionated for "I run a few heterogeneous services" | Ruby/Rails ecosystem, `rails new` → `kamal init` is the canonical Rails deploy story today |
@@ -81,7 +81,7 @@ Kamal is the closest neighbor — both are "ship a Rust/Ruby binary, ssh into ho
 
 ## vs. [Coolify](https://coolify.io)
 
-Coolify is a self-hosted **PaaS** — think open-source Heroku/Render — running as a long-lived web app on one of your servers. It manages everything: build pipelines, databases, env vars, auto-deploys from git, a UI for non-engineers. Yoink is a much narrower tool that handles the "deploy these containers to these hosts" piece without any of the PaaS surface area.
+Coolify is a self-hosted PaaS (think open-source Heroku/Render) running as a long-lived web app on one of your servers. It manages everything: build pipelines, databases, env vars, auto-deploys from git, a UI for non-engineers. Yoink is a much narrower tool that handles the "deploy these containers to these hosts" piece without any of the PaaS surface area.
 
 | | **yoink** | **Coolify** |
 |---|---|---|
@@ -94,7 +94,7 @@ Coolify is a self-hosted **PaaS** — think open-source Heroku/Render — runnin
 | Multi-user, RBAC, audit log | ✗ | ✓ |
 | Bundled reverse proxy | ✓ (Caddy) | ✓ (Traefik) |
 | Drift detection | ✓ | ✗ |
-| **Driven by AI agents / CI scripts** | ✓ (everything is CLI + YAML — no clicking) | ◐ (REST API exists, but UI is the primary surface; agents have to learn the API instead of just editing files) |
+| **Driven by AI agents / CI scripts** | ✓ (everything is CLI + YAML, no clicking required) | ◐ (REST API exists, but UI is the primary surface; agents have to learn the API instead of just editing files) |
 | Best fit | Engineers who already have a CI + git workflow and want a thin deploy layer | Teams who want a Heroku-shaped product and are happy operating Coolify itself as a long-lived service |
 
 **Pick Coolify when**: you want batteries-included PaaS (build, deploy, database, web UI, multi-user) and you're comfortable operating Coolify itself as a long-running service on one of your boxes.
@@ -103,7 +103,7 @@ Coolify is a self-hosted **PaaS** — think open-source Heroku/Render — runnin
 
 ## vs. [Dokku](https://dokku.com)
 
-Dokku is the original "Heroku in a box" — a single host runs Dokku, you `git push dokku main`, and a buildpack/Dockerfile flow ships your app behind nginx with auto-TLS. Light on infrastructure, deeply opinionated about the "git push to deploy" loop.
+Dokku is the original "Heroku in a box": a single host runs Dokku, you `git push dokku main`, and a buildpack/Dockerfile flow ships your app behind nginx with auto-TLS. Light on infrastructure, deeply opinionated about the "git push to deploy" loop.
 
 | | **yoink** | **Dokku** |
 |---|---|---|
@@ -122,7 +122,7 @@ Dokku is the original "Heroku in a box" — a single host runs Dokku, you `git p
 
 **Pick Dokku when**: one host is enough, the buildpack ergonomics fit your stack, and "git push to deploy" is the user experience you want.
 
-**Pick yoink when**: you want the same "drop a config and run a command" simplicity but across multiple hosts, with replicas, drift detection, and sealed in-repo secrets — and you'd rather not maintain a Dokku install on each box.
+**Pick yoink when**: you want the same "drop a config and run a command" simplicity but across multiple hosts, with replicas, drift detection, and sealed in-repo secrets, and you'd rather not maintain a Dokku install on each box.
 
 ## vs. [Komodo](https://komo.do)
 
@@ -131,11 +131,11 @@ Komodo is a fellow Rust-built deploy/management tool for self-hosted containers,
 | | **yoink** | **Komodo** |
 |---|---|---|
 | Architecture | Single Rust binary, runs on demand | `Komodo Core` (web service + UI) + `Komodo Periphery` (agent on every managed host) |
-| Always-on services to operate | None | Two: Core (with a database — MongoDB or FerretDB) + Periphery on each host |
+| Always-on services to operate | None | Two: Core (with a database, MongoDB or FerretDB) + Periphery on each host |
 | Operator interface | CLI + TUI (k9s-style, keyboard-only) | Web UI (primary) + CLI/API |
 | State of truth | The git repo's `yoink.yaml` | Komodo's database (UI-edited, with optional GitOps "Resource Sync" file imports) |
 | Deploy trigger | `yoink up` from operator's laptop or CI | Click in the UI, webhook, scheduled, or sync-from-git |
-| Multi-user / RBAC | None — operator-as-user | First-class users, groups, permissions |
+| Multi-user / RBAC | None (operator-as-user) | First-class users, groups, permissions |
 | Auth | Whatever ssh + git + your secret store gives you | OAuth (GitHub / Google) + local accounts, baked in |
 | Bring-your-own-host | yoink connects to any host you can ssh into | Each host needs `Periphery` installed + reachable from Core |
 | Container shape | Yoink-managed containers via per-service spec | Stacks (compose files) / Deployments / Builds / Repos |
@@ -152,14 +152,14 @@ Komodo is a fellow Rust-built deploy/management tool for self-hosted containers,
 
 ## vs. [Uncloud](https://uncloud.run)
 
-Uncloud is in the same neighborhood as yoink — small fleet, multi-service, deliberate-not-Kubernetes. The biggest split is again **ceremony**: Uncloud installs a per-host daemon (`uncloudd`) on every managed machine and stitches them into a WireGuard mesh; yoink is a one-binary client that talks to docker over plain ssh.
+Uncloud is in the same neighborhood as yoink: small fleet, multi-service, deliberate-not-Kubernetes. The biggest split is again **ceremony**: Uncloud installs a per-host daemon (`uncloudd`) on every managed machine and stitches them into a WireGuard mesh; yoink is a one-binary client that talks to docker over plain ssh.
 
 | | **yoink** | **Uncloud** |
 |---|---|---|
 | Architecture | Single client binary; talks to docker on each host over ssh | Per-host daemon (`uncloudd`) on every managed machine, peer-to-peer (no master) |
 | Always-on services to operate | None | One daemon per host (auto-installed by `uncloud machine init`) |
-| Cross-host networking | None — yoink relies on docker's per-host networks; cross-host is your routing problem (Tailscale, public DNS, …) | First-class — Uncloud builds a WireGuard mesh between machines, services dial each other by name across hosts |
-| Reverse proxy / public ingress | ✓ (bundled Caddy with admin-API push, sealed certs, mTLS) | First-class — built-in Caddy-based ingress with auto-TLS |
+| Cross-host networking | None; yoink relies on docker's per-host networks and cross-host is your routing problem (Tailscale, public DNS, …) | First-class; Uncloud builds a WireGuard mesh between machines, services dial each other by name across hosts |
+| Reverse proxy / public ingress | ✓ (bundled Caddy with admin-API push, sealed certs, mTLS) | First-class; built-in Caddy-based ingress with auto-TLS |
 | State of truth | The git repo's `yoink.yaml` | Cluster state lives in the daemon mesh; YAML config is also supported |
 | Drift detection | ✓ (`yoink.spec_hash` label) | ✓ (compares running state to declared spec) |
 | Multi-host service replicas | ✓ (per-host counts, `services[].hosts:` whitelist) | ✓ (cluster-aware scheduling) |
@@ -170,7 +170,7 @@ Uncloud is in the same neighborhood as yoink — small fleet, multi-service, del
 
 **Pick Uncloud when**: cross-host service-to-service networking matters (your api on one box talking to your worker on another), and you're OK with running a daemon per host as the price of that affordance.
 
-**Pick yoink when**: you already have a routing answer (Tailscale, a single edge box, public-DNS-everywhere), you don't want any always-on yoink-specific service running on the host, and the per-host docker daemon over ssh is enough surface area to manage from. The two tools converge on "small fleet of containers, opinionated defaults" — diverge on whether the deploy tool also owns the network fabric.
+**Pick yoink when**: you already have a routing answer (Tailscale, a single edge box, public-DNS-everywhere), you don't want any always-on yoink-specific service running on the host, and the per-host docker daemon over ssh is enough surface area to manage from. The two tools converge on "small fleet of containers, opinionated defaults" and diverge on whether the deploy tool also owns the network fabric.
 
 ## vs. plain `docker compose`
 
@@ -217,7 +217,7 @@ Different leagues. Yoink is for people who don't want a control plane.
 
 **Pick yoink when**: you want the Kubernetes ideas that pay off at small scale (drift detection, per-tier networks, healthcheck-gated rolls, declarative config, in-repo secrets) **without** the control plane and the team to operate it.
 
-## vs. nothing — just `ssh` + `docker run`
+## vs. nothing: just `ssh` + `docker run`
 
 The honest baseline. Many small deployments are exactly this and that's fine.
 

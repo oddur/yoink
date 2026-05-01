@@ -10,7 +10,7 @@ Full schema for `yoink.yaml`. Canonical source: [`yoink/src/config.rs`](https://
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `slug` | string (optional) | unset | Banner shown in the TUI's top chrome — use to mark a config (e.g. `"PRODUCTION — TREAD CAREFULLY"`) so the operator can't miss which environment they're pointed at. Keep it short (single line). |
+| `slug` | string (optional) | unset | Banner shown in the TUI's top chrome; use to mark a config (e.g. `"PRODUCTION — TREAD CAREFULLY"`) so the operator can't miss which environment they're pointed at. Keep it short (single line). |
 | `hosts` | list of [Host](#host) | required | One or more deploy targets. |
 | `deploy` | [Deploy](#deploy) | `{}` | Cross-service defaults (networks, etc.). |
 | `secrets` | [Secrets](#secrets) | unset | Secret provider config. Required if any service uses `secrets:` / `env_from_secrets:`. |
@@ -22,14 +22,14 @@ Full schema for `yoink.yaml`. Canonical source: [`yoink/src/config.rs`](https://
 
 ## Host
 
-Each host needs an address; that can be either a literal `address:` or, for cases where the address itself is sensitive (a public IP that you front through Cloudflare, a tailnet hostname you'd rather not commit), a sealed-secret reference via `address_secret:`. Set exactly one — neither or both is rejected at config load.
+Each host needs an address; that can be either a literal `address:` or, for cases where the address itself is sensitive (a public IP that you front through Cloudflare, a tailnet hostname you'd rather not commit), a sealed-secret reference via `address_secret:`. Set exactly one; neither or both is rejected at config load.
 
 | Field | Type | Notes |
 |---|---|---|
 | `address` | string | Hostname or IP. Anything your local SSH client accepts: a raw IP, a DNS name, a `~/.ssh/config` alias, or a tailnet hostname. Mutually exclusive with `address_secret`. |
 | `address_secret` | string (optional) | Name of an entry in your sealed-secrets bundle holding the host's address (IP or hostname). Resolved at config-load time after the bundle decrypts. Use this when the deploy config sits in a public repo and the host's address is sensitive. Mutually exclusive with `address`. |
 | `user` | string | SSH user. Must be in the `docker` group on the host (or be `root`). |
-| `ssh_key_secret` | string (optional) | Name of an entry in your sealed-secrets bundle holding a PEM-formatted SSH private key. When set, yoink decrypts the key into a per-process tempfile (mode `0o600`) and uses it for this host's SSH connections — both the docker daemon connection and the pre-flight ssh probe. Lets you ship the deploy key with the repo (encrypted at rest in `secrets.age`) instead of relying on every operator's personal `ssh-agent`. |
+| `ssh_key_secret` | string (optional) | Name of an entry in your sealed-secrets bundle holding a PEM-formatted SSH private key. When set, yoink decrypts the key into a per-process tempfile (mode `0o600`) and uses it for this host's SSH connections, both the docker daemon connection and the pre-flight ssh probe. Lets you ship the deploy key with the repo (encrypted at rest in `secrets.age`) instead of relying on every operator's personal `ssh-agent`. |
 
 ```yaml
 hosts:
@@ -65,12 +65,12 @@ Two providers, selected by the `provider:` tag.
 
 A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with the operator's age **identity** (private half) resolved in priority order:
 
-1. `YOINK_AGE_KEY` env (raw key) — CI / managed-env contexts
-2. `YOINK_AGE_KEY_FILE` env (path) — explicit override
-3. `~/.config/yoink/keys/*.key` — laptop default; yoink scans the dir and picks whichever key's public half matches one of `recipients:` below
-4. `~/.config/yoink/age.key` — legacy single-key fallback
+1. `YOINK_AGE_KEY` env (raw key): CI / managed-env contexts
+2. `YOINK_AGE_KEY_FILE` env (path): explicit override
+3. `~/.config/yoink/keys/*.key`: laptop default; yoink scans the dir and picks whichever key's public half matches one of `recipients:` below
+4. `~/.config/yoink/age.key`: legacy single-key fallback
 
-The keys-dir scan (#3) is what makes `yoink secrets key generate` work without per-project env-var setup — multiple projects with distinct identities coexist there, picked by recipient match.
+The keys-dir scan (#3) is what makes `yoink secrets key generate` work without per-project env-var setup; multiple projects with distinct identities coexist there, picked by recipient match.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -78,7 +78,7 @@ The keys-dir scan (#3) is what makes `yoink secrets key generate` work without p
 | `recipients` | list of string | `[]` | Public age **recipients** (`age1...`), one per principal that needs to decrypt. New writes are sealed against every entry; decryption only needs *one* matching identity. Validates non-empty at config-load. |
 | `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. `..` and absolute paths are rejected. |
 
-The recipient/identity split is the asymmetric-keypair mental model — see [Sealed secrets (age) — the default](/docs/guide/secrets#sealed-secrets-age--the-default) in the secrets guide for the full explanation.
+The recipient/identity split is the asymmetric-keypair mental model; see [Sealed secrets (age)](/docs/guide/secrets#sealed-secrets-age--the-default) in the secrets guide for the full explanation.
 
 Bootstrap: `yoink secrets key generate` writes a fresh **identity** to `~/.config/yoink/keys/<recipient>.key` (mode 0600) by default and prints the matching **recipient** (`age1…`, public; paste into `recipients:` above). `--out PATH` writes to a specific file at mode 0600 instead. `--print` sends the secret to stdout for piping into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`). `yoink secrets key public` re-derives the recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [secrets guide](/docs/guide/secrets).
 
@@ -89,7 +89,7 @@ Yoink invokes the configured command and reads a secrets bundle from stdout. For
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `provider` | string | required | `command` |
-| `command` | list of string | required | Argv to spawn. First element is the binary, the rest are arguments. No shell interpretation — wrap in `["sh", "-c", "..."]` if you need pipes. |
+| `command` | list of string | required | Argv to spawn. First element is the binary, the rest are arguments. No shell interpretation; wrap in `["sh", "-c", "..."]` if you need pipes. |
 | `format` | string | `auto` | `auto` inspects the first non-whitespace byte (`{` → JSON, else dotenv). `dotenv` / `json` force the parser. |
 
 ```yaml
@@ -229,7 +229,7 @@ The hardened defaults make new containers prod-safe out of the box. Override per
 | `read_only` | bool | `true` | Read-only rootfs. Combine with `tmpfs:` for writable scratch. |
 | `init` | bool | `true` | Run with tini as PID 1 (zombie reaping + proper SIGTERM). |
 | `tmpfs` | map of string | `{}` | `mount_path: "size=N,mode=NNNN"`. Auto-applies `noexec,nosuid,nodev`. |
-| `restart` | string | unset (docker default `no`) | Docker restart policy. Common values: `unless-stopped` (recommended for long-running services), `on-failure`, `always`. Set explicitly — yoink doesn't impose a default. |
+| `restart` | string | unset (docker default `no`) | Docker restart policy. Common values: `unless-stopped` (recommended for long-running services), `on-failure`, `always`. Set explicitly; yoink doesn't impose a default. |
 | `user` | string | `"65534:65534"` (nobody) | UID/GID. Default runs non-root. Override with `"0:0"` for images that genuinely need root, or a specific uid:gid (`"1000:1000"`, `"redis"`) when the image has pre-baked file ownership. |
 | `network_aliases` | list of string | `[]` | Extra DNS aliases on the attached networks. The container always gets the service `name` as an alias regardless; this field adds *more* names (e.g. for legacy hostname compat). |
 | `devices` | list of string | `[]` | Host devices to expose. Each entry is `<host-path>[:<container-path>[:<perms>]]` (docker's `--device` syntax). `<perms>` is some combination of `r`, `w`, `m`; defaults to `rwm`. Both bind-mounts the device file and adds it to the cgroup `devices.allow` list. Narrower than `--privileged` — only the listed devices become accessible. Common uses: `/dev/nvidia*` (GPU), `/dev/dri` (Intel/AMD VAAPI), `/dev/ttyUSB*` (USB serial), `/dev/fuse` (with `cap_add: [SYS_ADMIN]`), `/dev/snd` (audio). |
@@ -240,8 +240,8 @@ See [Security defaults](/docs/guide/security) for the full picture.
 
 Two places hooks live:
 
-- **Per-service** `services[].pre_deploy:` — runs before *that service's* wave starts (so a database migration finishes before the api container that depends on it is even pulled). Once per `up`, on the first host that has the service.
-- **Top-level** `hooks.pre_deploy:` — runs before *any* service-wave starts. Once per `up`, on the first host overall. Use for cluster-wide concerns that don't belong to a single service.
+- **Per-service** `services[].pre_deploy:` runs before *that service's* wave starts (so a database migration finishes before the api container that depends on it is even pulled). Once per `up`, on the first host that has the service.
+- **Top-level** `hooks.pre_deploy:` runs before *any* service-wave starts. Once per `up`, on the first host overall. Use for cluster-wide concerns that don't belong to a single service.
 
 ```yaml
 hooks:
@@ -274,7 +274,7 @@ Any service or hook with `tag:` unset (or set to a literal that you want to over
 yoink up --tag api=$(git rev-parse HEAD) --tag web=$(git rev-parse HEAD)
 ```
 
-`tag: { service: api }` mirrors the runtime tag — useful for `pre_deploy` migrations that must use the exact image being deployed.
+`tag: { service: api }` mirrors the runtime tag, useful for `pre_deploy` migrations that must use the exact image being deployed.
 
 ## Includes
 
@@ -316,7 +316,7 @@ Rules:
 
 - Only the unambiguous `${NAME}` form is recognized. Bare `$NAME` and lone `$` characters pass through unchanged so values containing literal dollar signs are unaffected.
 - `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`. Anything else (including `${HOST-IP}`, `${1BAD}`, or unterminated `${`) errors with a snippet pointing at the bad reference.
-- Missing variables are a hard error rather than silent empty substitution — a quietly-empty `address:` produces baffling failures further down the deploy.
+- Missing variables are a hard error rather than silent empty substitution; a quietly-empty `address:` produces baffling failures further down the deploy.
 - The POSIX `${NAME:-default}` form supplies a fallback when `NAME` is unset. Useful for commands that parse the full config but don't actually use the value (e.g. `yoink secrets seal` against a config whose hosts/domains reference `${HOST_IP}`). Set the var explicitly when you do mean to use it.
 - For long-lived secrets, prefer `secrets:` (sealed or `provider: command`) over passing values via env. The substitution path is intended for routing parameters (host IPs, hostnames, port numbers), not credentials.
 

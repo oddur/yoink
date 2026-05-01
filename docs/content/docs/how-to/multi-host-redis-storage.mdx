@@ -6,7 +6,7 @@ weight: 16
 
 When you run yoink across multiple hosts that serve the same domain, **each host's Caddy independently asks Let's Encrypt for a cert and you hit rate limits within a week**. The fix: share ACME state across all proxies via a small Redis instance reachable on a private network.
 
-If you're using Cloudflare's edge, the simpler answer is [Origin Certificates](/docs/how-to/cloudflare-origin-certs) — no ACME at all. This recipe is for the LE-direct case.
+If you're using Cloudflare's edge, the simpler answer is [Origin Certificates](/docs/how-to/cloudflare-origin-certs) with no ACME at all. This recipe is for the LE-direct case.
 
 ## Architecture
 
@@ -25,7 +25,7 @@ flowchart LR
 
 - A **single Redis** instance, deployed by yoink onto one canonical host.
 - All proxies use the [`caddy-storage-redis`](https://github.com/pberkel/caddy-storage-redis) plugin to point Caddy's storage at Redis instead of the local `/data` volume.
-- **Tailscale** (or any private network) keeps Redis off the public internet — the redis port is published only on the tailnet IP.
+- **Tailscale** (or any private network) keeps Redis off the public internet; the redis port is published only on the tailnet IP.
 
 The single Redis is a small SPOF, but a tractable one (it's only used for cert issuance/renewal, not request-path traffic). Backups via tailnet-replicated snapshots if you need it.
 
@@ -34,7 +34,7 @@ The single Redis is a small SPOF, but a tractable one (it's only used for cert i
 
 ### Bake the plugin into caddy [step]
 
-`caddy-storage-redis` isn't in the base `caddy:2` image. The plugin part is straightforward — `proxy.xcaddy:` does the build on every proxy host:
+`caddy-storage-redis` isn't in the base `caddy:2` image. The plugin part is straightforward: `proxy.xcaddy:` does the build on every proxy host:
 
 ```yaml
 proxy:
@@ -44,7 +44,7 @@ proxy:
       - github.com/pberkel/caddy-storage-redis
 ```
 
-That gets the storage *module* compiled into the caddy binary on each host. Wiring caddy to actually *use* Redis as its storage backend takes one more step — see the [Wire caddy's storage backend](#wire-caddys-storage-backend) section below.
+That gets the storage *module* compiled into the caddy binary on each host. Wiring caddy to actually *use* Redis as its storage backend takes one more step; see the [Wire caddy's storage backend](#wire-caddys-storage-backend) section below.
 
 See [Caddy plugins (xcaddy, no registry)](/docs/how-to/caddy-plugins) for the full xcaddy story (build cost, idempotency, debugging).
 
@@ -96,7 +96,7 @@ proxy:
 
 Yoink deep-merges that JSON into the rendered Caddy config before `/load`-ing it. The `storage` block sits at the top level alongside `admin` and `apps`, which is exactly where Caddy expects it. See the [`config_extra:` reference](/docs/guide/proxy#proxyconfig_extra-block--global-caddy-config-escape-hatch) for merge semantics.
 
-Every proxy host now reads ACME state from the shared Redis instead of its local `/data` volume. The `yoink_caddy_data` named volume becomes empty — but you can leave it; it does no harm.
+Every proxy host now reads ACME state from the shared Redis instead of its local `/data` volume. The `yoink_caddy_data` named volume becomes empty but you can leave it; it does no harm.
 
 ### Tailscale on every host [step]
 

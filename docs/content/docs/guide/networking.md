@@ -12,7 +12,7 @@ How yoink reaches your hosts, how services reach each other across them, and how
 
 ## Connectivity layer (Tailscale + SSH)
 
-Yoink's transport is `ssh://user@host` — it opens an SSH tunnel and speaks the Docker Engine API over the remote daemon's Unix socket. Yoink doesn't try to solve "how do I reach my hosts" — it expects you to bring an off-the-shelf SSH connectivity layer.
+Yoink's transport is `ssh://user@host`: it opens an SSH tunnel and speaks the Docker Engine API over the remote daemon's Unix socket. Yoink doesn't try to solve "how do I reach my hosts"; it expects you to bring an off-the-shelf SSH connectivity layer.
 
 Pairing this with **Tailscale SSH** is what we recommend, and what every example in these docs assumes:
 
@@ -30,11 +30,11 @@ The deploy user on each host is in the `docker` group (functionally root, scope 
 | **container lifecycle** (pull, start, healthcheck, drain, replace) | yoink |
 | **dep-ordered deploys** (redis before api before caddy) | yoink |
 | **per-tier network isolation** | yoink |
-| **HTTPS / hostname routing / cert issuance** | yoink (bundled Caddy — see [proxy guide](/docs/guide/proxy)) |
+| **HTTPS / hostname routing / cert issuance** | yoink (bundled Caddy; see [proxy guide](/docs/guide/proxy)) |
 | **operator → host connectivity** | Tailscale (or your SSH config) |
 | **CI → host connectivity** | Tailscale (or your SSH config) |
 | **stateful services** (postgres, etc.) | yoink (with a named volume) or docker compose on the host |
-| **secrets** | yoink (age-sealed) or any external CLI via `provider: command` — see [secrets guide](/docs/guide/secrets) |
+| **secrets** | yoink (age-sealed) or any external CLI via `provider: command`; see [secrets guide](/docs/guide/secrets) |
 
 ## Multi-host distribution
 
@@ -57,7 +57,7 @@ services:
       replicas: 2
 ```
 
-…gives you **4 api containers total**: 2 on `prod-eu-1`, 2 on `prod-eu-2`. Rolling swap is per host — yoink keeps `replicas - 1` alive on each host during the swap.
+…gives you **4 api containers total**: 2 on `prod-eu-1`, 2 on `prod-eu-2`. Rolling swap is per host; yoink keeps `replicas - 1` alive on each host during the swap.
 
 ### Pinning a service to specific hosts
 
@@ -103,7 +103,7 @@ services:
     run: { replicas: 1 }     # one container — singleton
 ```
 
-**Stateful pinned + stateless replicated** (single-host shape — see caveat below for multi-host):
+**Stateful pinned + stateless replicated** (single-host shape; see caveat below for multi-host):
 
 ```yaml
 services:
@@ -140,17 +140,17 @@ services:
     run: { port: 8080, replicas: 2 }
 ```
 
-Two services, same image, different env — region-aware deploys without conditionals in the config.
+Two services, same image, different env. Region-aware deploys without conditionals in the config.
 
 ### How `yoink up` schedules across hosts
 
 For each service, yoink computes its host set (`services[].hosts` ∩ `hosts[]`, defaulting to all hosts when unset) and runs the reconcile in parallel across those hosts. Within a host, the rolling swap is sequential per replica (start new → healthcheck → swap → drain old).
 
-Wave ordering (`depends_on`) is global — `redis` finishes its host fan-out before `api` starts, regardless of which hosts each lands on.
+Wave ordering (`depends_on`) is global: `redis` finishes its host fan-out before `api` starts, regardless of which hosts each lands on.
 
 ### Pre-deploy hooks
 
-`pre_deploy` hooks run **once per `up`**, on the first host that has the service. Don't multiply by replica count or host count — migrations run once, full stop.
+`pre_deploy` hooks run **once per `up`**, on the first host that has the service. Don't multiply by replica count or host count. Migrations run once.
 
 ### Pruning
 
@@ -158,26 +158,26 @@ Wave ordering (`depends_on`) is global — `redis` finishes its host fan-out bef
 
 ## Port-forward
 
-`yoink pf <service>` opens a tunnel from your laptop to a container port — the same shape `kubectl port-forward` gives you, reusing the SSH connection yoink already has to the host. Works whether or not the service publishes a host port; **you don't need to publish anything to debug a service**. Open URL, `Ctrl-C` to close.
+`yoink pf <service>` opens a tunnel from your laptop to a container port, the same shape `kubectl port-forward` gives you, reusing the SSH connection yoink already has to the host. Works whether or not the service publishes a host port; **you don't need to publish anything to debug a service**. Open URL, `Ctrl-C` to close.
 
 ### Why this matters
 
-Yoink doesn't add `publish:` entries by default — backend services sit on the docker network and are reachable through Caddy on `:443`, never bound to a host port. Operator UIs (pgadmin, monitoring) that need direct reach bind `127.0.0.1` over SSH/tailnet, not `0.0.0.0`. The proxy is the only thing on `:443`; with origin-pull mTLS, the origin is unreachable except through Cloudflare's edge.
+Yoink doesn't add `publish:` entries by default. Backend services sit on the docker network and are reachable through Caddy on `:443`, never bound to a host port. Operator UIs (pgadmin, monitoring) that need direct reach bind `127.0.0.1` over SSH/tailnet, not `0.0.0.0`. The proxy is the only thing on `:443`; with origin-pull mTLS, the origin is unreachable except through Cloudflare's edge.
 
 The standard pressure to weaken that default is debugging. Without `pf`, operators reach for one of three workarounds, each of which makes it worse:
 
-1. Add `publish:` "temporarily" — and the line stays in the yaml forever because removing it is a chore.
-2. `docker exec` + curl from inside — only works on images that ship `curl`, no browser path.
-3. One-off `docker run --network=container:<target>` shell with socat / nc — real-but-fiddly, manual cleanup per host.
+1. Add `publish:` "temporarily" and the line stays in the yaml forever because removing it is a chore.
+2. `docker exec` + curl from inside; only works on images that ship `curl`, no browser path.
+3. One-off `docker run --network=container:<target>` shell with socat / nc: real-but-fiddly, manual cleanup per host.
 
-`yoink pf` is option 3 made automatic: same SSH path as the deploy, auto-cleanup on Ctrl-C, one-key TUI invocation, footer band so you don't forget tunnels are open. **Debugging never requires changing what's exposed in production** — the locked-down default stays the only default.
+`yoink pf` is option 3 made automatic: same SSH path as the deploy, auto-cleanup on Ctrl-C, one-key TUI invocation, footer band so you don't forget tunnels are open. Debugging never requires changing what's exposed in production.
 
 ### What it works on
 
 Anything yoink runs:
 
 - Services that **publish** a host port (pgadmin / admin UIs).
-- Services with **no `publish:`** — the secure-by-default api/web shape only reachable via Caddy on `:443`.
+- Services with **no `publish:`**: the secure-by-default api/web shape only reachable via Caddy on `:443`.
 - Services on a single network or multi-network.
 - Replicated services. See [Replicas](#replicas) below for routing caveats.
 
@@ -207,10 +207,10 @@ The process holds the tunnel until you Ctrl-C; on exit the SSH child dies, the s
 
 #### Errors you'll see
 
-- **`service "x" has no \`publish:\` block and \`--mode published\` was forced`** — drop the flag (auto mode falls back to a sidecar) or pass `--mode sidecar` explicitly.
-- **`service "x" declares no \`networks:\``** — sidecar mode needs a docker network to join. Add a `networks:` entry to the service or to `deploy.networks:`.
-- **`service "x" has no \`publish:\` and no \`run.port:\``** — when no port arg is given, yoink defaults to `run.port`. Set one or pass the container port explicitly.
-- **`ssh probe to <host> failed: …`** — the same probe `yoink up` uses. Tailnet, key, host-key acceptance — fix once and `yoink pf` works for everything.
+- **`service "x" has no \`publish:\` block and \`--mode published\` was forced`**: drop the flag (auto mode falls back to a sidecar) or pass `--mode sidecar` explicitly.
+- **`service "x" declares no \`networks:\``**: sidecar mode needs a docker network to join. Add a `networks:` entry to the service or to `deploy.networks:`.
+- **`service "x" has no \`publish:\` and no \`run.port:\``**: when no port arg is given, yoink defaults to `run.port`. Set one or pass the container port explicitly.
+- **`ssh probe to <host> failed: …`**: the same probe `yoink up` uses. Fix tailnet membership, the SSH key, or host-key acceptance once and `yoink pf` works for everything.
 
 ### TUI
 
@@ -222,10 +222,10 @@ Three keys plus a visual indicator on every row whose service has a tunnel open:
 | `o` / `O` | Open the active port-forward URL in the system browser. Works in **any** view; falls back to the most-recently-opened tunnel when the focused row has no forward of its own. |
 | `F` (Shift-F) | Close every active port-forward. Sidecars are force-removed; ssh children killed. The footer band disappears. |
 
-Forwarded rows show a cyan `↦` prefix on the service cell — at-a-glance "is this thing tunneled?" without needing to read the footer. The marker scope follows how the tunnel was opened:
+Forwarded rows show a cyan `↦` prefix on the service cell, an at-a-glance "is this thing tunneled?" without needing to read the footer. The marker scope follows how the tunnel was opened:
 
-- **From a Dashboard / HostDetail / ContainerDetail row** — the operator pressed `f` on a specific replica. Only that replica gets the marker. The other replicas of the same service render unmarked, so a `web-1`/`web-2` pair shows which one you're tunneled through.
-- **From the Services pane** or **the CLI** (no row context) — every replica of the service gets the marker. Useful when the operator just cares "is `api` reachable?" rather than "which `api` am I hitting?"
+- **From a Dashboard / HostDetail / ContainerDetail row**: the operator pressed `f` on a specific replica. Only that replica gets the marker. The other replicas of the same service render unmarked, so a `web-1`/`web-2` pair shows which one you're tunneled through.
+- **From the Services pane** or **the CLI** (no row context): every replica of the service gets the marker. Useful when the operator just cares "is `api` reachable?" rather than "which `api` am I hitting?"
 
 ```
 host            service      container             state    ...
@@ -241,17 +241,17 @@ While any tunnel is open, a one-line footer band stays visible across every pane
 ↦ api :8080 → http://localhost:54321  pgadmin :80 → http://localhost:54322   [o] open  [F] close all
 ```
 
-The band is hard to miss on purpose — open tunnels are the kind of thing operators forget about and accidentally leave running between sessions. Quitting the TUI closes every tunnel cleanly.
+The band is hard to miss on purpose: open tunnels are the kind of thing operators forget about and accidentally leave running between sessions. Quitting the TUI closes every tunnel cleanly.
 
 ### Replicas
 
 For services with `replicas: > 1`, the tunnel may land on any healthy replica per connection. Pin the routing with one of:
 
-- **`--host <ADDRESS>`** — restrict the tunnel to replicas on a specific host. With one replica per host, that's enough to pin.
+- **`--host <ADDRESS>`**: restrict the tunnel to replicas on a specific host. With one replica per host, that's enough to pin.
 - **Use a `publish:` entry per replica** with distinct host ports for fully deterministic single-replica access.
 - **`--replica <N>` (0-based)** is accepted but currently validates range only; sticky per-replica routing is on the roadmap.
 
-The TUI's `↦` marker shows which replica row was selected when you pressed `f`. Treat it as "this is the tunnel I opened" — not a routing guarantee.
+The TUI's `↦` marker shows which replica row was selected when you pressed `f`. Treat it as "this is the tunnel I opened," not a routing guarantee.
 
 ### What's guaranteed
 
@@ -262,10 +262,10 @@ The TUI's `↦` marker shows which replica row was selected when you pressed `f`
 
 ## See also
 
-- [Security](/docs/guide/security) — why `publish:` should be the exception, not the rule.
-- [Reverse proxy](/docs/guide/proxy) — HTTPS / hostname routing for services with `domain:`.
-- [Multi-host Let's Encrypt with Redis](/docs/how-to/multi-host-redis-storage) — proxy-side coordination when more than one host fronts the same domain.
-- [Run staging alongside prod](/docs/how-to/staging-alongside-prod) — same primitives, separate `yoink.yaml` per environment.
-- [TanStack Start + postgres](/docs/how-to/tanstack-stack) — end-to-end recipe that uses `yoink pf` to verify the deploy.
-- [CLI reference: pf](/docs/reference/cli) — full flag surface.
-- [Configuration reference](/docs/reference/config) — full `hosts:` / `replicas:` / `pin:` schema.
+- [Security](/docs/guide/security): why `publish:` should be the exception, not the rule.
+- [Reverse proxy](/docs/guide/proxy): HTTPS / hostname routing for services with `domain:`.
+- [Multi-host Let's Encrypt with Redis](/docs/how-to/multi-host-redis-storage): proxy-side coordination when more than one host fronts the same domain.
+- [Run staging alongside prod](/docs/how-to/staging-alongside-prod): same primitives, separate `yoink.yaml` per environment.
+- [TanStack Start + postgres](/docs/how-to/tanstack-stack): end-to-end recipe that uses `yoink pf` to verify the deploy.
+- [CLI reference: pf](/docs/reference/cli): full flag surface.
+- [Configuration reference](/docs/reference/config): full `hosts:` / `replicas:` / `pin:` schema.

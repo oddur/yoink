@@ -10,7 +10,7 @@ How to use age-sealed secrets from a CI workflow. The whole integration is one e
 
 ## Prerequisites
 
-You've already set up sealed secrets locally — see [Sealed secrets (age)](/docs/guide/secrets) if not. Specifically:
+You've already set up sealed secrets locally; see [Sealed secrets (age)](/docs/guide/secrets) if not. Specifically:
 
 - `secrets.age` is committed to the repo (encrypted)
 - `yoink.yaml` has a `secrets.recipients:` list with at least your laptop's recipient
@@ -21,7 +21,7 @@ You've already set up sealed secrets locally — see [Sealed secrets (age)](/doc
 
 ### Generate a CI-only identity and ship it to GitHub [step]
 
-Each principal that needs to decrypt — your laptop, CI, a teammate's laptop — gets its own age keypair. **Don't reuse the laptop pair for CI**; if a CI runner is ever compromised you want to revoke its identity without disturbing day-to-day operator workflow.
+Each principal that needs to decrypt (your laptop, CI, a teammate's laptop) gets its own age keypair. **Don't reuse the laptop pair for CI**; if a CI runner is ever compromised you want to revoke its identity without disturbing day-to-day operator workflow.
 
 One command does the generate + ship:
 
@@ -29,13 +29,13 @@ One command does the generate + ship:
 yoink secrets key generate --print | gh secret set YOINK_AGE_KEY --repo you/your-repo
 ```
 
-`--print` sends the secret to **stdout**; the header, recipient, and follow-up notes go to **stderr**. The pipe captures only the `AGE-SECRET-KEY-1…` line — `gh secret set` gets a clean key, and you still see the recipient (`age1…`) on your terminal so you can copy it into `yoink.yaml` in the next step.
+`--print` sends the secret to **stdout**; the header, recipient, and follow-up notes go to **stderr**. The pipe captures only the `AGE-SECRET-KEY-1…` line, so `gh secret set` gets a clean key, and you still see the recipient (`age1…`) on your terminal so you can copy it into `yoink.yaml` in the next step.
 
-If you'd rather paste manually: run without the pipe, copy the secret out, then `Repo Settings → Secrets and variables → Actions → New repository secret` named `YOINK_AGE_KEY`. Clear your scrollback (`reset`) when done — bare `key generate --print` leaves the identity in your terminal.
+If you'd rather paste manually: run without the pipe, copy the secret out, then `Repo Settings → Secrets and variables → Actions → New repository secret` named `YOINK_AGE_KEY`. Clear your scrollback (`reset`) when done; bare `key generate --print` leaves the identity in your terminal.
 
 ### Add the CI recipient to `yoink.yaml` [step]
 
-`recipients:` is a list. Add the new CI recipient *alongside* the existing laptop recipient — don't replace it, or you'll lock yourself out of the file you just sealed. Either identity decrypts the same `secrets.age`; that's the whole reason `recipients` is a list.
+`recipients:` is a list. Add the new CI recipient *alongside* the existing laptop recipient; don't replace it, or you'll lock yourself out of the file you just sealed. Either identity decrypts the same `secrets.age`; that's the whole reason `recipients` is a list.
 
 ```yaml
 secrets:
@@ -85,13 +85,13 @@ Yoink finds `YOINK_AGE_KEY` in the env, decrypts `secrets.age` on the runner, an
 
 ## How yoink finds the key
 
-Same code path locally and in CI — yoink tries each source in order, stops at the first match:
+Same code path locally and in CI; yoink tries each source in order, stops at the first match:
 
 | Order | Source | When |
 |---|---|---|
 | 1 | `YOINK_AGE_KEY` env (raw key) | CI |
 | 2 | `YOINK_AGE_KEY_FILE` env (path) | Explicit override |
-| 3 | `~/.config/yoink/keys/*.key` | Laptop default — picks the key whose public matches `secrets.recipients:` |
+| 3 | `~/.config/yoink/keys/*.key` | Laptop default; picks the key whose public matches `secrets.recipients:` |
 | 4 | `~/.config/yoink/age.key` | Legacy fallback |
 
 If none match, yoink errors with a pointer to `yoink secrets key generate`.
@@ -103,7 +103,7 @@ When you want to roll the CI identity (left the company, suspected leak, periodi
 
 ### Run `yoink secrets rotate` [step]
 
-Generates a new identity, re-seals `secrets.age` against `[old recipients + new recipient]`, and prints the new private + public key. After this step `yoink.yaml` and `secrets.age` are already updated locally — commit them.
+Generates a new identity, re-seals `secrets.age` against `[old recipients + new recipient]`, and prints the new private + public key. After this step `yoink.yaml` and `secrets.age` are already updated locally; commit them.
 
 ```sh
 yoink secrets rotate
@@ -135,17 +135,17 @@ In CI debug, useful to confirm yoink can read what you expect:
     YOINK_AGE_KEY: ${{ secrets.YOINK_AGE_KEY }}
 ```
 
-`show --reveal` prints actual values. Don't use `--reveal` in CI — workflow logs are visible to anyone with read access to the repo. (Yoink also refuses to do this when `$CI` is set; override with `YOINK_ALLOW_REVEAL_IN_CI=1` if you really mean it, e.g. when piping into a different secret store rather than into build logs.)
+`show --reveal` prints actual values. Don't use `--reveal` in CI: workflow logs are visible to anyone with read access to the repo. (Yoink also refuses to do this when `$CI` is set; override with `YOINK_ALLOW_REVEAL_IN_CI=1` if you really mean it, e.g. when piping into a different secret store rather than into build logs.)
 
 ## Two axes of rotation
 
-Recipients (who can decrypt) and values (what's stored) are independent — an important distinction during incident response. Editing `yoink.yaml` `recipients:` rotates *who can decrypt*; editing `secrets.age` via `yoink secrets edit` rotates *what's stored*. A leaked CI identity needs both: revoke the recipient (so the leaked identity can't decrypt new edits) **and** rotate every value (because the attacker has a copy of the old `secrets.age` and the leaked identity already decrypts it).
+Recipients (who can decrypt) and values (what's stored) are independent, an important distinction during incident response. Editing `yoink.yaml` `recipients:` rotates *who can decrypt*; editing `secrets.age` via `yoink secrets edit` rotates *what's stored*. A leaked CI identity needs both: revoke the recipient (so the leaked identity can't decrypt new edits) **and** rotate every value (because the attacker has a copy of the old `secrets.age` and the leaked identity already decrypts it).
 
 ## Failure modes
 
-- **`age decryption failed: no matching key`** — CI's secret doesn't match any recipient in `secrets.age`. Either the GitHub secret wasn't updated after a rotation, or you forgot to re-seal after adding the new recipient. Run `yoink secrets show` locally with the same key to confirm.
-- **`no age identity found`** — the workflow forgot the `env: YOINK_AGE_KEY:` block on the deploy step.
-- **`workflow logs leak the values`** — never use `yoink secrets show --reveal` in CI; never `echo $DATABASE_URL` in a step. GitHub auto-masks values that match registered secrets, but yoink-decrypted plaintext isn't registered.
+- **`age decryption failed: no matching key`**: CI's secret doesn't match any recipient in `secrets.age`. Either the GitHub secret wasn't updated after a rotation, or you forgot to re-seal after adding the new recipient. Run `yoink secrets show` locally with the same key to confirm.
+- **`no age identity found`**: the workflow forgot the `env: YOINK_AGE_KEY:` block on the deploy step.
+- **`workflow logs leak the values`**: never use `yoink secrets show --reveal` in CI; never `echo $DATABASE_URL` in a step. GitHub auto-masks values that match registered secrets, but yoink-decrypted plaintext isn't registered.
 
 ## See also
 
