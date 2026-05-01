@@ -34,7 +34,7 @@ If I want to retire a device I remove it from the tailnet and it can't reach any
 
 ## A shout-out to Depot
 
-The CI side of this is much nicer if your runners join the tailnet without you wiring it up by hand. I run CI on [Depot](https://depot.dev), which has native Tailscale integration. Flip a switch in project settings and every runner joins the tailnet for the duration of a job as an ephemeral device, then leaves when the job ends. There's no bootstrap auth key to plumb through, no `tailscaled` install step in a workflow, no auth keys hanging around in a secret store waiting to be forgotten about.
+The CI side of this is much nicer if your runners join the tailnet without you wiring it up by hand. I run CI on [Depot](https://depot.dev/docs/integrations/tailscale), which has native Tailscale integration. Flip a switch in project settings and every runner joins the tailnet for the duration of a job as an ephemeral device, then leaves when the job ends. There's no bootstrap auth key to plumb through, no `tailscaled` install step in a workflow, no auth keys hanging around in a secret store waiting to be forgotten about.
 
 Runners come up tagged `tag:ci`, and one line in my tailnet ACLs lets `tag:ci` SSH into hosts tagged `tag:prod`. That's the whole authorization model. With yoink the deploy step is:
 
