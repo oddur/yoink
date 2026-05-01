@@ -35,6 +35,18 @@ The public interface doesn't even have port 22 open. The provider firewall block
 
 When someone leaves the team, I remove them from the tailnet ACL and they lose access to every host at once. When CI's OAuth client gets rotated, every old token dies the next time it's used. None of this requires touching a single `authorized_keys` file. The keys that used to be the connective tissue of the deploy system simply aren't there anymore.
 
+## A quick shout-out to Depot
+
+The CI side of this story is dramatically easier if your runners can join the tailnet without you having to babysit it. I run my CI on [Depot](https://depot.dev), which has native Tailscale integration — flip a switch in the project settings and every Depot runner joins my tailnet on job start as an ephemeral device, then leaves when the job ends. No bootstrap secrets to plumb through, no `tailscaled` install step in a workflow, no half-leaked auth keys lying around.
+
+The runners come up with `tag:ci`, and a single line in my tailnet ACLs grants `tag:ci` permission to SSH into hosts tagged `tag:prod`. That's the entire authorization model: tag-to-tag. No per-runner provisioning, no per-host updates when the runner pool churns, no static credentials to revoke. Combined with yoink, the deploy job is, in full:
+
+```yaml
+- run: yoink up --config yoink.yaml
+```
+
+The runner is on the tailnet, the host trusts `tag:ci`, yoink dials the host by name. There's nothing else to set up.
+
 ## The backplane falls out for free
 
 Here's the part I didn't expect. The same tailnet that carries my deploy traffic is also a perfectly good backplane network for the services themselves.
