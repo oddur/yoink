@@ -4,7 +4,7 @@ date: 2026-05-01
 description: Why pairing yoink with Tailscale lets you take SSH keys out of the deploy pipeline entirely, drop port 22 from the public internet, and get a free cross-provider service backplane in the bargain.
 ---
 
-There's a particular kind of small-team operational tax that nobody puts on a roadmap, but everyone pays. It's the SSH key tax. A new engineer joins; someone generates a keypair, pastes a public key into `authorized_keys` on every host, commits the change, opens a PR, merges it. Six months later that engineer rotates laptops, or leaves, and the same dance runs in reverse — except half the time it doesn't, because nobody's tracking which keys are still in use, and the trust list grows like a junk drawer.
+There's a particular kind of operational tax that nobody puts on a roadmap, but everyone pays. It's the SSH key tax. You spin up a new host; you generate a keypair, paste a public key into `authorized_keys`, commit the change to your config repo, deploy. Six months later you rotate your laptop, or you bring up a second host, or you decide to retire the old key, and the same dance runs in reverse — except half the time it doesn't, because nobody's tracking which keys are still in use, and the trust list on every box grows like a junk drawer.
 
 CI is worse. CI needs to deploy, so CI needs a key. That key lives in a secrets manager somewhere, gets injected into the runner at job start, and is, by virtue of being long-lived and machine-held, the most attractive credential in the entire system. Rotating it is a project. Revoking it during an incident is a project. Auditing who can read it is a project.
 
@@ -33,7 +33,7 @@ ListenAddress 100.64.0.0/10
 
 The public interface doesn't even have port 22 open. The provider firewall blocks it; the host firewall blocks it; the daemon doesn't listen on it. The brute-force traffic that used to fill `/var/log/auth.log` is just gone, because there's nothing to brute-force against.
 
-When someone leaves the team, I remove them from the tailnet ACL and they lose access to every host at once. When CI's OAuth client gets rotated, every old token dies the next time it's used. None of this requires touching a single `authorized_keys` file. The keys that used to be the connective tissue of the deploy system simply aren't there anymore.
+If I want to retire a device, I remove it from the tailnet and it loses access to every host at once. When CI's OAuth client gets rotated, every old token dies the next time it's used. None of this requires touching a single `authorized_keys` file. The keys that used to be the connective tissue of the deploy system simply aren't there anymore.
 
 ## A quick shout-out to Depot
 
