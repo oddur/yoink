@@ -1007,9 +1007,14 @@ BAZ=plain
 
         // Recipients name `other_public` so the dir scan WOULD match
         // — but env_key takes precedence regardless.
-        let id =
-            load_identity_resolved(Some(env_secret.to_string()), None, &keys, &legacy, &[other_public])
-                .expect("env wins");
+        let id = load_identity_resolved(
+            Some(env_secret.to_string()),
+            None,
+            &keys,
+            &legacy,
+            &[other_public],
+        )
+        .expect("env wins");
         assert_eq!(id.to_public().to_string(), env_public);
     }
 

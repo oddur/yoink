@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use zeroize::Zeroizing;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 use yoink::config::Config;
 use yoink::deploy;
@@ -4904,7 +4904,10 @@ mod tests {
     #[test]
     fn as_pair_value_can_contain_equals_and_at() {
         let m = parse_as_pairs(&["URL=http://x.example.com/a=1".into()], 1024).unwrap();
-        assert_eq!(m.get("URL").map(|z| z.as_str()), Some("http://x.example.com/a=1"));
+        assert_eq!(
+            m.get("URL").map(|z| z.as_str()),
+            Some("http://x.example.com/a=1")
+        );
     }
 
     #[test]

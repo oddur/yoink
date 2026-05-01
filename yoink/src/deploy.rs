@@ -1905,7 +1905,10 @@ services:
         let mut cfg = config_one_service();
         cfg.services[0].secrets = vec!["DATABASE_URL".into(), "MISSING".into()];
         let mut values = BTreeMap::new();
-        values.insert("DATABASE_URL".into(), Zeroizing::new("fake-test-fixture".to_string()));
+        values.insert(
+            "DATABASE_URL".into(),
+            Zeroizing::new("fake-test-fixture".to_string()),
+        );
         values.insert("UNRELATED".into(), Zeroizing::new("ignored".to_string()));
         let bundle = SecretsBundle::new(values);
         let env = build_env(&cfg.services[0], Some(&bundle));

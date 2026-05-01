@@ -2305,7 +2305,10 @@ secrets:
         )]);
         let mut cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
         let mut values = std::collections::BTreeMap::new();
-        values.insert("PROD_HOST_IP".to_string(), zeroize::Zeroizing::new("10.0.0.42".to_string()));
+        values.insert(
+            "PROD_HOST_IP".to_string(),
+            zeroize::Zeroizing::new("10.0.0.42".to_string()),
+        );
         let bundle = SecretsBundle::new(values);
         cfg.resolve_host_addresses(Some(&bundle)).expect("resolves");
         assert_eq!(cfg.hosts[0].address, "10.0.0.42");

@@ -942,8 +942,14 @@ services:
 "#;
         let cfg = parse(yaml);
         let mut values = std::collections::BTreeMap::new();
-        values.insert("CF_CERT".to_string(), zeroize::Zeroizing::new("-----BEGIN CERT-----\n".to_string()));
-        values.insert("CF_KEY".to_string(), zeroize::Zeroizing::new("-----BEGIN KEY-----\n".to_string()));
+        values.insert(
+            "CF_CERT".to_string(),
+            zeroize::Zeroizing::new("-----BEGIN CERT-----\n".to_string()),
+        );
+        values.insert(
+            "CF_KEY".to_string(),
+            zeroize::Zeroizing::new("-----BEGIN KEY-----\n".to_string()),
+        );
         let bundle = SecretsBundle::new(values);
         let json = render(&cfg, |_| vec!["api-1".into()], Some(&bundle)).expect("render");
         let entries = &json["apps"]["tls"]["certificates"]["load_pem"];
@@ -987,10 +993,16 @@ services:
             "CF_CERT".to_string(),
             zeroize::Zeroizing::new("-----BEGIN CERTIFICATE-----\n".to_string()),
         );
-        values.insert("CF_KEY".to_string(), zeroize::Zeroizing::new("-----BEGIN PRIVATE KEY-----\n".to_string()));
+        values.insert(
+            "CF_KEY".to_string(),
+            zeroize::Zeroizing::new("-----BEGIN PRIVATE KEY-----\n".to_string()),
+        );
         values.insert(
             "CF_CA".to_string(),
-            zeroize::Zeroizing::new("-----BEGIN CERTIFICATE-----\nMIIBfakeCAder\n-----END CERTIFICATE-----\n".to_string()),
+            zeroize::Zeroizing::new(
+                "-----BEGIN CERTIFICATE-----\nMIIBfakeCAder\n-----END CERTIFICATE-----\n"
+                    .to_string(),
+            ),
         );
         let bundle = SecretsBundle::new(values);
         let json = render(&cfg, |_| vec!["api-1".into()], Some(&bundle)).expect("render");
@@ -1050,8 +1062,14 @@ services:
         // No proxy.email: but no ACME because proxy.tls is set.
         let cfg = parse(yaml);
         let mut values = std::collections::BTreeMap::new();
-        values.insert("CF_CERT".to_string(), zeroize::Zeroizing::new("cert".to_string()));
-        values.insert("CF_KEY".to_string(), zeroize::Zeroizing::new("key".to_string()));
+        values.insert(
+            "CF_CERT".to_string(),
+            zeroize::Zeroizing::new("cert".to_string()),
+        );
+        values.insert(
+            "CF_KEY".to_string(),
+            zeroize::Zeroizing::new("key".to_string()),
+        );
         let json = render(&cfg, |_| vec![], Some(&SecretsBundle::new(values))).expect("render");
         assert!(json["apps"]["tls"]["automation"].is_null());
         assert!(json["apps"]["tls"]["certificates"]["load_pem"][0].is_object());

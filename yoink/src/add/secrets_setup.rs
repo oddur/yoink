@@ -83,7 +83,10 @@ pub fn bootstrap(config_path: &Path, key_path: &Path) -> Result<BootstrapResult>
     }
 
     let (secret, public) = sealed::keygen();
-    let body = format!("# created by `yoink add`\n# public key: {public}\n{}\n", secret.as_str());
+    let body = format!(
+        "# created by `yoink add`\n# public key: {public}\n{}\n",
+        secret.as_str()
+    );
     sealed::write_atomically_secret(key_path, body.as_bytes())
         .with_context(|| format!("write {}", key_path.display()))?;
 

@@ -927,7 +927,9 @@ mod tests {
                 recipients: vec![recipient.clone()],
             }),
         };
-        bundle.values.insert("FOO".into(), Zeroizing::new("bar baz".into()));
+        bundle
+            .values
+            .insert("FOO".into(), Zeroizing::new("bar baz".into()));
         bundle.keys = bundle.values.keys().cloned().collect();
         persist(&bundle).expect("persist");
 
