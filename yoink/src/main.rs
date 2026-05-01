@@ -811,6 +811,30 @@ enum SecretsAction {
         #[arg(long)]
         reveal: bool,
     },
+    /// Decrypt and print the sealed bundle as shell-evalable
+    /// `export KEY='value'` lines, for loading secrets into your
+    /// current shell during local development:
+    ///
+    ///   source <(yoink secrets env)
+    ///   # or
+    ///   eval "$(yoink secrets env)"
+    ///
+    /// Values are POSIX single-quote-escaped so embedded quotes,
+    /// newlines, and `$` are passed through literally. Pass
+    /// `--no-export` to drop the `export ` prefix (useful for
+    /// piping into a `.env`-style file consumed by tools like
+    /// `docker run --env-file`).
+    ///
+    /// Refuses to run in CI by default — same guard as
+    /// `secrets show --reveal`. Override with
+    /// `YOINK_ALLOW_REVEAL_IN_CI=1` if you really mean it.
+    Env {
+        /// Emit bare `KEY='value'` lines instead of
+        /// `export KEY='value'`. Use when feeding tools that
+        /// consume dotenv-style files rather than shell `source`.
+        #[arg(long)]
+        no_export: bool,
+    },
     /// One-shot: read a plaintext dotenv from `--in` (or stdin) OR
     /// individual `--as KEY=...` pairs, **merge** into the existing
     /// sealed bundle (matching `secrets ssh-key generate --seal-as`'s
@@ -4173,6 +4197,7 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
         },
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
+        SecretsAction::Env { no_export } => cmd_secrets_env(config, no_export),
         SecretsAction::Seal {
             r#in,
             as_pairs,
@@ -4453,6 +4478,52 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_secrets_env(config: &Config, no_export: bool) -> Result<()> {
+    use yoink::config::SecretsConfig;
+    use yoink::sealed;
+    if let Some(ci_var) = detected_ci_env()
+        && !is_truthy_env("YOINK_ALLOW_REVEAL_IN_CI")
+    {
+        return Err(anyhow::anyhow!(
+            "refusing to print real secret values: detected CI environment (${ci_var} is set). \
+             `secrets env` is meant for sourcing into a local dev shell, not CI logs. \
+             If this is intentional, set YOINK_ALLOW_REVEAL_IN_CI=1"
+        ));
+    }
+    let SecretsConfig::Age { file, recipients } = expect_secrets_provider_age(config)? else {
+        unreachable!()
+    };
+    let path = sealed::resolve_sealed_path(config, file.as_deref())?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
+    let identity = sealed::load_identity(recipients)?;
+    let plaintext = sealed::unseal(&bytes, &identity)?;
+    let parsed = sealed::parse_dotenv(&plaintext)?;
+    let prefix = if no_export { "" } else { "export " };
+    for (k, v) in &parsed {
+        println!("{prefix}{k}={}", posix_single_quote(v));
+    }
+    Ok(())
+}
+
+/// POSIX-safe single-quote escape: wrap in `'…'`, and replace each
+/// embedded `'` with `'\''` (close-quote, escaped quote, reopen).
+/// Passes through newlines, `$`, backticks, and backslashes literally,
+/// so values round-trip into the shell exactly as sealed.
+fn posix_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 #[allow(clippy::too_many_lines, clippy::items_after_statements)]
