@@ -21,13 +21,13 @@ yoink add openclaw --up       # app: render fragment + run `yoink up`
 
 ## What it does
 
-1. Fetches `templates/<name>/` from `oddur/yoink@main` (or another repo — see below).
+1. Fetches `templates/<name>/` from `oddur/yoink@main` (or another repo; see below).
 2. Reads the template's `template.yaml` manifest.
 3. Prompts for variables without a default. `--yes` uses every default.
 4. Renders the files with [minijinja](https://github.com/mitsuhiko/minijinja).
 5. Generates and **seals** declared secrets into your `secrets.age` — random bytes never leave the local process.
 6. Adds the fragment glob to your `yoink.yaml` `include:` list if not already covered.
-7. Prints the manifest's notes — usually how to wire the service into your app.
+7. Prints the manifest's notes, usually how to wire the service into your app.
 
 Every step gates on a confirmation diff. `--yes` skips prompts (required in CI).
 
@@ -89,7 +89,7 @@ Missing variables fail fast in non-interactive mode rather than defaulting to em
 
 - **"variable X has no default"**: pass `--var X=value` or run interactively.
 - **"couldn't resolve …@main"**: GitHub API unreachable. Falls back to the cached SHA if you've added this template before with the same ref; otherwise pass `@<sha>`.
-- **"rendered file failed yoink validation"**: template bug — report it (or open a PR for bundled templates).
+- **"rendered file failed yoink validation"**: template bug; report it (or open a PR for bundled templates).
 
 ## See also
 

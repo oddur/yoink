@@ -17,15 +17,15 @@ services:
       port: 50051
 ```
 
-That's the whole opt-in. `yoink up`, point your gRPC client at `api.example.com:443`, done.
+Run `yoink up`, point your gRPC client at `api.example.com:443`.
 
-> **Behind Cloudflare?** Cloudflare doesn't proxy gRPC by default. In the dashboard, go to **Network → gRPC** and toggle it on for the zone — without this, Cloudflare returns HTTP/2 connection errors regardless of how Caddy is configured. After enabling, regular CDN features (caching, WAF) still apply; Cloudflare just speaks h2 end-to-end.
+> **Behind Cloudflare?** Cloudflare doesn't proxy gRPC by default. In the dashboard, go to **Network → gRPC** and toggle it on for the zone; without this, Cloudflare returns HTTP/2 connection errors regardless of how Caddy is configured. After enabling, regular CDN features (caching, WAF) still apply; Cloudflare just speaks h2 end-to-end.
 
-Without `upstream_h2c:`, Caddy talks to the backend over HTTP/1.1, which gRPC clients can't use — you'll see `INTERNAL` errors or empty responses. With it, the proxy speaks HTTP/2 cleartext (h2c) on the internal docker network; the public side stays TLS-terminated HTTP/2.
+Without `upstream_h2c:`, Caddy talks to the backend over HTTP/1.1, which gRPC clients can't use; you'll see `INTERNAL` errors or empty responses. With it, the proxy speaks HTTP/2 cleartext (h2c) on the internal docker network; the public side stays TLS-terminated HTTP/2.
 
 ## Mixed gRPC + HTTP/1.1 backends
 
-Servers that handle both gRPC and plain HTTP on the same port (Tonic + Axum, grpc-go + http.Handler, grpc-java + servlet) usually serve HTTP/1.1 requests over h2c just fine — HTTP/2 carries HTTP/1.1 semantics natively. **A single `upstream_h2c: true` covers both protocols** for these servers.
+Servers that handle both gRPC and plain HTTP on the same port (Tonic + Axum, grpc-go + http.Handler, grpc-java + servlet) usually serve HTTP/1.1 requests over h2c just fine; HTTP/2 carries HTTP/1.1 semantics natively. **A single `upstream_h2c: true` covers both protocols** for these servers.
 
 If your backend rejects HTTP/1.1 over h2c (some older grpc-only servers do), you can still serve mixed traffic by routing only gRPC requests through h2c and everything else through HTTP/1.1, using `caddy_extra_caddyfile:`:
 
@@ -50,10 +50,10 @@ services:
 
 ## gRPC-Web
 
-Browsers can't speak native gRPC — they need [gRPC-Web](https://github.com/grpc/grpc-web), which uses HTTP/1.1 or HTTP/2 (no h2c required) plus a translation layer. Two options:
+Browsers can't speak native gRPC; they need [gRPC-Web](https://github.com/grpc/grpc-web), which uses HTTP/1.1 or HTTP/2 (no h2c required) plus a translation layer. Two options:
 
 - **Translation in your backend**: Tonic has [`tonic-web`](https://docs.rs/tonic-web/), grpc-go has [improbable-eng/grpc-web](https://github.com/improbable-eng/grpc-web/tree/master/go/grpcwebproxy). Backend speaks both gRPC and gRPC-Web on the same port. `upstream_h2c: true` on yoink covers both because gRPC-Web traffic is regular HTTP/1.1 over h2c.
-- **Caddy plugin**: there's a `caddy-grpc-web` plugin that translates at the proxy layer. Add it via [`proxy.xcaddy:`](/docs/how-to/caddy-plugins) — yoink builds a custom caddy with the module on each proxy host.
+- **Caddy plugin**: there's a `caddy-grpc-web` plugin that translates at the proxy layer. Add it via [`proxy.xcaddy:`](/docs/how-to/caddy-plugins); yoink builds a custom caddy with the module on each proxy host.
 
 ## Reflection / grpcurl
 
@@ -68,7 +68,7 @@ If your backend has reflection enabled, the `list` should print your service des
 
 ## Mutual TLS (Cloudflare origin-pull)
 
-If you're fronting via Cloudflare, the [Cloudflare Origin Certificates recipe](/docs/how-to/cloudflare-origin-certs) covers the mTLS setup that locks your origin to Cloudflare's edge IPs. gRPC + mTLS works the same way — `upstream_h2c: true` + `proxy.tls.client_auth` together:
+If you're fronting via Cloudflare, the [Cloudflare Origin Certificates recipe](/docs/how-to/cloudflare-origin-certs) covers the mTLS setup that locks your origin to Cloudflare's edge IPs. gRPC + mTLS works the same way; `upstream_h2c: true` + `proxy.tls.client_auth` together:
 
 ```yaml
 proxy:
@@ -88,7 +88,7 @@ services:
       port: 50051
 ```
 
-A common shape: Tonic + Axum behind Cloudflare with origin-pull mTLS — a single `upstream_h2c: true` covers both gRPC and the REST surface.
+A common shape: Tonic + Axum behind Cloudflare with origin-pull mTLS; a single `upstream_h2c: true` covers both gRPC and the REST surface.
 
 ## See also
 

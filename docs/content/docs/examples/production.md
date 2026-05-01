@@ -73,7 +73,7 @@ proxy:
       trust_pool_secret: CF_ORIGIN_PULL_CA
 ```
 
-For ACME (Let's Encrypt) instead of sealed Cloudflare origin certs, drop `proxy.tls` and set `proxy.email: ops@example.com` — every service with `domain:` then auto-issues. See the [proxy guide](/docs/guide/proxy) and the [Cloudflare Origin Certs recipe](/docs/how-to/cloudflare-origin-certs).
+For ACME (Let's Encrypt) instead of sealed Cloudflare origin certs, drop `proxy.tls` and set `proxy.email: ops@example.com`; every service with `domain:` then auto-issues. See the [proxy guide](/docs/guide/proxy) and the [Cloudflare Origin Certs recipe](/docs/how-to/cloudflare-origin-certs).
 
 ## `services/prod/api.yaml`
 
@@ -208,14 +208,14 @@ See [PR-comment dry-run](/docs/how-to/pr-comment-dry-run) for the complete workf
 
 ## What this exercises
 
-- **Multi-tier networks** — `redis` only on `redis`; otel isolated on `otel`; api joined to `api/redis/otel` per its dial-out needs.
-- **Bundled reverse proxy** — `domain:` on api/web, one `proxy.tls` block at the top, no `caddy.yaml`. Auto-joins `yoink-ingress` with each routed service.
-- **Pre-deploy hooks** — `api-migrate` runs once per up before the api swap, same image as the runtime.
-- **`env_from_secrets`** — store under one name, expose under a different env-var name. For legacy env-var conventions.
-- **`files:` mounts** — content-hashed bind that feeds into `spec_hash`. Edit the otel config, redeploy, the otel container rerolls.
-- **Surgical security opt-outs** — `otel` opts out of the hardened defaults (with a comment); everything else inherits.
-- **Config fragmentation** — one file per service, glob-included. Renaming a service is a one-file operation.
-- **Staging alongside prod** — see [the recipe](/docs/how-to/staging-alongside-prod) for `yoink.staging.yaml` with `name: api-staging` on the same hosts.
+- **Multi-tier networks**: `redis` only on `redis`; otel isolated on `otel`; api joined to `api/redis/otel` per its dial-out needs.
+- **Bundled reverse proxy**: `domain:` on api/web, one `proxy.tls` block at the top, no `caddy.yaml`. Auto-joins `yoink-ingress` with each routed service.
+- **Pre-deploy hooks**: `api-migrate` runs once per up before the api swap, same image as the runtime.
+- **`env_from_secrets`**: store under one name, expose under a different env-var name. For legacy env-var conventions.
+- **`files:` mounts**: content-hashed bind that feeds into `spec_hash`. Edit the otel config, redeploy, the otel container rerolls.
+- **Surgical security opt-outs**: `otel` opts out of the hardened defaults (with a comment); everything else inherits.
+- **Config fragmentation**: one file per service, glob-included. Renaming a service is a one-file operation.
+- **Staging alongside prod**: see [the recipe](/docs/how-to/staging-alongside-prod) for `yoink.staging.yaml` with `name: api-staging` on the same hosts.
 
 ## See also
 

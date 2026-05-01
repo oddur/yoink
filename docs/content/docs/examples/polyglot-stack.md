@@ -6,7 +6,7 @@ weight: 2
 
 A real app is usually a backend, a frontend, a cache, and something fronting them with TLS. `docker-compose up` on a VPS works until a deploy half-rolls and you're SSHing in to figure out which container is in what state.
 
-The same stack under yoink: **single host, Rust API + Node web + Caddy + Redis**, each tier on its own docker network so a compromise of one doesn't reach the others. Images from a registry (CI-built); `yoink up` rolls with healthcheck-gated swaps in dependency-ordered waves. Scales to multiple hosts via `hosts:` — see [Production-shape](/docs/examples/production).
+The same stack under yoink: **single host, Rust API + Node web + Caddy + Redis**, each tier on its own docker network so a compromise of one doesn't reach the others. Images from a registry (CI-built); `yoink up` rolls with healthcheck-gated swaps in dependency-ordered waves. Scales to multiple hosts via `hosts:`; see [Production-shape](/docs/examples/production).
 
 ```yaml
 # yoink.yaml
@@ -131,7 +131,7 @@ yoink up --tag api=$SHA --tag web=$SHA
 - **Per-tier networks**: `redis` only on `redis`; `caddy` joins `api` and `web` but never `redis`. A compromised `caddy` can't enumerate redis via docker DNS.
 - **`depends_on` waves**: `redis` → `api` → `web` → `caddy`. Independent services in the same wave run concurrently.
 - **Pre-deploy hooks**: `api-migrate` runs once per `up` (not per replica) before the api swap. Same image as the runtime container.
-- **Replicas**: `api` and `web` each at 2 — rolling swap keeps 1 alive while the new one healthchecks.
+- **Replicas**: `api` and `web` each at 2; rolling swap keeps 1 alive while the new one healthchecks.
 - **Surgical security opt-out**: `caddy` re-adds `NET_BIND_SERVICE` only; `read_only`, `cap_drop=ALL`, and `no-new-privileges` stay default-on. Docker socket bind is `:ro`; data dir is explicit `:rw`.
 
 ## See also

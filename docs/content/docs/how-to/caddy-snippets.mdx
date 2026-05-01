@@ -4,7 +4,7 @@ description: Copy-paste Caddyfile snippets for forward auth, basic auth, IP allo
 weight: 17
 ---
 
-`caddy_extra_json:` and `caddy_extra_caddyfile:` are the escape hatch for Caddy features that aren't deploy primitives — auth, rate limiting, headers, redirects, IP allowlists, body limits.
+`caddy_extra_json:` and `caddy_extra_caddyfile:` are the escape hatch for Caddy features that aren't deploy primitives: auth, rate limiting, headers, redirects, IP allowlists, body limits.
 
 Each snippet shows both the Caddyfile form (Caddy's docs use this) and the JSON equivalent (admin API consumes this). Both work on vanilla `caddy:2` unless noted.
 
@@ -14,7 +14,7 @@ For the proxy block schema, see the [Reverse proxy guide](/docs/guide/proxy).
 **Caddyfile vs JSON**: `caddy_extra_caddyfile:` shells out to `caddy adapt` at render time (needs docker on the operator's machine). `caddy_extra_json:` is parsed inline. Mutually exclusive on a single service.
 </Callout>
 
-## Forward auth → Authelia / Authentik / oauth2-proxy
+## Adding authentication
 
 Gates every request through an auth-decision endpoint on another service. Standard SSO pattern for self-hosted apps.
 
@@ -140,7 +140,7 @@ caddy_extra_json: |
   ]
 ```
 
-(Yoink already emits `Strict-Transport-Security` for TLS sites by default — see the `hsts:` field in the [proxy guide](/docs/guide/proxy).)
+(Yoink already emits `Strict-Transport-Security` for TLS sites by default; see the `hsts:` field in the [proxy guide](/docs/guide/proxy).)
 
 ## Request body size limit
 
@@ -210,7 +210,7 @@ caddy_extra_json: |
 
 ## Plugins via `proxy.xcaddy:`
 
-For directives outside stock Caddy (rate-limit, l4, redis-storage, third-party DNS providers), list plugins under `proxy.xcaddy:`. Yoink builds Caddy on each proxy host with those modules baked in — no registry, no operator-side Dockerfile. See [`proxy.xcaddy:`](/docs/guide/proxy#proxyxcaddy-block--caddy-plugins-without-a-registry).
+For directives outside stock Caddy (rate-limit, l4, redis-storage, third-party DNS providers), list plugins under `proxy.xcaddy:`. Yoink builds Caddy on each proxy host with those modules baked in; no registry, no operator-side Dockerfile. See [`proxy.xcaddy:`](/docs/guide/proxy#proxyxcaddy-block--caddy-plugins-without-a-registry).
 
 ### Rate limiting (`caddy-ratelimit`)
 

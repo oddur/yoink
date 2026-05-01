@@ -4,7 +4,7 @@ description: Open VS Code in the browser rooted in a running container's live fi
 weight: 9
 ---
 
-`docker exec` + `cat` + `vi` is the loop for inspecting or editing files in a running container. `yoink vscode <service>` replaces it with VS Code in your browser, rooted in the container's live filesystem. Saves land on the running container's files directly — no copy-out, no rebuild, no redeploy.
+`docker exec` + `cat` + `vi` is the loop for inspecting or editing files in a running container. `yoink vscode <service>` replaces it with VS Code in your browser, rooted in the container's live filesystem. Saves land on the running container's files directly, with no copy-out, no rebuild, no redeploy.
 
 ```sh
 yoink vscode api
@@ -14,7 +14,7 @@ First run pulls `codercom/code-server` (~700 MB) on the host; subsequent runs re
 
 ## What the editor sees
 
-The sidecar joins the target's PID namespace and code-server is pointed at `/proc/1/root` — the kernel's magic symlink to PID 1's rootfs. Every read and write through that path operates on the target's view of the filesystem:
+The sidecar joins the target's PID namespace and code-server is pointed at `/proc/1/root`, the kernel's magic symlink to PID 1's rootfs. Every read and write through that path operates on the target's view of the filesystem:
 
 - The image layers as the running container sees them.
 - Bind mounts the daemon set up (e.g. yoink's per-service config files).
@@ -35,13 +35,13 @@ Each invocation spawns a fresh container on the host:
 | User | `0:0` (PID 1's `/proc/PID/root` is owned by root in most images) |
 | PID namespace | shared with the target (`pid_mode: container:<target>`) |
 | Capabilities | adds `CAP_SYS_PTRACE` so `/proc/PID/root` passes the kernel's `ptrace_may_access` gate |
-| Network | the target's first declared docker network — separate net-ns so docker can publish a host port |
+| Network | the target's first declared docker network (separate net-ns so docker can publish a host port) |
 | Port | `127.0.0.1:<random>:8080`, tunneled via `ssh -L` |
 | Cleanup | force-remove on Ctrl-C; `auto_remove: true` as fallback |
 
 Concurrent invocations get unique names; two operators on the same service work side-by-side.
 
-If the host enforces a custom seccomp/AppArmor profile that blocks `SYS_PTRACE`, the sidecar starts but every file read returns `EACCES`. The fix is host-side — add `SYS_PTRACE` to the daemon's allowlist or relax the per-container profile yoink applies (see `proxy:` / per-service `options.cap_add:`).
+If the host enforces a custom seccomp/AppArmor profile that blocks `SYS_PTRACE`, the sidecar starts but every file read returns `EACCES`. The fix is host-side: add `SYS_PTRACE` to the daemon's allowlist or relax the per-container profile yoink applies (see `proxy:` / per-service `options.cap_add:`).
 
 ## In-browser terminal caveat
 
@@ -63,7 +63,7 @@ There isn't one. code-server has no true read-only setting. Same write-foot-gun 
 ## Requirements
 
 - Target service running. `yoink vscode` finds it via the `yoink.service=<name>` label.
-- Host SSH-able. `address: local` is rejected — there's no tunnel endpoint.
+- Host SSH-able. `address: local` is rejected; there's no tunnel endpoint.
 - Service declares a `networks:` entry. The sidecar joins it for in-terminal DNS.
 
 ## See also

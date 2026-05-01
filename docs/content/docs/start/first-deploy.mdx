@@ -13,22 +13,22 @@ yoink init root@1.2.3.4              # generates yoink.yaml from your repo
 yoink up --build                     # builds locally, ships, runs
 ```
 
-Done. `yoink init` reads your `Dockerfile`, `git remote`, and (optionally) `~/.ssh/config` to fill in every field. `yoink up` builds the image locally, ships it to the host over SSH (no registry needed for services with a `build:` block), and runs it through a healthcheck-gated rolling deploy.
+`yoink init` reads your `Dockerfile`, `git remote`, and (optionally) `~/.ssh/config` to fill in every field. `yoink up` builds the image locally, ships it to the host over SSH (no registry needed for services with a `build:` block), and runs it through a healthcheck-gated rolling deploy.
 
 > **One small edit between the two commands**, if you want the standalone path with no registry account at all: open the generated `yoink.yaml` and change `image:` to a bare name (e.g. `my-tool`) so it doesn't include a registry prefix. The walkthrough below shows the full flow.
 
-Edit a line of code, run `yoink up --build` again — yoink rebuilds, ships only changed layers, rolls the new container behind the healthcheck. ~5–15 seconds for a small image.
+Edit a line of code, run `yoink up --build` again. Yoink rebuilds, ships only changed layers, and rolls the new container behind the healthcheck. ~5–15 seconds for a small image.
 
 ## Prerequisites
 
 - Yoink [installed](/docs/start/install) on your laptop (`brew install oddur/yoink/yoink`).
-- A host with docker installed and key-based SSH login that works — `ssh root@<host>` should drop you into a shell. A fresh Hetzner / Linode / DigitalOcean / Hetzner Cloud box with your SSH public key in `~/.ssh/authorized_keys` qualifies.
+- A host with docker installed and key-based SSH login that works; `ssh root@<host>` should drop you into a shell. A fresh Hetzner / Linode / DigitalOcean / Hetzner Cloud box with your SSH public key in `~/.ssh/authorized_keys` qualifies.
 - Docker on your laptop (`yoink build` shells out to `docker build`).
 
 That's it. Yoink uses your operating system's SSH client, so anything you've set up (`~/.ssh/config`, `ssh-agent`, hardware keys, jump hosts) just works.
 
 <Callout type="info">
-**No Tailscale required.** Plain SSH to the host's IP or DNS name is the simplest path. Tailscale becomes useful when you have multiple hosts behind NAT or want stable hostnames — see [Pairing](/docs/guide/networking).
+**No Tailscale required.** Plain SSH to the host's IP or DNS name is the simplest path. Tailscale becomes useful when you have multiple hosts behind NAT or want stable hostnames; see [Pairing](/docs/guide/networking).
 </Callout>
 
 ## Walkthrough
@@ -62,9 +62,9 @@ inferred:
 
 The summary tells you exactly what was inferred and where each value came from. Edit the line in `yoink.yaml` if anything's off.
 
-`init` also generated an age identity for sealed secrets — that's the backup notice. **Paste the contents of that key file into a password manager now**; it's the only thing that can decrypt your sealed values, and yoink doesn't keep a copy. (Pass `--no-secrets` to `init` if you'd rather bring your own key or use `provider: command`.)
+`init` also generated an age identity for sealed secrets; that's the backup notice. **Paste the contents of that key file into a password manager now**; it's the only thing that can decrypt your sealed values, and yoink doesn't keep a copy. (Pass `--no-secrets` to `init` if you'd rather bring your own key or use `provider: command`.)
 
-For this walkthrough we'll change one thing: edit `image:` to a bare name (no registry prefix) so we can use **standalone mode** — build locally, ship directly to the host, no registry involved:
+For this walkthrough we'll change one thing: edit `image:` to a bare name (no registry prefix) so we can use **standalone mode**: build locally, ship directly to the host, no registry involved:
 
 ```yaml
 services:
@@ -93,7 +93,7 @@ Edit code or Dockerfile. Re-run the same command:
 yoink up --build
 ```
 
-Only changed layers cross the wire. Healthcheck-gated swap — the old container only stops after the new one is healthy.
+Only changed layers cross the wire. Healthcheck-gated swap; the old container only stops after the new one is healthy.
 
 ### Inspect what's running [step]
 

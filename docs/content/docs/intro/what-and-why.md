@@ -28,7 +28,7 @@ A small, opinionated container deploy CLI + TUI for people who run a handful of 
 
 ## Why it exists
 
-Single-host PaaS tools are wonderful for "one app, one host" but creak the moment you want a second app on the same box, replicas of the same service, or network isolation between tiers. Kubernetes solves all that — and a hundred other problems you don't have, in exchange for a control plane to operate, a YAML schema with a learning curve, and a vocabulary you have to teach every new operator.
+Single-host PaaS tools are wonderful for "one app, one host" but creak the moment you want a second app on the same box, replicas of the same service, or network isolation between tiers. Kubernetes solves all that and a hundred other problems you don't have, in exchange for a control plane to operate, a YAML schema with a learning curve, and a vocabulary you have to teach every new operator.
 
 `yoink` is the thinnest tool that gives you the few Kubernetes ideas that actually matter at small scale, while keeping the "one binary, ssh into the host, drive Docker directly" simplicity:
 
@@ -37,7 +37,7 @@ Single-host PaaS tools are wonderful for "one app, one host" but creak the momen
 - **Per-service network tiers.** Each service joins a named network; only services on the same network can dial each other. Basic blast-radius isolation without a CNI plugin.
 - **Dependency-ordered deploys.** Services declare `depends_on:` and `yoink up` runs them in topological-sort waves (independent services in parallel).
 - **Drift detection.** Every effective spec (image, env, networks, mounts, options, file content) hashes deterministically and lands as a label. The TUI shows drift across the cluster without guessing.
-- **Build where it makes sense, ship how it makes sense.** Build on a laptop OR in CI; ship via a registry OR straight to each host. Yoink picks the right path per service automatically from the `build:` block, with layer-level dedup either way — drop `build:` for CI-built infra, keep it for app code, mix freely in one `yoink up`. See [deploy modes](/docs/guide/deploy-modes).
+- **Build where it makes sense, ship how it makes sense.** Build on a laptop OR in CI; ship via a registry OR straight to each host. Yoink picks the right path per service automatically from the `build:` block, with layer-level dedup either way. Drop `build:` for CI-built infra, keep it for app code, mix freely in one `yoink up`. See [deploy modes](/docs/guide/deploy-modes).
 - **Secure by default.** Every container yoink creates is hardened up front:
   - Non-root uid (`65534` / nobody)
   - `cap_drop=ALL`
@@ -48,15 +48,15 @@ Single-host PaaS tools are wonderful for "one app, one host" but creak the momen
   - binds default `:ro`
 
   Override per service when an image genuinely needs root or specific file ownership.
-- **Port-forward without weakening the deploy posture.** `yoink pf <service>` opens a kubectl-style tunnel to any container — published or not — so the locked-down "no `publish:` for backends" default stops fighting with the on-call's need to point a browser at something. Same one-key UX in the TUI. See [port-forward](/docs/guide/networking#port-forward).
-- **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI) or — on a laptop — auto-discovered from `~/.config/yoink/keys/<recipient>.key` (where `yoink secrets key generate` saves by default; one identity per project, no env var to set). No remote vault required. For teams that prefer a managed store, `provider: command` shells out to whatever CLI you already use (Doppler, 1Password, Vault, AWS Secrets Manager, the Infisical CLI, …) — no first-party SDK to vendor.
-- **Bundled reverse proxy.** Set `domain:` on a service and yoink's bundled Caddy fronts it with HTTPS — automatic Let's Encrypt or sealed Cloudflare origin certs (with optional origin-pull mTLS). h2c for gRPC, HSTS, compression, multi-host canonical redirects — all one-line opt-ins.
-- **CLI + YAML, no GUI.** The entire control surface is the `yoink` binary plus `yoink.yaml`. No web dashboard to click, no API to script. The same workflow that you run by hand drives CI runners and AI coding agents identically — yoink is happy to be driven by Claude Code, Cursor, or a GitHub Actions job.
+- **Port-forward without weakening the deploy posture.** `yoink pf <service>` opens a kubectl-style tunnel to any container (published or not) so the locked-down "no `publish:` for backends" default stops fighting with the on-call's need to point a browser at something. Same one-key UX in the TUI. See [port-forward](/docs/guide/networking#port-forward).
+- **Sealed secrets out of the box.** A single `secrets.age` file committed to the repo, decrypted at deploy time with one key resolved from `YOINK_AGE_KEY` (env in CI) or, on a laptop, auto-discovered from `~/.config/yoink/keys/<recipient>.key` (where `yoink secrets key generate` saves by default; one identity per project, no env var to set). No remote vault required. For teams that prefer a managed store, `provider: command` shells out to whatever CLI you already use (Doppler, 1Password, Vault, AWS Secrets Manager, the Infisical CLI, …) with no first-party SDK to vendor.
+- **Bundled reverse proxy.** Set `domain:` on a service and yoink's bundled Caddy fronts it with HTTPS: automatic Let's Encrypt or sealed Cloudflare origin certs (with optional origin-pull mTLS). h2c for gRPC, HSTS, compression, multi-host canonical redirects, all one-line opt-ins.
+- **CLI + YAML, no GUI.** The entire control surface is the `yoink` binary plus `yoink.yaml`. No web dashboard to click, no API to script. The same workflow that you run by hand drives CI runners and AI coding agents identically; yoink is happy to be driven by Claude Code, Cursor, or a GitHub Actions job.
 - **k9s-style TUI.** A terminal dashboard with one-key reconcile, prune, kill, shell-into, debug-sidecar, log filter, deploy history with one-press rollback. Keyboard-only.
 
 ## Batteries included, extensible at the edges
 
-Yoink picks "batteries included" over "framework" for the boring-but-important pieces an operator would otherwise have to glue together themselves: hardened container defaults, healthcheck-gated swaps, drift detection, dependency ordering, and **sealed secrets**. The age-sealed path means you can ship a real production deploy from a fresh laptop with nothing more than `yoink` itself, ssh access, and a docker daemon on the host — no vault to operate, no third-party account to provision.
+Yoink picks "batteries included" over "framework" for the boring-but-important pieces an operator would otherwise have to glue together themselves: hardened container defaults, healthcheck-gated swaps, drift detection, dependency ordering, and **sealed secrets**. The age-sealed path means you can ship a real production deploy from a fresh laptop with nothing more than `yoink` itself, ssh access, and a docker daemon on the host; no vault to operate, no third-party account to provision.
 
 Where the in-the-box default isn't the right answer for a team, yoink extends rather than blocks. **Secrets** is the canonical example:
 
@@ -67,7 +67,7 @@ Where the in-the-box default isn't the right answer for a team, yoink extends ra
 | When it's the right choice | small team, single environment, trust the repo as the source of truth | shared rotation across many repos, audit trail, fine-grained ACLs, can't commit secrets at all |
 | Examples | `secrets.age` + `YOINK_AGE_KEY` | `["doppler","secrets","download","--no-file","--format","env"]`, `["op","inject","-i","secrets.tpl"]`, `["vault","kv","get","-format=json","..."]`, … |
 
-The `command` path means yoink doesn't need first-party integrations for every secret manager — any CLI that emits dotenv or JSON on stdout works. See [external secrets via CLI](/docs/guide/secrets) for per-tool recipes.
+The `command` path means yoink doesn't need first-party integrations for every secret manager; any CLI that emits dotenv or JSON on stdout works. See [external secrets via CLI](/docs/guide/secrets) for per-tool recipes.
 
 The same shape applies elsewhere: registry credentials, CI integrations, host-level networking. Yoink's job is to make the obvious choice work without configuration, and to stay out of the way when the operator needs to swap a piece for something specific.
 
