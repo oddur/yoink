@@ -23,6 +23,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use zeroize::Zeroizing;
 
 use crate::config::{Config, SecretsConfig, SecretsFormat};
 use crate::sealed;
@@ -163,20 +164,22 @@ pub enum SecretsError {
 
 /// In-memory map of resolved secret keys → values. Built once at the
 /// start of a reconcile. Each service then picks the keys it needs.
+/// Values are wrapped in `Zeroizing<String>` so they are wiped from
+/// memory when the bundle is dropped.
 #[derive(Clone, Default)]
 pub struct SecretsBundle {
-    values: BTreeMap<String, String>,
+    values: BTreeMap<String, Zeroizing<String>>,
 }
 
 impl SecretsBundle {
     #[must_use]
-    pub fn new(values: BTreeMap<String, String>) -> Self {
+    pub fn new(values: BTreeMap<String, Zeroizing<String>>) -> Self {
         Self { values }
     }
 
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.values.get(key).map(String::as_str)
+        self.values.get(key).map(|v| v.as_str())
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
@@ -266,6 +269,8 @@ fn load_age_bundle(
         source,
     })?;
     let identity = sealed::load_identity(recipients).map_err(SecretsError::NoAgeIdentity)?;
+    // `unseal` returns `Zeroizing<String>`; plaintext is wiped when this
+    // function returns.
     let plaintext =
         sealed::unseal(&bytes, &identity).map_err(|source| SecretsError::SealedDecrypt {
             path: path.to_path_buf(),
@@ -510,7 +515,7 @@ fn parse_json_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
     let obj = raw
         .as_object()
         .ok_or_else(|| "expected a top-level JSON object of \"KEY\":\"VALUE\" pairs".to_string())?;
-    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut out: BTreeMap<String, Zeroizing<String>> = BTreeMap::new();
     for (k, v) in obj {
         let value = match v {
             serde_json::Value::String(s) => s.clone(),
@@ -529,7 +534,7 @@ fn parse_json_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
                 ));
             }
         };
-        out.insert(k.clone(), value);
+        out.insert(k.clone(), Zeroizing::new(value));
     }
     Ok(SecretsBundle::new(out))
 }
@@ -548,7 +553,7 @@ fn parse_json_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
 /// upstream tools where we don't control the format.
 fn parse_dotenv_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
-    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut out: BTreeMap<String, Zeroizing<String>> = BTreeMap::new();
     // Iterator-based: each `iter.next()` advances exactly once, so we
     // can't accidentally fail to advance and spin (the previous
     // index-mutation shape had four explicit `i += 1` sites and any
@@ -581,7 +586,7 @@ fn parse_dotenv_bundle(bytes: &[u8]) -> Result<SecretsBundle, String> {
             parse_single_line_value(value_start, key, line_idx)?
         };
 
-        out.insert(key.to_string(), value);
+        out.insert(key.to_string(), Zeroizing::new(value));
     }
     Ok(SecretsBundle::new(out))
 }

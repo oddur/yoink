@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tracing::warn;
+use zeroize::Zeroizing;
 
 use crate::config::{Config, HookSpec, HookTag, ServiceConfig};
 use crate::docker::{self, BuildError, RunSpec, SHORT_HASH_LEN};
@@ -1147,10 +1148,10 @@ pub fn registry_credentials(
     let reg = config.registry.as_ref()?;
     let bundle = secrets?;
     let username = bundle.get(&reg.username_secret)?.to_string();
-    let password = bundle.get(&reg.password_secret)?.to_string();
+    let password = Zeroizing::new(bundle.get(&reg.password_secret)?.to_string());
     Some(bollard::auth::DockerCredentials {
         username: Some(username),
-        password: Some(password),
+        password: Some(password.to_string()),
         serveraddress: Some(reg.server.clone()),
         ..Default::default()
     })
@@ -1904,8 +1905,8 @@ services:
         let mut cfg = config_one_service();
         cfg.services[0].secrets = vec!["DATABASE_URL".into(), "MISSING".into()];
         let mut values = BTreeMap::new();
-        values.insert("DATABASE_URL".into(), "fake-test-fixture".into());
-        values.insert("UNRELATED".into(), "ignored".into());
+        values.insert("DATABASE_URL".into(), Zeroizing::new("fake-test-fixture".to_string()));
+        values.insert("UNRELATED".into(), Zeroizing::new("ignored".to_string()));
         let bundle = SecretsBundle::new(values);
         let env = build_env(&cfg.services[0], Some(&bundle));
         assert_eq!(
