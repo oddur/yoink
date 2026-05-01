@@ -1,64 +1,60 @@
 ---
-title: Deploying without SSH keys — yoink + Tailscale
+title: Deploying without SSH keys, with yoink and Tailscale
 date: 2026-05-01
-description: Why pairing yoink with Tailscale lets you take SSH keys out of the deploy pipeline entirely, drop port 22 from the public internet, and get a free cross-provider service backplane in the bargain.
+description: How putting yoink behind Tailscale let me stop managing SSH keys for deploys, drop port 22 from the public internet, and end up with a backplane network across providers as a side effect.
 ---
 
-There's a particular kind of operational tax that nobody puts on a roadmap, but everyone pays. It's the SSH key tax. You spin up a new host; you generate a keypair, paste a public key into `authorized_keys`, commit the change to your config repo, deploy. Six months later you rotate your laptop, or you bring up a second host, or you decide to retire the old key, and the same dance runs in reverse — except half the time it doesn't, because nobody's tracking which keys are still in use, and the trust list on every box grows like a junk drawer.
+I don't like managing SSH keys. New host, new keypair, paste the pubkey into `authorized_keys`, commit it somewhere, deploy. Six months later I rotate my laptop and have to remember which boxes still trust the old key. Bring up a second host and the dance starts over. The trust list on every machine grows like a junk drawer and nobody is keeping a real inventory.
 
-CI is worse. CI needs to deploy, so CI needs a key. That key lives in a secrets manager somewhere, gets injected into the runner at job start, and is, by virtue of being long-lived and machine-held, the most attractive credential in the entire system. Rotating it is a project. Revoking it during an incident is a project. Auditing who can read it is a project.
+CI is where this gets actively bad. CI has to deploy, so CI has a key, and that key is long-lived and machine-held and one of the more attractive credentials in the whole setup. Rotating it is annoying enough that I put it off, revoking it during an incident is annoying enough that I'd hesitate, and auditing what reads it requires me to actually go look.
 
-Yoink is opinionated about secrets: it has a clean sealed-secrets workflow, so the keys you do have are encrypted at rest in the repo, fetched at deploy time from your secret store of choice, and never sit around in plaintext on a developer's laptop. That's already a real upgrade over the "paste your private key into a GitHub secret" pattern.
+Yoink does the secret distribution part well. Sealed secrets live in the repo, get decrypted at deploy time from whatever store you point them at, and never sit on disk in plaintext. That solves the "private key in a GitHub Actions secret" problem cleanly, and for a while I thought that was the answer. Sealed secrets are still secrets, though, and the right number of secrets to manage for a thing like this is zero.
 
-But the more I used it, the more I noticed that the sealed-secrets machinery — as elegant as it is — was solving a problem I'd rather not have at all. The best key is no key.
+## How Tailscale changes it
 
-## The shift
+Tailscale is how I got rid of them. Instead of giving every machine a credential, you give every machine an identity. My laptop is on the tailnet because I logged in with SSO. The host is on the tailnet because I ran `tailscale up` on it once at provisioning. The CI runner is on the tailnet because it auth'd as an ephemeral device for the duration of the job. Nobody is holding a static key.
 
-Tailscale is how I got rid of the keys. Not most of them — all of them.
-
-The idea is simple. Instead of distributing a credential to every machine that might want to talk to your hosts, you distribute *identity*. My laptop is on the tailnet because I logged into it with my SSO. The CI runner is on the tailnet because it authenticated with an OAuth client and was tagged ephemeral, so it'll evaporate when the job ends. The host is on the tailnet because it ran `tailscale up` once at provisioning time. Everybody has an identity; nobody is holding a static key that opens a door.
-
-What does deploying look like with this in place? Here's the entire pre-flight on a fresh laptop:
+The pre-flight on a fresh laptop, in full:
 
 ```sh
 tailscale up
 yoink up --config yoink.yaml
 ```
 
-That's it. Yoink reaches the target host by its MagicDNS name — `app-eu-1`, say — over the WireGuard mesh. There's no `~/.ssh/config` entry. There's no `IdentityFile` line. There's no key on disk. The host's `sshd` is running, but it's bound to the tailscale interface:
+Yoink dials the host by its MagicDNS name (`app-eu-1`, say) over the mesh. There is no `~/.ssh/config` entry, no `IdentityFile`, no key file. `sshd` is running on the host but it's bound to the tailscale interface:
 
 ```
 ListenAddress 100.64.0.0/10
 ```
 
-The public interface doesn't even have port 22 open. The provider firewall blocks it; the host firewall blocks it; the daemon doesn't listen on it. The brute-force traffic that used to fill `/var/log/auth.log` is just gone, because there's nothing to brute-force against.
+Port 22 isn't open on the public IP. The provider firewall blocks it, the host firewall blocks it, and `sshd` isn't listening on it anyway. The constant brute-force noise that used to fill `auth.log` stops, because there's nothing on the public internet to attack.
 
-If I want to retire a device, I remove it from the tailnet and it loses access to every host at once. When CI's OAuth client gets rotated, every old token dies the next time it's used. None of this requires touching a single `authorized_keys` file. The keys that used to be the connective tissue of the deploy system simply aren't there anymore.
+If I want to retire a device I remove it from the tailnet and it can't reach anything. If I want to rotate CI's auth I rotate the OAuth client and old tokens die on next use. I haven't touched an `authorized_keys` file in months.
 
-## A quick shout-out to Depot
+## A shout-out to Depot
 
-The CI side of this story is dramatically easier if your runners can join the tailnet without you having to babysit it. I run my CI on [Depot](https://depot.dev), which has native Tailscale integration — flip a switch in the project settings and every Depot runner joins my tailnet on job start as an ephemeral device, then leaves when the job ends. No bootstrap secrets to plumb through, no `tailscaled` install step in a workflow, no half-leaked auth keys lying around.
+The CI side of this is much nicer if your runners join the tailnet without you wiring it up by hand. I run CI on [Depot](https://depot.dev), which has native Tailscale integration. Flip a switch in project settings and every runner joins the tailnet for the duration of a job as an ephemeral device, then leaves when the job ends. There's no bootstrap auth key to plumb through, no `tailscaled` install step in a workflow, no auth keys to forget about and find lying around six months later.
 
-The runners come up with `tag:ci`, and a single line in my tailnet ACLs grants `tag:ci` permission to SSH into hosts tagged `tag:prod`. That's the entire authorization model: tag-to-tag. No per-runner provisioning, no per-host updates when the runner pool churns, no static credentials to revoke. Combined with yoink, the deploy job is, in full:
+Runners come up tagged `tag:ci`, and one line in my tailnet ACLs lets `tag:ci` SSH into hosts tagged `tag:prod`. That's the whole authorization model. With yoink the deploy step is:
 
 ```yaml
 - run: yoink up --config yoink.yaml
 ```
 
-The runner is on the tailnet, the host trusts `tag:ci`, yoink dials the host by name. There's nothing else to set up.
+The runner is on the tailnet, the host trusts `tag:ci`, yoink dials the host by name, and there is nothing else to set up.
 
-## The backplane falls out for free
+## A backplane I wasn't planning for
 
-Here's the part I didn't expect. The same tailnet that carries my deploy traffic is also a perfectly good backplane network for the services themselves.
+The same tailnet that carries deploy traffic works fine as a backplane for the services themselves, which I didn't really expect when I started.
 
-Suppose I want a second host in another region — `app-us-1` on a different provider entirely. With a traditional setup that's a real project: VPC peering, transit gateways, NAT, route tables, a bastion or two, and probably a meeting about who pays for the egress. With Tailscale it's `tailscale up` again. The two hosts are now on the same flat network, addressable by name, mutually authenticated. If `app-eu-1` needs to talk to a Postgres replica running on `app-us-1`, it just dials `app-us-1:5432`. The traffic is encrypted, the endpoints are authenticated, and neither host has anything listening on the public internet.
+Suppose I want a second host in another region. Call it `app-us-1`, on a different provider. Normally that's a real piece of work: VPC peering, transit gateways, route tables, a bastion, egress costs, a meeting about who owns the bill. With Tailscale it's `tailscale up` on the new box. Both hosts are now on the same flat, authenticated network, and if `app-eu-1` needs to talk to a Postgres replica on `app-us-1` it just dials `app-us-1:5432`. Encrypted, authenticated, and neither side has anything listening on the public internet.
 
-It also means you don't have to colocate every service on a single box just to keep the wiring sane. If I want Postgres on a host with fast local disk, Redis on a small memory-optimized box, and the application tier on a third host sized for CPU, I can. Each one is a yoink target on the same tailnet; the app dials `pg-1:5432` and `redis-1:6379` by name, with traffic encrypted and authenticated end to end, and none of those datastores need a public IP at all. The "everything on one big VM" pattern stops being the path of least resistance, because splitting things up no longer costs you a networking project.
+It also means I don't have to keep cramming everything onto one box just to keep the wiring sane. I can put Postgres on a host with fast disk, Redis on a smaller memory-optimized one, and the app on a third sized for CPU. Each is a yoink target on the same tailnet, and the app dials `pg-1:5432` and `redis-1:6379` by name. None of the datastores need a public IP. Splitting services across hosts stops being a networking project, so I actually do it.
 
-This works across providers. It works across continents. It works for hosts I run on a closet machine at home, if I want. The blast radius of a compromised provider account is dramatically smaller because the provider isn't in the trust path of the network — Tailscale's coordination plane is, and that's a small, well-scoped thing to reason about.
+This works across providers and across continents, and it works for the box in my closet. Provider compromise also stops being load-bearing for network trust, because the provider isn't in the trust path anymore. Tailscale's coordination plane is, and that's a much smaller thing to worry about.
 
-## Why the combination
+## Why the two together
 
-The reason I keep coming back to this pairing is that each tool stays simple by leaning on the other. Yoink doesn't have to solve identity, because Tailscale already did. Tailscale doesn't have to solve orchestration, because yoink already did. Yoink's sealed secrets are still pulling their weight — there are plenty of real secrets in any deploy that aren't SSH keys, and you want those encrypted in the repo and fetched fresh each time. But the credential that used to sit at the center of the whole pipeline, the one you used to lose sleep over, is gone.
+Each tool stays small by leaning on the other. Yoink hands off identity to Tailscale, Tailscale hands off orchestration to yoink, and neither has to grow features to cover what the other already does. Sealed secrets still earn their keep, because there are plenty of secrets in any deploy that aren't SSH keys, but the credential that used to sit at the center of the whole pipeline isn't there to manage anymore.
 
-The first time you delete the SSH section of your runbook, it feels like cheating. It isn't. It's just what happens when identity moves up the stack and stops pretending to be a file on disk.
+I noticed this when I went to update the SSH section of my runbook and realized I'd deleted it months ago and hadn't missed it.
