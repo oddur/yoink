@@ -52,6 +52,8 @@ Suppose I want a second host in another region. Call it `app-us-1`, on a differe
 
 It also means I don't have to keep cramming everything onto one box just to keep the wiring sane. I can put Postgres on a host with fast disk, Redis on a smaller memory-optimized one, and the app on a third sized for CPU. Each is a yoink target on the same tailnet, and the app dials `pg-1:5432` and `redis-1:6379` by name. None of the datastores need a public IP. Splitting services across hosts stops being a networking project, so I actually do it.
 
+The same tailnet ACLs that gate SSH also gate this east-west traffic. A few lines say only `tag:app` can reach `pg-1:5432`, only `tag:app` can reach `redis-1:6379`, and the app hosts can't reach each other on anything other than the ports they need. The result is a flat-looking network that isn't actually flat — closer to per-service security groups than the "everything on the LAN" feel a hobby tailnet usually has, and without the cloud console clicking that gets you there.
+
 This works across providers and across continents, and it works for the box in my closet. Provider compromise stops being load-bearing for network trust, because the provider isn't in the trust path anymore. Trust now concentrates in two places: my SSO and Tailscale's coordination plane. That's a real tradeoff, not a free win — phish my SSO and an attacker has the same access I do. The bet I'm making is that those two are easier to defend well than a fleet of `authorized_keys` files I'd otherwise be re-pasting by hand.
 
 ## How it fits together
