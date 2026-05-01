@@ -1,7 +1,10 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
+import { createServerFn } from '@tanstack/react-start';
+import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { HomeLayout } from 'fumadocs-ui/layouts/home';
 import { Card, Cards } from 'fumadocs-ui/components/card';
 import { baseOptions } from '@/lib/layout.shared';
+import { blogSource } from '@/lib/source';
 import { TerminalPlayer } from '@/components/terminal-player';
 import {
   Globe,
@@ -13,8 +16,29 @@ import {
 } from 'lucide-react';
 import { Suspense } from 'react';
 
+const getLatestPost = createServerFn({ method: 'GET' })
+  .middleware([staticFunctionMiddleware])
+  .handler(async () => {
+    const pages = blogSource.getPages();
+    if (!pages.length) return null;
+    const withDates = pages.map((p) => {
+      const d = p.data as Record<string, unknown>;
+      const rawDate = d.date;
+      const dateStr =
+        rawDate instanceof Date
+          ? rawDate.toISOString().slice(0, 10)
+          : typeof rawDate === 'string'
+            ? rawDate
+            : '';
+      return { slug: p.slugs.join('/'), title: d.title as string, date: dateStr };
+    });
+    withDates.sort((a, b) => b.date.localeCompare(a.date));
+    return withDates[0] ?? null;
+  });
+
 export const Route = createFileRoute('/')({
   component: Home,
+  loader: () => getLatestPost(),
 });
 
 const features = [
@@ -51,6 +75,7 @@ const features = [
 ];
 
 function Home() {
+  const latestPost = Route.useLoaderData();
   return (
     <HomeLayout {...baseOptions()}>
       {/* ── Hero ─────────────────────────────────────────────────────── */}
@@ -131,6 +156,35 @@ function Home() {
           ))}
         </div>
       </section>
+
+      {/* ── Latest blog post ──────────────────────────────────────────── */}
+      {latestPost && (
+        <section className="px-4 pb-10 max-w-5xl mx-auto w-full">
+          <Link
+            to="/blog/$slug"
+            params={{ slug: latestPost.slug }}
+            className="flex items-center justify-between gap-4 px-5 py-4 rounded-xl border border-fd-border bg-fd-card hover:border-fd-ring/50 transition-colors group"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <span className="shrink-0 text-xs font-medium text-fd-primary bg-fd-primary/10 px-2 py-0.5 rounded-full">
+                New post
+              </span>
+              <span className="text-sm font-medium text-fd-foreground truncate group-hover:text-fd-primary transition-colors">
+                {latestPost.title}
+              </span>
+            </div>
+            {latestPost.date && (
+              <time className="shrink-0 text-xs text-fd-muted-foreground">
+                {new Date(latestPost.date).toLocaleDateString('en-US', {
+                  year: 'numeric',
+                  month: 'short',
+                  day: 'numeric',
+                })}
+              </time>
+            )}
+          </Link>
+        </section>
+      )}
 
       {/* ── Start-here cards ──────────────────────────────────────────── */}
       <section className="px-4 pb-20 max-w-5xl mx-auto w-full">
