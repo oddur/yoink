@@ -1,0 +1,52 @@
+---
+title: Deploying without SSH keys — yoink + Tailscale
+date: 2026-05-01
+description: Why pairing yoink with Tailscale lets you take SSH keys out of the deploy pipeline entirely, drop port 22 from the public internet, and get a free cross-provider service backplane in the bargain.
+---
+
+There's a particular kind of small-team operational tax that nobody puts on a roadmap, but everyone pays. It's the SSH key tax. A new engineer joins; someone generates a keypair, pastes a public key into `authorized_keys` on every host, commits the change, opens a PR, merges it. Six months later that engineer rotates laptops, or leaves, and the same dance runs in reverse — except half the time it doesn't, because nobody's tracking which keys are still in use, and the trust list grows like a junk drawer.
+
+CI is worse. CI needs to deploy, so CI needs a key. That key lives in a secrets manager somewhere, gets injected into the runner at job start, and is, by virtue of being long-lived and machine-held, the most attractive credential in the entire system. Rotating it is a project. Revoking it during an incident is a project. Auditing who can read it is a project.
+
+Yoink is opinionated about secrets: it has a clean sealed-secrets workflow, so the keys you do have are encrypted at rest in the repo, fetched at deploy time from your secret store of choice, and never sit around in plaintext on a developer's laptop. That's already a real upgrade over the "paste your private key into a GitHub secret" pattern.
+
+But the more I used it, the more I noticed that the sealed-secrets machinery — as elegant as it is — was solving a problem I'd rather not have at all. The best key is no key.
+
+## The shift
+
+Tailscale is how I got rid of the keys. Not most of them — all of them.
+
+The idea is simple. Instead of distributing a credential to every machine that might want to talk to your hosts, you distribute *identity*. My laptop is on the tailnet because I logged into it with my SSO. The CI runner is on the tailnet because it authenticated with an OAuth client and was tagged ephemeral, so it'll evaporate when the job ends. The host is on the tailnet because it ran `tailscale up` once at provisioning time. Everybody has an identity; nobody is holding a static key that opens a door.
+
+What does deploying look like with this in place? Here's the entire pre-flight on a fresh laptop:
+
+```sh
+tailscale up
+yoink up --config yoink.yaml
+```
+
+That's it. Yoink reaches the target host by its MagicDNS name — `app-eu-1`, say — over the WireGuard mesh. There's no `~/.ssh/config` entry. There's no `IdentityFile` line. There's no key on disk. The host's `sshd` is running, but it's bound to the tailscale interface:
+
+```
+ListenAddress 100.64.0.0/10
+```
+
+The public interface doesn't even have port 22 open. The provider firewall blocks it; the host firewall blocks it; the daemon doesn't listen on it. The brute-force traffic that used to fill `/var/log/auth.log` is just gone, because there's nothing to brute-force against.
+
+When someone leaves the team, I remove them from the tailnet ACL and they lose access to every host at once. When CI's OAuth client gets rotated, every old token dies the next time it's used. None of this requires touching a single `authorized_keys` file. The keys that used to be the connective tissue of the deploy system simply aren't there anymore.
+
+## The backplane falls out for free
+
+Here's the part I didn't expect. The same tailnet that carries my deploy traffic is also a perfectly good backplane network for the services themselves.
+
+Suppose I want a second host in another region — `app-us-1` on a different provider entirely. With a traditional setup that's a real project: VPC peering, transit gateways, NAT, route tables, a bastion or two, and probably a meeting about who pays for the egress. With Tailscale it's `tailscale up` again. The two hosts are now on the same flat network, addressable by name, mutually authenticated. If `app-eu-1` needs to talk to a Postgres replica running on `app-us-1`, it just dials `app-us-1:5432`. The traffic is encrypted, the endpoints are authenticated, and neither host has anything listening on the public internet.
+
+It also means you don't have to colocate every service on a single box just to keep the wiring sane. If I want Postgres on a host with fast local disk, Redis on a small memory-optimized box, and the application tier on a third host sized for CPU, I can. Each one is a yoink target on the same tailnet; the app dials `pg-1:5432` and `redis-1:6379` by name, with traffic encrypted and authenticated end to end, and none of those datastores need a public IP at all. The "everything on one big VM" pattern stops being the path of least resistance, because splitting things up no longer costs you a networking project.
+
+This works across providers. It works across continents. It works for hosts I run on a closet machine at home, if I want. The blast radius of a compromised provider account is dramatically smaller because the provider isn't in the trust path of the network — Tailscale's coordination plane is, and that's a small, well-scoped thing to reason about.
+
+## Why the combination
+
+The reason I keep coming back to this pairing is that each tool stays simple by leaning on the other. Yoink doesn't have to solve identity, because Tailscale already did. Tailscale doesn't have to solve orchestration, because yoink already did. Yoink's sealed secrets are still pulling their weight — there are plenty of real secrets in any deploy that aren't SSH keys, and you want those encrypted in the repo and fetched fresh each time. But the credential that used to sit at the center of the whole pipeline, the one you used to lose sleep over, is gone.
+
+The first time you delete the SSH section of your runbook, it feels like cheating. It isn't. It's just what happens when identity moves up the stack and stops pretending to be a file on disk.
