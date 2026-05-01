@@ -100,14 +100,12 @@ secrets:
   provider: age
   recipients: [age1…]
   profiles:
-    terraform-backblaze:
-      include: [TFSTATE_B2_KEY_ID, TFSTATE_B2_APPLICATION_KEY,
-                B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY]
+    terraform-cloudflare:
+      include: [CLOUDFLARE_API_TOKEN,
+                TFSTATE_B2_KEY_ID, TFSTATE_B2_APPLICATION_KEY]
       rename:
         TFSTATE_B2_KEY_ID:          AWS_ACCESS_KEY_ID
         TFSTATE_B2_APPLICATION_KEY: AWS_SECRET_ACCESS_KEY
-        B2_APPLICATION_KEY_ID:      TF_VAR_b2_application_key_id
-        B2_APPLICATION_KEY:         TF_VAR_b2_application_key
       unset: [B2_ENDPOINT, B2_BUCKET_NAME]
 ```
 
@@ -116,25 +114,26 @@ Use it from a Taskfile:
 ```yaml
 env:
   YOINK_TF:
-    sh: cd ../../deploy-prod && yoink secrets env --profile terraform-backblaze
+    sh: cd ../../deploy-prod && yoink secrets env --profile terraform-cloudflare
 tasks:
   tf:plan:
     cmds:
       - eval "$YOINK_TF" && terraform plan
 ```
 
-Or from a yoink pre-deploy hook (the profile's `unset` field must be empty for hook use):
+Or from a yoink pre-deploy hook (subprocess flavor — runs on the operator's machine):
 
 ```yaml
 hooks:
   pre_deploy:
     - name: cloudflare-tf-apply
-      image: hashicorp/terraform
-      tag: "1.9"
-      entrypoint: ["/bin/sh", "-c"]
-      cmd: ["cd /tf && terraform init && terraform apply -auto-approve"]
+      working_dir: ../terraform/cloudflare
+      cmd: ["sh", "-c",
+            "terraform init -input=false && terraform apply -auto-approve"]
       secrets_profile: terraform-cloudflare
 ```
+
+The profile's `unset:` applies on subprocess hooks (yoink calls `Command::env_remove` for each entry); container hooks reject it because there's no parent env to clear. See [Run Terraform from a hook](/docs/how-to/terraform-from-hooks) for the full walkthrough.
 
 In CI, when `GITHUB_ENV` is set in the environment, `yoink secrets env` auto-prepends `echo '::add-mask::<value>'` lines for every revealed value — no per-key copy-paste needed; new keys added to the profile are masked automatically.
 
