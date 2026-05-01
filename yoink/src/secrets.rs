@@ -222,7 +222,9 @@ pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, Secre
     };
     let any_secrets_referenced = config_references_secrets(config);
     let bundle = match cfg {
-        SecretsConfig::Age { file, recipients } => {
+        SecretsConfig::Age {
+            file, recipients, ..
+        } => {
             let path = sealed::resolve_sealed_path(config, file.as_deref())?;
             load_age_bundle(&path, recipients, any_secrets_referenced)?
         }

@@ -844,6 +844,14 @@ enum SecretsAction {
         /// consume dotenv-style files rather than shell `source`.
         #[arg(long)]
         no_export: bool,
+        /// Apply a named profile from `secrets.profiles` in
+        /// `yoink.yaml`: filter the bundle to the profile's `include`
+        /// keys, rename per the profile's `rename` map, and emit
+        /// `unset 'KEY'` lines for each `unset:` entry before the
+        /// exports. Designed for Terraform / CI consumers — see the
+        /// "use the bundle from terraform" how-to.
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
     },
     /// One-shot: read a plaintext dotenv from `--in` (or stdin) OR
     /// individual `--as KEY=...` pairs, **merge** into the existing
@@ -4644,7 +4652,9 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
         },
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
-        SecretsAction::Env { no_export } => cmd_secrets_env(config, no_export),
+        SecretsAction::Env { no_export, profile } => {
+            cmd_secrets_env(config, no_export, profile.as_deref())
+        }
         SecretsAction::Seal {
             r#in,
             as_pairs,
@@ -4909,7 +4919,10 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
              not into build logs), set YOINK_ALLOW_REVEAL_IN_CI=1"
         ));
     }
-    let SecretsConfig::Age { file, recipients } = expect_secrets_provider_age(config)? else {
+    let SecretsConfig::Age {
+        file, recipients, ..
+    } = expect_secrets_provider_age(config)?
+    else {
         unreachable!()
     };
     let path = sealed::resolve_sealed_path(config, file.as_deref())?;
@@ -4928,7 +4941,7 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_secrets_env(config: &Config, no_export: bool) -> Result<()> {
+fn cmd_secrets_env(config: &Config, no_export: bool, profile_name: Option<&str>) -> Result<()> {
     use yoink::config::SecretsConfig;
     use yoink::sealed;
     if let Some(ci_var) = detected_ci_env()
@@ -4940,8 +4953,28 @@ fn cmd_secrets_env(config: &Config, no_export: bool) -> Result<()> {
              If this is intentional, set YOINK_ALLOW_REVEAL_IN_CI=1"
         ));
     }
-    let SecretsConfig::Age { file, recipients } = expect_secrets_provider_age(config)? else {
+    let SecretsConfig::Age {
+        file,
+        recipients,
+        profiles,
+        ..
+    } = expect_secrets_provider_age(config)?
+    else {
         unreachable!()
+    };
+    // Resolve the profile up front so we fail before unsealing if it
+    // doesn't exist — better diagnostic than "key X is missing" when
+    // the operator typo'd the profile name.
+    let profile = match profile_name {
+        Some(name) => Some(profiles.get(name).ok_or_else(|| {
+            let known = if profiles.is_empty() {
+                "(none defined in secrets.profiles)".into()
+            } else {
+                profiles.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            anyhow::anyhow!("unknown profile {name:?}; known: {known}")
+        })?),
+        None => None,
     };
     let path = sealed::resolve_sealed_path(config, file.as_deref())?;
     let bytes =
@@ -4949,9 +4982,63 @@ fn cmd_secrets_env(config: &Config, no_export: bool) -> Result<()> {
     let identity = sealed::load_identity(recipients)?;
     let plaintext = sealed::unseal(&bytes, &identity)?;
     let parsed = sealed::parse_dotenv(&plaintext)?;
+
+    // Resolve the profile against the unsealed bundle: filter to
+    // `include`, then map each key through `rename`. Emits a stable
+    // ordering: BTreeMap iteration is alphabetical, matching the
+    // existing no-profile path.
+    let resolved: Vec<(String, &str)> = if let Some(p) = profile {
+        // Verify every `include` key exists before emitting anything,
+        // so a typo'd key fails loud instead of silently dropping.
+        for key in &p.include {
+            if !parsed.contains_key(key) {
+                anyhow::bail!(
+                    "profile {:?} references key {key:?} which is not present in the sealed bundle",
+                    profile_name.unwrap_or("?")
+                );
+            }
+        }
+        let allowed: Option<std::collections::BTreeSet<&String>> = if p.include.is_empty() {
+            None
+        } else {
+            Some(p.include.iter().collect())
+        };
+        parsed
+            .iter()
+            .filter(|(k, _)| allowed.as_ref().is_none_or(|set| set.contains(*k)))
+            .map(|(k, v)| {
+                let env_name = p.rename.get(k).cloned().unwrap_or_else(|| k.clone());
+                (env_name, v.as_str())
+            })
+            .collect()
+    } else {
+        parsed
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str()))
+            .collect()
+    };
+
+    // GitHub Actions auto-mask: when the operator's environment has
+    // `GITHUB_ENV` (always true on a runner), prepend per-value
+    // `::add-mask::` lines so any later log of the value gets
+    // redacted. Removes the per-key copy-paste boilerplate from CI
+    // workflows and makes "I forgot to mask this new key" impossible.
+    let in_github_actions = std::env::var_os("GITHUB_ENV").is_some();
+    if in_github_actions {
+        for (_name, value) in &resolved {
+            println!("echo '::add-mask::{}'", value.replace('\'', r"'\''"));
+        }
+    }
+
+    if let Some(p) = profile {
+        for u in &p.unset {
+            println!("unset '{u}'");
+        }
+    }
+
     let prefix = if no_export { "" } else { "export " };
-    for (k, v) in &parsed {
-        println!("{prefix}{k}={}", posix_single_quote(v));
+    for (name, value) in &resolved {
+        println!("{prefix}{name}={}", posix_single_quote(value));
     }
     Ok(())
 }
@@ -5236,7 +5323,10 @@ fn expect_secrets_provider_age(config: &Config) -> Result<&yoink::config::Secret
 
 fn expect_age_block(config: &Config) -> Result<(Option<String>, &Vec<String>)> {
     use yoink::config::SecretsConfig;
-    let SecretsConfig::Age { file, recipients } = expect_secrets_provider_age(config)? else {
+    let SecretsConfig::Age {
+        file, recipients, ..
+    } = expect_secrets_provider_age(config)?
+    else {
         unreachable!()
     };
     if recipients.is_empty() {

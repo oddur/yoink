@@ -77,8 +77,66 @@ The keys-dir scan (#3) is what makes `yoink secrets key generate` work without p
 | `provider` | string | required | `age` |
 | `recipients` | list of string | `[]` | Public age **recipients** (`age1...`), one per principal that needs to decrypt. New writes are sealed against every entry; decryption only needs *one* matching identity. Validates non-empty at config-load. |
 | `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. `..` and absolute paths are rejected. |
+| `profiles` | map of [SecretsProfile](#secretsprofile) | `{}` | Named env-shape recipes for downstream consumers (Terraform state-backend creds, provider tokens, CI shell exports). Consumed by `yoink secrets env --profile <NAME>` and by `hooks.pre_deploy[].secrets_profile`. See [Secrets profiles](#secrets-profiles). |
 
 The recipient/identity split is the asymmetric-keypair mental model; see [Sealed secrets (age)](/docs/guide/secrets#sealed-secrets-age--the-default) in the secrets guide for the full explanation.
+
+#### Secrets profiles
+
+A profile names "what env shape does one downstream tool expect" and lets the same recipe drive both an operator shell (Taskfile, CI workflow) and a yoink pre-deploy hook. Without profiles, the same `bundle-key → env-var-name` mapping is hand-encoded in N Taskfiles plus N CI workflows, with a separate `unset` block per consumer for env-leak cleanup; profiles consolidate it next to the bundle that supplies the values.
+
+##### `SecretsProfile`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `include` | list of string | `[]` | Allowlist of bundle keys this consumer cares about. Empty = "every key in the bundle." A listed key missing from the bundle is a hard error at resolve time — loud-fail beats silently feeding empty creds. |
+| `rename` | map of string→string | `{}` | `bundle_key → env_var_name`. Renames apply after `include`; keys not in the map keep their original name. Targets must be POSIX env-var names (`[A-Za-z_][A-Za-z0-9_]*`); mixed case is allowed because Terraform's `TF_VAR_<varname>` puts the (lowercase) variable name in the suffix. |
+| `unset` | list of string | `[]` | Env vars to clear in the importing shell *before* the exports land. Solves the "devbox `init_hook` leaks `B2_ENDPOINT` and the b2 SDK underneath the terraform provider mis-routes auth" class of issue. **Operator-shell-only** — a hook runs in a fresh container with no parent env to clear; referencing an `unset` profile from a hook is a config-validation error. |
+
+Profile names must match `[a-z0-9-]+` (lowercase letters, digits, hyphens).
+
+```yaml
+secrets:
+  provider: age
+  recipients: [age1…]
+  profiles:
+    terraform-backblaze:
+      include: [TFSTATE_B2_KEY_ID, TFSTATE_B2_APPLICATION_KEY,
+                B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY]
+      rename:
+        TFSTATE_B2_KEY_ID:          AWS_ACCESS_KEY_ID
+        TFSTATE_B2_APPLICATION_KEY: AWS_SECRET_ACCESS_KEY
+        B2_APPLICATION_KEY_ID:      TF_VAR_b2_application_key_id
+        B2_APPLICATION_KEY:         TF_VAR_b2_application_key
+      unset: [B2_ENDPOINT, B2_BUCKET_NAME]
+```
+
+Use it from a Taskfile:
+
+```yaml
+env:
+  YOINK_TF:
+    sh: cd ../../deploy-prod && yoink secrets env --profile terraform-backblaze
+tasks:
+  tf:plan:
+    cmds:
+      - eval "$YOINK_TF" && terraform plan
+```
+
+Or from a yoink pre-deploy hook (the profile's `unset` field must be empty for hook use):
+
+```yaml
+hooks:
+  pre_deploy:
+    - name: cloudflare-tf-apply
+      image: hashicorp/terraform
+      tag: "1.9"
+      entrypoint: ["/bin/sh", "-c"]
+      cmd: ["cd /tf && terraform init && terraform apply -auto-approve"]
+      secrets_profile: terraform-cloudflare
+```
+
+In CI, when `GITHUB_ENV` is set in the environment, `yoink secrets env` auto-prepends `echo '::add-mask::<value>'` lines for every revealed value — no per-key copy-paste needed; new keys added to the profile are masked automatically.
 
 Bootstrap: `yoink secrets key generate` writes a fresh **identity** to `~/.config/yoink/keys/<recipient>.key` (mode 0600) by default and prints the matching **recipient** (`age1…`, public; paste into `recipients:` above). `--out PATH` writes to a specific file at mode 0600 instead. `--print` sends the secret to stdout for piping into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`). `yoink secrets key public` re-derives the recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [secrets guide](/docs/guide/secrets).
 

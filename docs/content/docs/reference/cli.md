@@ -245,6 +245,13 @@ yoink secrets env                        decrypt the bundle and print
                                          Same CI guard as `show --reveal`.
   --no-export                            emit bare `KEY='value'` lines (dotenv
                                          style) instead of `export KEY='value'`.
+  --profile <NAME>                       apply a `secrets.profiles` recipe from yoink.yaml:
+                                         filter to its `include` keys, rename per its
+                                         `rename` map, prepend `unset 'KEY'` lines for
+                                         each `unset` entry. When `$GITHUB_ENV` is set,
+                                         auto-prepend `::add-mask::` lines for every
+                                         revealed value. See the secrets profiles section
+                                         in the configuration reference.
 yoink secrets seal --in <PATH>           seal a plaintext dotenv (or read from stdin)
   --as KEY=value                         set one key directly; --as KEY=@PATH reads
                                          the value from a file. Repeatable.
