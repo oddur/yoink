@@ -53,6 +53,24 @@ It also means I don't have to keep cramming everything onto one box just to keep
 
 This works across providers and across continents, and it works for the box in my closet. Provider compromise also stops being load-bearing for network trust, because the provider isn't in the trust path anymore. Tailscale's coordination plane is, and that's a much smaller thing to worry about.
 
+## How it fits together
+
+```mermaid
+flowchart TB
+    L([My laptop<br/>SSO identity])
+    C([Depot CI runner<br/>tag:ci, ephemeral])
+    T(((Tailnet)))
+    L -- yoink up --> T
+    C -- yoink up --> T
+    T --> APP1[app-eu-1]
+    T --> APP2[app-us-1<br/>different provider]
+    APP1 --> PG[(pg-1)]
+    APP1 --> RD[(redis-1)]
+    APP2 -. backplane .-> PG
+```
+
+Identity at the top, tailnet in the middle, hosts at the bottom. Nothing in this picture has a public listener for SSH, and nothing relies on a static key.
+
 ## Why the two together
 
 Each tool stays small by leaning on the other. Yoink hands off identity to Tailscale, Tailscale hands off orchestration to yoink, and neither has to grow features to cover what the other already does. Sealed secrets still earn their keep, because there are plenty of secrets in any deploy that aren't SSH keys, but the credential that used to sit at the center of the whole pipeline isn't there to manage anymore.
