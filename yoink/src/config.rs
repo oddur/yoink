@@ -1505,7 +1505,22 @@ impl Config {
         if self.include.is_empty() {
             return Ok(());
         }
-        let base = self.config_dir.clone().unwrap_or_else(|| ".".into());
+        // `config_dir` is `Some("")` when `load_from_path` is called
+        // with a bare filename (no directory component) — the typical
+        // `yoink validate` / `yoink up` invocation from the same
+        // directory as `yoink.yaml`. Falling back to `.` in that case
+        // produces an explicit `./services/*.yaml` for relative
+        // patterns, which is a stable cwd-relative form across
+        // platforms; without the fallback, the resulting bare
+        // `services/*.yaml` matched zero files on linux/glibc with
+        // glob 0.3 (works on darwin), losing every fragment-included
+        // service. See issue #79 for the bisect.
+        let base = self
+            .config_dir
+            .as_ref()
+            .filter(|p| !p.as_os_str().is_empty())
+            .cloned()
+            .unwrap_or_else(|| ".".into());
         // Collect matched paths first, sort for deterministic order
         // (filesystems return entries in arbitrary order; keeping the
         // service list stable means spec hashes don't churn between
@@ -2378,6 +2393,57 @@ hosts:
         cfg.resolve_host_addresses(None).expect("noop ok");
         assert_eq!(cfg.hosts[0].address, "1.2.3.4");
         assert!(!cfg.any_host_address_sealed());
+    }
+
+    /// Regression: when `Config::load_from_path` is called with a
+    /// bare filename like `"yoink.yaml"`, `path.parent()` returns
+    /// `Some("")` — an empty `PathBuf` — and `config_dir` lands as
+    /// `Some(empty)`. Joining that empty base with a relative include
+    /// pattern produced `services/*.yaml` (no `./` prefix), which the
+    /// `glob` crate matched on darwin but not on linux/glibc. The fix
+    /// is to treat an empty `config_dir` the same as `None` and fall
+    /// back to `.` so the joined pattern is always cwd-anchored.
+    /// See issue #79.
+    #[test]
+    fn include_glob_resolves_when_config_dir_is_empty() {
+        let dir = write_temp_tree(&[
+            (
+                "yoink.yaml",
+                r#"
+hosts:
+  - { address: h1, user: root }
+include:
+  - services/*.yaml
+"#,
+            ),
+            (
+                "services/api.yaml",
+                r#"
+services:
+  - name: api
+    image: img/api
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+            ),
+        ]);
+        // Run the fragment-merge from inside the temp dir with the
+        // exact "bare filename" config path that operators type into
+        // their shell. `set_current_dir` is process-global so this
+        // test must not run alongside others that also tweak cwd —
+        // none currently do. RAII guard restores even on panic so a
+        // load failure can't leave the test runner with a dangling cwd.
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _guard = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&dir).unwrap();
+        let cfg = Config::load_from_path(std::path::Path::new("yoink.yaml")).unwrap();
+        let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["api"]);
     }
 
     #[test]
