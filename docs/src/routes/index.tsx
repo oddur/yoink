@@ -28,7 +28,7 @@ export const Route = createFileRoute('/')({
           : typeof rawDate === 'string'
             ? rawDate
             : '';
-      return { slug: p.slugs.join('/'), title: d.title as string, date: dateStr };
+      return { slug: p.url.replace(/^\/blog\//, ''), title: d.title as string, date: dateStr };
     });
     withDates.sort((a, b) => b.date.localeCompare(a.date));
     return withDates[0] ?? null;
