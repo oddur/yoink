@@ -210,8 +210,10 @@ services:
         let mut values = std::collections::BTreeMap::new();
         values.insert(
             "h1_key".to_string(),
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----"
-                .to_string(),
+            zeroize::Zeroizing::new(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----"
+                    .to_string(),
+            ),
         );
         let bundle = SecretsBundle::new(values);
         let mgr = prepare(&cfg, Some(&bundle))

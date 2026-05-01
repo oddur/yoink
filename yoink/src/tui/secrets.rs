@@ -31,6 +31,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
+use zeroize::Zeroizing;
 
 use crate::config::{Config, SecretsConfig};
 use crate::sealed;
@@ -73,8 +74,9 @@ enum LoadStatus {
 struct LoadedBundle {
     /// In-memory plaintext map. All edits mutate this first; the
     /// re-seal-and-write step happens on commit. Kept sorted via
-    /// BTreeMap (parse_dotenv already returns one).
-    values: BTreeMap<String, String>,
+    /// BTreeMap (parse_dotenv already returns one). Values are wrapped
+    /// in `Zeroizing<String>` so they are wiped from memory on drop.
+    values: BTreeMap<String, Zeroizing<String>>,
     /// Stable list of keys (mirror of `values.keys()`) — table
     /// navigation indexes into this so the row order matches what
     /// the operator sees.
@@ -278,7 +280,7 @@ impl SecretsState {
         };
         let saved = match commit {
             EditCommit::Set { key, value } => {
-                bundle.values.insert(key.clone(), value);
+                bundle.values.insert(key.clone(), Zeroizing::new(value));
                 bundle.keys = bundle.values.keys().cloned().collect();
                 if let Err(e) = persist(bundle) {
                     self.flash(format!("save failed: {e}"));
@@ -343,7 +345,7 @@ impl SecretsState {
         let LoadStatus::Loaded(bundle) = &self.bundle else {
             return None;
         };
-        bundle.values.get(key).map(String::as_str)
+        bundle.values.get(key).map(|v| v.as_str())
     }
 
     fn visible_indices(&self) -> Vec<usize> {
@@ -484,7 +486,7 @@ impl SecretsState {
         } else {
             for src in &visible {
                 let k = &bundle.keys[*src];
-                let v = bundle.values.get(k).map_or("", String::as_str);
+                let v = bundle.values.get(k).map_or("", |v| v.as_str());
                 let display = if self.reveal { v.to_string() } else { mask(v) };
                 rows.push(Row::new(vec![Cell::from(k.clone()), Cell::from(display)]));
             }
@@ -752,9 +754,9 @@ mod tests {
 
     fn fixture_loaded(values: &[(&str, &str)]) -> SecretsState {
         let mut s = SecretsState::new();
-        let map: BTreeMap<String, String> = values
+        let map: BTreeMap<String, Zeroizing<String>> = values
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| ((*k).to_string(), Zeroizing::new((*v).to_string())))
             .collect();
         let keys: Vec<String> = map.keys().cloned().collect();
         s.bundle = LoadStatus::Loaded(LoadedBundle {
@@ -925,14 +927,16 @@ mod tests {
                 recipients: vec![recipient.clone()],
             }),
         };
-        bundle.values.insert("FOO".into(), "bar baz".into());
+        bundle
+            .values
+            .insert("FOO".into(), Zeroizing::new("bar baz".into()));
         bundle.keys = bundle.values.keys().cloned().collect();
         persist(&bundle).expect("persist");
 
         let bytes = std::fs::read(&path).expect("read sealed");
         let plaintext = sealed::unseal(&bytes, &id).expect("unseal");
         let parsed = sealed::parse_dotenv(&plaintext).expect("parse");
-        assert_eq!(parsed.get("FOO").unwrap(), "bar baz");
+        assert_eq!(parsed.get("FOO").unwrap().as_str(), "bar baz");
 
         std::fs::remove_dir_all(dir).ok();
     }

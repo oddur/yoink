@@ -29,6 +29,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 use yoink::config::Config;
 use yoink::deploy;
@@ -4299,7 +4300,7 @@ fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool, print: bool) -> R
         eprintln!("New age identity. Save the secret somewhere — yoink won't.");
         eprintln!();
         eprintln!("Secret (private — never commit) — piped to stdout:");
-        println!("{secret}");
+        println!("{}", secret.as_str());
         eprintln!();
         eprintln!("Public recipient (add to yoink.yaml):");
         eprintln!();
@@ -4332,8 +4333,9 @@ fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool, print: bool) -> R
         ));
     }
     let body = format!(
-        "# created: {}\n# public key: {public}\n{secret}\n",
+        "# created: {}\n# public key: {public}\n{}\n",
         chrono_like_now(),
+        secret.as_str(),
     );
     sealed::write_atomically_secret(&path, body.as_bytes())?;
     eprintln!("wrote identity to {} (mode 0600)", path.display());
@@ -4375,13 +4377,13 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
     } else {
         (
             BTreeMap::new(),
-            String::from("# yoink secrets — KEY=value, one per line\n"),
+            Zeroizing::new(String::from("# yoink secrets — KEY=value, one per line\n")),
         )
     };
 
     // Write dotenv sorted by key so the operator sees a stable diff.
     let initial = if original_bundle.is_empty() {
-        plaintext
+        plaintext.to_string()
     } else {
         sealed::render_dotenv(&original_bundle)
     };
@@ -4472,9 +4474,9 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
     let parsed = sealed::parse_dotenv(&plaintext)?;
     for (k, v) in &parsed {
         if reveal {
-            println!("{k}={v}");
+            println!("{k}={}", v.as_str());
         } else {
-            println!("{k}={}", mask_value(v));
+            println!("{k}={}", mask_value(v.as_str()));
         }
     }
     Ok(())
@@ -4586,7 +4588,7 @@ fn cmd_secrets_seal(
     // Load existing bundle (if any). On the first seal — when
     // `secrets.age` doesn't exist yet — there's nothing to merge
     // with, so an empty existing map is fine.
-    let existing: std::collections::BTreeMap<String, String> = if target.exists() {
+    let existing: std::collections::BTreeMap<String, Zeroizing<String>> = if target.exists() {
         let identity = sealed::load_identity(recipients).context(
             "decrypt existing sealed bundle to merge new keys (use --replace to skip the merge \
              and wholesale-rewrite the bundle)",
@@ -4674,7 +4676,7 @@ fn cmd_secrets_seal(
 fn parse_as_pairs(
     as_pairs: &[String],
     cap_bytes: u64,
-) -> Result<std::collections::BTreeMap<String, String>> {
+) -> Result<std::collections::BTreeMap<String, Zeroizing<String>>> {
     let mut out = std::collections::BTreeMap::new();
     for raw in as_pairs {
         let (key, rhs) = raw.split_once('=').ok_or_else(|| {
@@ -4706,7 +4708,7 @@ fn parse_as_pairs(
         } else {
             rhs.to_string()
         };
-        if out.insert(key.to_string(), value).is_some() {
+        if out.insert(key.to_string(), Zeroizing::new(value)).is_some() {
             return Err(anyhow::anyhow!(
                 "--as {key}=… given more than once; pass each KEY at most once"
             ));
@@ -4757,7 +4759,7 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     eprintln!();
     // The secret itself is the only stdout output — designed to pipe
     // into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`).
-    println!("{new_secret}");
+    println!("{}", new_secret.as_str());
     eprintln!();
     eprintln!("New public recipient (add to yoink.yaml under `secrets.recipients:`):");
     eprintln!();
@@ -4967,13 +4969,16 @@ mod tests {
     #[test]
     fn as_pair_literal_value() {
         let m = parse_as_pairs(&["FOO=bar".into()], 1024).unwrap();
-        assert_eq!(m.get("FOO"), Some(&"bar".to_string()));
+        assert_eq!(m.get("FOO").map(|z| z.as_str()), Some("bar"));
     }
 
     #[test]
     fn as_pair_value_can_contain_equals_and_at() {
         let m = parse_as_pairs(&["URL=http://x.example.com/a=1".into()], 1024).unwrap();
-        assert_eq!(m.get("URL"), Some(&"http://x.example.com/a=1".to_string()));
+        assert_eq!(
+            m.get("URL").map(|z| z.as_str()),
+            Some("http://x.example.com/a=1")
+        );
     }
 
     #[test]
@@ -4983,7 +4988,7 @@ mod tests {
         std::fs::write(&path, "multi\nline\nvalue").unwrap();
         let arg = format!("KEY=@{}", path.display());
         let m = parse_as_pairs(&[arg], 1024).unwrap();
-        assert_eq!(m.get("KEY"), Some(&"multi\nline\nvalue".to_string()));
+        assert_eq!(m.get("KEY").map(|z| z.as_str()), Some("multi\nline\nvalue"));
     }
 
     #[test]

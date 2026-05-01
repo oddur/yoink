@@ -30,6 +30,7 @@ use age::{
     x25519,
 };
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::config::Config;
 
@@ -324,9 +325,9 @@ fn parse_identity(raw: &str) -> Result<x25519::Identity, SealedError> {
 /// representation (`AGE-SECRET-KEY-1...`) and matching public
 /// recipient (`age1...`).
 #[must_use]
-pub fn keygen() -> (String, String) {
+pub fn keygen() -> (Zeroizing<String>, String) {
     let id = x25519::Identity::generate();
-    let secret = id.to_string().expose_secret().to_owned();
+    let secret = Zeroizing::new(id.to_string().expose_secret().to_owned());
     let public = id.to_public().to_string();
     (secret, public)
 }
@@ -391,7 +392,7 @@ pub fn ssh_keygen_into_bundle(
     if bundle.contains_key(seal_as) {
         return Err(SealedError::SecretAlreadySealed(seal_as.to_string()));
     }
-    bundle.insert(seal_as.to_string(), (*priv_pem).clone());
+    bundle.insert(seal_as.to_string(), Zeroizing::new((*priv_pem).to_string()));
 
     let canonical = render_dotenv(&bundle);
     let sealed_bytes = seal(canonical.as_bytes(), recipients)?;
@@ -442,8 +443,11 @@ pub fn seal(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>, SealedEr
 }
 
 /// Decrypt ASCII-armored ciphertext with `identity`. Returns the
-/// recovered plaintext as a UTF-8 string.
-pub fn unseal(ciphertext: &[u8], identity: &x25519::Identity) -> Result<String, SealedError> {
+/// recovered plaintext as a `Zeroizing<String>` that is wiped on drop.
+pub fn unseal(
+    ciphertext: &[u8],
+    identity: &x25519::Identity,
+) -> Result<Zeroizing<String>, SealedError> {
     let armored = ArmoredReader::new(ciphertext);
     let decryptor =
         age::Decryptor::new(armored).map_err(|e| SealedError::Decrypt(e.to_string()))?;
@@ -454,7 +458,7 @@ pub fn unseal(ciphertext: &[u8], identity: &x25519::Identity) -> Result<String, 
     reader
         .read_to_string(&mut out)
         .map_err(|e| SealedError::Decrypt(e.to_string()))?;
-    Ok(out)
+    Ok(Zeroizing::new(out))
 }
 
 /// Parse a dotenv-shaped string into a `KEY -> VALUE` map.
@@ -471,7 +475,7 @@ pub fn unseal(ciphertext: &[u8], identity: &x25519::Identity) -> Result<String, 
 /// Not supported (intentionally): variable interpolation. Secrets that
 /// need to compose at runtime should be derived in code from the
 /// resolved bundle, not from the file format.
-pub fn parse_dotenv(input: &str) -> Result<BTreeMap<String, String>, SealedError> {
+pub fn parse_dotenv(input: &str) -> Result<BTreeMap<String, Zeroizing<String>>, SealedError> {
     let mut out = BTreeMap::new();
     let mut iter = input.lines().enumerate();
     while let Some((idx, raw)) = iter.next() {
@@ -512,7 +516,7 @@ pub fn parse_dotenv(input: &str) -> Result<BTreeMap<String, String>, SealedError
         } else {
             strip_optional_quotes(value_start.trim_end()).to_string()
         };
-        out.insert(key.to_string(), value);
+        out.insert(key.to_string(), Zeroizing::new(value));
     }
     Ok(out)
 }
@@ -586,7 +590,7 @@ fn strip_optional_quotes(s: &str) -> &str {
 /// would change the parse: spaces, `#`, leading/trailing whitespace,
 /// or a quote character. In those cases the value is double-quoted.
 #[must_use]
-pub fn render_dotenv(values: &BTreeMap<String, String>) -> String {
+pub fn render_dotenv(values: &BTreeMap<String, Zeroizing<String>>) -> String {
     let mut out = String::new();
     for (k, v) in values {
         out.push_str(k);
@@ -697,8 +701,8 @@ mod tests {
     fn parse_dotenv_basic() {
         let s = "FOO=bar\nBAZ=qux\n";
         let m = parse_dotenv(s).unwrap();
-        assert_eq!(m.get("FOO").unwrap(), "bar");
-        assert_eq!(m.get("BAZ").unwrap(), "qux");
+        assert_eq!(m.get("FOO").unwrap().as_str(), "bar");
+        assert_eq!(m.get("BAZ").unwrap().as_str(), "qux");
     }
 
     #[test]
@@ -712,9 +716,9 @@ BAR='single quoted'
 BAZ=plain
 "#;
         let m = parse_dotenv(s).unwrap();
-        assert_eq!(m.get("FOO").unwrap(), "hello world");
-        assert_eq!(m.get("BAR").unwrap(), "single quoted");
-        assert_eq!(m.get("BAZ").unwrap(), "plain");
+        assert_eq!(m.get("FOO").unwrap().as_str(), "hello world");
+        assert_eq!(m.get("BAR").unwrap().as_str(), "single quoted");
+        assert_eq!(m.get("BAZ").unwrap().as_str(), "plain");
     }
 
     #[test]
@@ -738,8 +742,8 @@ BAZ=plain
         // would render it.
         let input = "FOO=1\nKEY='-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXkt\nQyNTUxOQAAACDa\n-----END OPENSSH PRIVATE KEY-----'\nBAR=2\n";
         let parsed = parse_dotenv(input).unwrap();
-        assert_eq!(parsed.get("FOO"), Some(&"1".to_string()));
-        assert_eq!(parsed.get("BAR"), Some(&"2".to_string()));
+        assert_eq!(parsed.get("FOO").unwrap().as_str(), "1");
+        assert_eq!(parsed.get("BAR").unwrap().as_str(), "2");
         let key = parsed.get("KEY").unwrap();
         assert!(key.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
         assert!(key.contains("b3BlbnNzaC1rZXkt"));
@@ -751,10 +755,10 @@ BAZ=plain
         let input = "KEY=\"line one\nline two\nline three\"\nNEXT=ok\n";
         let parsed = parse_dotenv(input).unwrap();
         assert_eq!(
-            parsed.get("KEY"),
-            Some(&"line one\nline two\nline three".to_string())
+            parsed.get("KEY").unwrap().as_str(),
+            "line one\nline two\nline three"
         );
-        assert_eq!(parsed.get("NEXT"), Some(&"ok".to_string()));
+        assert_eq!(parsed.get("NEXT").unwrap().as_str(), "ok");
     }
 
     #[test]
@@ -774,19 +778,19 @@ BAZ=plain
 
     #[test]
     fn render_dotenv_round_trips() {
-        let mut m = BTreeMap::new();
-        m.insert("A".into(), "1".into());
-        m.insert("B".into(), "two words".into());
-        m.insert("C".into(), "with#hash".into());
-        m.insert("D".into(), "with\"quote".into());
+        let mut m: BTreeMap<String, Zeroizing<String>> = BTreeMap::new();
+        m.insert("A".into(), Zeroizing::new("1".into()));
+        m.insert("B".into(), Zeroizing::new("two words".into()));
+        m.insert("C".into(), Zeroizing::new("with#hash".into()));
+        m.insert("D".into(), Zeroizing::new("with\"quote".into()));
         let s = render_dotenv(&m);
         let parsed = parse_dotenv(&s).unwrap();
         // Quoted values lose escape chars in our minimal parser — but
         // the round trip still preserves the values for the cases
         // operators actually hit (spaces, hashes).
-        assert_eq!(parsed.get("A").unwrap(), "1");
-        assert_eq!(parsed.get("B").unwrap(), "two words");
-        assert_eq!(parsed.get("C").unwrap(), "with#hash");
+        assert_eq!(parsed.get("A").unwrap().as_str(), "1");
+        assert_eq!(parsed.get("B").unwrap().as_str(), "two words");
+        assert_eq!(parsed.get("C").unwrap().as_str(), "with#hash");
         // For escaped quote, `parse_dotenv` keeps the `\\"` literal —
         // documented limitation. Operators avoid embedded quotes.
         assert!(parsed.contains_key("D"));
@@ -803,7 +807,7 @@ BAZ=plain
         assert!(sealed.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----"));
 
         let recovered = unseal(&sealed, &id).unwrap();
-        assert_eq!(recovered, "FOO=bar\nBAZ=qux\n");
+        assert_eq!(recovered.as_str(), "FOO=bar\nBAZ=qux\n");
     }
 
     #[test]
@@ -1003,8 +1007,14 @@ BAZ=plain
 
         // Recipients name `other_public` so the dir scan WOULD match
         // — but env_key takes precedence regardless.
-        let id = load_identity_resolved(Some(env_secret), None, &keys, &legacy, &[other_public])
-            .expect("env wins");
+        let id = load_identity_resolved(
+            Some(env_secret.to_string()),
+            None,
+            &keys,
+            &legacy,
+            &[other_public],
+        )
+        .expect("env wins");
         assert_eq!(id.to_public().to_string(), env_public);
     }
 

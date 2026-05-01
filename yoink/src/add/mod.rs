@@ -406,7 +406,8 @@ fn seal_new_secrets(config: &Config, new_secrets: &[render::RenderedSecret]) -> 
 
     // Merge with existing sealed contents if the file already exists.
     // Try-read directly (avoids a TOCTOU race between exists() and read).
-    let mut values: BTreeMap<String, String> = match std::fs::read(&path) {
+    use zeroize::Zeroizing;
+    let mut values: BTreeMap<String, Zeroizing<String>> = match std::fs::read(&path) {
         Ok(bytes) => {
             let identity = sealed::load_identity(recipients)?;
             let plaintext = sealed::unseal(&bytes, &identity)?;
@@ -427,7 +428,7 @@ fn seal_new_secrets(config: &Config, new_secrets: &[render::RenderedSecret]) -> 
             );
             continue;
         }
-        values.insert(s.name.clone(), s.value.clone());
+        values.insert(s.name.clone(), Zeroizing::new(s.value.clone()));
         added += 1;
     }
 
