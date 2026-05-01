@@ -1865,19 +1865,25 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             drain_sink.record(ev).await;
         }
     });
-    let tag_overrides_for_lookup = tag_overrides.clone();
+    // For audit events that need a `tag` field: prefer a CLI override
+    // (`--tag service=xyz`), fall back to the service's `tag:` in
+    // yoink.yaml. `tag_overrides` already shadows yaml tags during the
+    // deploy itself; we mirror that resolution here.
+    let mut tag_lookup: std::collections::BTreeMap<String, String> = config
+        .services
+        .iter()
+        .filter_map(|s| s.tag.clone().map(|t| (s.name.clone(), t)))
+        .collect();
+    for (k, v) in &tag_overrides {
+        tag_lookup.insert(k.clone(), v.clone());
+    }
     let run_ctx_for_closure = run_ctx.clone();
     let mut sink = move |service: Option<&str>, event: deploy::DeployEvent| {
         eprintln!("{}", output::format_deploy_event(service, &event));
         if let Some((host, kind)) = yoink::audit::map_deploy_event(
             service,
             &event,
-            &|svc| {
-                tag_overrides_for_lookup
-                    .get(svc)
-                    .cloned()
-                    .unwrap_or_default()
-            },
+            &|svc| tag_lookup.get(svc).cloned().unwrap_or_default(),
         ) {
             let ev = yoink::audit::build_event(&run_ctx_for_closure, host, kind);
             let _ = audit_tx.send(ev);
@@ -3388,7 +3394,7 @@ async fn cmd_audit_log(
             return false;
         }
         if let Some(id) = deploy_id_filter
-            && ev.deploy_id != id
+            && !ev.deploy_id.starts_with(id)
         {
             return false;
         }
