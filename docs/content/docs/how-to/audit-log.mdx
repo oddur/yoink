@@ -97,6 +97,18 @@ Not recorded:
 - Operator identity beyond `$USER@$HOSTNAME`. There's no central identity provider; the field is informational only.
 - Secret values. Event payloads carry names (`SecretsRotated.new_recipient`), never values.
 
+## In the TUI
+
+`yoink tui` opens to the dashboard; press `a` (or `7`) to open the **Audit** pane. Same merged-and-deduped view, plus:
+
+- `↑↓` / `j` `k` — select row
+- `Enter` — toggle a detail panel below the table (full `event_id`, `deploy_id`, actor + git SHA, and the failed-deploy `log_tail` when applicable)
+- `/` — substring filter across host, event name, summary, `deploy_id`, and actor; `Enter` commits, `Esc` cancels editing
+- `r` — re-fetch (parallel SSH per host plus one local read for the operator log)
+- `Esc` — clears the active filter on first press, returns to Dashboard on second
+
+`yoink tui --mode audit` jumps straight there.
+
 ## Schema
 
 See [Audit event schema](/docs/reference/audit-event-schema) for the per-variant fields and JSON shape. The schema is versioned via the per-event `v` field; older readers can refuse newer lines instead of misreading them.

@@ -89,6 +89,7 @@ pub enum Mode {
     Logs,
     Resources,
     Secrets,
+    Audit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +131,10 @@ pub enum View {
     /// containers — Images / Volumes / Networks tabs. Reaches lazydocker
     /// feature parity for browsing local docker state.
     Resources,
+    /// On-host JSONL audit log, merged with the operator-side log,
+    /// rendered as a sortable / filterable table. Same data path as
+    /// `yoink audit log`. Activated with `A` from the dashboard.
+    Audit,
 }
 
 impl View {
@@ -148,6 +153,7 @@ impl View {
             View::Logs => 3,
             View::Resources => 4,
             View::Secrets => 5,
+            View::Audit => 6,
         }
     }
 
@@ -159,8 +165,8 @@ impl View {
         let global = vec![
             "global",
             "  q / Ctrl-C    quit yoink",
-            "  1 2 3 4 5 6   dashboard / hosts / services / logs / resources / secrets",
-            "  d h s l R e   same panes, letter aliases (R = resources, e = secrets)",
+            "  1 2 3 4 5 6 7  dashboard / hosts / services / logs / resources / secrets / audit",
+            "  d h s l R e a same panes, letter aliases (R = resources, e = secrets, a = audit)",
             "  Tab / S-Tab   cycle panes forward / backward",
             "  D             doctor — diagnose deploy-blockers",
             "  E             edit config in $EDITOR (jumps to focused service/host)",
@@ -300,6 +306,14 @@ impl View {
                 "  Ctrl-C/D     forwarded into the in-shell process",
                 "  exit / Ctrl-D end the in-container shell",
             ],
+            View::Audit => vec![
+                "audit log",
+                "  ↑↓ / j k     select row",
+                "  enter        toggle detail (event_id, log_tail for failed deploys)",
+                "  /            filter substring (host / event / summary / actor)",
+                "  r            refresh",
+                "  esc          clear filter or back to dashboard",
+            ],
         };
         let mut out = global;
         out.extend(view_specific);
@@ -350,6 +364,7 @@ impl View {
             ],
             View::Secrets => vec![root, "Secrets".into()],
             View::Resources => vec![root, "Resources".into()],
+            View::Audit => vec![root, "Audit".into()],
         }
     }
 }
@@ -363,6 +378,7 @@ impl From<Mode> for View {
             Mode::Logs => View::Logs,
             Mode::Secrets => View::Secrets,
             Mode::Resources => View::Resources,
+            Mode::Audit => View::Audit,
         }
     }
 }
@@ -463,6 +479,14 @@ enum Update {
         url: String,
         tunnel: crate::transport::tunnel::SshTunnel,
         sidecar: crate::pf::SidecarHandle,
+    },
+    /// Result of `schedule_audit_refresh` — merged operator + per-host
+    /// JSONL events, deduped on `event_id`, sorted newest-first.
+    /// `errors` carries per-source failures so the pane can surface
+    /// them instead of silently dropping unreachable hosts.
+    Audit {
+        events: Vec<crate::audit::AuditEvent>,
+        errors: Vec<(String, String)>,
     },
 }
 
@@ -812,6 +836,7 @@ pub struct App {
     pub services: ServicesState,
     pub service_detail: ServiceDetailState,
     pub history: super::history::HistoryState,
+    pub audit: super::audit::AuditState,
     pub container_detail: ContainerDetailState,
     pub logs: LogsState,
     pub resources: ResourcesState,
@@ -905,6 +930,7 @@ pub struct App {
     dashboard_in_flight: bool,
     container_detail_in_flight: bool,
     history_in_flight: bool,
+    audit_in_flight: bool,
     resources_in_flight: bool,
     /// Per-host docker-event ring buffer (formatted for display).
     /// Newest entries pushed at the back. Drives the events panel
@@ -973,6 +999,7 @@ impl App {
             services: ServicesState::new(),
             service_detail: ServiceDetailState::new(),
             history: super::history::HistoryState::new(),
+            audit: super::audit::AuditState::new(),
             container_detail: ContainerDetailState::new(),
             logs: LogsState::new(),
             resources: ResourcesState::new(),
@@ -1005,6 +1032,7 @@ impl App {
             dashboard_in_flight: false,
             container_detail_in_flight: false,
             history_in_flight: false,
+            audit_in_flight: false,
             resources_in_flight: false,
             host_events: std::collections::HashMap::new(),
             container_history: std::collections::HashMap::new(),
@@ -1810,6 +1838,21 @@ impl App {
             return false;
         }
 
+        // Audit pane owns its own substring filter input — same shape
+        // as the secrets edit gate. Captured before navigation so a
+        // digit / `s` / `q` typed into the filter can't shoot off a
+        // tab transition or quit.
+        if matches!(self.view, View::Audit) && self.audit.editing_filter() {
+            match key.code {
+                KeyCode::Esc => self.audit.cancel_filter(),
+                KeyCode::Enter => self.audit.commit_filter(),
+                KeyCode::Backspace => self.audit.backspace_filter(),
+                KeyCode::Char(c) => self.audit.type_filter(c),
+                _ => {}
+            }
+            return false;
+        }
+
         // Reconcile-progress modal: while running, eat all keys
         // (Ctrl-C/Q already handled above) so a stray j/k can't
         // navigate the underlying view. `y` always works to yank
@@ -1856,8 +1899,13 @@ impl App {
         }
 
         // `/` enters filter input mode for the current pane (when it
-        // supports filtering — Logs handled separately above).
-        if key.code == KeyCode::Char('/') && !logs_view {
+        // supports filtering — Logs handles its own filter inline,
+        // and Audit owns its filter state outside the shared
+        // `FilterState`, so both fall through to pane-local dispatch).
+        if key.code == KeyCode::Char('/')
+            && !logs_view
+            && !matches!(self.view, View::Audit)
+        {
             self.begin_pane_filter_input();
             return false;
         }
@@ -1892,6 +1940,13 @@ impl App {
             }
             KeyCode::Char('6' | 'e') => {
                 self.transition(View::Secrets).await;
+                return false;
+            }
+            // `7` is the canonical tab digit; `a` is the letter alias.
+            // Lowercase `a` is unused elsewhere as a global; capital `A`
+            // is taken on Dashboard ("reconcile ALL").
+            KeyCode::Char('7' | 'a') => {
+                self.transition(View::Audit).await;
                 return false;
             }
             // Capital `D` opens the doctor modal — runs the same checks
@@ -2001,6 +2056,7 @@ impl App {
                     2 => View::Logs,
                     3 => View::Resources,
                     4 => View::Secrets,
+                    5 => View::Audit,
                     _ => View::Dashboard,
                 };
                 self.transition(next).await;
@@ -2008,12 +2064,13 @@ impl App {
             }
             KeyCode::BackTab => {
                 let prev = match self.view.top_section() {
-                    0 => View::Secrets,
+                    0 => View::Audit,
                     1 => View::Dashboard,
                     2 => View::Hosts,
                     3 => View::Services,
                     4 => View::Logs,
-                    _ => View::Resources,
+                    5 => View::Resources,
+                    _ => View::Secrets,
                 };
                 self.transition(prev).await;
                 return false;
@@ -2410,6 +2467,26 @@ impl App {
                 KeyCode::Char('r') => self.schedule_resources_refresh(),
                 _ => {}
             },
+            View::Audit => match key.code {
+                // Filter-edit mode is intercepted at the top of `on_key`,
+                // so by the time we get here we're in the navigation
+                // mode of the audit pane.
+                KeyCode::Up | KeyCode::Char('k') => self.audit.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.audit.select_next(),
+                KeyCode::Enter => self.audit.toggle_expand(),
+                KeyCode::Char('/') => self.audit.begin_filter(),
+                KeyCode::Char('r') => self.schedule_audit_refresh(),
+                // Two-stage Esc: clears the filter on the first press
+                // if one is set, then exits to Dashboard on the second.
+                KeyCode::Esc => {
+                    if self.audit.filter_active() {
+                        self.audit.clear_filter();
+                    } else {
+                        self.transition(View::Dashboard).await;
+                    }
+                }
+                _ => {}
+            },
         }
         false
     }
@@ -2616,6 +2693,9 @@ impl App {
             View::Resources => {
                 self.schedule_resources_refresh();
             }
+            View::Audit => {
+                self.schedule_audit_refresh();
+            }
         }
         self.view = new_view;
     }
@@ -2669,6 +2749,33 @@ impl App {
                 service,
                 rows,
                 errors,
+            });
+        });
+    }
+
+    /// Read the merged operator + per-host audit JSONL via
+    /// `audit::fetch_events`. Local file I/O for the operator log,
+    /// SSH `cat` for each host. Posts `Update::Audit` back to the run
+    /// loop.
+    fn schedule_audit_refresh(&mut self) {
+        if self.audit_in_flight {
+            return;
+        }
+        self.audit_in_flight = true;
+        let hosts: Vec<Host> = self.config.hosts.iter().map(Host::from).collect();
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            // 7-day window matches the CLI default. The pane reads
+            // both active and rotated files when we reach back > 24h.
+            let opts = crate::audit::FetchOptions {
+                host_filter: None,
+                since_secs: 7 * 24 * 3600,
+                origin: None,
+            };
+            let outcome = crate::audit::fetch_events(&hosts, &opts).await;
+            let _ = tx.send(Update::Audit {
+                events: outcome.events,
+                errors: outcome.errors,
             });
         });
     }
@@ -2998,6 +3105,10 @@ impl App {
             } => {
                 self.history.apply(&service, rows, errors);
                 self.history_in_flight = false;
+            }
+            Update::Audit { events, errors } => {
+                self.audit.apply(events, errors);
+                self.audit_in_flight = false;
             }
             Update::Event { host, event } => self.on_docker_event(&host, &event),
             Update::Toast(msg) => self.push_toast(msg),
@@ -3699,6 +3810,9 @@ impl App {
             View::Resources => {
                 self.resources
                     .render(frame, pane_area, &self.config, &self.throbber_state);
+            }
+            View::Audit => {
+                self.audit.render(frame, pane_area, &self.throbber_state);
             }
         }
 

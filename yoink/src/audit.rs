@@ -853,6 +853,311 @@ fn short_hash_from_name(container: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Read path: same code is shared by the `yoink audit log|run` CLI and the TUI
+// pane. Each caller layers its own filter / format on top of `fetch_events`.
+
+/// Knobs for [`fetch_events`]. Filters that are CLI-only (service,
+/// deploy-id prefix, event-name) live in `cmd_audit_log` rather than
+/// here so the TUI doesn't pay for them.
+#[derive(Debug, Clone)]
+pub struct FetchOptions {
+    /// Restrict the host fetch to one host's address; the operator log
+    /// is still pulled (it's fleet-wide) unless `origin == Some("host")`.
+    pub host_filter: Option<String>,
+    /// Window relative to now, in seconds. Events older than this are
+    /// dropped.
+    pub since_secs: u64,
+    /// Restrict to one origin. `Some("operator")` skips host fetches
+    /// entirely; `Some("host")` skips the operator log.
+    pub origin: Option<String>,
+}
+
+/// Result of a fetch. Errors carry the source label (host address or
+/// `"operator log"`) plus a one-line message.
+#[derive(Debug, Clone, Default)]
+pub struct FetchOutcome {
+    pub events: Vec<AuditEvent>,
+    pub errors: Vec<(String, String)>,
+}
+
+/// Read the operator log + every host's log (subject to filters),
+/// dedupe on `event_id`, drop events older than `since_secs`, sort
+/// newest-first. Per-host fetch failures land in `errors` instead of
+/// aborting the whole call.
+pub async fn fetch_events(hosts: &[Host], opts: &FetchOptions) -> FetchOutcome {
+    let cutoff_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_sub(opts.since_secs);
+    let want_rotated = opts.since_secs > 24 * 3600;
+    let cutoff_ts = ts_string_for(cutoff_unix);
+
+    let mut events: Vec<AuditEvent> = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+
+    let want_operator = opts.origin.as_deref() != Some("host");
+    if want_operator {
+        match read_operator_audit_files(want_rotated).await {
+            Ok(bytes) => collect_jsonl(&mut events, &mut errors, &bytes, "operator log"),
+            Err(e) => errors.push(("operator log".into(), e.to_string())),
+        }
+    }
+
+    let want_host = opts.origin.as_deref() != Some("operator");
+    if want_host {
+        let scoped: Vec<Host> = hosts
+            .iter()
+            .filter(|h| opts.host_filter.as_ref().is_none_or(|f| &h.address == f))
+            .cloned()
+            .collect();
+        let fetches = scoped.iter().map(|h| async move {
+            let host = h.clone();
+            let bytes = fetch_audit_files(&host, want_rotated).await;
+            (host, bytes)
+        });
+        let results = futures_util::future::join_all(fetches).await;
+        for (host, fetch) in results {
+            match fetch {
+                Ok(bytes) => collect_jsonl(&mut events, &mut errors, &bytes, &host.address),
+                Err(e) => errors.push((host.address, e.to_string())),
+            }
+        }
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    events.retain(|ev| seen.insert(ev.event_id.clone()) && ev.ts >= cutoff_ts);
+    events.sort_by(|a, b| b.ts.cmp(&a.ts));
+
+    FetchOutcome { events, errors }
+}
+
+/// Read the operator-side audit files. Concatenates the active file
+/// plus (when `include_rotated`) every `events-*.jsonl` in the same
+/// directory. Missing files are silently treated as empty.
+pub async fn read_operator_audit_files(include_rotated: bool) -> std::io::Result<String> {
+    let mut out = String::new();
+    if let Ok(bytes) = tokio::fs::read_to_string(operator_audit_file()).await {
+        out.push_str(&bytes);
+    }
+    if include_rotated {
+        let dir = operator_audit_dir();
+        if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("events-")
+                    && name_str.ends_with(".jsonl")
+                    && let Ok(bytes) = tokio::fs::read_to_string(entry.path()).await
+                {
+                    out.push_str(&bytes);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Cat the active host audit file plus rotated files (when requested)
+/// over SSH (or locally for the synthetic `local` host). Returns the
+/// concatenated JSONL bytes; missing files read as empty.
+pub async fn fetch_audit_files(host: &Host, include_rotated: bool) -> anyhow::Result<String> {
+    let script = if include_rotated {
+        format!("cat {AUDIT_FILE} {AUDIT_DIR}/events-*.jsonl 2>/dev/null || true")
+    } else {
+        format!("cat {AUDIT_FILE} 2>/dev/null || true")
+    };
+    run_audit_shell(host, &script).await
+}
+
+/// Run `script` on `host`'s shell. Local synthetic host uses `sh -c`;
+/// remote uses `ssh -o BatchMode=yes user@addr script`. Returns stdout.
+pub async fn run_audit_shell(host: &Host, script: &str) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let output = if host.is_local() {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .await
+            .context("local sh -c")?
+    } else {
+        tokio::process::Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg(format!("{}@{}", host.user, host.address))
+            .arg(script)
+            .output()
+            .await
+            .with_context(|| format!("ssh {}@{}", host.user, host.address))?
+    };
+    if !output.status.success() {
+        let prog = if host.is_local() { "sh" } else { "ssh" };
+        anyhow::bail!(
+            "{prog} exit {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Parse a JSONL blob into `events`; malformed lines push a
+/// `(source, message)` row into `errors` instead of aborting. The
+/// source is the host address or `"operator log"`.
+fn collect_jsonl(
+    events: &mut Vec<AuditEvent>,
+    errors: &mut Vec<(String, String)>,
+    bytes: &str,
+    source: &str,
+) {
+    for line in bytes.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<AuditEvent>(trimmed) {
+            Ok(ev) => events.push(ev),
+            Err(e) => errors.push((source.into(), format!("malformed event: {e}"))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Display helpers — used by the CLI text format and the TUI pane.
+
+/// Stable `PascalCase` label for the variant. Used for column rendering
+/// and `--event` filter matching.
+#[must_use]
+pub fn event_name(kind: &AuditEventKind) -> &'static str {
+    use AuditEventKind as K;
+    match kind {
+        K::RunStarted { .. } => "RunStarted",
+        K::RunFinished { .. } => "RunFinished",
+        K::LockAcquired => "LockAcquired",
+        K::LockReleased => "LockReleased",
+        K::HookStarted { .. } => "HookStarted",
+        K::HookFinished { .. } => "HookFinished",
+        K::PullStarted { .. } => "PullStarted",
+        K::PullFinished { .. } => "PullFinished",
+        K::NetworkReady { .. } => "NetworkReady",
+        K::ContainerStarted { .. } => "ContainerStarted",
+        K::HealthcheckHealthy { .. } => "HealthcheckHealthy",
+        K::ContainerCreated { .. } => "ContainerCreated",
+        K::AlreadyAtSpec { .. } => "AlreadyAtSpec",
+        K::OldContainerStopped { .. } => "OldContainerStopped",
+        K::ContainerRemoved { .. } => "ContainerRemoved",
+        K::DeployFailed { .. } => "DeployFailed",
+        K::RollbackStarted { .. } => "RollbackStarted",
+        K::RollbackFinished { .. } => "RollbackFinished",
+        K::ContainerPruned { .. } => "ContainerPruned",
+        K::SecretsRotated { .. } => "SecretsRotated",
+        K::FileUploaded { .. } => "FileUploaded",
+    }
+}
+
+/// Service field on event kinds that have one; `None` for envelope
+/// events (`RunStarted`, `LockAcquired`, etc.).
+#[must_use]
+pub fn event_service(ev: &AuditEvent) -> Option<&str> {
+    use AuditEventKind as K;
+    match &ev.kind {
+        K::ContainerStarted { service, .. }
+        | K::ContainerCreated { service, .. }
+        | K::ContainerRemoved { service, .. }
+        | K::AlreadyAtSpec { service, .. }
+        | K::OldContainerStopped { service, .. }
+        | K::DeployFailed { service, .. }
+        | K::RollbackStarted { service, .. }
+        | K::RollbackFinished { service, .. }
+        | K::HealthcheckHealthy { service, .. }
+        | K::FileUploaded { service, .. } => Some(service.as_str()),
+        K::ContainerPruned { service, .. } => service.as_deref(),
+        _ => None,
+    }
+}
+
+/// One-line human summary of the variant payload.
+#[must_use]
+pub fn event_summary(kind: &AuditEventKind) -> String {
+    use AuditEventKind as K;
+    match kind {
+        K::RunStarted { command, services } => {
+            format!("{command} services=[{}]", services.join(","))
+        }
+        K::RunFinished {
+            command, ok, error, ..
+        } => {
+            if *ok {
+                format!("{command} ok")
+            } else {
+                format!("{command} FAILED: {}", error.as_deref().unwrap_or(""))
+            }
+        }
+        K::LockAcquired | K::LockReleased => String::new(),
+        K::HookStarted { name } | K::HookFinished { name } => name.clone(),
+        K::PullStarted { image, tag } | K::PullFinished { image, tag } => {
+            format!("{image}:{tag}")
+        }
+        K::NetworkReady { network, created } => {
+            if *created {
+                format!("{network} (created)")
+            } else {
+                network.clone()
+            }
+        }
+        K::ContainerStarted {
+            service,
+            container,
+            tag,
+            ..
+        }
+        | K::ContainerCreated {
+            service,
+            container,
+            tag,
+            ..
+        } => format!("{service} {container} tag={tag}"),
+        K::AlreadyAtSpec {
+            service,
+            container,
+            spec_hash,
+        } => format!("{service} {container} spec={spec_hash}"),
+        K::HealthcheckHealthy {
+            service,
+            container,
+            attempts,
+        } => format!("{service} {container} after {attempts}"),
+        K::OldContainerStopped { service, container }
+        | K::ContainerRemoved { service, container } => format!("{service} {container}"),
+        K::DeployFailed {
+            service,
+            container,
+            log_tail,
+        } => format!("{service} {container} ({} log lines)", log_tail.len()),
+        K::RollbackStarted {
+            service,
+            target_tag,
+        } => format!("{service} → {target_tag}"),
+        K::RollbackFinished { service, ok, error } => {
+            if *ok {
+                format!("{service} ok")
+            } else {
+                format!("{service} FAILED: {}", error.as_deref().unwrap_or(""))
+            }
+        }
+        K::ContainerPruned { service, container } => {
+            format!("{} {container}", service.as_deref().unwrap_or("?"))
+        }
+        K::SecretsRotated { new_recipient } => format!("→ {new_recipient}"),
+        K::FileUploaded {
+            service,
+            sha256,
+            remote_path,
+        } => format!("{service} {sha256} → {remote_path}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

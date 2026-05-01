@@ -38,6 +38,7 @@ Heavily inspired by [k9s](https://k9scli.io/) and [lazydocker](https://github.co
 | `l` | Logs |
 | `R` | Resources (Images / Volumes / Networks) |
 | `e` | Encrypted-secrets |
+| `a` | Audit log (merged operator + on-host JSONL) |
 | `Tab` / `Shift-Tab` | cycle modes forward / backward |
 | `?` | toggle help overlay (per-view keybinds) |
 | `q` / `Ctrl-C` | quit |
@@ -198,6 +199,20 @@ The buffer is bounded at 5,000 lines; older lines fall off as new ones arrive. F
 
 Reached via `Enter` from any list view. Same shape as the multiplexed Logs pane, scoped to one container. Same keybindings; `Esc` returns to the parent. `!` and `B` are also bound here for quick "tail logs → drop into shell" pivots.
 
+## Audit pane (`a`)
+
+Merged operator + per-host JSONL audit log: every state-changing run yoink performed (deploy, rollback, prune, secrets rotate). Same data path as `yoink audit log`, with stable selection on `event_id` so a refresh keeps you on the row you were looking at.
+
+| key | action |
+|---|---|
+| `↑↓` / `j` `k` | select row |
+| `Enter` | toggle detail panel (full `event_id`, `deploy_id`, actor, git SHA, log tail for `DeployFailed`) |
+| `/` | begin substring filter — matches host, event name, summary, `deploy_id`, actor |
+| `r` | refresh (parallel SSH per host + local operator log read) |
+| `Esc` | clears active filter on first press, returns to Dashboard on second |
+
+The first column tags each row with `operator` (purple) or `host` (cyan) so you can tell at a glance which side of the merge a line came from.
+
 ## Shell / debug sidecar (`!`, `B`)
 
 Both gestures put you on a PTY inside the host's docker daemon with no SSH on top; yoink uses the Docker exec API and the TUI streams bytes both ways through a terminal-emulator parser.
@@ -245,7 +260,7 @@ yoink tui --mode hosts          # start on a specific top-level pane
 yoink tui --mouse               # enable mouse capture (scroll wheel + selection)
 ```
 
-`--mode` accepts `dashboard` / `hosts` / `services` / `logs` / `resources` / `secrets`. `--mouse` is opt-in because mouse capture disables your terminal's native text-selection; if you don't actively use mouse scroll inside the TUI, leave it off.
+`--mode` accepts `dashboard` / `hosts` / `services` / `logs` / `resources` / `secrets` / `audit`. `--mouse` is opt-in because mouse capture disables your terminal's native text-selection; if you don't actively use mouse scroll inside the TUI, leave it off.
 
 `YOINK_NO_HL=1` in the environment skips the `hl` auto-detection (the logs pane will use raw output even if `hl` is on PATH). Useful when troubleshooting `hl` itself.
 
