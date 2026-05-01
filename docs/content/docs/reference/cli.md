@@ -217,6 +217,15 @@ yoink secrets edit                       decrypt the configured sealed file into
 yoink secrets show [--reveal]            print KEY=value (values masked unless --reveal).
                                          Refuses --reveal in CI ($CI set) unless
                                          YOINK_ALLOW_REVEAL_IN_CI=1.
+yoink secrets env                        decrypt the bundle and print
+                                         `export KEY='value'` lines for sourcing
+                                         into a local dev shell, e.g.
+                                         `source <(yoink secrets env)`. Values
+                                         are POSIX single-quoted so `$`, quotes,
+                                         and newlines pass through literally.
+                                         Same CI guard as `show --reveal`.
+  --no-export                            emit bare `KEY='value'` lines (dotenv
+                                         style) instead of `export KEY='value'`.
 yoink secrets seal --in <PATH>           seal a plaintext dotenv (or read from stdin)
   --as KEY=value                         set one key directly; --as KEY=@PATH reads
                                          the value from a file. Repeatable.
