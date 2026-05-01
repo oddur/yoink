@@ -1,5 +1,5 @@
 ---
-title: Deploying without SSH keys, with yoink and Tailscale
+title: Keyless deploys and a private backplane, with yoink and Tailscale
 date: 2026-05-01
 author: Oddur Magnusson
 description: How putting yoink behind Tailscale let me stop managing SSH keys for deploys, drop port 22 from the public internet, and end up with a backplane network across providers as a side effect.
@@ -9,11 +9,11 @@ I don't like managing SSH keys. New host, new keypair, paste the pubkey into `au
 
 CI is where this gets actively annoying. CI has to deploy, so CI has a key, and that key is long-lived and machine-held and the most attractive credential in the whole setup. Rotating it is annoying enough that I put it off, and the longer it sits there the worse the eventual cleanup feels.
 
-Yoink does the secret distribution part well. Sealed secrets live in the repo, get decrypted at deploy time from whatever store you point them at, and never sit on disk in plaintext. That solves the "private key in a GitHub Actions secret" problem cleanly, and for a while I thought that was the answer. Sealed secrets are still secrets, though, and the right number of secrets to manage for a thing like this is zero.
+Yoink does the secret distribution part well. Sealed secrets live in the repo, get decrypted at deploy time from whatever store you point them at, and don't get written to disk in plaintext along the way. That solves the "private key in a GitHub Actions secret" problem cleanly, and for a while I thought that was the answer. But sealed secrets are still secrets, and what I actually wanted was to stop managing the one credential that opens a shell on every host.
 
 ## How Tailscale changes it
 
-[Tailscale](https://tailscale.com) is how I got rid of them. Instead of giving every machine a credential, you give every machine an identity. My laptop is on the tailnet because I logged in with SSO. The host is on the tailnet because I ran `tailscale up` on it once at provisioning. The CI runner is on the tailnet because it auth'd as an ephemeral device for the duration of the job. Nobody is holding a static key.
+[Tailscale](https://tailscale.com) is how I got rid of them. Instead of giving every machine a credential I have to track, you give every machine an identity. My laptop is on the tailnet because I logged in with SSO. The host is on the tailnet because I ran `tailscale up` on it once at provisioning. The CI runner is on the tailnet because it auth'd as an ephemeral device for the duration of the job. Tailscale's own keys exist, of course, but they live inside Tailscale and rotate on their own. There's nothing in `authorized_keys` for me to babysit.
 
 The pre-flight on a fresh laptop, in full:
 
@@ -32,9 +32,9 @@ Port 22 isn't open on the public IP. The provider firewall blocks it, the host f
 
 If I want to retire a device I remove it from the tailnet and it can't reach anything. If I want to rotate CI's auth I rotate the OAuth client and old tokens die on next use. I haven't had to open an `authorized_keys` file since.
 
-## A shout-out to Depot
+## Depot makes the CI side easy
 
-The CI side of this is much nicer if your runners join the tailnet without you wiring it up by hand. I run CI on [Depot](https://depot.dev/docs/integrations/tailscale), which has native Tailscale integration. Connect Depot to your tailnet once in organization settings (an OAuth client + a tag, both standard Tailscale primitives) and every runner joins the tailnet for the duration of a job as an ephemeral device, then leaves when the job ends. There's no bootstrap auth key to plumb through, no `tailscaled` install step in a workflow, no auth keys hanging around in a secret store waiting to be forgotten about.
+You can wire Tailscale into any CI runner with a `tailscale up` step and an auth key, but it's the kind of glue I'd rather not own. I use [Depot](https://depot.dev/docs/integrations/tailscale) for CI, which has the integration built in. Connect Depot to your tailnet once in organization settings (an OAuth client + a tag, both standard Tailscale primitives) and every runner joins the tailnet for the duration of a job as an ephemeral device, then leaves when the job ends. No bootstrap auth key to inject, no `tailscaled` install step, no leftover secret to rotate later.
 
 Runners come up tagged `tag:ci`, and one line in my tailnet ACLs lets `tag:ci` SSH into hosts tagged `tag:prod`. That's the whole authorization model. With yoink the deploy step is:
 
@@ -52,7 +52,7 @@ Suppose I want a second host in another region. Call it `app-us-1`, on a differe
 
 It also means I don't have to keep cramming everything onto one box just to keep the wiring sane. I can put Postgres on a host with fast disk, Redis on a smaller memory-optimized one, and the app on a third sized for CPU. Each is a yoink target on the same tailnet, and the app dials `pg-1:5432` and `redis-1:6379` by name. None of the datastores need a public IP. Splitting services across hosts stops being a networking project, so I actually do it.
 
-This works across providers and across continents, and it works for the box in my closet. Provider compromise also stops being load-bearing for network trust, because the provider isn't in the trust path anymore. Tailscale's coordination plane is, and that's a much smaller thing to worry about.
+This works across providers and across continents, and it works for the box in my closet. Provider compromise stops being load-bearing for network trust, because the provider isn't in the trust path anymore. Trust now concentrates in two places: my SSO and Tailscale's coordination plane. That's a real tradeoff, not a free win — phish my SSO and an attacker has the same access I do. The bet I'm making is that those two are easier to defend well than a fleet of `authorized_keys` files I'd otherwise be re-pasting by hand.
 
 ## How it fits together
 
