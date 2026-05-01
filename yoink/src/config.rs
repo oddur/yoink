@@ -2431,12 +2431,17 @@ services:
         // exact "bare filename" config path that operators type into
         // their shell. `set_current_dir` is process-global so this
         // test must not run alongside others that also tweak cwd —
-        // none currently do. We restore on the way out.
-        let prev = std::env::current_dir().unwrap();
+        // none currently do. RAII guard restores even on panic so a
+        // load failure can't leave the test runner with a dangling cwd.
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _guard = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(&dir).unwrap();
-        let load_result = Config::load_from_path(std::path::Path::new("yoink.yaml"));
-        std::env::set_current_dir(&prev).unwrap();
-        let cfg = load_result.unwrap();
+        let cfg = Config::load_from_path(std::path::Path::new("yoink.yaml")).unwrap();
         let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["api"]);
     }
