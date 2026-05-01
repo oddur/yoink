@@ -13,7 +13,7 @@ Yoink does the secret distribution part well. Sealed secrets live in the repo, g
 
 ## How Tailscale changes it
 
-Tailscale is how I got rid of them. Instead of giving every machine a credential, you give every machine an identity. My laptop is on the tailnet because I logged in with SSO. The host is on the tailnet because I ran `tailscale up` on it once at provisioning. The CI runner is on the tailnet because it auth'd as an ephemeral device for the duration of the job. Nobody is holding a static key.
+[Tailscale](https://tailscale.com) is how I got rid of them. Instead of giving every machine a credential, you give every machine an identity. My laptop is on the tailnet because I logged in with SSO. The host is on the tailnet because I ran `tailscale up` on it once at provisioning. The CI runner is on the tailnet because it auth'd as an ephemeral device for the duration of the job. Nobody is holding a static key.
 
 The pre-flight on a fresh laptop, in full:
 
