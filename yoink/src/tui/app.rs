@@ -1857,7 +1857,7 @@ impl App {
 
         // `/` enters filter input mode for the current pane (when it
         // supports filtering — Logs handled separately above).
-        if key.code == KeyCode::Char('/') {
+        if key.code == KeyCode::Char('/') && !logs_view {
             self.begin_pane_filter_input();
             return false;
         }
