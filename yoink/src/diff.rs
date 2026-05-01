@@ -49,6 +49,14 @@ pub struct ServiceDiff {
     pub change: ChangeKind,
 }
 
+// The `Update` variant is large because `FieldDiff` carries several
+// `Vec<String>` and `Option<String>` fields to hold per-field diff
+// data. Most of that data lives on the heap (strings in Vecs), so the
+// actual in-memory footprint at runtime is small — the on-stack size
+// is wide but sparse. Boxing `FieldDiff` would require touching every
+// match arm in the codebase without a meaningful runtime win for a
+// type that is constructed once and read a handful of times.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ChangeKind {
@@ -82,6 +90,22 @@ pub struct FieldDiff {
     pub labels_added: Vec<String>,
     pub labels_removed: Vec<String>,
     pub labels_changed: Vec<String>,
+    /// Bind/volume mounts added in the desired spec (shown as host
+    /// paths or named-volume names, not full bind strings).
+    pub mounts_added: Vec<String>,
+    /// Bind/volume mounts removed from the desired spec.
+    pub mounts_removed: Vec<String>,
+    /// `host_port:container_port/proto` publish entries added.
+    pub publish_added: Vec<String>,
+    /// `host_port:container_port/proto` publish entries removed.
+    pub publish_removed: Vec<String>,
+    /// Human-readable description of the memory limit change, or
+    /// `None` when the limit is unchanged. Format: `"old → new"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_changed: Option<String>,
+    /// Replica count change. `None` when unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas_changed: Option<String>,
 }
 
 impl FieldDiff {
@@ -93,6 +117,12 @@ impl FieldDiff {
             && self.labels_added.is_empty()
             && self.labels_removed.is_empty()
             && self.labels_changed.is_empty()
+            && self.mounts_added.is_empty()
+            && self.mounts_removed.is_empty()
+            && self.publish_added.is_empty()
+            && self.publish_removed.is_empty()
+            && self.memory_changed.is_none()
+            && self.replicas_changed.is_none()
     }
 }
 
@@ -283,10 +313,9 @@ pub async fn compute(
     Ok(DiffReport { services, orphans })
 }
 
-/// Inspect the running container, parse its env into a key/value map,
-/// and return a key-only diff against the desired env+labels. Errors
-/// are swallowed (`Default::default()` returned) — the dry-run is
-/// informational and the hash drift is still authoritative.
+/// Inspect the running container and return a key-only diff against the
+/// desired spec. Errors are swallowed (`Default::default()` returned) —
+/// the dry-run is informational and the hash drift is still authoritative.
 async fn inspect_field_diff(
     ops: &dyn DockerOps,
     host: &Host,
@@ -299,13 +328,100 @@ async fn inspect_field_diff(
     let detail = ops.inspect_container(host, container).await?;
     let desired_env = deploy::build_env(service, secrets);
     let desired_labels = deploy::build_labels(service, tag, desired_hash);
-    Ok(field_diff_scoped(
+    let mut diff = field_diff_scoped(
         service,
         &detail.env_map(),
         &detail.labels,
         &desired_env,
         &desired_labels,
-    ))
+    );
+
+    // Mounts: extract the "source" part from each side and compare as sets.
+    // Running container: mounts are "src → dst [mode]" strings; take the
+    // prefix before " → " as the source key.
+    // Desired spec: `service.run.binds` are "src:dst[:mode]"; take the first
+    // colon-separated field. `service.run.volumes` are "name:dst"; take the name.
+    let current_mounts: BTreeSet<String> = detail
+        .mounts
+        .iter()
+        .filter_map(|m| m.split_once(" → ").map(|(src, _)| src.to_string()))
+        .collect();
+    let desired_mounts: BTreeSet<String> = service
+        .run
+        .binds
+        .iter()
+        .map(|b| {
+            // Take only the host-path prefix (before the first `:`)
+            // so we can compare mounts as plain source paths.
+            b.split_once(':')
+                .map_or(b.as_str(), |(src, _)| src)
+                .to_string()
+        })
+        .chain(service.run.volumes.iter().map(|v| {
+            v.split_once(':')
+                .map_or(v.as_str(), |(name, _)| name)
+                .to_string()
+        }))
+        .collect();
+    diff.mounts_added = desired_mounts
+        .difference(&current_mounts)
+        .cloned()
+        .collect();
+    diff.mounts_removed = current_mounts
+        .difference(&desired_mounts)
+        .cloned()
+        .collect();
+
+    // Publish ports: compare sorted sets of "host_port:container_port/proto"
+    // strings. Running container stores them as "host_port:container_port/proto"
+    // (the format parse_inspect produces). Desired spec uses the same format
+    // in `service.run.publish` but without the "/proto" unless specified.
+    // Normalise both sides to sorted BTreeSets for a clean set diff.
+    let current_ports: BTreeSet<String> = detail
+        .ports
+        .iter()
+        .filter(|p| !p.starts_with("(unpublished)"))
+        .cloned()
+        .collect();
+    // Desired publish strings are already in `host_port:container_port[/proto]`
+    // form — normalise to include "/tcp" when the proto is omitted so the
+    // comparison is apples-to-apples with what inspect returns.
+    let desired_ports: BTreeSet<String> = service
+        .run
+        .publish
+        .iter()
+        .map(|p| {
+            if p.contains('/') {
+                p.clone()
+            } else {
+                format!("{p}/tcp")
+            }
+        })
+        .collect();
+    diff.publish_added = desired_ports.difference(&current_ports).cloned().collect();
+    diff.publish_removed = current_ports.difference(&desired_ports).cloned().collect();
+
+    // Memory: compare running limit vs desired limit.
+    let desired_memory_bytes: Option<i64> = service
+        .run
+        .options
+        .memory
+        .as_deref()
+        .and_then(|m| crate::docker::parse_memory(m).ok());
+    let current_memory_bytes: Option<i64> = detail.memory_bytes.filter(|&b| b > 0);
+    if desired_memory_bytes != current_memory_bytes {
+        let fmt_mem = |b: Option<i64>| match b {
+            None => "unlimited".to_string(),
+            Some(n) => crate::output::format_bytes(n),
+        };
+        diff.memory_changed = Some(format!(
+            "{} → {}",
+            fmt_mem(current_memory_bytes),
+            fmt_mem(desired_memory_bytes)
+        ));
+    }
+
+    Ok(diff)
 }
 
 /// Pure-function part of `inspect_field_diff`: given current vs desired
@@ -358,6 +474,15 @@ fn field_diff_scoped(
         labels_added,
         labels_removed,
         labels_changed,
+        // Mounts, ports, memory, and replicas are populated by the
+        // async `inspect_field_diff` caller that has the full RunSpec;
+        // `field_diff_scoped` is the pure env+label subset.
+        mounts_added: Vec::new(),
+        mounts_removed: Vec::new(),
+        publish_added: Vec::new(),
+        publish_removed: Vec::new(),
+        memory_changed: None,
+        replicas_changed: None,
     }
 }
 
@@ -523,16 +648,22 @@ fn text_row(d: &ServiceDiff) -> String {
             fields,
         } => {
             let head = format!(
-                "~ {:18} {} → {}    {current_image} → {desired_image}",
+                "~ {:18} {} → {}",
                 d.service,
                 short(current_hash),
                 short(&d.desired_hash),
             );
-            let detail = field_diff_lines(fields, "      ");
-            if detail.is_empty() {
+            let mut detail_lines = Vec::new();
+            // Image line — only when the image reference actually changed.
+            if current_image != desired_image {
+                detail_lines.push(format!("  image:    {current_image} → {desired_image}"));
+            }
+            // Per-field detail lines from the inspect diff.
+            detail_lines.extend(field_diff_lines(fields));
+            if detail_lines.is_empty() {
                 head
             } else {
-                format!("{head}\n{detail}")
+                format!("{head}\n{}", detail_lines.join("\n"))
             }
         }
         ChangeKind::NoOp { current_hash } => format!(
@@ -543,42 +674,84 @@ fn text_row(d: &ServiceDiff) -> String {
     }
 }
 
-/// Render a `FieldDiff` as `+`/`-`/`~` lines, indented by `indent`.
-/// Empty when nothing changed at the env/label level.
-fn field_diff_lines(fields: &FieldDiff, indent: &str) -> String {
+/// Render a `FieldDiff` as a compact list of indented detail lines (each
+/// prefixed with two spaces so they sit under the `~ service` header).
+/// Each entry names the field and uses a short verb — "added", "removed",
+/// or "changed" — so the operator can scan the column quickly without
+/// parsing `+`/`-` sigils. Returns an empty `Vec` when the diff is empty.
+fn field_diff_lines(fields: &FieldDiff) -> Vec<String> {
     if fields.is_empty() {
-        return String::new();
+        return Vec::new();
     }
+    let indent = "  ";
     let mut lines = Vec::new();
-    let mut group = |label: &str, added: &[String], removed: &[String], changed: &[String]| {
-        if added.is_empty() && removed.is_empty() && changed.is_empty() {
-            return;
+
+    // Env: one line listing all changed keys with verb-per-key format.
+    let mut env_parts: Vec<String> = Vec::new();
+    for k in &fields.env_added {
+        env_parts.push(format!("{k} added"));
+    }
+    for k in &fields.env_removed {
+        env_parts.push(format!("{k} removed"));
+    }
+    for k in &fields.env_changed {
+        env_parts.push(format!("{k} changed"));
+    }
+    if !env_parts.is_empty() {
+        lines.push(format!("{indent}env:      {}", env_parts.join(", ")));
+    }
+
+    // Mounts: one line for added, one for removed.
+    if !fields.mounts_added.is_empty() || !fields.mounts_removed.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        for m in &fields.mounts_added {
+            parts.push(format!("+ {m}"));
         }
-        let mut parts = Vec::new();
-        for k in added {
-            parts.push(format!("+ {k}"));
+        for m in &fields.mounts_removed {
+            parts.push(format!("- {m}"));
         }
-        for k in removed {
-            parts.push(format!("- {k}"));
+        lines.push(format!("{indent}mounts:   {}", parts.join(", ")));
+    }
+
+    // Publish ports.
+    if !fields.publish_added.is_empty() || !fields.publish_removed.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        for p in &fields.publish_added {
+            parts.push(format!("+ {p}"));
         }
-        for k in changed {
-            parts.push(format!("~ {k}"));
+        for p in &fields.publish_removed {
+            parts.push(format!("- {p}"));
         }
-        lines.push(format!("{indent}{label}: {}", parts.join(", ")));
-    };
-    group(
-        "env",
-        &fields.env_added,
-        &fields.env_removed,
-        &fields.env_changed,
-    );
-    group(
-        "labels",
-        &fields.labels_added,
-        &fields.labels_removed,
-        &fields.labels_changed,
-    );
-    lines.join("\n")
+        lines.push(format!("{indent}ports:    {}", parts.join(", ")));
+    }
+
+    // Memory.
+    if let Some(mem) = &fields.memory_changed {
+        lines.push(format!("{indent}memory:   {mem}"));
+    }
+
+    // Replicas.
+    if let Some(rep) = &fields.replicas_changed {
+        lines.push(format!("{indent}replicas: {rep}"));
+    }
+
+    // Labels: keep them compact on a single line since most operators
+    // won't have label churn and the keys are usually short.
+    let mut label_parts: Vec<String> = Vec::new();
+    for k in &fields.labels_added {
+        label_parts.push(format!("+ {k}"));
+    }
+    for k in &fields.labels_removed {
+        label_parts.push(format!("- {k}"));
+    }
+    for k in &fields.labels_changed {
+        label_parts.push(format!("~ {k}"));
+    }
+    if !label_parts.is_empty() {
+        lines.push(format!("{indent}labels:   {}", label_parts.join(", ")));
+    }
+
+    lines
 }
 
 fn markdown_cells(d: &ServiceDiff) -> (&'static str, String, String) {
@@ -743,8 +916,46 @@ mod tests {
             fields.labels_removed = vec!["yoink.caddy.tls".into()];
         }
         let t = diff_with(vec![row], vec![]).render(Format::Text);
-        assert!(t.contains("env: + DATABASE_POOL_SIZE, ~ LOG_LEVEL"));
-        assert!(t.contains("labels: - yoink.caddy.tls"));
+        assert!(t.contains("DATABASE_POOL_SIZE added"), "got: {t}");
+        assert!(t.contains("LOG_LEVEL changed"), "got: {t}");
+        assert!(t.contains("labels:"), "got: {t}");
+        assert!(t.contains("- yoink.caddy.tls"), "got: {t}");
+    }
+
+    #[test]
+    fn text_render_shows_image_on_own_line_when_changed() {
+        let row = update("docs", "h1");
+        // `update` already sets current_image: "img:v1", desired_image: "img:v2"
+        let t = diff_with(vec![row], vec![]).render(Format::Text);
+        assert!(t.contains("image:"), "got: {t}");
+        assert!(t.contains("img:v1 → img:v2"), "got: {t}");
+    }
+
+    #[test]
+    fn text_render_shows_mount_and_port_diff() {
+        let mut row = update("api", "h1");
+        if let ChangeKind::Update { ref mut fields, .. } = row.change {
+            fields.mounts_added = vec!["/data/uploads".into()];
+            fields.mounts_removed = vec!["/old/path".into()];
+            fields.publish_added = vec!["8080:80/tcp".into()];
+        }
+        let t = diff_with(vec![row], vec![]).render(Format::Text);
+        assert!(t.contains("mounts:"), "got: {t}");
+        assert!(t.contains("+ /data/uploads"), "got: {t}");
+        assert!(t.contains("- /old/path"), "got: {t}");
+        assert!(t.contains("ports:"), "got: {t}");
+        assert!(t.contains("+ 8080:80/tcp"), "got: {t}");
+    }
+
+    #[test]
+    fn text_render_shows_memory_diff() {
+        let mut row = update("api", "h1");
+        if let ChangeKind::Update { ref mut fields, .. } = row.change {
+            fields.memory_changed = Some("512 MiB → 1.0 GiB".into());
+        }
+        let t = diff_with(vec![row], vec![]).render(Format::Text);
+        assert!(t.contains("memory:"), "got: {t}");
+        assert!(t.contains("512 MiB → 1.0 GiB"), "got: {t}");
     }
 
     #[test]
