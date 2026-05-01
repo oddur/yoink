@@ -87,10 +87,7 @@ impl AuditState {
             return;
         }
         let new_idx = prev_id
-            .and_then(|id| {
-                self.visible_rows()
-                    .position(|(_, r)| r.event_id == id)
-            })
+            .and_then(|id| self.visible_rows().position(|(_, r)| r.event_id == id))
             .unwrap_or(0);
         self.table.select(Some(new_idx.min(visible_len - 1)));
     }
@@ -196,9 +193,7 @@ impl AuditState {
     /// is selected.
     fn selected_event_id(&self) -> Option<&str> {
         let i = self.table.selected()?;
-        self.visible_rows()
-            .nth(i)
-            .map(|(_, r)| r.event_id.as_str())
+        self.visible_rows().nth(i).map(|(_, r)| r.event_id.as_str())
     }
 
     fn selected_row(&self) -> Option<&AuditRow> {
@@ -229,8 +224,8 @@ impl AuditState {
         } else {
             format!(" · {} error(s)", self.errors.len())
         };
-        let header = Paragraph::new(format!("{title_left}{title_filter}{title_errors}"))
-            .style(bold());
+        let header =
+            Paragraph::new(format!("{title_left}{title_filter}{title_errors}")).style(bold());
         frame.render_widget(header, layout[0]);
 
         // Split body: table on top, optional detail panel below when
@@ -267,7 +262,9 @@ impl AuditState {
         let visible: Vec<&AuditRow> = self.visible_rows().map(|(_, r)| r).collect();
 
         let body_rows: Vec<Row<'_>> = if !self.loaded {
-            vec![Row::new(vec![Cell::from(super::ui::loading_line(throbber))])]
+            vec![Row::new(vec![Cell::from(super::ui::loading_line(
+                throbber,
+            ))])]
         } else if self.rows.is_empty() && !self.errors.is_empty() {
             vec![Row::new(vec![Cell::from(
                 "(no audit events fetched — every source failed; see footer)",
@@ -347,10 +344,7 @@ impl AuditState {
     fn footer_line(&self) -> Paragraph<'_> {
         let (text, style) = if self.editing_filter {
             (
-                format!(
-                    "/ {} · enter commit · esc cancel",
-                    self.pending_filter
-                ),
+                format!("/ {} · enter commit · esc cancel", self.pending_filter),
                 Style::default().fg(Color::Cyan),
             )
         } else if !self.errors.is_empty() {
@@ -403,7 +397,9 @@ fn event_kind_style(kind: &AuditEventKind) -> Style {
         K::ContainerCreated { .. } | K::RunFinished { ok: true, .. } => {
             Style::default().fg(Color::Green)
         }
-        K::RollbackStarted { .. } | K::RollbackFinished { .. } => Style::default().fg(Color::Yellow),
+        K::RollbackStarted { .. } | K::RollbackFinished { .. } => {
+            Style::default().fg(Color::Yellow)
+        }
         _ => Style::default(),
     }
 }
@@ -411,7 +407,7 @@ fn event_kind_style(kind: &AuditEventKind) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AuditEventKind, build_event, RunContext};
+    use crate::audit::{AuditEventKind, RunContext, build_event};
     use pretty_assertions::assert_eq;
 
     fn ctx() -> RunContext {
@@ -474,10 +470,7 @@ mod tests {
     #[test]
     fn filter_empty_input_clears_filter() {
         let mut s = AuditState::new();
-        s.apply(
-            vec![ev("h1", AuditEventKind::LockAcquired)],
-            Vec::new(),
-        );
+        s.apply(vec![ev("h1", AuditEventKind::LockAcquired)], Vec::new());
         s.begin_filter();
         s.commit_filter();
         assert!(s.filter.is_none());
@@ -511,7 +504,12 @@ mod tests {
         let pinned_id = s.selected_event_id().map(str::to_string);
         // Refresh injects a new (newer) event at the top; pinned row
         // should still be the same logical event.
-        let third = ev("h1", AuditEventKind::HookStarted { name: "post".into() });
+        let third = ev(
+            "h1",
+            AuditEventKind::HookStarted {
+                name: "post".into(),
+            },
+        );
         s.apply(vec![third, first, second], Vec::new());
         assert_eq!(
             s.selected_event_id().map(str::to_string),

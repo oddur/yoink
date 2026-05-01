@@ -1902,10 +1902,7 @@ impl App {
         // supports filtering — Logs handles its own filter inline,
         // and Audit owns its filter state outside the shared
         // `FilterState`, so both fall through to pane-local dispatch).
-        if key.code == KeyCode::Char('/')
-            && !logs_view
-            && !matches!(self.view, View::Audit)
-        {
+        if key.code == KeyCode::Char('/') && !logs_view && !matches!(self.view, View::Audit) {
             self.begin_pane_filter_input();
             return false;
         }
