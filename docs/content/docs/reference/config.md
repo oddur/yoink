@@ -77,8 +77,65 @@ The keys-dir scan (#3) is what makes `yoink secrets key generate` work without p
 | `provider` | string | required | `age` |
 | `recipients` | list of string | `[]` | Public age **recipients** (`age1...`), one per principal that needs to decrypt. New writes are sealed against every entry; decryption only needs *one* matching identity. Validates non-empty at config-load. |
 | `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. `..` and absolute paths are rejected. |
+| `profiles` | map of [SecretsProfile](#secretsprofile) | `{}` | Named env-shape recipes for downstream consumers (Terraform state-backend creds, provider tokens, CI shell exports). Consumed by `yoink secrets env --profile <NAME>` and by `hooks.pre_deploy[].secrets_profile`. See [Secrets profiles](#secrets-profiles). |
 
 The recipient/identity split is the asymmetric-keypair mental model; see [Sealed secrets (age)](/docs/guide/secrets#sealed-secrets-age--the-default) in the secrets guide for the full explanation.
+
+#### Secrets profiles
+
+A profile names "what env shape does one downstream tool expect" and lets the same recipe drive both an operator shell (Taskfile, CI workflow) and a yoink pre-deploy hook. Without profiles, the same `bundle-key → env-var-name` mapping is hand-encoded in N Taskfiles plus N CI workflows, with a separate `unset` block per consumer for env-leak cleanup; profiles consolidate it next to the bundle that supplies the values.
+
+##### `SecretsProfile`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `include` | list of string | `[]` | Allowlist of bundle keys this consumer cares about. Empty = "every key in the bundle." A listed key missing from the bundle is a hard error at resolve time — loud-fail beats silently feeding empty creds. |
+| `rename` | map of string→string | `{}` | `bundle_key → env_var_name`. Renames apply after `include`; keys not in the map keep their original name. Targets must be POSIX env-var names (`[A-Za-z_][A-Za-z0-9_]*`); mixed case is allowed because Terraform's `TF_VAR_<varname>` puts the (lowercase) variable name in the suffix. |
+| `unset` | list of string | `[]` | Env vars to clear in the importing shell *before* the exports land. Solves the "devbox `init_hook` leaks `B2_ENDPOINT` and the b2 SDK underneath the terraform provider mis-routes auth" class of issue. **Operator-shell-only** — a hook runs in a fresh container with no parent env to clear; referencing an `unset` profile from a hook is a config-validation error. |
+
+Profile names must match `[a-z0-9-]+` (lowercase letters, digits, hyphens).
+
+```yaml
+secrets:
+  provider: age
+  recipients: [age1…]
+  profiles:
+    terraform-cloudflare:
+      include: [CLOUDFLARE_API_TOKEN,
+                TFSTATE_B2_KEY_ID, TFSTATE_B2_APPLICATION_KEY]
+      rename:
+        TFSTATE_B2_KEY_ID:          AWS_ACCESS_KEY_ID
+        TFSTATE_B2_APPLICATION_KEY: AWS_SECRET_ACCESS_KEY
+      unset: [B2_ENDPOINT, B2_BUCKET_NAME]
+```
+
+Use it from a Taskfile:
+
+```yaml
+env:
+  YOINK_TF:
+    sh: cd ../../deploy-prod && yoink secrets env --profile terraform-cloudflare
+tasks:
+  tf:plan:
+    cmds:
+      - eval "$YOINK_TF" && terraform plan
+```
+
+Or from a yoink pre-deploy hook (subprocess flavor — runs on the operator's machine):
+
+```yaml
+hooks:
+  pre_deploy:
+    - name: cloudflare-tf-apply
+      working_dir: ../terraform/cloudflare
+      cmd: ["sh", "-c",
+            "terraform init -input=false && terraform apply -auto-approve"]
+      secrets_profile: terraform-cloudflare
+```
+
+The profile's `unset:` applies on subprocess hooks (yoink calls `Command::env_remove` for each entry); container hooks reject it because there's no parent env to clear. See [Run Terraform from a hook](/docs/how-to/terraform-from-hooks) for the full walkthrough.
+
+In CI, when `GITHUB_ENV` is set in the environment, `yoink secrets env` auto-prepends `echo '::add-mask::<value>'` lines for every revealed value — no per-key copy-paste needed; new keys added to the profile are masked automatically.
 
 Bootstrap: `yoink secrets key generate` writes a fresh **identity** to `~/.config/yoink/keys/<recipient>.key` (mode 0600) by default and prints the matching **recipient** (`age1…`, public; paste into `recipients:` above). `--out PATH` writes to a specific file at mode 0600 instead. `--print` sends the secret to stdout for piping into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`). `yoink secrets key public` re-derives the recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [secrets guide](/docs/guide/secrets).
 
@@ -255,16 +312,23 @@ Both shapes use the same [Hook](#hook) entry shape below. A non-zero exit aborts
 
 ## Hook
 
+A hook runs in one of two flavors, distinguished by the presence of `image:`:
+
+- **Container hook** (`image:` + `tag:` set): yoink pulls the image and runs `cmd:` inside docker on the first host. Use for pinned tool images or isolation from the operator's filesystem.
+- **Subprocess hook** (no `image:`, no `tag:`): yoink invokes `cmd[0]` directly on the operator's machine (or the CI runner). Inherits the parent env. Use for tools already on PATH (`terraform`, `dbmate`, `alembic`, `gcloud`, …) — see [Run Terraform from a hook](/docs/how-to/terraform-from-hooks).
+
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `name` | string | required | Hook identifier (used in logs, lock label). |
-| `image` | string | required | Image reference. Usually the same as the runtime service. |
-| `tag` | string \| `{service: <name>}` | unset | Literal tag, or `{service: api}` to mirror the runtime tag exactly. |
-| `entrypoint` | list of string | image default | Override `ENTRYPOINT`. |
-| `cmd` | list of string | image default | Override `CMD`. |
+| `image` | string | unset | Container hook only. Usually the same as the runtime service. |
+| `tag` | string \| `{service: <name>}` | unset | Container hook only. Literal tag, or `{service: api}` to mirror the runtime tag. Required when `image:` is set; rejected otherwise. |
+| `entrypoint` | list of string | image default | Container hook only. Override `ENTRYPOINT`. |
+| `cmd` | list of string | image default | Container: override `CMD`. Subprocess: required; `cmd[0]` is the binary, the rest are args. |
+| `working_dir` | string (path) | yoink.yaml's dir | Subprocess hook only. Resolved relative to `yoink.yaml`'s directory. |
 | `env` | map of string | `{}` | Plain env vars. |
 | `secrets` | list of string | `[]` | Secret names exposed as env vars of the same name. Often a different role than the runtime (e.g. a migrate role). |
 | `env_from_secrets` | map of string | `{}` | `ENV_NAME: SECRET_NAME` mapping. |
+| `secrets_profile` | string | unset | Reference a named recipe from `secrets.profiles`. Profile's `include` joins `secrets`; profile's `rename` joins `env_from_secrets`. Profile's `unset:` applies on subprocess hooks (via `Command::env_remove`); rejected on container hooks (no parent env to clear). See [Secrets profiles](#secrets-profiles). |
 
 ## Tag overrides at deploy time
 

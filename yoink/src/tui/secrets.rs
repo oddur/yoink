@@ -665,7 +665,9 @@ fn load(config: &Config) -> LoadStatus {
                 write_target: None,
             })
         }
-        SecretsConfig::Age { file, recipients } => {
+        SecretsConfig::Age {
+            file, recipients, ..
+        } => {
             let path = match sealed::resolve_sealed_path(config, file.as_deref()) {
                 Ok(p) => p,
                 Err(e) => return LoadStatus::Failed(e.to_string()),

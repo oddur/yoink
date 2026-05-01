@@ -564,7 +564,10 @@ async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
 // ---------- sealed.age existence ----------
 
 fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
-    let Some(SecretsConfig::Age { file, recipients }) = &config.secrets else {
+    let Some(SecretsConfig::Age {
+        file, recipients, ..
+    }) = &config.secrets
+    else {
         return vec![Finding::pass(
             "secrets",
             "sealed file check skipped (not using `provider: age`)",

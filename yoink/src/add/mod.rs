@@ -391,7 +391,10 @@ enum SealReport {
 }
 
 fn seal_new_secrets(config: &Config, new_secrets: &[render::RenderedSecret]) -> Result<SealReport> {
-    let Some(SecretsConfig::Age { file, recipients }) = &config.secrets else {
+    let Some(SecretsConfig::Age {
+        file, recipients, ..
+    }) = &config.secrets
+    else {
         return Ok(SealReport::Skipped {
             reason: "no `secrets:` block configured (run `yoink secrets key generate` first)"
                 .into(),

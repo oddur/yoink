@@ -500,6 +500,37 @@ pub struct RegistryConfig {
     pub password_secret: String,
 }
 
+/// Named recipe for "what env shape does one downstream tool expect."
+/// Stored on `SecretsConfig::Age.profiles` as `name -> profile`,
+/// referenced by `yoink secrets env --profile <NAME>` and by
+/// `hooks.pre_deploy[].secrets_profile`. The profile composes three
+/// independent bits:
+///
+/// - `include`: allowlist of bundle keys that the consumer cares
+///   about. Empty means "everything." A listed key that's missing
+///   from the sealed bundle is a hard error at resolve time —
+///   loud-fail beats silently feeding empty creds to terraform.
+/// - `rename`: `bundle_key -> env_var_name` map for adapting the
+///   bundle's natural names to the downstream tool's expected names
+///   (e.g. `TFSTATE_B2_KEY_ID -> AWS_ACCESS_KEY_ID`). Renames apply
+///   after `include`. Keys not in the map keep their original name.
+/// - `unset`: env vars to clear in the importing shell *before* the
+///   exports land. Solves the "devbox `init_hook` leaks runtime
+///   `B2_ENDPOINT` and the b2 SDK underneath the terraform provider
+///   mis-routes auth" class of issue. Operator-shell-only — a hook
+///   container has no parent env to clear, so referencing an `unset`
+///   profile from a hook is rejected at config-load time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsProfile {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub rename: BTreeMap<String, String>,
+    #[serde(default)]
+    pub unset: Vec<String>,
+}
+
 /// Secrets provider config. The default, batteries-included shape is
 /// `age` — a single sealed file (`secrets.age` next to `yoink.yaml`)
 /// committed to the repo, decrypted at deploy time with one key
@@ -531,6 +562,13 @@ pub enum SecretsConfig {
         /// key (`age1...`). Decryption only needs one matching identity.
         #[serde(default)]
         recipients: Vec<String>,
+        /// Named env-shape recipes for downstream consumers (Terraform
+        /// state-backend creds, provider tokens, …). Each profile
+        /// captures which keys from the bundle a tool wants and what
+        /// to rename them to. Consumed by `yoink secrets env --profile
+        /// <NAME>` and by `hooks.pre_deploy[].secrets_profile`.
+        #[serde(default)]
+        profiles: BTreeMap<String, SecretsProfile>,
     },
     /// External CLI provider. yoink invokes `command`, captures
     /// stdout, and parses it as a secrets bundle. Format is
@@ -1082,14 +1120,28 @@ pub struct HookConfig {
 #[serde(deny_unknown_fields)]
 pub struct HookSpec {
     pub name: String,
-    pub image: String,
+    /// Container image. Required for **container hooks**; omit for
+    /// **subprocess hooks** that run directly on the operator's
+    /// machine (or the CI runner). When omitted, `tag:` must also be
+    /// omitted and `cmd:` runs as a child process with the resolved
+    /// env merged in.
+    #[serde(default)]
+    pub image: Option<String>,
     /// Either a literal tag string or `{ service = "api" }` to mirror
-    /// the deploy-time tag of another service in this config.
-    pub tag: HookTag,
+    /// the deploy-time tag of another service in this config. Required
+    /// when `image:` is set; rejected when not.
+    #[serde(default)]
+    pub tag: Option<HookTag>,
     #[serde(default)]
     pub entrypoint: Option<Vec<String>>,
     #[serde(default)]
     pub cmd: Vec<String>,
+    /// Working directory for **subprocess hooks**, resolved relative
+    /// to the directory of `yoink.yaml`. Default: yoink.yaml's
+    /// directory. Rejected on container hooks (containers carry their
+    /// own `WORKDIR` from the image).
+    #[serde(default)]
+    pub working_dir: Option<std::path::PathBuf>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -1100,6 +1152,16 @@ pub struct HookSpec {
     /// actually reads (`AUTH_DATABASE_URL`).
     #[serde(default)]
     pub env_from_secrets: BTreeMap<String, String>,
+    /// Reference a named recipe from `secrets.profiles`. Desugared at
+    /// config-load time: the profile's `include` is appended to
+    /// `secrets`, and its `rename` is merged into `env_from_secrets`.
+    /// Any explicit `secrets` / `env_from_secrets` entries on this
+    /// hook take precedence on key collision (operator overrides the
+    /// profile). The profile's `unset` field is operator-shell-only;
+    /// referencing a profile that has a non-empty `unset` from a hook
+    /// is a config-validation error.
+    #[serde(default)]
+    pub secrets_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1107,6 +1169,18 @@ pub struct HookSpec {
 pub enum HookTag {
     Literal(String),
     Ref { service: String },
+}
+
+impl HookSpec {
+    /// `true` when this hook runs as a child process on the operator's
+    /// machine instead of inside a docker container. Determined by the
+    /// absence of `image:` — see [`HookSpec::image`] for the schema
+    /// rule. Container hooks need `image:` + `tag:`; subprocess hooks
+    /// have neither and run `cmd[0]` directly with the resolved env.
+    #[must_use]
+    pub fn is_subprocess(&self) -> bool {
+        self.image.is_none()
+    }
 }
 
 fn default_healthcheck_timeout() -> Duration {
@@ -1182,6 +1256,95 @@ fn local_socket_exists() -> bool {
 ///   `[A-Za-z_][A-Za-z0-9_]*` or is unterminated.
 fn expand_env_vars(text: &str) -> Result<String, ConfigError> {
     expand_env_vars_with(text, |name| std::env::var(name).ok())
+}
+
+/// Internal-consistency check on every profile in `secrets.profiles`.
+/// Bundle-key existence is checked at resolve time (when the bundle is
+/// actually loaded) — at config-validate time we only check the
+/// structural invariants that don't need the plaintext bundle. Rename
+/// targets must be POSIX env-var names; mixed case is allowed
+/// because Terraform's `TF_VAR_<varname>` suffix is lowercase.
+fn validate_secrets_profiles(
+    profiles: &BTreeMap<String, SecretsProfile>,
+) -> Result<(), ConfigError> {
+    for (name, profile) in profiles {
+        if !is_valid_profile_name(name) {
+            return Err(ConfigError::Invalid(format!(
+                "secrets.profiles: name {name:?} must match `[a-z0-9-]+` \
+                 (lowercase letters, digits, hyphens)",
+            )));
+        }
+        for key in &profile.include {
+            if key.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.profiles.{name}.include: empty entry"
+                )));
+            }
+        }
+        // Renames may target a key not in `include` only when
+        // `include` is empty (the "everything passes through" mode).
+        // When `include` is non-empty, every rename source must be in
+        // it — otherwise the rename refers to a key the profile is
+        // also dropping, which is almost certainly a typo.
+        if !profile.include.is_empty() {
+            for src in profile.rename.keys() {
+                if !profile.include.iter().any(|k| k == src) {
+                    return Err(ConfigError::Invalid(format!(
+                        "secrets.profiles.{name}.rename: source key {src:?} is not in \
+                         `include` (rename refers to a key the profile drops)",
+                    )));
+                }
+            }
+        }
+        // Rename targets must be valid POSIX env-var names; the
+        // profile's whole purpose is feeding shell exports, so a name
+        // like `aws-access-key` would silently break downstream.
+        let mut seen_targets: BTreeMap<&str, &str> = BTreeMap::new();
+        for (src, target) in &profile.rename {
+            if !is_valid_env_var_name(target) {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.profiles.{name}.rename.{src}: target {target:?} is not a \
+                     valid env var name (must match `[A-Za-z_][A-Za-z0-9_]*`)",
+                )));
+            }
+            if let Some(prior) = seen_targets.insert(target.as_str(), src.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.profiles.{name}.rename: target {target:?} appears twice \
+                     (sources {prior:?} and {src:?})",
+                )));
+            }
+        }
+        for u in &profile.unset {
+            if !is_valid_env_var_name(u) {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.profiles.{name}.unset: {u:?} is not a valid env var name",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// POSIX env-var name: `[A-Za-z_][A-Za-z0-9_]*`. Mixed case is
+/// allowed because Terraform's `TF_VAR_<varname>` convention puts the
+/// (lowercase) variable name in the env-var suffix; rejecting
+/// lowercase would refuse the most common use case.
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn expand_env_vars_with<F>(text: &str, lookup: F) -> Result<String, ConfigError>
@@ -1393,6 +1556,7 @@ impl Config {
         let mut cfg: Self = yaml_serde::from_str(&text)?;
         cfg.config_dir = path.parent().map(std::path::Path::to_path_buf);
         cfg.merge_includes()?;
+        cfg.apply_secrets_profiles_to_hooks()?;
         cfg.normalize_image_references()?;
         crate::proxy::inject_implicit_proxy(&mut cfg)?;
         cfg.validate()?;
@@ -1421,6 +1585,7 @@ impl Config {
         let mut cfg: Self = yaml_serde::from_str(&text)?;
         cfg.config_dir = path.parent().map(std::path::Path::to_path_buf);
         cfg.merge_includes()?;
+        cfg.apply_secrets_profiles_to_hooks()?;
         cfg.normalize_image_references()?;
         // Skip inject_implicit_proxy + validate + topo_sort — those
         // are what reject incomplete configs. The add flow only reads
@@ -1559,6 +1724,101 @@ impl Config {
         Ok(())
     }
 
+    /// Resolve `hooks.pre_deploy[].secrets_profile` references into the
+    /// hook's `secrets` (from the profile's `include`) and
+    /// `env_from_secrets` (from the profile's `rename`). The hook's own
+    /// `secrets` / `env_from_secrets` entries take precedence on key
+    /// collision. After this pass, `secrets_profile` is `None` so
+    /// downstream code (drift detection, dry-run output, hook runner)
+    /// is profile-agnostic.
+    ///
+    /// Errors:
+    /// - Reference to a profile name that isn't in `secrets.profiles`.
+    /// - Reference to a profile with a non-empty `unset` (hooks run in
+    ///   a fresh container, no parent env to clear; the operator
+    ///   probably split their profile wrong).
+    /// - The `secrets:` block isn't `provider: age` (profiles are an
+    ///   age-only feature today; non-age users get a clear error
+    ///   instead of a silent miss).
+    fn apply_secrets_profiles_to_hooks(&mut self) -> Result<(), ConfigError> {
+        // Run profile-block validation up front so a malformed
+        // profile fails before we start mutating hooks. Skipping any
+        // hook resolution past this point on Err means a later
+        // `validate()` doesn't have to re-check the same invariants.
+        if let Some(SecretsConfig::Age { profiles, .. }) = &self.secrets {
+            validate_secrets_profiles(profiles)?;
+        }
+        if self
+            .hooks
+            .pre_deploy
+            .iter()
+            .all(|h| h.secrets_profile.is_none())
+        {
+            return Ok(());
+        }
+        // Disjoint borrow: `&self.secrets` + `&mut self.hooks` are
+        // separate fields, so the loop below can borrow hooks mutably
+        // while `profiles` keeps its immutable handle on `secrets`.
+        let profiles = match &self.secrets {
+            Some(SecretsConfig::Age { profiles, .. }) => profiles,
+            Some(SecretsConfig::Command { .. }) => {
+                return Err(ConfigError::Invalid(
+                    "hooks reference `secrets_profile:` but `secrets.provider:` is `command`; \
+                     profiles are an age-only feature today"
+                        .into(),
+                ));
+            }
+            None => {
+                return Err(ConfigError::Invalid(
+                    "hooks reference `secrets_profile:` but no `secrets:` block is configured"
+                        .into(),
+                ));
+            }
+        };
+        for hook in &mut self.hooks.pre_deploy {
+            let Some(name) = hook.secrets_profile.clone() else {
+                continue;
+            };
+            let profile = profiles.get(&name).ok_or_else(|| {
+                let known = if profiles.is_empty() {
+                    "(none defined)".into()
+                } else {
+                    profiles.keys().cloned().collect::<Vec<_>>().join(", ")
+                };
+                ConfigError::Invalid(format!(
+                    "hook `{}` references unknown secrets profile {name:?}; known: {known}",
+                    hook.name,
+                ))
+            })?;
+            // Profile `unset` semantics: container hooks run in a
+            // fresh container with no parent env to clear, so the
+            // field can't apply — reject. Subprocess hooks inherit
+            // the operator's env, so `unset` IS meaningful: yoink
+            // calls `Command::env_remove(KEY)` for each entry before
+            // spawning the child.
+            if !profile.unset.is_empty() && !hook.is_subprocess() {
+                return Err(ConfigError::Invalid(format!(
+                    "hook `{}` is a container hook but references profile {name:?} which sets \
+                     `unset:` — that field needs a parent shell to clear from. Drop `image:`/`tag:` \
+                     to make this a subprocess hook, or split the `unset:` keys into a separate \
+                     profile that the hook doesn't reference.",
+                    hook.name,
+                )));
+            }
+            for key in &profile.include {
+                if !hook.secrets.iter().any(|k| k == key) {
+                    hook.secrets.push(key.clone());
+                }
+            }
+            for (bundle_key, env_name) in &profile.rename {
+                hook.env_from_secrets
+                    .entry(env_name.clone())
+                    .or_insert_with(|| bundle_key.clone());
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<(), ConfigError> {
         if self.deploy.networks.is_empty() {
@@ -1566,6 +1826,10 @@ impl Config {
                 "deploy.networks must declare at least one network".into(),
             ));
         }
+        // `apply_secrets_profiles_to_hooks` (run by `load_from_path`
+        // before `validate`) already calls `validate_secrets_profiles`
+        // up front, so a malformed profile is rejected before any
+        // hook desugar; no need to re-check here.
         // Empty hosts is permitted at load time — operators may
         // bootstrap a project (e.g. `yoink init --create-ssh-key` then
         // provision + `yoink hosts add`) where the fleet is genuinely
@@ -1796,21 +2060,65 @@ impl Config {
         // (depends_on cycle detection deferred to topo_sort_services
         //  which has the full graph in front of it.)
 
-        // Hook tag refs must point at a real service.
+        // Hook shape: container hooks need image+tag, subprocess
+        // hooks have neither (they run on the operator's machine
+        // with the resolved env merged into a child process).
         for hook in &self.hooks.pre_deploy {
-            if hook.image.trim().is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "hook {:?}.image must not be empty",
-                    hook.name
-                )));
-            }
-            if let HookTag::Ref { service } = &hook.tag
-                && !seen_names.contains(service.as_str())
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "hook {:?}.tag references unknown service {service:?}",
-                    hook.name
-                )));
+            match (&hook.image, &hook.tag) {
+                (Some(image), Some(tag)) => {
+                    if image.trim().is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?}.image must not be empty",
+                            hook.name
+                        )));
+                    }
+                    if let HookTag::Ref { service } = tag
+                        && !seen_names.contains(service.as_str())
+                    {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?}.tag references unknown service {service:?}",
+                            hook.name
+                        )));
+                    }
+                    if hook.working_dir.is_some() {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?} sets `working_dir:`, which is only valid on subprocess \
+                             hooks (no `image:` / `tag:`). Container hooks carry `WORKDIR` from \
+                             the image; use `cmd: [\"sh\",\"-c\",\"cd /path && …\"]` if you need \
+                             to override it inside the container.",
+                            hook.name
+                        )));
+                    }
+                }
+                (None, None) => {
+                    if hook.cmd.is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?} has no `image:` and no `cmd:` — subprocess hooks need \
+                             a `cmd:` to run.",
+                            hook.name
+                        )));
+                    }
+                    if hook.entrypoint.is_some() {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?} sets `entrypoint:` but has no `image:` — entrypoint is a \
+                             container concept; use `cmd: [\"<binary>\", \"<args>\"…]` directly.",
+                            hook.name
+                        )));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "hook {:?} sets `image:` but no `tag:` — container hooks need both.",
+                        hook.name
+                    )));
+                }
+                (None, Some(_)) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "hook {:?} sets `tag:` but no `image:` — drop both for a subprocess hook \
+                         or set both for a container hook.",
+                        hook.name
+                    )));
+                }
             }
         }
 
@@ -2579,11 +2887,11 @@ hooks:
         assert_eq!(c.hooks.pre_deploy[0].name, "bt-migrate");
         assert!(matches!(
             c.hooks.pre_deploy[0].tag,
-            HookTag::Ref { ref service } if service == "api"
+            Some(HookTag::Ref { ref service }) if service == "api"
         ));
         assert!(matches!(
             c.hooks.pre_deploy[1].tag,
-            HookTag::Literal(ref t) if t == "latest"
+            Some(HookTag::Literal(ref t)) if t == "latest"
         ));
     }
 
@@ -3101,5 +3409,438 @@ services:
         assert!(!c.requires_configured_registry());
         // And nothing requires a pull at all.
         assert!(!c.any_service_requires_pull());
+    }
+
+    // -- secrets profiles ---------------------------------------------
+
+    /// Build a yoink.yaml string with a configurable `terraform-backblaze`
+    /// profile (control whether it has an `unset:` line) and an
+    /// arbitrary `pre_deploy` hooks block. Replaces a fragile
+    /// `.replace("…unset…", "")` pattern in earlier tests.
+    fn config_with_profiles_yaml(extra_hook: &str, with_unset: bool) -> String {
+        let unset_line = if with_unset {
+            "      unset: [B2_ENDPOINT, B2_BUCKET_NAME]\n"
+        } else {
+            ""
+        };
+        format!(
+            r#"
+deploy:
+  networks: [smoke]
+hosts:
+  - {{ address: h1, user: root }}
+services:
+  - name: app
+    image: nginx
+    tag: "1"
+    run: {{ port: 80, healthcheck_path: / }}
+secrets:
+  provider: age
+  recipients: [age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq8jhcsq]
+  profiles:
+    terraform-backblaze:
+      include: [TFSTATE_B2_KEY_ID, TFSTATE_B2_APPLICATION_KEY,
+                B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY]
+      rename:
+        TFSTATE_B2_KEY_ID:          AWS_ACCESS_KEY_ID
+        TFSTATE_B2_APPLICATION_KEY: AWS_SECRET_ACCESS_KEY
+        B2_APPLICATION_KEY_ID:      TF_VAR_b2_application_key_id
+        B2_APPLICATION_KEY:         TF_VAR_b2_application_key
+{unset_line}    needs-unset:
+      include: [FOO]
+      unset: [PARENT_LEAK]
+hooks:
+  pre_deploy:
+{extra_hook}
+"#
+        )
+    }
+
+    fn parse_via_temp(yaml: &str) -> Result<Config, ConfigError> {
+        let dir = write_temp_tree(&[("yoink.yaml", yaml)]);
+        Config::load_from_path(&dir.join("yoink.yaml"))
+    }
+
+    #[test]
+    fn profiles_round_trip_through_load() {
+        let cfg = parse_via_temp(&config_with_profiles_yaml("", true)).unwrap();
+        let Some(SecretsConfig::Age { profiles, .. }) = &cfg.secrets else {
+            panic!("expected age secrets");
+        };
+        assert!(profiles.contains_key("terraform-backblaze"));
+        let p = &profiles["terraform-backblaze"];
+        assert_eq!(p.include.len(), 4);
+        assert_eq!(
+            p.rename.get("TFSTATE_B2_KEY_ID").map(String::as_str),
+            Some("AWS_ACCESS_KEY_ID")
+        );
+        assert_eq!(
+            p.unset,
+            vec!["B2_ENDPOINT".to_string(), "B2_BUCKET_NAME".into()]
+        );
+    }
+
+    #[test]
+    fn profile_rename_target_must_be_env_var_safe() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts:
+  - { address: h, user: root }
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+secrets:
+  provider: age
+  recipients: [age1xyz]
+  profiles:
+    bad:
+      include: [FOO]
+      rename:
+        FOO: aws-access-key
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a valid env var name"),
+            "expected env-var-name error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn profile_rename_target_collision_rejected() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts:
+  - { address: h, user: root }
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+secrets:
+  provider: age
+  recipients: [age1xyz]
+  profiles:
+    bad:
+      include: [FOO, BAR]
+      rename:
+        FOO: AWS_ACCESS_KEY_ID
+        BAR: AWS_ACCESS_KEY_ID
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        assert!(err.to_string().contains("appears twice"));
+    }
+
+    #[test]
+    fn profile_rename_source_must_be_in_include() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts:
+  - { address: h, user: root }
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+secrets:
+  provider: age
+  recipients: [age1xyz]
+  profiles:
+    bad:
+      include: [FOO]
+      rename:
+        BAR: AWS_ACCESS_KEY_ID
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        assert!(err.to_string().contains("not in `include`"));
+    }
+
+    #[test]
+    fn profile_name_must_be_kebab_case() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts:
+  - { address: h, user: root }
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+secrets:
+  provider: age
+  recipients: [age1xyz]
+  profiles:
+    "Bad Profile":
+      include: [FOO]
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        assert!(err.to_string().contains("[a-z0-9-]"));
+    }
+
+    #[test]
+    fn old_yaml_without_profiles_block_parses_unchanged() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts:
+  - { address: h, user: root }
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+secrets:
+  provider: age
+  recipients: [age1xyz]
+"#;
+        let cfg = parse_via_temp(yaml).unwrap();
+        let Some(SecretsConfig::Age { profiles, .. }) = &cfg.secrets else {
+            panic!("expected age secrets");
+        };
+        assert!(profiles.is_empty());
+    }
+
+    // -- hook desugar -------------------------------------------------
+
+    #[test]
+    fn hook_secrets_profile_desugars_into_secrets_and_renames() {
+        let hook = r#"
+    - name: cf-tf
+      image: hashicorp/terraform
+      tag: "1.9"
+      cmd: ["apply"]
+      secrets_profile: terraform-backblaze
+"#;
+        // The referenced profile must NOT carry an `unset:` line —
+        // hooks can't honor it. This test exercises the happy
+        // desugar path.
+        let yaml = config_with_profiles_yaml(hook, false);
+        let cfg = parse_via_temp(&yaml).unwrap();
+        let h = &cfg.hooks.pre_deploy[0];
+        // After desugar, the field still carries the original profile
+        // name — the subprocess runner re-reads it to apply the
+        // profile's `unset` list at hook-run time. The
+        // `include`/`rename` halves of the profile have already been
+        // merged into `secrets` / `env_from_secrets`.
+        assert_eq!(h.secrets_profile.as_deref(), Some("terraform-backblaze"));
+        // Include set merged into `secrets`.
+        for key in [
+            "TFSTATE_B2_KEY_ID",
+            "TFSTATE_B2_APPLICATION_KEY",
+            "B2_APPLICATION_KEY_ID",
+            "B2_APPLICATION_KEY",
+        ] {
+            assert!(h.secrets.iter().any(|s| s == key), "missing {key}");
+        }
+        // Rename merged into env_from_secrets ({env_name: bundle_key}).
+        assert_eq!(
+            h.env_from_secrets
+                .get("AWS_ACCESS_KEY_ID")
+                .map(String::as_str),
+            Some("TFSTATE_B2_KEY_ID")
+        );
+        assert_eq!(
+            h.env_from_secrets
+                .get("TF_VAR_b2_application_key")
+                .map(String::as_str),
+            Some("B2_APPLICATION_KEY")
+        );
+    }
+
+    #[test]
+    fn hook_explicit_env_from_secrets_wins_over_profile() {
+        let hook = r#"
+    - name: cf-tf
+      image: hashicorp/terraform
+      tag: "1.9"
+      cmd: ["apply"]
+      secrets_profile: terraform-backblaze
+      env_from_secrets:
+        AWS_ACCESS_KEY_ID: SOMETHING_ELSE
+"#;
+        let yaml = config_with_profiles_yaml(hook, false);
+        let cfg = parse_via_temp(&yaml).unwrap();
+        let h = &cfg.hooks.pre_deploy[0];
+        // Operator's explicit mapping survives the merge.
+        assert_eq!(
+            h.env_from_secrets
+                .get("AWS_ACCESS_KEY_ID")
+                .map(String::as_str),
+            Some("SOMETHING_ELSE")
+        );
+    }
+
+    #[test]
+    fn hook_referencing_unknown_profile_rejected() {
+        let hook = r#"
+    - name: cf-tf
+      image: hashicorp/terraform
+      tag: "1.9"
+      cmd: ["apply"]
+      secrets_profile: does-not-exist
+"#;
+        let yaml = config_with_profiles_yaml(hook, true);
+        let err = parse_via_temp(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does-not-exist"), "got: {msg}");
+        assert!(msg.contains("known:"));
+    }
+
+    #[test]
+    fn hook_referencing_profile_with_unset_rejected() {
+        let hook = r#"
+    - name: tf
+      image: hashicorp/terraform
+      tag: "1.9"
+      cmd: ["apply"]
+      secrets_profile: needs-unset
+"#;
+        let yaml = config_with_profiles_yaml(hook, true);
+        let err = parse_via_temp(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("container hook"), "got: {msg}");
+        assert!(msg.contains("subprocess hook"), "got: {msg}");
+    }
+
+    // -- subprocess hooks --------------------------------------------
+
+    #[test]
+    fn subprocess_hook_with_no_image_no_tag_parses() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+      cmd: ["terraform", "apply", "-auto-approve"]
+"#;
+        let cfg = parse_via_temp(yaml).unwrap();
+        let h = &cfg.hooks.pre_deploy[0];
+        assert!(h.is_subprocess());
+        assert!(h.image.is_none());
+        assert!(h.tag.is_none());
+    }
+
+    #[test]
+    fn container_hook_missing_tag_rejected() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+      image: hashicorp/terraform
+      cmd: ["apply"]
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("image:"), "got: {msg}");
+        assert!(msg.contains("no `tag:`"), "got: {msg}");
+    }
+
+    #[test]
+    fn subprocess_hook_with_entrypoint_rejected() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+      entrypoint: ["sh", "-c"]
+      cmd: ["terraform apply"]
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("entrypoint"), "got: {msg}");
+        assert!(msg.contains("container concept"), "got: {msg}");
+    }
+
+    #[test]
+    fn subprocess_hook_with_no_cmd_rejected() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no `cmd:`"), "got: {msg}");
+    }
+
+    #[test]
+    fn container_hook_with_working_dir_rejected() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+      image: hashicorp/terraform
+      tag: "1.9"
+      working_dir: terraform/cf
+      cmd: ["apply"]
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("working_dir"), "got: {msg}");
+        assert!(msg.contains("subprocess"), "got: {msg}");
+    }
+
+    #[test]
+    fn subprocess_hook_accepts_profile_with_unset() {
+        let hook = r#"
+    - name: tf
+      cmd: ["terraform", "apply"]
+      secrets_profile: needs-unset
+"#;
+        let yaml = config_with_profiles_yaml(hook, true);
+        // Subprocess hook references a profile that has `unset:` —
+        // legal, since the subprocess inherits the parent env and
+        // yoink calls `Command::env_remove(KEY)` for each entry.
+        let cfg = parse_via_temp(&yaml).unwrap();
+        let h = &cfg.hooks.pre_deploy[0];
+        assert!(h.is_subprocess());
+        assert!(h.secrets.iter().any(|s| s == "FOO"));
+        // Profile reference is preserved so the runner can re-read
+        // the `unset:` list at hook-run time.
+        assert_eq!(h.secrets_profile.as_deref(), Some("needs-unset"));
     }
 }

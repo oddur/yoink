@@ -576,7 +576,7 @@ pub async fn deploy_service(
     // `created`-state containers hanging around until the next prune.
     for hook in &service.pre_deploy {
         let hook_tag = resolve_hook_tag(hook, &BTreeMap::new(), &config.services);
-        let resolved_tag = if matches!(hook.tag, HookTag::Ref { .. }) {
+        let resolved_tag = if matches!(hook.tag, Some(HookTag::Ref { .. })) {
             // For `tag: { service: <self> }`, use the deploy-time tag
             // we were called with rather than the static fallback.
             tag.to_string()
@@ -1618,12 +1618,19 @@ async fn swap_out_old_containers_by_set(
     Ok(stopped)
 }
 
+/// Resolve a container hook's tag. Subprocess hooks have no tag —
+/// callers should check `hook.is_subprocess()` first; this helper
+/// returns an empty string when called on a hook with no tag set
+/// (defensive fallback; should be unreachable after `validate()`).
 fn resolve_hook_tag(
     hook: &HookSpec,
     overrides: &BTreeMap<String, String>,
     services: &[ServiceConfig],
 ) -> String {
-    match &hook.tag {
+    let Some(tag) = hook.tag.as_ref() else {
+        return String::new();
+    };
+    match tag {
         HookTag::Literal(t) => t.clone(),
         HookTag::Ref { service: name } => overrides.get(name).cloned().unwrap_or_else(|| {
             services
@@ -1635,8 +1642,12 @@ fn resolve_hook_tag(
     }
 }
 
-/// Run a one-shot hook container on the first applicable host. Pulls
-/// the image, runs to completion, surfaces stdout+stderr on failure.
+/// Dispatch a hook to either the container path (image+tag, runs in
+/// docker via `run_one_shot`) or the subprocess path (no image, runs
+/// `cmd[0]` directly on the operator's machine with the resolved env
+/// merged in). Validation guarantees `image`/`tag` are both Some for
+/// container hooks and both None for subprocess hooks; the dispatch
+/// here only has to honor that invariant.
 async fn run_hook(
     ops: &dyn DockerOps,
     config: &Config,
@@ -1644,14 +1655,21 @@ async fn run_hook(
     tag: &str,
     secrets: Option<&SecretsBundle>,
 ) -> Result<(), DeployError> {
+    if hook.is_subprocess() {
+        return run_subprocess_hook(config, hook, secrets).await;
+    }
     let host_cfg = config.hosts.first().ok_or_else(|| DeployError::Hook {
         name: hook.name.clone(),
         message: "no hosts configured".into(),
     })?;
     let host = Host::from(host_cfg);
 
+    let image = hook
+        .image
+        .as_deref()
+        .expect("validated: container hook has image");
     let credentials = registry_credentials(config, secrets);
-    ops.pull_image(&host, &hook.image, tag, credentials)
+    ops.pull_image(&host, image, tag, credentials)
         .await
         .map_err(|source| DeployError::Docker {
             host: host.address.clone(),
@@ -1668,7 +1686,7 @@ async fn run_hook(
         .first()
         .map_or("bridge", String::as_str);
     let body = docker::build_hook_container(
-        &hook.image,
+        image,
         tag,
         hook_network,
         hook.entrypoint.as_deref(),
@@ -1712,6 +1730,88 @@ fn hook_env(hook: &HookSpec, secrets: Option<&SecretsBundle>) -> BTreeMap<String
         }
     }
     env
+}
+
+/// Run a subprocess hook on the operator's machine. Inherits the
+/// parent env, applies the profile's `unset` list (via
+/// `Command::env_remove`), then layers the resolved hook env on top
+/// (merged from `env` + sealed `secrets` + `env_from_secrets`). Sets
+/// `working_dir` if specified, falling back to the directory of
+/// `yoink.yaml`. Forwards stdout/stderr to the operator's terminal —
+/// terraform's plan output stays live. Non-zero exit fails the deploy.
+async fn run_subprocess_hook(
+    config: &Config,
+    hook: &HookSpec,
+    secrets: Option<&SecretsBundle>,
+) -> Result<(), DeployError> {
+    if hook.cmd.is_empty() {
+        return Err(DeployError::Hook {
+            name: hook.name.clone(),
+            message: "subprocess hook has no `cmd:` to run".into(),
+        });
+    }
+    let mut command = tokio::process::Command::new(&hook.cmd[0]);
+    if hook.cmd.len() > 1 {
+        command.args(&hook.cmd[1..]);
+    }
+
+    // Working dir: explicit `working_dir:` if set, else yoink.yaml's
+    // directory. The latter matches how operators expect relative
+    // paths in `cmd:` to resolve when they pass things like
+    // `terraform -chdir=../terraform/cloudflare`.
+    let base = config
+        .config_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let cwd = match &hook.working_dir {
+        Some(rel) if rel.is_absolute() => rel.clone(),
+        Some(rel) => base.join(rel),
+        None => base,
+    };
+    command.current_dir(&cwd);
+
+    // Apply the profile's `unset` list — clears any conflicting
+    // var the parent shell exported (devbox `init_hook` leaks,
+    // operator's own `export …`) before yoink layers the new env on
+    // top. Container hooks can't honor this (no parent env to
+    // clear); the validation pass at config-load rejects the combo.
+    if let Some(profile_name) = hook.secrets_profile.as_deref()
+        && let Some(crate::config::SecretsConfig::Age { profiles, .. }) = &config.secrets
+        && let Some(profile) = profiles.get(profile_name)
+    {
+        for key in &profile.unset {
+            command.env_remove(key);
+        }
+    }
+
+    // Layer the resolved hook env on top of the inherited parent env.
+    for (k, v) in hook_env(hook, secrets) {
+        command.env(k, v);
+    }
+
+    // Forward stdout/stderr live; the operator should see terraform's
+    // plan output as it streams. Capture nothing here — yoink's deploy
+    // log shows which hook ran via `HookStarted`/`HookFinished`.
+    command.stdout(std::process::Stdio::inherit());
+    command.stderr(std::process::Stdio::inherit());
+
+    let status = command.status().await.map_err(|e| DeployError::Hook {
+        name: hook.name.clone(),
+        message: format!("spawn `{}`: {e}", hook.cmd[0]),
+    })?;
+    if !status.success() {
+        return Err(DeployError::Hook {
+            name: hook.name.clone(),
+            message: format!(
+                "subprocess `{}` exited {}",
+                hook.cmd[0],
+                status
+                    .code()
+                    .map_or_else(|| "by signal".to_string(), |c| format!("with code {c}"))
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
