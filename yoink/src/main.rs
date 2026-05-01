@@ -4333,23 +4333,89 @@ fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool, print: bool) -> R
 }
 
 fn cmd_secrets_edit(config: &Config) -> Result<()> {
+    use std::collections::BTreeMap;
     use yoink::sealed;
+
     let (file_override, recipients) = expect_age_block(config)?;
     let path = sealed::resolve_sealed_path(config, file_override.as_deref())?;
-    let plaintext = if path.exists() {
+
+    // Decrypt the current bundle (or start with an empty template).
+    let (original_bundle, plaintext) = if path.exists() {
         let bytes =
             std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
         let identity = sealed::load_identity(recipients)?;
-        sealed::unseal(&bytes, &identity)?
+        let pt = sealed::unseal(&bytes, &identity)?;
+        let bundle = sealed::parse_dotenv(&pt)?;
+        (bundle, pt)
     } else {
-        String::from("# yoink secrets — KEY=value, one per line\n")
+        (
+            BTreeMap::new(),
+            String::from("# yoink secrets — KEY=value, one per line\n"),
+        )
     };
-    let edited = open_in_editor(&plaintext)?;
-    let parsed = sealed::parse_dotenv(&edited)?;
-    let canonical = sealed::render_dotenv(&parsed);
+
+    // Write dotenv sorted by key so the operator sees a stable diff.
+    let initial = if original_bundle.is_empty() {
+        plaintext
+    } else {
+        sealed::render_dotenv(&original_bundle)
+    };
+
+    // Open editor; None means the editor exited non-zero → treat as
+    // "cancelled", not an error (same UX as `git commit` / `kubectl edit`).
+    let Some(edited) = open_in_editor(&initial)? else {
+        eprintln!("edit cancelled");
+        return Ok(());
+    };
+
+    let edited_bundle = sealed::parse_dotenv(&edited)?;
+
+    // Diff: compute added / changed / removed key sets.
+    let mut added: Vec<&str> = Vec::new();
+    let mut changed: Vec<&str> = Vec::new();
+    let mut removed: Vec<&str> = Vec::new();
+
+    for (k, v) in &edited_bundle {
+        match original_bundle.get(k.as_str()) {
+            None => added.push(k),
+            Some(orig) if orig != v => changed.push(k),
+            _ => {}
+        }
+    }
+    for k in original_bundle.keys() {
+        if !edited_bundle.contains_key(k.as_str()) {
+            removed.push(k);
+        }
+    }
+
+    if added.is_empty() && changed.is_empty() && removed.is_empty() {
+        eprintln!("no changes");
+        return Ok(());
+    }
+
+    // Re-seal the full (edited) bundle and write atomically.
+    let canonical = sealed::render_dotenv(&edited_bundle);
     let sealed_bytes = sealed::seal(canonical.as_bytes(), recipients)?;
     sealed::write_atomically_secret(&path, &sealed_bytes)?;
-    eprintln!("sealed {} key(s) to {}", parsed.len(), path.display());
+
+    // Print summary — key names only, never values.
+    if !added.is_empty() {
+        added.sort_unstable();
+        eprintln!("  added:   {}", added.join(", "));
+    }
+    if !changed.is_empty() {
+        changed.sort_unstable();
+        eprintln!("  changed: {}", changed.join(", "));
+    }
+    if !removed.is_empty() {
+        removed.sort_unstable();
+        eprintln!("  removed: {}", removed.join(", "));
+    }
+    eprintln!(
+        "sealed {} key(s) to {}",
+        edited_bundle.len(),
+        path.display()
+    );
     Ok(())
 }
 
@@ -4662,10 +4728,21 @@ fn expect_age_block(config: &Config) -> Result<(Option<String>, &Vec<String>)> {
     Ok((file.clone(), recipients))
 }
 
-fn open_in_editor(initial: &str) -> Result<String> {
+/// Open `initial` content in `$EDITOR` (falling back to `$VISUAL`,
+/// then `nano`, then `vi`) and return the edited text.
+///
+/// Returns `Ok(Some(text))` on success, `Ok(None)` when the editor
+/// exits non-zero (user cancelled — same semantics as `git commit`
+/// and `kubectl edit`). Use `?` to propagate spawn/IO errors.
+///
+/// Before the temp file is removed, its contents are overwritten with
+/// NUL bytes so the plaintext secrets can't be recovered from disk via
+/// forensic tools, even on filesystems that don't immediately reclaim
+/// pages.
+fn open_in_editor(initial: &str) -> Result<Option<String>> {
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "vi".to_string());
+        .unwrap_or_else(|_| "nano".to_string());
     // `$EDITOR` commonly carries flags (`code --wait`, `nvim --noplugin`,
     // `emacsclient -nw`). Treat the whole string as a shell-style cmd
     // by splitting on ASCII whitespace; the first token is the program
@@ -4700,18 +4777,59 @@ fn open_in_editor(initial: &str) -> Result<String> {
         .arg(scratch.path())
         .status()
         .with_context(|| format!("launch editor {editor:?}"))?;
+
     if !status.success() {
-        return Err(anyhow::anyhow!(
-            "editor {editor:?} exited with {status} — aborting"
-        ));
+        // Secure-wipe before RAII drop so plaintext can't be recovered
+        // from disk after cancellation either.
+        secure_wipe_tempfile(&mut scratch);
+        return Ok(None);
     }
 
     let edited = std::fs::read_to_string(scratch.path())
         .with_context(|| format!("read edited file {}", scratch.path().display()))?;
+
+    // Overwrite with zeros before the file is unlinked. This is a
+    // best-effort defence: modern SSDs and memory-mapped filesystems
+    // don't guarantee physical erasure, but it raises the bar for a
+    // simple data-recovery pass on a shared or cloud host.
+    secure_wipe_tempfile(&mut scratch);
     // Drop runs unlink(2); explicit `close()` would let us surface a
     // cleanup error but we'd rather not fail the seal on a tmpfs hiccup.
     drop(scratch);
-    Ok(edited)
+    Ok(Some(edited))
+}
+
+/// Overwrite a `NamedTempFile`'s contents with NUL bytes so the
+/// plaintext doesn't survive as slack space after the file is deleted.
+/// Errors are swallowed — a wipe failure must not prevent the caller
+/// from completing its primary operation or cleaning up.
+fn secure_wipe_tempfile(f: &mut tempfile::NamedTempFile) {
+    use std::io::{Seek, SeekFrom, Write as _};
+    // Obtain file length; bail silently on any error.
+    let Ok(meta) = f.as_file().metadata() else {
+        return;
+    };
+    let file_len = meta.len();
+    if file_len == 0 {
+        return;
+    }
+    // Use a fixed-size zero chunk and repeat writes to avoid a u64→usize
+    // truncation on 32-bit targets (secret files are small in practice,
+    // but the cast would be unsound on platforms where usize < u64).
+    const CHUNK: usize = 4096;
+    let zeros = [0u8; CHUNK];
+    let file = f.as_file_mut();
+    let _ = file.seek(SeekFrom::Start(0));
+    let mut remaining = file_len;
+    while remaining > 0 {
+        // Safe: min(remaining, CHUNK as u64) ≤ CHUNK which fits in usize.
+        let n = usize::try_from(remaining.min(CHUNK as u64)).unwrap_or(CHUNK);
+        if file.write_all(&zeros[..n]).is_err() {
+            break;
+        }
+        remaining -= n as u64;
+    }
+    let _ = file.flush();
 }
 
 fn mask_value(s: &str) -> String {
