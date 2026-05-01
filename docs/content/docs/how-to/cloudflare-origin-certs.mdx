@@ -10,7 +10,7 @@ If you're already on Cloudflare's edge, **Origin Certificates** are the simplest
 
 - **No rate limits.** LE caps you to 5 duplicate certs / week / domain. With multi-host and forgetful redeploys, hitting that is easy.
 - **No port-80 / DNS-01 dance.** Origin certs are issued out-of-band from Cloudflare's dashboard.
-- **15-year validity.** Set a calendar reminder, rotate quarterly, never think about it.
+- **15-year validity.** Rotate annually if you prefer; otherwise set a calendar reminder for the expiry.
 - **Works with locked-down origins.** Your origin can be on a private network, behind WAF rules, etc. Only Cloudflare's edge needs to reach it, and it does so via TLS on port 443 using the origin cert.
 
 The downside: only Cloudflare-fronted clients trust the cert. Origin certs are not for direct browser access.

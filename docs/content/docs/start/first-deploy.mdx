@@ -13,7 +13,7 @@ yoink init root@1.2.3.4              # generates yoink.yaml from your repo
 yoink up --build                     # builds locally, ships, runs
 ```
 
-Done. `yoink init` reads your `Dockerfile`, `git remote`, and (optionally) `~/.ssh/config` to fill in every field. `yoink up` builds the image locally, ships it to the host over SSH (no registry needed for services with a `build:` block), and runs it through a healthcheck-gated rolling deploy.
+`yoink init` reads your `Dockerfile`, `git remote`, and (optionally) `~/.ssh/config` to fill in every field. `yoink up` builds the image locally, ships it to the host over SSH (no registry needed for services with a `build:` block), and runs it through a healthcheck-gated rolling deploy.
 
 > **One small edit between the two commands**, if you want the standalone path with no registry account at all: open the generated `yoink.yaml` and change `image:` to a bare name (e.g. `my-tool`) so it doesn't include a registry prefix. The walkthrough below shows the full flow.
 
