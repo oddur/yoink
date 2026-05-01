@@ -56,14 +56,20 @@ const clientLoader = browserCollections.blog.createClientLoader({
       <DocsPage toc={[]}>
         <DocsBody>
           <h1 className="text-3xl font-bold mb-2">{frontmatter.title as string}</h1>
-          {frontmatter.date && (
-            <time className="text-sm text-fd-muted-foreground block mb-8">
-              {new Date(frontmatter.date as string).toLocaleDateString('en-US', {
-                year: 'numeric',
-                month: 'long',
-                day: 'numeric',
-              })}
-            </time>
+          {(frontmatter.date || frontmatter.author) && (
+            <p className="text-sm text-fd-muted-foreground mb-8">
+              {frontmatter.date && (
+                <time>
+                  {new Date(frontmatter.date as string).toLocaleDateString('en-US', {
+                    year: 'numeric',
+                    month: 'long',
+                    day: 'numeric',
+                  })}
+                </time>
+              )}
+              {frontmatter.date && frontmatter.author && ' · '}
+              {frontmatter.author && <span>{frontmatter.author as string}</span>}
+            </p>
           )}
           <div className="prose max-w-none">
             <MDX components={useMDXComponents()} />

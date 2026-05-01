@@ -1,4 +1,4 @@
-import { defineConfig, defineDocs, remarkInclude } from 'fumadocs-mdx/config';
+import { defineConfig, defineDocs, frontmatterSchema, remarkInclude } from 'fumadocs-mdx/config';
 import { remarkCodeTab, remarkMdxMermaid, remarkSteps } from 'fumadocs-core/mdx-plugins';
 
 export const docs = defineDocs({
@@ -12,6 +12,12 @@ export const docs = defineDocs({
 
 export const blog = defineDocs({
   dir: 'content/blog',
+  docs: {
+    schema: frontmatterSchema.loose(),
+    postprocess: {
+      includeProcessedMarkdown: true,
+    },
+  },
 });
 
 export const about = defineDocs({
