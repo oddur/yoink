@@ -1893,11 +1893,9 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     let run_ctx_for_closure = run_ctx.clone();
     let mut sink = move |service: Option<&str>, event: deploy::DeployEvent| {
         eprintln!("{}", output::format_deploy_event(service, &event));
-        if let Some((host, kind)) = yoink::audit::map_deploy_event(
-            service,
-            &event,
-            &|svc| tag_lookup.get(svc).cloned().unwrap_or_default(),
-        ) {
+        if let Some((host, kind)) = yoink::audit::map_deploy_event(service, &event, &|svc| {
+            tag_lookup.get(svc).cloned().unwrap_or_default()
+        }) {
             let ev = yoink::audit::build_event(&run_ctx_for_closure, host, kind);
             let _ = audit_tx.send(ev);
         }
@@ -3326,9 +3324,7 @@ async fn cmd_audit(config: &Config, action: AuditAction) -> Result<()> {
             )
             .await
         }
-        AuditAction::Run { deploy_id, format } => {
-            cmd_audit_run(config, &deploy_id, format).await
-        }
+        AuditAction::Run { deploy_id, format } => cmd_audit_run(config, &deploy_id, format).await,
         AuditAction::Gc {
             keep,
             host,
@@ -3486,11 +3482,7 @@ async fn cmd_audit_log(
     Ok(())
 }
 
-async fn cmd_audit_run(
-    config: &Config,
-    deploy_id: &str,
-    format: TableFormat,
-) -> Result<()> {
+async fn cmd_audit_run(config: &Config, deploy_id: &str, format: TableFormat) -> Result<()> {
     cmd_audit_log(
         config,
         None,
@@ -3762,10 +3754,7 @@ fn audit_event_summary(kind: &yoink::audit::AuditEventKind) -> String {
             if *ok {
                 format!("{command} ok")
             } else {
-                format!(
-                    "{command} FAILED: {}",
-                    error.as_deref().unwrap_or("")
-                )
+                format!("{command} FAILED: {}", error.as_deref().unwrap_or(""))
             }
         }
         K::LockAcquired | K::LockReleased => String::new(),
@@ -3808,10 +3797,7 @@ fn audit_event_summary(kind: &yoink::audit::AuditEventKind) -> String {
             service,
             container,
             log_tail,
-        } => format!(
-            "{service} {container} ({} log lines)",
-            log_tail.len()
-        ),
+        } => format!("{service} {container} ({} log lines)", log_tail.len()),
         K::RollbackStarted {
             service,
             target_tag,

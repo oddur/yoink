@@ -73,14 +73,27 @@ pub enum AuditEventKind {
     LockAcquired,
     LockReleased,
     /// A pre-/post-deploy hook started running. Best-effort.
-    HookStarted { name: String },
+    HookStarted {
+        name: String,
+    },
     /// Hook finished. Forensic — the exit code matters for triage.
-    HookFinished { name: String },
+    HookFinished {
+        name: String,
+    },
     /// Image pull began on this host. Best-effort progress event.
-    PullStarted { image: String, tag: String },
-    PullFinished { image: String, tag: String },
+    PullStarted {
+        image: String,
+        tag: String,
+    },
+    PullFinished {
+        image: String,
+        tag: String,
+    },
     /// Docker network ensured (created if missing). Progress event.
-    NetworkReady { network: String, created: bool },
+    NetworkReady {
+        network: String,
+        created: bool,
+    },
     /// New container started. Progress (the forensic
     /// "this is the container we'll keep" event is `ContainerCreated`,
     /// emitted after the healthcheck passes).
@@ -111,10 +124,16 @@ pub enum AuditEventKind {
         spec_hash: String,
     },
     /// Old replica stopped after a successful swap. Progress.
-    OldContainerStopped { service: String, container: String },
+    OldContainerStopped {
+        service: String,
+        container: String,
+    },
     /// Old replica removed. Forensic — pairs with `ContainerCreated` to
     /// reconstruct a swap.
-    ContainerRemoved { service: String, container: String },
+    ContainerRemoved {
+        service: String,
+        container: String,
+    },
     /// Healthcheck never passed; the deploy aborted and this is the
     /// container's last log lines for triage.
     DeployFailed {
@@ -123,7 +142,10 @@ pub enum AuditEventKind {
         log_tail: Vec<String>,
     },
     /// `yoink rollback <SERVICE>` started.
-    RollbackStarted { service: String, target_tag: String },
+    RollbackStarted {
+        service: String,
+        target_tag: String,
+    },
     /// `yoink rollback <SERVICE>` finished.
     RollbackFinished {
         service: String,
@@ -136,7 +158,9 @@ pub enum AuditEventKind {
         container: String,
     },
     /// `yoink secrets rotate` re-sealed against a new recipient.
-    SecretsRotated { new_recipient: String },
+    SecretsRotated {
+        new_recipient: String,
+    },
     /// File uploaded into `/var/lib/yoink/files/` for a service mount.
     FileUploaded {
         service: String,
@@ -279,7 +303,7 @@ pub fn ts_string_for(unix_secs: u64) -> String {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
-    clippy::many_single_char_names,
+    clippy::many_single_char_names
 )]
 fn unix_to_components(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
     let s = secs % 86_400;
@@ -724,7 +748,11 @@ pub fn map_deploy_event(
             String::new(),
             AuditEventKind::HookFinished { name: name.clone() },
         )),
-        DeployEvent::PullStarted { host, image, tag: t } => Some((
+        DeployEvent::PullStarted {
+            host,
+            image,
+            tag: t,
+        } => Some((
             host.clone(),
             AuditEventKind::PullStarted {
                 image: image.clone(),
@@ -817,8 +845,7 @@ fn short_hash_from_name(container: &str) -> String {
     if parts.is_empty() {
         return String::new();
     }
-    let trailing_is_index =
-        parts[0].chars().all(|c| c.is_ascii_digit()) && !parts[0].is_empty();
+    let trailing_is_index = parts[0].chars().all(|c| c.is_ascii_digit()) && !parts[0].is_empty();
     if trailing_is_index && parts.len() > 1 {
         parts[1].to_string()
     } else {
@@ -913,25 +940,31 @@ mod tests {
     #[test]
     fn forensic_classification_matches_plan() {
         assert!(AuditEventKind::LockAcquired.is_forensic());
-        assert!(AuditEventKind::ContainerCreated {
-            service: "s".into(),
-            container: "c".into(),
-            spec_hash: "h".into(),
-            tag: "t".into(),
-        }
-        .is_forensic());
+        assert!(
+            AuditEventKind::ContainerCreated {
+                service: "s".into(),
+                container: "c".into(),
+                spec_hash: "h".into(),
+                tag: "t".into(),
+            }
+            .is_forensic()
+        );
         assert!(!AuditEventKind::HookStarted { name: "n".into() }.is_forensic());
-        assert!(!AuditEventKind::PullStarted {
-            image: "i".into(),
-            tag: "t".into(),
-        }
-        .is_forensic());
-        assert!(!AuditEventKind::HealthcheckHealthy {
-            service: "s".into(),
-            container: "c".into(),
-            attempts: 1,
-        }
-        .is_forensic());
+        assert!(
+            !AuditEventKind::PullStarted {
+                image: "i".into(),
+                tag: "t".into(),
+            }
+            .is_forensic()
+        );
+        assert!(
+            !AuditEventKind::HealthcheckHealthy {
+                service: "s".into(),
+                container: "c".into(),
+                attempts: 1,
+            }
+            .is_forensic()
+        );
     }
 
     #[tokio::test]
