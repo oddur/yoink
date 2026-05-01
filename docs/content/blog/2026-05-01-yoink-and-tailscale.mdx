@@ -44,9 +44,9 @@ Runners come up tagged `tag:ci`, and one line in my tailnet ACLs lets `tag:ci` S
 
 The runner is on the tailnet, the host trusts `tag:ci`, yoink dials the host by name, and there is nothing else to set up.
 
-## A backplane I wasn't planning for
+## The backplane
 
-The same tailnet that carries deploy traffic works fine as a backplane for the services themselves, which I didn't really expect when I started.
+The same tailnet that carries deploy traffic is also a backplane for the services themselves. That was the point from day one, not a happy accident — keyless SSH was the appetizer, this is the main course.
 
 Suppose I want a second host in another region. Call it `app-us-1`, on a different provider. Normally that's a real piece of work: VPC peering, transit gateways, route tables, a bastion, egress costs, a meeting about who owns the bill. With Tailscale it's `tailscale up` on the new box. Both hosts are now on the same flat, authenticated network, and if `app-eu-1` needs to talk to a Postgres replica on `app-us-1` it just dials `app-us-1:5432`. Encrypted, authenticated, and neither side has anything listening on the public internet.
 
