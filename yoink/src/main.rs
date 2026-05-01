@@ -3361,19 +3361,23 @@ async fn cmd_audit_log(
         anyhow::bail!("no hosts match the filter (or no hosts configured)");
     }
 
-    // Build the ops handle so we can resolve `ssh_key_secret:` keys
-    // for hosts that need them. `build_real_ops` short-circuits to a
-    // no-key handle when no host declares one, so the common path
-    // doesn't pay for sealed-bundle decryption.
-    let bundle = load_secrets_bundle(config).await?;
-    let ops = build_real_ops(config, bundle.as_ref()).await?;
-
     let opts = FetchOptions {
         host_filter: host_filter.map(str::to_string),
         since_secs: parse_since(since)?,
         origin: origin_filter.map(str::to_string),
     };
-    let outcome = fetch_events(&hosts, &opts, |h| ops.ssh_keyfile(h)).await;
+    // Resolve `ssh_key_secret:` keypair tempfiles only when we'll
+    // actually SSH out — `--origin operator` reads the local file
+    // and never touches a host, so skip the bundle load entirely.
+    let ops = if origin_filter == Some("operator") {
+        None
+    } else {
+        Some(build_real_ops(config, None).await?)
+    };
+    let outcome = fetch_events(&hosts, &opts, |h| {
+        ops.as_ref().and_then(|o| o.ssh_keyfile(h))
+    })
+    .await;
     for (source, msg) in &outcome.errors {
         eprintln!("yoink audit: {source}: {msg}");
     }
@@ -3475,10 +3479,10 @@ async fn cmd_audit_gc(
         anyhow::bail!("no hosts match the filter (or no hosts configured)");
     }
 
-    // Resolve sealed SSH keys for hosts that need them; same shape as
-    // `cmd_audit_log`. Build once, reuse across hosts.
-    let bundle = load_secrets_bundle(config).await?;
-    let ops = build_real_ops(config, bundle.as_ref()).await?;
+    // Resolve sealed SSH keys for hosts that need them. `build_real_ops`
+    // short-circuits to a no-key handle when no host declares one, so
+    // the common path doesn't pay for sealed-bundle decryption.
+    let ops = build_real_ops(config, None).await?;
 
     let mut removed = 0_usize;
     for host in hosts {
