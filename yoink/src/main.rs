@@ -3349,7 +3349,7 @@ async fn cmd_audit_log(
     format: TableFormat,
 ) -> Result<()> {
     use yoink::audit::{FetchOptions, event_name, event_service, event_summary, fetch_events};
-    use yoink::docker_ops::Host;
+    use yoink::docker_ops::{DockerOps as _, Host};
 
     if let Some(o) = origin_filter
         && !matches!(o, "operator" | "host")
@@ -3361,12 +3361,19 @@ async fn cmd_audit_log(
         anyhow::bail!("no hosts match the filter (or no hosts configured)");
     }
 
+    // Build the ops handle so we can resolve `ssh_key_secret:` keys
+    // for hosts that need them. `build_real_ops` short-circuits to a
+    // no-key handle when no host declares one, so the common path
+    // doesn't pay for sealed-bundle decryption.
+    let bundle = load_secrets_bundle(config).await?;
+    let ops = build_real_ops(config, bundle.as_ref()).await?;
+
     let opts = FetchOptions {
         host_filter: host_filter.map(str::to_string),
         since_secs: parse_since(since)?,
         origin: origin_filter.map(str::to_string),
     };
-    let outcome = fetch_events(&hosts, &opts).await;
+    let outcome = fetch_events(&hosts, &opts, |h| ops.ssh_keyfile(h)).await;
     for (source, msg) in &outcome.errors {
         eprintln!("yoink audit: {source}: {msg}");
     }
@@ -3451,7 +3458,7 @@ async fn cmd_audit_gc(
     host_filter: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    use yoink::docker_ops::Host;
+    use yoink::docker_ops::{DockerOps as _, Host};
     let secs = parse_since(keep)?;
     let cutoff_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3468,9 +3475,15 @@ async fn cmd_audit_gc(
         anyhow::bail!("no hosts match the filter (or no hosts configured)");
     }
 
+    // Resolve sealed SSH keys for hosts that need them; same shape as
+    // `cmd_audit_log`. Build once, reuse across hosts.
+    let bundle = load_secrets_bundle(config).await?;
+    let ops = build_real_ops(config, bundle.as_ref()).await?;
+
     let mut removed = 0_usize;
     for host in hosts {
-        let result = audit_gc_one(&host, cutoff_unix, dry_run).await;
+        let key_path = ops.ssh_keyfile(&host);
+        let result = audit_gc_one(&host, key_path.as_deref(), cutoff_unix, dry_run).await;
         match result {
             Ok(n) => {
                 removed += n;
@@ -3493,6 +3506,7 @@ async fn cmd_audit_gc(
 
 async fn audit_gc_one(
     host: &yoink::docker_ops::Host,
+    key_path: Option<&std::path::Path>,
     cutoff_unix: u64,
     dry_run: bool,
 ) -> Result<usize> {
@@ -3504,7 +3518,7 @@ async fn audit_gc_one(
          find . -maxdepth 1 -type f -name 'events-*.jsonl' -printf '%T@ %f\\n' 2>/dev/null \
          || true"
     );
-    let listing = run_audit_shell(host, &list_script).await?;
+    let listing = run_audit_shell(host, key_path, &list_script).await?;
 
     let mut to_remove: Vec<String> = Vec::new();
     for line in listing.lines() {
@@ -3533,7 +3547,7 @@ async fn audit_gc_one(
         .collect::<Vec<_>>()
         .join(" ");
     let rm_script = format!("cd {AUDIT_DIR} && rm -f {names}");
-    run_audit_shell(host, &rm_script).await?;
+    run_audit_shell(host, key_path, &rm_script).await?;
     Ok(to_remove.len())
 }
 

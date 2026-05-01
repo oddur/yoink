@@ -2761,6 +2761,13 @@ impl App {
         self.audit_in_flight = true;
         let hosts: Vec<Host> = self.config.hosts.iter().map(Host::from).collect();
         let tx = self.update_tx.clone();
+        // Pre-resolve sealed `ssh_key_secret` keypair paths per host
+        // so the fetch closure stays `Send + Sync`. The TUI's `ops`
+        // owns the `KeyManager` that materialized those tempfiles.
+        let key_paths: std::collections::HashMap<String, std::path::PathBuf> = hosts
+            .iter()
+            .filter_map(|h| self.ops.ssh_keyfile(h).map(|p| (h.address.clone(), p)))
+            .collect();
         tokio::spawn(async move {
             // 7-day window matches the CLI default. The pane reads
             // both active and rotated files when we reach back > 24h.
@@ -2769,7 +2776,9 @@ impl App {
                 since_secs: 7 * 24 * 3600,
                 origin: None,
             };
-            let outcome = crate::audit::fetch_events(&hosts, &opts).await;
+            let outcome =
+                crate::audit::fetch_events(&hosts, &opts, |h| key_paths.get(&h.address).cloned())
+                    .await;
             let _ = tx.send(Update::Audit {
                 events: outcome.events,
                 errors: outcome.errors,
@@ -3700,6 +3709,7 @@ impl App {
             "4 Logs",
             "5 Resources",
             "6 Secrets",
+            "7 Audit",
         ];
         let selected_tab = Some(self.view.top_section());
         super::ui::render_header(

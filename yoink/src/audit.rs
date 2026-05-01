@@ -885,7 +885,16 @@ pub struct FetchOutcome {
 /// dedupe on `event_id`, drop events older than `since_secs`, sort
 /// newest-first. Per-host fetch failures land in `errors` instead of
 /// aborting the whole call.
-pub async fn fetch_events(hosts: &[Host], opts: &FetchOptions) -> FetchOutcome {
+///
+/// `keypair_for` resolves the operator-side path of the SSH private
+/// key for a host that declares `ssh_key_secret:` in `yoink.yaml` —
+/// pass `|h| ops.ssh_keyfile(h)` from a `DockerOps` impl. Hosts that
+/// don't declare a managed key get the operator's normal SSH auth
+/// (agent, default identity).
+pub async fn fetch_events<F>(hosts: &[Host], opts: &FetchOptions, keypair_for: F) -> FetchOutcome
+where
+    F: Fn(&Host) -> Option<std::path::PathBuf> + Send + Sync,
+{
     let cutoff_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -906,15 +915,14 @@ pub async fn fetch_events(hosts: &[Host], opts: &FetchOptions) -> FetchOutcome {
 
     let want_host = opts.origin.as_deref() != Some("operator");
     if want_host {
-        let scoped: Vec<Host> = hosts
+        let scoped: Vec<(Host, Option<std::path::PathBuf>)> = hosts
             .iter()
             .filter(|h| opts.host_filter.as_ref().is_none_or(|f| &h.address == f))
-            .cloned()
+            .map(|h| (h.clone(), keypair_for(h)))
             .collect();
-        let fetches = scoped.iter().map(|h| async move {
-            let host = h.clone();
-            let bytes = fetch_audit_files(&host, want_rotated).await;
-            (host, bytes)
+        let fetches = scoped.iter().map(|(h, key)| async move {
+            let bytes = fetch_audit_files(h, key.as_deref(), want_rotated).await;
+            (h.clone(), bytes)
         });
         let results = futures_util::future::join_all(fetches).await;
         for (host, fetch) in results {
@@ -960,19 +968,31 @@ pub async fn read_operator_audit_files(include_rotated: bool) -> std::io::Result
 
 /// Cat the active host audit file plus rotated files (when requested)
 /// over SSH (or locally for the synthetic `local` host). Returns the
-/// concatenated JSONL bytes; missing files read as empty.
-pub async fn fetch_audit_files(host: &Host, include_rotated: bool) -> anyhow::Result<String> {
+/// concatenated JSONL bytes; missing files read as empty. `key_path`
+/// is the operator-side path to the SSH private key when the host
+/// declares `ssh_key_secret:` (decrypted by `ssh_keys::prepare`); pass
+/// `None` to fall back to the operator's normal SSH auth.
+pub async fn fetch_audit_files(
+    host: &Host,
+    key_path: Option<&std::path::Path>,
+    include_rotated: bool,
+) -> anyhow::Result<String> {
     let script = if include_rotated {
         format!("cat {AUDIT_FILE} {AUDIT_DIR}/events-*.jsonl 2>/dev/null || true")
     } else {
         format!("cat {AUDIT_FILE} 2>/dev/null || true")
     };
-    run_audit_shell(host, &script).await
+    run_audit_shell(host, key_path, &script).await
 }
 
 /// Run `script` on `host`'s shell. Local synthetic host uses `sh -c`;
-/// remote uses `ssh -o BatchMode=yes user@addr script`. Returns stdout.
-pub async fn run_audit_shell(host: &Host, script: &str) -> anyhow::Result<String> {
+/// remote uses `ssh -o BatchMode=yes [-i key_path] user@addr script`.
+/// Returns stdout.
+pub async fn run_audit_shell(
+    host: &Host,
+    key_path: Option<&std::path::Path>,
+    script: &str,
+) -> anyhow::Result<String> {
     use anyhow::Context as _;
     let output = if host.is_local() {
         tokio::process::Command::new("sh")
@@ -982,12 +1002,17 @@ pub async fn run_audit_shell(host: &Host, script: &str) -> anyhow::Result<String
             .await
             .context("local sh -c")?
     } else {
-        tokio::process::Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(format!("{}@{}", host.user, host.address))
-            .arg(script)
-            .output()
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.arg("-o").arg("BatchMode=yes");
+        if let Some(key) = key_path {
+            // -o IdentitiesOnly=yes prevents ssh from trying every key
+            // in the agent first (which would land on the wrong key
+            // and exhaust auth attempts before reaching `-i`).
+            cmd.arg("-o").arg("IdentitiesOnly=yes").arg("-i").arg(key);
+        }
+        cmd.arg(format!("{}@{}", host.user, host.address))
+            .arg(script);
+        cmd.output()
             .await
             .with_context(|| format!("ssh {}@{}", host.user, host.address))?
     };
