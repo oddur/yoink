@@ -17,6 +17,7 @@
     "pr-comment-dry-run",
     "using-templates",
     "self-hosted-registry",
+    "terraform-from-hooks",
     "---Networking & Proxy---",
     "grpc-hosting",
     "caddy-plugins",

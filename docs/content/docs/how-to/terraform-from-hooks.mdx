@@ -1,0 +1,125 @@
+---
+title: Run Terraform (or any infra glue) from a hook
+description: Provision DNS, certs, databases, or any external resource the service depends on as a yoink pre-deploy hook — running directly on the operator's machine with the sealed bundle wired in via a `secrets_profile`.
+---
+
+Some services can't deploy until something outside the container is in place — DNS records, an origin cert, a managed database, an IAM role. Running that step manually before every deploy is forgettable; pinning it inside CI doubles the deploy job's surface. yoink's pre-deploy hooks run an arbitrary command (or container) before the service swap, with full access to the same sealed bundle. Combined with [`secrets_profile`](/docs/reference/config#secrets-profiles), one block both *names* the env shape the tool wants and *runs* the tool every deploy.
+
+Worked example: a service whose origin needs Cloudflare DNS pointed at it and Authenticated Origin Pulls turned on before traffic arrives. The Terraform module that owns that state lives in `terraform/cloudflare/`; the hook runs `terraform apply` against it as a pre-deploy step.
+
+## Two hook flavors
+
+| flavor | when | shape | use for |
+|---|---|---|---|
+| **subprocess** | yoink invokes the binary directly on the operator's machine (or CI runner). | `cmd: [...]`, no `image:`, no `tag:` | Tools already on the operator's PATH: `terraform`, `dbmate`, `alembic`, `gcloud`, `stripe`. |
+| **container** | yoink pulls an image and runs the command inside docker on the first host. | `image:` + `tag:` + `cmd:` | Isolation, portable runtimes, pinning a tool version that isn't on every operator's machine. |
+
+Both share `secrets:`, `env_from_secrets:`, and `secrets_profile:`. The rest of this page uses the subprocess flavor (no Dockerfile, no registry round-trip — terraform is just a binary).
+
+## Layout
+
+```
+deploy-prod/
+├── yoink.yaml          # the deploy config below
+└── secrets.age         # sealed bundle, includes CLOUDFLARE_API_TOKEN
+                        # + TFSTATE_B2_KEY_ID/_APPLICATION_KEY
+
+terraform/cloudflare/
+├── main.tf             # zone, dns, origin_pulls, …
+├── terraform.tfvars
+└── …
+```
+
+## 1. Define the profile [step]
+
+In `deploy-prod/yoink.yaml`, declare a profile that captures exactly the env shape Terraform's Cloudflare provider + S3-compatible state backend need:
+
+```yaml
+secrets:
+  provider: age
+  recipients: [age1…]
+  profiles:
+    terraform-cloudflare:
+      include: [CLOUDFLARE_API_TOKEN,
+                TFSTATE_B2_KEY_ID, TFSTATE_B2_APPLICATION_KEY]
+      rename:
+        TFSTATE_B2_KEY_ID:          AWS_ACCESS_KEY_ID
+        TFSTATE_B2_APPLICATION_KEY: AWS_SECRET_ACCESS_KEY
+      unset: [B2_ENDPOINT, B2_BUCKET_NAME,
+              B2_ACCESS_KEY_ID, B2_SECRET_ACCESS_KEY]
+```
+
+`include` is the allowlist — the hook's env won't carry the rest of the bundle. `rename` adapts the bundle's natural key names to the env names the providers expect. `unset` clears any conflicting key the operator's parent shell exported (e.g. devbox's `init_hook` setting `B2_ENDPOINT` for the runtime app, which the b2 SDK underneath the Terraform provider would otherwise mis-route auth to).
+
+## 2. Wire the hook [step]
+
+```yaml
+hooks:
+  pre_deploy:
+    - name: cloudflare-tf-apply
+      working_dir: ../terraform/cloudflare
+      cmd: ["sh", "-c",
+            "terraform init -input=false && terraform apply -auto-approve"]
+      secrets_profile: terraform-cloudflare
+```
+
+No `image:`, no `tag:` — yoink runs `cmd[0]` directly. `working_dir:` resolves relative to `yoink.yaml`'s directory, so the operator can run `yoink up` from anywhere and the hook still finds the module. The hook inherits the operator's env (so `terraform` is on PATH, the provider plugin cache is reused, the `.terraform/` dir is right where it expects), then yoink layers on:
+
+- `Command::env_remove(KEY)` for every `unset` entry from the profile.
+- `CLOUDFLARE_API_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` populated from the sealed bundle (with the rename applied).
+
+stdout and stderr stream live to the operator's terminal — terraform's plan/apply output is visible as it happens.
+
+## 3. Verify the profile reference resolves [step]
+
+```sh
+yoink validate
+```
+
+The profile desugar runs at config-load time, so an unknown name (`secrets_profile: terraform-cloudfare` typo) fails here — before any deploy lock is taken:
+
+```text
+yoink: hook `cloudflare-tf-apply` references unknown secrets profile "terraform-cloudfare";
+       known: terraform-backblaze, terraform-cloudflare
+```
+
+Subprocess hooks accept profiles with `unset:`. Container hooks don't (no parent env to clear); validation flags the combo with a clear message.
+
+## 4. Deploy [step]
+
+```sh
+yoink up
+```
+
+Order on each `yoink up`:
+
+1. Pre-deploy hook spawns a child process with the resolved env. `terraform apply` reconciles the Cloudflare zone against the module.
+2. If `terraform apply` exits non-zero, the hook fails, the deploy aborts, no service swap happens. The audit log keeps a `HookFinished` event with the exit code so post-mortems don't need scrollback.
+3. On success, yoink proceeds with the container reconcile.
+
+## Drift, rotation, retry
+
+The hook's env keys feed [`spec_hash`](/docs/guide/architecture#drift-detection) like any other env. Adding a key to the profile (or rotating the value behind one) flips the hook's hash, which flips the service's hash, which schedules a redeploy on the next `yoink up`. The profile is the single source of truth for which credentials this hook reads — change the bundle entry, run a deploy, both Terraform's apply and the container's swap pick it up consistently.
+
+If `terraform apply` fails partway, re-running `yoink up` reruns the hook (Terraform converges; that's the point). For debug, the operator-shell side and the hook side share the same profile via [`yoink secrets env --profile terraform-cloudflare`](/docs/how-to/sealed-secrets-workflow#use-the-bundle-from-terraform--ci) — same env, same `terraform plan` outcome.
+
+## When to use a container hook instead
+
+Subprocess is the right default. Reach for the container flavor when:
+
+- the binary isn't on every operator's machine (and you don't want to pin it via devbox / homebrew);
+- you need isolation from the operator's filesystem (write-only sandbox, scratch fs);
+- the hook runs an LLM agent / migration tool / audit script that you want pinned to a specific image hash for reproducibility.
+
+The container shape adds `image:` + `tag:` and runs in docker on the first host; everything else (`secrets_profile`, `secrets`, `env_from_secrets`) is identical.
+
+## Beyond Terraform
+
+Hooks aren't Terraform-specific. Any deploy-time glue fits the same pattern: an alembic migration runner, a Stripe-pricing reconciler, a `gcloud` IAM apply, a `dbmate` schema migration. As long as the tool reads its credentials from env vars, a profile + a subprocess hook bridges the sealed bundle to the tool with one declarative block per consumer.
+
+## See also
+
+- [Secrets profiles](/docs/reference/config#secrets-profiles) — the schema reference for `include` / `rename` / `unset`.
+- [Sealed secrets workflow](/docs/how-to/sealed-secrets-workflow#use-the-bundle-from-terraform--ci) — the operator-shell and CI sides of the same profile.
+- [Architecture: drift detection](/docs/guide/architecture#drift-detection) — how a profile change cascades into a redeploy via `spec_hash`.
+- [Audit log](/docs/how-to/audit-log) — `HookFinished` events with exit codes for post-mortems.

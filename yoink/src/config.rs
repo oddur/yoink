@@ -1120,14 +1120,28 @@ pub struct HookConfig {
 #[serde(deny_unknown_fields)]
 pub struct HookSpec {
     pub name: String,
-    pub image: String,
+    /// Container image. Required for **container hooks**; omit for
+    /// **subprocess hooks** that run directly on the operator's
+    /// machine (or the CI runner). When omitted, `tag:` must also be
+    /// omitted and `cmd:` runs as a child process with the resolved
+    /// env merged in.
+    #[serde(default)]
+    pub image: Option<String>,
     /// Either a literal tag string or `{ service = "api" }` to mirror
-    /// the deploy-time tag of another service in this config.
-    pub tag: HookTag,
+    /// the deploy-time tag of another service in this config. Required
+    /// when `image:` is set; rejected when not.
+    #[serde(default)]
+    pub tag: Option<HookTag>,
     #[serde(default)]
     pub entrypoint: Option<Vec<String>>,
     #[serde(default)]
     pub cmd: Vec<String>,
+    /// Working directory for **subprocess hooks**, resolved relative
+    /// to the directory of `yoink.yaml`. Default: yoink.yaml's
+    /// directory. Rejected on container hooks (containers carry their
+    /// own `WORKDIR` from the image).
+    #[serde(default)]
+    pub working_dir: Option<std::path::PathBuf>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -1155,6 +1169,18 @@ pub struct HookSpec {
 pub enum HookTag {
     Literal(String),
     Ref { service: String },
+}
+
+impl HookSpec {
+    /// `true` when this hook runs as a child process on the operator's
+    /// machine instead of inside a docker container. Determined by the
+    /// absence of `image:` — see [`HookSpec::image`] for the schema
+    /// rule. Container hooks need `image:` + `tag:`; subprocess hooks
+    /// have neither and run `cmd[0]` directly with the resolved env.
+    #[must_use]
+    pub fn is_subprocess(&self) -> bool {
+        self.image.is_none()
+    }
 }
 
 fn default_healthcheck_timeout() -> Duration {
@@ -1750,7 +1776,7 @@ impl Config {
             }
         };
         for hook in &mut self.hooks.pre_deploy {
-            let Some(name) = hook.secrets_profile.take() else {
+            let Some(name) = hook.secrets_profile.clone() else {
                 continue;
             };
             let profile = profiles.get(&name).ok_or_else(|| {
@@ -1764,11 +1790,18 @@ impl Config {
                     hook.name,
                 ))
             })?;
-            if !profile.unset.is_empty() {
+            // Profile `unset` semantics: container hooks run in a
+            // fresh container with no parent env to clear, so the
+            // field can't apply — reject. Subprocess hooks inherit
+            // the operator's env, so `unset` IS meaningful: yoink
+            // calls `Command::env_remove(KEY)` for each entry before
+            // spawning the child.
+            if !profile.unset.is_empty() && !hook.is_subprocess() {
                 return Err(ConfigError::Invalid(format!(
-                    "hook `{}` references profile {name:?} which sets `unset:` — that field is \
-                     operator-shell-only and can't apply to a hook (hooks run in a fresh \
-                     container with no parent env)",
+                    "hook `{}` is a container hook but references profile {name:?} which sets \
+                     `unset:` — that field needs a parent shell to clear from. Drop `image:`/`tag:` \
+                     to make this a subprocess hook, or split the `unset:` keys into a separate \
+                     profile that the hook doesn't reference.",
                     hook.name,
                 )));
             }
@@ -2027,21 +2060,65 @@ impl Config {
         // (depends_on cycle detection deferred to topo_sort_services
         //  which has the full graph in front of it.)
 
-        // Hook tag refs must point at a real service.
+        // Hook shape: container hooks need image+tag, subprocess
+        // hooks have neither (they run on the operator's machine
+        // with the resolved env merged into a child process).
         for hook in &self.hooks.pre_deploy {
-            if hook.image.trim().is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "hook {:?}.image must not be empty",
-                    hook.name
-                )));
-            }
-            if let HookTag::Ref { service } = &hook.tag
-                && !seen_names.contains(service.as_str())
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "hook {:?}.tag references unknown service {service:?}",
-                    hook.name
-                )));
+            match (&hook.image, &hook.tag) {
+                (Some(image), Some(tag)) => {
+                    if image.trim().is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?}.image must not be empty",
+                            hook.name
+                        )));
+                    }
+                    if let HookTag::Ref { service } = tag
+                        && !seen_names.contains(service.as_str())
+                    {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?}.tag references unknown service {service:?}",
+                            hook.name
+                        )));
+                    }
+                    if hook.working_dir.is_some() {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?} sets `working_dir:`, which is only valid on subprocess \
+                             hooks (no `image:` / `tag:`). Container hooks carry `WORKDIR` from \
+                             the image; use `cmd: [\"sh\",\"-c\",\"cd /path && …\"]` if you need \
+                             to override it inside the container.",
+                            hook.name
+                        )));
+                    }
+                }
+                (None, None) => {
+                    if hook.cmd.is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?} has no `image:` and no `cmd:` — subprocess hooks need \
+                             a `cmd:` to run.",
+                            hook.name
+                        )));
+                    }
+                    if hook.entrypoint.is_some() {
+                        return Err(ConfigError::Invalid(format!(
+                            "hook {:?} sets `entrypoint:` but has no `image:` — entrypoint is a \
+                             container concept; use `cmd: [\"<binary>\", \"<args>\"…]` directly.",
+                            hook.name
+                        )));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "hook {:?} sets `image:` but no `tag:` — container hooks need both.",
+                        hook.name
+                    )));
+                }
+                (None, Some(_)) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "hook {:?} sets `tag:` but no `image:` — drop both for a subprocess hook \
+                         or set both for a container hook.",
+                        hook.name
+                    )));
+                }
             }
         }
 
@@ -2810,11 +2887,11 @@ hooks:
         assert_eq!(c.hooks.pre_deploy[0].name, "bt-migrate");
         assert!(matches!(
             c.hooks.pre_deploy[0].tag,
-            HookTag::Ref { ref service } if service == "api"
+            Some(HookTag::Ref { ref service }) if service == "api"
         ));
         assert!(matches!(
             c.hooks.pre_deploy[1].tag,
-            HookTag::Literal(ref t) if t == "latest"
+            Some(HookTag::Literal(ref t)) if t == "latest"
         ));
     }
 
@@ -3546,9 +3623,12 @@ secrets:
         let yaml = config_with_profiles_yaml(hook, false);
         let cfg = parse_via_temp(&yaml).unwrap();
         let h = &cfg.hooks.pre_deploy[0];
-        // After desugar, the field is None — downstream code is
-        // profile-agnostic.
-        assert!(h.secrets_profile.is_none());
+        // After desugar, the field still carries the original profile
+        // name — the subprocess runner re-reads it to apply the
+        // profile's `unset` list at hook-run time. The
+        // `include`/`rename` halves of the profile have already been
+        // merged into `secrets` / `env_from_secrets`.
+        assert_eq!(h.secrets_profile.as_deref(), Some("terraform-backblaze"));
         // Include set merged into `secrets`.
         for key in [
             "TFSTATE_B2_KEY_ID",
@@ -3624,6 +3704,143 @@ secrets:
         let yaml = config_with_profiles_yaml(hook, true);
         let err = parse_via_temp(&yaml).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("operator-shell-only"), "got: {msg}");
+        assert!(msg.contains("container hook"), "got: {msg}");
+        assert!(msg.contains("subprocess hook"), "got: {msg}");
+    }
+
+    // -- subprocess hooks --------------------------------------------
+
+    #[test]
+    fn subprocess_hook_with_no_image_no_tag_parses() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+      cmd: ["terraform", "apply", "-auto-approve"]
+"#;
+        let cfg = parse_via_temp(yaml).unwrap();
+        let h = &cfg.hooks.pre_deploy[0];
+        assert!(h.is_subprocess());
+        assert!(h.image.is_none());
+        assert!(h.tag.is_none());
+    }
+
+    #[test]
+    fn container_hook_missing_tag_rejected() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+      image: hashicorp/terraform
+      cmd: ["apply"]
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("image:"), "got: {msg}");
+        assert!(msg.contains("no `tag:`"), "got: {msg}");
+    }
+
+    #[test]
+    fn subprocess_hook_with_entrypoint_rejected() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+      entrypoint: ["sh", "-c"]
+      cmd: ["terraform apply"]
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("entrypoint"), "got: {msg}");
+        assert!(msg.contains("container concept"), "got: {msg}");
+    }
+
+    #[test]
+    fn subprocess_hook_with_no_cmd_rejected() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no `cmd:`"), "got: {msg}");
+    }
+
+    #[test]
+    fn container_hook_with_working_dir_rejected() {
+        let yaml = r#"
+deploy:
+  networks: [n]
+hosts: [{ address: h, user: root }]
+services:
+  - name: a
+    image: i
+    tag: v1
+    run: {}
+hooks:
+  pre_deploy:
+    - name: tf
+      image: hashicorp/terraform
+      tag: "1.9"
+      working_dir: terraform/cf
+      cmd: ["apply"]
+"#;
+        let err = parse_via_temp(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("working_dir"), "got: {msg}");
+        assert!(msg.contains("subprocess"), "got: {msg}");
+    }
+
+    #[test]
+    fn subprocess_hook_accepts_profile_with_unset() {
+        let hook = r#"
+    - name: tf
+      cmd: ["terraform", "apply"]
+      secrets_profile: needs-unset
+"#;
+        let yaml = config_with_profiles_yaml(hook, true);
+        // Subprocess hook references a profile that has `unset:` —
+        // legal, since the subprocess inherits the parent env and
+        // yoink calls `Command::env_remove(KEY)` for each entry.
+        let cfg = parse_via_temp(&yaml).unwrap();
+        let h = &cfg.hooks.pre_deploy[0];
+        assert!(h.is_subprocess());
+        assert!(h.secrets.iter().any(|s| s == "FOO"));
+        // Profile reference is preserved so the runner can re-read
+        // the `unset:` list at hook-run time.
+        assert_eq!(h.secrets_profile.as_deref(), Some("needs-unset"));
     }
 }

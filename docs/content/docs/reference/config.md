@@ -313,16 +313,23 @@ Both shapes use the same [Hook](#hook) entry shape below. A non-zero exit aborts
 
 ## Hook
 
+A hook runs in one of two flavors, distinguished by the presence of `image:`:
+
+- **Container hook** (`image:` + `tag:` set): yoink pulls the image and runs `cmd:` inside docker on the first host. Use for pinned tool images or isolation from the operator's filesystem.
+- **Subprocess hook** (no `image:`, no `tag:`): yoink invokes `cmd[0]` directly on the operator's machine (or the CI runner). Inherits the parent env. Use for tools already on PATH (`terraform`, `dbmate`, `alembic`, `gcloud`, …) — see [Run Terraform from a hook](/docs/how-to/terraform-from-hooks).
+
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `name` | string | required | Hook identifier (used in logs, lock label). |
-| `image` | string | required | Image reference. Usually the same as the runtime service. |
-| `tag` | string \| `{service: <name>}` | unset | Literal tag, or `{service: api}` to mirror the runtime tag exactly. |
-| `entrypoint` | list of string | image default | Override `ENTRYPOINT`. |
-| `cmd` | list of string | image default | Override `CMD`. |
+| `image` | string | unset | Container hook only. Usually the same as the runtime service. |
+| `tag` | string \| `{service: <name>}` | unset | Container hook only. Literal tag, or `{service: api}` to mirror the runtime tag. Required when `image:` is set; rejected otherwise. |
+| `entrypoint` | list of string | image default | Container hook only. Override `ENTRYPOINT`. |
+| `cmd` | list of string | image default | Container: override `CMD`. Subprocess: required; `cmd[0]` is the binary, the rest are args. |
+| `working_dir` | string (path) | yoink.yaml's dir | Subprocess hook only. Resolved relative to `yoink.yaml`'s directory. |
 | `env` | map of string | `{}` | Plain env vars. |
 | `secrets` | list of string | `[]` | Secret names exposed as env vars of the same name. Often a different role than the runtime (e.g. a migrate role). |
 | `env_from_secrets` | map of string | `{}` | `ENV_NAME: SECRET_NAME` mapping. |
+| `secrets_profile` | string | unset | Reference a named recipe from `secrets.profiles`. Profile's `include` joins `secrets`; profile's `rename` joins `env_from_secrets`. Profile's `unset:` applies on subprocess hooks (via `Command::env_remove`); rejected on container hooks (no parent env to clear). See [Secrets profiles](#secrets-profiles). |
 
 ## Tag overrides at deploy time
 
