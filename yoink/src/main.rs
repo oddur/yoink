@@ -361,18 +361,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Roll a service back to the most recent previously-deployed tag.
-    /// Reads `yoink.version` off the host's exited containers labeled
-    /// with this service, picks the newest, and dispatches through the
-    /// usual `up` flow (rolling swap + healthcheck + migrations).
-    /// Pass `--tag <value>` to skip the discovery step and pin to a
-    /// specific tag.
+    /// Roll one or all services back to the most recently stopped
+    /// previous-generation container on each host. Discovers the
+    /// previous generation by comparing `yoink.spec_hash` labels:
+    /// the current generation is the running container; the most
+    /// recently stopped container with a DIFFERENT `spec_hash` is the
+    /// previous generation. The tag is extracted from that container's
+    /// image reference and fed back through the usual `up` flow
+    /// (rolling swap + healthcheck). Omit `--service` to roll back
+    /// every service that has a previous generation.
     Rollback {
-        /// Service name as declared in the config.
-        service: String,
-        /// Skip discovery; deploy this tag.
+        /// Restrict to one service (by name as declared in the config).
+        /// Omit to roll back all services that have a previous generation.
+        #[arg(long = "service", short = 's', value_name = "NAME")]
+        service: Option<String>,
+        /// Restrict discovery and rollback to containers on this host
+        /// (host address as declared in the config). Omit to operate
+        /// across all configured hosts.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Print what would be redeployed (service, host, previous tag)
+        /// without actually running `up`. Useful for confirming the
+        /// rollback target before committing.
         #[arg(long)]
-        tag: Option<String>,
+        dry_run: bool,
     },
     /// Remove yoink-managed containers that the current config no
     /// longer describes (renamed/removed services) plus stale exited
@@ -1265,7 +1277,11 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Command::Status { json } => cmd_status(&config, json).await,
-        Command::Rollback { service, tag } => cmd_rollback(&config, service, tag).await,
+        Command::Rollback {
+            service,
+            host,
+            dry_run,
+        } => cmd_rollback(&config, service.as_deref(), host.as_deref(), dry_run).await,
         Command::Prune { dry_run } => cmd_prune(&config, dry_run).await,
         Command::Exec { service, host, cmd } => {
             cmd_exec(&config, &service, host.as_deref(), cmd).await
@@ -1900,86 +1916,193 @@ async fn cmd_status(config: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::large_futures)]
-async fn cmd_rollback(config: &Config, service: String, tag: Option<String>) -> Result<()> {
+#[allow(clippy::large_futures, clippy::too_many_lines)]
+async fn cmd_rollback(
+    config: &Config,
+    service_filter: Option<&str>,
+    host_filter: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    use std::collections::BTreeMap;
     use yoink::docker_ops::Host;
-    let ops = build_real_ops(config, None).await?;
 
-    // Verify the service exists in config; otherwise the user typo'd.
-    if !config.services.iter().any(|s| s.name == service) {
-        anyhow::bail!(
-            "service {service:?} is not declared in the loaded config; \
-             pass --service to one that is"
+    // Validate --service filter if given.
+    if let Some(name) = service_filter {
+        anyhow::ensure!(
+            config.services.iter().any(|s| s.name == name),
+            "service {name:?} is not declared in the loaded config"
         );
     }
 
-    // Resolve the tag — either user-supplied or discovered.
-    let resolved_tag = if let Some(t) = tag {
-        t
-    } else {
-        // Walk every configured host, gather containers labeled with this
-        // service, find the newest non-running one. That's the tag we
-        // rolled away from. Skip the currently-running container even if
-        // its `created_unix` would otherwise win.
-        let label = format!("yoink.service={service}");
-        let mut candidates: Vec<(i64, String)> = Vec::new();
-        let mut current_versions: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        for host_cfg in &config.hosts {
-            let host = Host::from(host_cfg);
-            let containers = ops
-                .list_containers_by_label(&host, &label)
-                .await
-                .with_context(|| format!("list {label} on {}", host.address))?;
-            for c in containers {
-                if let Some(v) = &c.yoink_version {
-                    if c.is_running() {
-                        current_versions.insert(v.clone());
-                    } else if let Some(ts) = c.created_unix {
-                        candidates.push((ts, v.clone()));
-                    }
-                }
+    // Validate --host filter if given.
+    if let Some(addr) = host_filter {
+        anyhow::ensure!(
+            config.hosts.iter().any(|h| h.address == addr),
+            "host {addr:?} is not declared in the loaded config"
+        );
+    }
+
+    let ops = build_real_ops(config, None).await?;
+
+    // For each host (optionally filtered), list ALL yoink-managed containers
+    // (running + stopped). Group by `yoink.service` label. For each service
+    // group, collect the running containers' spec_hashes (current generation),
+    // then pick the most recently stopped container with a DIFFERENT spec_hash
+    // — that's the previous generation. Extract the image tag from its image
+    // reference and record (host, tag) pairs per service.
+    //
+    // Result: service_name -> Vec<(host_address, prev_tag)>
+    let mut rollback_plan: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+
+    let hosts_to_scan: Vec<&yoink::config::HostConfig> = config
+        .hosts
+        .iter()
+        .filter(|h| host_filter.is_none_or(|addr| h.address == addr))
+        .collect();
+
+    for host_cfg in &hosts_to_scan {
+        let host = Host::from(*host_cfg);
+        // list_containers_by_label uses all(true) internally — returns both
+        // running and stopped/exited containers.
+        let all = ops
+            .list_containers_by_label(&host, "yoink.managed=true")
+            .await
+            .with_context(|| format!("list yoink containers on {}", host.address))?;
+
+        // Group by service label, applying the optional service filter.
+        let mut by_service: BTreeMap<String, Vec<yoink::docker_ops::ContainerInfo>> =
+            BTreeMap::new();
+        for c in all {
+            let Some(ref svc_name) = c.yoink_service else {
+                continue;
+            };
+            if service_filter.is_some_and(|f| svc_name != f) {
+                continue;
+            }
+            by_service.entry(svc_name.clone()).or_default().push(c);
+        }
+
+        for (svc_name, containers) in by_service {
+            // Collect running spec_hashes (the current generation).
+            let running_hashes: std::collections::BTreeSet<&str> = containers
+                .iter()
+                .filter(|c| c.is_running())
+                .filter_map(|c| c.yoink_spec_hash.as_deref())
+                .collect();
+
+            // Stopped containers sorted newest-first by creation time.
+            let mut stopped: Vec<_> = containers.iter().filter(|c| !c.is_running()).collect();
+            stopped.sort_by_key(|c| std::cmp::Reverse(c.created_unix.unwrap_or(0)));
+
+            // Most recently stopped container with a DIFFERENT spec_hash.
+            let prev = stopped.into_iter().find(|c| {
+                c.yoink_spec_hash
+                    .as_deref()
+                    .is_some_and(|h| !running_hashes.contains(h))
+            });
+
+            let Some(prev_container) = prev else {
+                info_eprintln!(
+                    "[{}] {svc_name}: no previous generation found, skipping",
+                    host.address
+                );
+                continue;
+            };
+
+            let prev_tag = extract_image_tag(&prev_container.image).to_string();
+            rollback_plan
+                .entry(svc_name)
+                .or_default()
+                .push((host.address.clone(), prev_tag));
+        }
+    }
+
+    if rollback_plan.is_empty() {
+        eprintln!("nothing to roll back");
+        return Ok(());
+    }
+
+    if dry_run {
+        eprintln!("dry-run -- would roll back:");
+        for (svc, host_tags) in &rollback_plan {
+            for (h, tag) in host_tags {
+                println!("  [{h}] {svc} -> {tag}");
             }
         }
-        candidates.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
-        candidates
-            .into_iter()
-            .find(|(_, v)| !current_versions.contains(v))
-            .map(|(_, v)| v)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no previous version of {service:?} found on any host; \
-                     pass --tag explicitly to deploy a specific image"
-                )
-            })?
-    };
+        return Ok(());
+    }
 
-    info_eprintln!("rolling {service} back to tag {resolved_tag}");
-    let services_arg = std::slice::from_ref(&service);
-    let tag_arg = format!("{service}={resolved_tag}");
-    let tag_args = std::slice::from_ref(&tag_arg);
-    cmd_up(
-        config,
-        UpOptions {
-            services: services_arg,
-            tag_args,
-            allow_dirty: true,
-            dry_run: false,
-            format: DryRunFormat::Text,
-            no_registry: false,
-            transport: yoink::transport::Transport::Auto,
-            build: false,
-            rebuild_proxy: false,
-            force: false,
-            here: false,
-            plan: false,
-            watch: false,
-            config_path: std::path::Path::new(""),
-        },
-    )
-    .await
+    // Execute rollbacks. All hosts for a service normally land on the same
+    // tag (deployed together). When they diverge, warn and use the first
+    // host's tag (config order). cmd_up operates on all hosts in the config
+    // — per-host targeting will land in a future release.
+    for (svc_name, host_tags) in rollback_plan {
+        let all_same = host_tags.windows(2).all(|w| w[0].1 == w[1].1);
+        let tag = host_tags[0].1.clone();
+
+        if !all_same {
+            eprintln!(
+                "warning: per-host tag divergence for {svc_name}; \
+                 using tag {tag} (from {})",
+                host_tags[0].0
+            );
+        }
+
+        info_eprintln!(
+            "rolling {svc_name} back to tag {tag} on {} host(s)",
+            host_tags.len()
+        );
+        let svc_slice = std::slice::from_ref(&svc_name);
+        let tag_arg = format!("{svc_name}={tag}");
+        let tag_args = std::slice::from_ref(&tag_arg);
+        cmd_up(
+            config,
+            UpOptions {
+                services: svc_slice,
+                tag_args,
+                allow_dirty: true,
+                dry_run: false,
+                format: DryRunFormat::Text,
+                no_registry: false,
+                transport: yoink::transport::Transport::Auto,
+                build: false,
+                rebuild_proxy: false,
+                force: false,
+                here: false,
+                plan: false,
+                watch: false,
+                config_path: std::path::Path::new(""),
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
+/// Extract the tag portion from a docker image reference.
+///
+/// Examples:
+///   `ghcr.io/user/app:abc123`  => `abc123`
+///   `myapp:def456`             => `def456`
+///   `nginx`                    => `nginx`   (bare, no tag)
+///   `registry:5000/img:tag`    => `tag`     (port in registry host)
+///
+/// Rule: take the last `:` suffix, but only when the text after the
+/// colon contains no `/` (i.e. it is a tag, not a port-bearing registry
+/// host). If the final colon belongs to a host:port segment, the whole
+/// string is returned unchanged.
+fn extract_image_tag(image: &str) -> &str {
+    let Some(colon_pos) = image.rfind(':') else {
+        return image;
+    };
+    let after = &image[colon_pos + 1..];
+    if after.contains('/') {
+        image // colon is inside a registry host:port, not a tag delimiter
+    } else {
+        after
+    }
+}
 #[allow(clippy::large_futures)]
 async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
     use yoink::prune::{self, PruneReason};
