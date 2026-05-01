@@ -4983,34 +4983,36 @@ fn cmd_secrets_env(config: &Config, no_export: bool, profile_name: Option<&str>)
     let plaintext = sealed::unseal(&bytes, &identity)?;
     let parsed = sealed::parse_dotenv(&plaintext)?;
 
-    // Resolve the profile against the unsealed bundle: filter to
-    // `include`, then map each key through `rename`. Emits a stable
-    // ordering: BTreeMap iteration is alphabetical, matching the
-    // existing no-profile path.
+    // Resolve the profile against the unsealed bundle. With a
+    // non-empty `include`, walk the include list (typically small —
+    // O(profile keys)) and look each up in the bundle, instead of
+    // walking the whole bundle and filtering. Sorted for stable
+    // output order.
     let resolved: Vec<(String, &str)> = if let Some(p) = profile {
-        // Verify every `include` key exists before emitting anything,
-        // so a typo'd key fails loud instead of silently dropping.
-        for key in &p.include {
-            if !parsed.contains_key(key) {
-                anyhow::bail!(
-                    "profile {:?} references key {key:?} which is not present in the sealed bundle",
-                    profile_name.unwrap_or("?")
-                );
-            }
-        }
-        let allowed: Option<std::collections::BTreeSet<&String>> = if p.include.is_empty() {
-            None
+        let mut out: Vec<(String, &str)> = if p.include.is_empty() {
+            parsed
+                .iter()
+                .map(|(k, v)| {
+                    let env_name = p.rename.get(k).cloned().unwrap_or_else(|| k.clone());
+                    (env_name, v.as_str())
+                })
+                .collect()
         } else {
-            Some(p.include.iter().collect())
+            let mut acc = Vec::with_capacity(p.include.len());
+            for key in &p.include {
+                let value = parsed.get(key).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "profile {:?} references key {key:?} which is not present in the sealed bundle",
+                        profile_name.unwrap_or("?")
+                    )
+                })?;
+                let env_name = p.rename.get(key).cloned().unwrap_or_else(|| key.clone());
+                acc.push((env_name, value.as_str()));
+            }
+            acc
         };
-        parsed
-            .iter()
-            .filter(|(k, _)| allowed.as_ref().is_none_or(|set| set.contains(*k)))
-            .map(|(k, v)| {
-                let env_name = p.rename.get(k).cloned().unwrap_or_else(|| k.clone());
-                (env_name, v.as_str())
-            })
-            .collect()
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     } else {
         parsed
             .iter()
@@ -5026,7 +5028,14 @@ fn cmd_secrets_env(config: &Config, no_export: bool, profile_name: Option<&str>)
     let in_github_actions = std::env::var_os("GITHUB_ENV").is_some();
     if in_github_actions {
         for (_name, value) in &resolved {
-            println!("echo '::add-mask::{}'", value.replace('\'', r"'\''"));
+            // Wrap the whole `::add-mask::<value>` payload in a
+            // single-quoted shell string so the log redaction matches
+            // the literal value, even if it contains shell
+            // metacharacters.
+            println!(
+                "echo {}",
+                posix_single_quote(&format!("::add-mask::{value}"))
+            );
         }
     }
 

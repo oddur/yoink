@@ -1277,8 +1277,8 @@ fn validate_secrets_profiles(
         for (src, target) in &profile.rename {
             if !is_valid_env_var_name(target) {
                 return Err(ConfigError::Invalid(format!(
-                    "secrets.profiles.{name}.rename[{src:?}]: target {target:?} is not a \
-                     valid env var name (must match `[A-Z_][A-Z0-9_]*`)",
+                    "secrets.profiles.{name}.rename.{src}: target {target:?} is not a \
+                     valid env var name (must match `[A-Za-z_][A-Za-z0-9_]*`)",
                 )));
             }
             if let Some(prior) = seen_targets.insert(target.as_str(), src.as_str()) {
@@ -1715,6 +1715,13 @@ impl Config {
     ///   age-only feature today; non-age users get a clear error
     ///   instead of a silent miss).
     fn apply_secrets_profiles_to_hooks(&mut self) -> Result<(), ConfigError> {
+        // Run profile-block validation up front so a malformed
+        // profile fails before we start mutating hooks. Skipping any
+        // hook resolution past this point on Err means a later
+        // `validate()` doesn't have to re-check the same invariants.
+        if let Some(SecretsConfig::Age { profiles, .. }) = &self.secrets {
+            validate_secrets_profiles(profiles)?;
+        }
         if self
             .hooks
             .pre_deploy
@@ -1723,8 +1730,11 @@ impl Config {
         {
             return Ok(());
         }
+        // Disjoint borrow: `&self.secrets` + `&mut self.hooks` are
+        // separate fields, so the loop below can borrow hooks mutably
+        // while `profiles` keeps its immutable handle on `secrets`.
         let profiles = match &self.secrets {
-            Some(SecretsConfig::Age { profiles, .. }) => profiles.clone(),
+            Some(SecretsConfig::Age { profiles, .. }) => profiles,
             Some(SecretsConfig::Command { .. }) => {
                 return Err(ConfigError::Invalid(
                     "hooks reference `secrets_profile:` but `secrets.provider:` is `command`; \
@@ -1783,9 +1793,10 @@ impl Config {
                 "deploy.networks must declare at least one network".into(),
             ));
         }
-        if let Some(SecretsConfig::Age { profiles, .. }) = &self.secrets {
-            validate_secrets_profiles(profiles)?;
-        }
+        // `apply_secrets_profiles_to_hooks` (run by `load_from_path`
+        // before `validate`) already calls `validate_secrets_profiles`
+        // up front, so a malformed profile is rejected before any
+        // hook desugar; no need to re-check here.
         // Empty hosts is permitted at load time — operators may
         // bootstrap a project (e.g. `yoink init --create-ssh-key` then
         // provision + `yoink hosts add`) where the fleet is genuinely
@@ -3325,7 +3336,16 @@ services:
 
     // -- secrets profiles ---------------------------------------------
 
-    fn config_with_profiles_yaml(extra_hook: &str) -> String {
+    /// Build a yoink.yaml string with a configurable `terraform-backblaze`
+    /// profile (control whether it has an `unset:` line) and an
+    /// arbitrary `pre_deploy` hooks block. Replaces a fragile
+    /// `.replace("…unset…", "")` pattern in earlier tests.
+    fn config_with_profiles_yaml(extra_hook: &str, with_unset: bool) -> String {
+        let unset_line = if with_unset {
+            "      unset: [B2_ENDPOINT, B2_BUCKET_NAME]\n"
+        } else {
+            ""
+        };
         format!(
             r#"
 deploy:
@@ -3349,8 +3369,7 @@ secrets:
         TFSTATE_B2_APPLICATION_KEY: AWS_SECRET_ACCESS_KEY
         B2_APPLICATION_KEY_ID:      TF_VAR_b2_application_key_id
         B2_APPLICATION_KEY:         TF_VAR_b2_application_key
-      unset: [B2_ENDPOINT, B2_BUCKET_NAME]
-    needs-unset:
+{unset_line}    needs-unset:
       include: [FOO]
       unset: [PARENT_LEAK]
 hooks:
@@ -3367,7 +3386,7 @@ hooks:
 
     #[test]
     fn profiles_round_trip_through_load() {
-        let cfg = parse_via_temp(&config_with_profiles_yaml("")).unwrap();
+        let cfg = parse_via_temp(&config_with_profiles_yaml("", true)).unwrap();
         let Some(SecretsConfig::Age { profiles, .. }) = &cfg.secrets else {
             panic!("expected age secrets");
         };
@@ -3521,10 +3540,10 @@ secrets:
       cmd: ["apply"]
       secrets_profile: terraform-backblaze
 "#;
-        // Drop `unset:` from the profile we reference because hooks
-        // can't honor it; this test verifies the happy desugar path.
-        let yaml = config_with_profiles_yaml(hook)
-            .replace("      unset: [B2_ENDPOINT, B2_BUCKET_NAME]\n", "");
+        // The referenced profile must NOT carry an `unset:` line —
+        // hooks can't honor it. This test exercises the happy
+        // desugar path.
+        let yaml = config_with_profiles_yaml(hook, false);
         let cfg = parse_via_temp(&yaml).unwrap();
         let h = &cfg.hooks.pre_deploy[0];
         // After desugar, the field is None — downstream code is
@@ -3565,8 +3584,7 @@ secrets:
       env_from_secrets:
         AWS_ACCESS_KEY_ID: SOMETHING_ELSE
 "#;
-        let yaml = config_with_profiles_yaml(hook)
-            .replace("      unset: [B2_ENDPOINT, B2_BUCKET_NAME]\n", "");
+        let yaml = config_with_profiles_yaml(hook, false);
         let cfg = parse_via_temp(&yaml).unwrap();
         let h = &cfg.hooks.pre_deploy[0];
         // Operator's explicit mapping survives the merge.
@@ -3587,7 +3605,7 @@ secrets:
       cmd: ["apply"]
       secrets_profile: does-not-exist
 "#;
-        let yaml = config_with_profiles_yaml(hook);
+        let yaml = config_with_profiles_yaml(hook, true);
         let err = parse_via_temp(&yaml).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("does-not-exist"), "got: {msg}");
@@ -3603,7 +3621,7 @@ secrets:
       cmd: ["apply"]
       secrets_profile: needs-unset
 "#;
-        let yaml = config_with_profiles_yaml(hook);
+        let yaml = config_with_profiles_yaml(hook, true);
         let err = parse_via_temp(&yaml).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("operator-shell-only"), "got: {msg}");
