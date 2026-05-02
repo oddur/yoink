@@ -215,7 +215,6 @@ impl fmt::Debug for SecretsBundle {
 /// rather than "you legitimately have zero secrets". `provider:
 /// command` returns its own `CommandEmpty` (we have the command
 /// string for the error message); the age path returns `SealedEmpty`.
-#[allow(clippy::large_futures)]
 pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, SecretsError> {
     let Some(cfg) = &config.secrets else {
         return Ok(None);
@@ -288,7 +287,6 @@ fn load_age_bundle(
     Ok(SecretsBundle::new(map))
 }
 
-#[allow(clippy::large_futures)]
 async fn load_command_bundle(
     command: &[String],
     format: SecretsFormat,

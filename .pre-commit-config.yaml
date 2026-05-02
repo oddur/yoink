@@ -1,19 +1,17 @@
+# Local Claude session state is not source-controlled prose; skip
+# whitespace/EOF/JSON-strict checks across that whole subtree.
+exclude: ^\.claude/
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^\.claude/
       - id: end-of-file-fixer
-        exclude: ^\.claude/
       - id: check-toml
       - id: check-merge-conflict
       - id: check-json
-        # Claude session state is not strict JSON.
-        exclude: ^\.claude/
       - id: check-yaml
-        # Fumadocs MDX frontmatter trips the strict YAML parser.
-        exclude: ^docs/content/
 
   - repo: https://github.com/doublify/pre-commit-rust
     rev: v1.0
@@ -21,16 +19,18 @@ repos:
       - id: fmt
         args: ["--all"]
         pass_filenames: false
+      # Workspace clippy is too slow for every commit; runs on push instead.
+      # `cargo check` would be redundant — clippy runs the same frontend.
       - id: clippy
         args: ["--workspace", "--all-targets", "--", "-D", "warnings"]
         pass_filenames: false
-      - id: cargo-check
-        args: ["--workspace", "--all-targets"]
-        pass_filenames: false
+        stages: [pre-push]
 
   - repo: https://github.com/trufflesecurity/trufflehog
     rev: v3.93.0
     hooks:
+      # Pre-push only: `--since-commit HEAD` reads committed history, so a
+      # pre-commit invocation can't see staged content yet.
       - id: trufflehog
         entry: trufflehog git file://. --since-commit HEAD --results=verified --fail --trust-local-git-config
-        stages: [pre-commit, pre-push]
+        stages: [pre-push]
