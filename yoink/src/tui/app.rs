@@ -1478,7 +1478,6 @@ impl App {
     /// don't block startup on it — the column shows `?` for the few
     /// seconds the loader takes, then resolves to ✓/⚠ once the
     /// bundle lands.
-    #[allow(clippy::large_futures)]
     fn spawn_secrets_loader(&self) {
         let config = self.config.clone();
         let slot = self.secrets.clone();
@@ -3196,7 +3195,6 @@ impl App {
     /// land via `Update::Doctor`; the modal renders Loading until
     /// they arrive. Idempotent — re-pressing `D` (or `r` while
     /// open) just kicks off another run.
-    #[allow(clippy::large_futures)]
     fn open_doctor(&mut self) {
         self.doctor.mark_loading();
         let ops = self.ops.clone();
@@ -3216,7 +3214,6 @@ impl App {
     /// services where `service.tag` is absent — otherwise
     /// `compute` would error with `TagMissing`, which is correct
     /// for `yoink up` but useless for "what changed".
-    #[allow(clippy::large_futures)]
     fn open_drift(&mut self, host: Host, service: String) {
         self.drift.set_target(host.clone(), service.clone());
         let ops = self.ops.clone();
