@@ -156,6 +156,17 @@ Fired by `yoink prune` for every removed container.
 | `sha256` | string | Content hash — same as the path under `/var/lib/yoink/files/`. |
 | `remote_path` | string | Absolute path on the host. |
 
+### `WebhookFired`
+
+Forensic. One per outbound webhook attempt, success or failure. Always lands `origin: "operator"` — webhooks fire from the operator's machine.
+
+| field | type | notes |
+|---|---|---|
+| `name` | string | The webhook's `name:` from `yoink.yaml`. |
+| `ok` | bool | `true` only on a 2xx response. |
+| `status` | int \| null | HTTP status code when the response was received; `null` when the call never reached a status (DNS / TCP / TLS / timeout / template error). |
+| `error` | string \| null | Failure reason: `transport: …`, `non-2xx: <code>`, `timed out after <duration>`, `template parse: …`, `template render: …`, or a missing-secret message. `null` when `ok=true`. |
+
 ## Forensic vs. progress
 
 The flush policy is per-variant. **Forensic** events bypass the per-host buffer and SSH-flush immediately, so a `kill -9` mid-deploy still lands them on disk. **Progress** events buffer and flush at end of run.
@@ -171,6 +182,7 @@ The flush policy is per-variant. **Forensic** events bypass the per-host buffer 
 | `ContainerPruned` | `AlreadyAtSpec` |
 | `SecretsRotated` |  |
 | `FileUploaded` |  |
+| `WebhookFired` |  |
 
 ## Storage
 

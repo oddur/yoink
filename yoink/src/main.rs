@@ -1864,6 +1864,26 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         },
     )
     .await;
+    let webhook_http = yoink::webhooks::http_client();
+    let operator_host = run_ctx
+        .actor
+        .split_once('@')
+        .map_or(run_ctx.actor.as_str(), |(_, h)| h)
+        .to_string();
+    let started_ctx = yoink::webhooks::Context::run_started(
+        &run_ctx,
+        &operator_host,
+        selected_service_names.clone(),
+    );
+    yoink::webhooks::dispatch_all(
+        &config.webhooks,
+        &started_ctx,
+        bundle.as_ref(),
+        &webhook_http,
+        &operator_sink,
+        &run_ctx,
+    )
+    .await;
     for host_cfg in &config.hosts {
         let host = Host::from(host_cfg);
         yoink::audit::emit(
@@ -1990,6 +2010,22 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             ok,
             error: err_msg.clone(),
         },
+    )
+    .await;
+    let finished_ctx = yoink::webhooks::Context::run_finished(
+        &run_ctx,
+        &operator_host,
+        selected_service_names.clone(),
+        ok,
+        err_msg.clone(),
+    );
+    yoink::webhooks::dispatch_all(
+        &config.webhooks,
+        &finished_ctx,
+        bundle.as_ref(),
+        &webhook_http,
+        &operator_sink,
+        &run_ctx,
     )
     .await;
     audit_sink.flush().await;

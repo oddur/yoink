@@ -27,3 +27,4 @@ pub mod status;
 pub mod transport;
 pub mod tui;
 pub mod vscode;
+pub mod webhooks;

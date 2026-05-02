@@ -27,6 +27,7 @@
     "multi-host-redis-storage",
     "---Operations---",
     "audit-log",
+    "notify-on-deploy",
     "---Developer Tooling---",
     "vscode"
   ]
