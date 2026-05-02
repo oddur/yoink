@@ -167,6 +167,14 @@ pub enum AuditEventKind {
         sha256: String,
         remote_path: String,
     },
+    /// Outbound webhook attempt. Recorded for every fire, success or
+    /// failure — a failed webhook never aborts the run, only this event.
+    WebhookFired {
+        name: String,
+        ok: bool,
+        status: Option<u16>,
+        error: Option<String>,
+    },
 }
 
 impl AuditEventKind {
@@ -189,6 +197,7 @@ impl AuditEventKind {
                 | AuditEventKind::ContainerPruned { .. }
                 | AuditEventKind::SecretsRotated { .. }
                 | AuditEventKind::FileUploaded { .. }
+                | AuditEventKind::WebhookFired { .. }
         )
     }
 }
@@ -1078,6 +1087,7 @@ pub fn event_name(kind: &AuditEventKind) -> &'static str {
         K::ContainerPruned { .. } => "ContainerPruned",
         K::SecretsRotated { .. } => "SecretsRotated",
         K::FileUploaded { .. } => "FileUploaded",
+        K::WebhookFired { .. } => "WebhookFired",
     }
 }
 
@@ -1180,6 +1190,19 @@ pub fn event_summary(kind: &AuditEventKind) -> String {
             sha256,
             remote_path,
         } => format!("{service} {sha256} → {remote_path}"),
+        K::WebhookFired {
+            name,
+            ok,
+            status,
+            error,
+        } => {
+            if *ok {
+                let s = status.map_or_else(|| "ok".to_string(), |c| format!("{c}"));
+                format!("{name} {s}")
+            } else {
+                format!("{name} FAILED: {}", error.as_deref().unwrap_or(""))
+            }
+        }
     }
 }
 

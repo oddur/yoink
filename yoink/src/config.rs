@@ -89,6 +89,11 @@ pub struct Config {
     pub config_dir: Option<std::path::PathBuf>,
     #[serde(default)]
     pub hooks: HookConfig,
+    /// Outbound HTTP notifications fired on run-level deploy events.
+    /// Operator-side, best-effort: a failed webhook never aborts the
+    /// run, only records a `WebhookFired { ok: false }` audit event.
+    #[serde(default)]
+    pub webhooks: Vec<WebhookSpec>,
 }
 
 /// Defaults that apply across every service. A service can override most
@@ -1183,6 +1188,73 @@ impl HookSpec {
     }
 }
 
+/// One outbound HTTP webhook entry. See `Config::webhooks`.
+///
+/// `url`, every value in `headers`, and `body` are templated at fire
+/// time: literal `${secret:NAME}` placeholders are resolved against the
+/// loaded sealed-secrets bundle first, then the result is rendered
+/// through minijinja with the run/event context.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSpec {
+    pub name: String,
+    pub url: String,
+    /// Which run-level triggers this webhook fires on. Must contain at
+    /// least one entry; a webhook with no triggers would be silently
+    /// dead config and is rejected.
+    pub on: Vec<WebhookTrigger>,
+    #[serde(default)]
+    pub method: HttpMethod,
+    /// Per-request timeout. Defaults to 10s — long enough for a
+    /// healthy receiver, short enough that a wedged receiver can't
+    /// stall the deploy's audit-flush.
+    #[serde(default = "default_webhook_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Request body. `None` means "no body" — appropriate for GET-style
+    /// webhooks (e.g. ntfy.sh URL-only triggers). For POST/PUT, leave
+    /// it `None` only when the receiver genuinely accepts an empty body.
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookTrigger {
+    /// Fired right after the run's `RunStarted` audit event lands.
+    RunStarted,
+    /// Fired when `RunFinished { ok: true }` lands.
+    RunSucceeded,
+    /// Fired when `RunFinished { ok: false }` lands. The deploy error
+    /// message is exposed to the template as `error`.
+    RunFailed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    Get,
+    #[default]
+    Post,
+    Put,
+}
+
+impl HttpMethod {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            HttpMethod::Get => "GET",
+            HttpMethod::Post => "POST",
+            HttpMethod::Put => "PUT",
+        }
+    }
+}
+
+fn default_webhook_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
 fn default_healthcheck_timeout() -> Duration {
     Duration::from_secs(60)
 }
@@ -2119,6 +2191,55 @@ impl Config {
                         hook.name
                     )));
                 }
+            }
+        }
+
+        // Templates are deliberately not parsed here — minijinja errors
+        // surface at fire time as `WebhookFired { ok: false }` so a typo
+        // in one template doesn't gate every deploy.
+        let mut webhook_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (i, wh) in self.webhooks.iter().enumerate() {
+            if wh.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "webhooks[{i}].name must not be empty"
+                )));
+            }
+            if !webhook_names.insert(wh.name.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate webhook name {:?}",
+                    wh.name
+                )));
+            }
+            if wh.url.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "webhook {:?}.url must not be empty",
+                    wh.name
+                )));
+            }
+            // Full URL parsing happens at fire time, after
+            // `${secret:…}` substitution — a sealed value may carry the
+            // scheme/host.
+            if !(wh.url.starts_with("http://")
+                || wh.url.starts_with("https://")
+                || wh.url.contains("${secret:"))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "webhook {:?}.url must be http(s) (got {:?})",
+                    wh.name, wh.url
+                )));
+            }
+            if wh.on.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "webhook {:?}.on must list at least one trigger \
+                     (run_started | run_succeeded | run_failed)",
+                    wh.name
+                )));
+            }
+            if wh.timeout.is_zero() {
+                return Err(ConfigError::Invalid(format!(
+                    "webhook {:?}.timeout must be > 0",
+                    wh.name
+                )));
             }
         }
 

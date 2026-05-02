@@ -18,6 +18,7 @@ Full schema for `yoink.yaml`. Canonical source: [`yoink/src/config.rs`](https://
 | `proxy` | [Proxy](#proxy) | unset | Bundled Caddy reverse proxy. Implicitly enabled when any service has a `domain:` set. |
 | `services` | list of [Service](#service) | `[]` | Services to deploy. Can be defined inline or split via `include:`. |
 | `hooks` | [Hooks](#hooks) | `{}` | Top-level hooks not scoped to a single service. Currently: `pre_deploy:`. |
+| `webhooks` | list of [Webhook](#webhooks) | `[]` | Outbound HTTP notifications fired on run-level events. Operator-side, best-effort. |
 | `include` | list of glob | `[]` | Glob paths (relative to the config file) merged into `services`. |
 
 ## Host
@@ -329,6 +330,32 @@ A hook runs in one of two flavors, distinguished by the presence of `image:`:
 | `secrets` | list of string | `[]` | Secret names exposed as env vars of the same name. Often a different role than the runtime (e.g. a migrate role). |
 | `env_from_secrets` | map of string | `{}` | `ENV_NAME: SECRET_NAME` mapping. |
 | `secrets_profile` | string | unset | Reference a named recipe from `secrets.profiles`. Profile's `include` joins `secrets`; profile's `rename` joins `env_from_secrets`. Profile's `unset:` applies on subprocess hooks (via `Command::env_remove`); rejected on container hooks (no parent env to clear). See [Secrets profiles](#secrets-profiles). |
+
+## Webhooks
+
+Outbound HTTP calls fired on `RunStarted` / `RunFinished`. Operator-side: the request goes from the box running `yoink up`, not from each host. Best-effort: every fire records a `WebhookFired` audit event whose `ok` field carries the outcome; a failure never aborts the deploy. See [Notify chat / paging / observability on deploy](/docs/how-to/notify-on-deploy) for templating, secrets, and worked receiver examples (ntfy, Slack, Grafana).
+
+```yaml
+webhooks:
+  - name: slack-deploys
+    url: "https://hooks.slack.com/${secret:SLACK_WEBHOOK_PATH}"
+    on: [run_succeeded, run_failed]
+    headers:
+      Content-Type: application/json
+    body: '{ "text": "{{ command }} {{ services | join(\", \") }}{% if error %} — {{ error }}{% endif %}" }'
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `name` | string | required | Unique across the `webhooks:` list. Appears in `WebhookFired.name`. |
+| `url` | string | required | Templated. Must resolve to `http(s)://…` after `${secret:NAME}` substitution. |
+| `on` | list of trigger | required | Subset of `run_started`, `run_succeeded`, `run_failed`. At least one entry required. |
+| `method` | `GET` \| `POST` \| `PUT` | `POST` |  |
+| `timeout` | duration | `10s` | `humantime` syntax. |
+| `headers` | map of string | `{}` | Each value templated. |
+| `body` | string | unset | Templated. Omit for GET-style receivers. |
+
+Templating runs in two passes per field: `${secret:NAME}` literal substitution from the sealed bundle, then minijinja rendering with `UndefinedBehavior::Strict`. Available template variables: `event`, `ok`, `command`, `services`, `deploy_id`, `actor`, `host`, `git_sha`, `yoink_version`, `error`, `ts`. See [Notify chat / paging / observability on deploy: Template context](/docs/how-to/notify-on-deploy#template-context) for the full table.
 
 ## Tag overrides at deploy time
 
