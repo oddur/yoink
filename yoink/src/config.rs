@@ -2197,8 +2197,7 @@ impl Config {
         // Templates are deliberately not parsed here — minijinja errors
         // surface at fire time as `WebhookFired { ok: false }` so a typo
         // in one template doesn't gate every deploy.
-        let mut webhook_names: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        let mut webhook_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (i, wh) in self.webhooks.iter().enumerate() {
             if wh.name.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(

@@ -144,10 +144,7 @@ fn strict_env<'a>() -> Environment<'a> {
     env
 }
 
-fn substitute_secrets(
-    input: &str,
-    secrets: Option<&SecretsBundle>,
-) -> Result<String, String> {
+fn substitute_secrets(input: &str, secrets: Option<&SecretsBundle>) -> Result<String, String> {
     const NEEDLE: &str = "${secret:";
     if !input.contains(NEEDLE) {
         return Ok(input.to_string());
@@ -237,8 +234,8 @@ async fn send(
     let url = render_field_with(&env, &spec.url, ctx, secrets)?;
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in &spec.headers {
-        let rendered = render_field_with(&env, v, ctx, secrets)
-            .map_err(|e| format!("header {k:?}: {e}"))?;
+        let rendered =
+            render_field_with(&env, v, ctx, secrets).map_err(|e| format!("header {k:?}: {e}"))?;
         headers.insert(k.clone(), rendered);
     }
     let body = match &spec.body {
