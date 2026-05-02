@@ -74,11 +74,39 @@ Yoink installed, host with Docker + SSH ready? Head to [**Five-minute first depl
 
 ## Upgrading
 
+<Tabs items={["Homebrew", "Cargo", "curl", "Pre-built binary"]}>
+
+  <Tab>
+
 ```sh
-brew upgrade oddur/yoink/yoink              # Homebrew
-cargo install --git https://github.com/oddur/yoink yoink --force   # cargo
-curl -LsSf https://github.com/oddur/yoink/releases/latest/download/yoink-installer.sh | sh   # installer script
+brew upgrade oddur/yoink/yoink
 ```
+
+  </Tab>
+
+  <Tab>
+
+```sh
+cargo install --git https://github.com/oddur/yoink yoink --force
+```
+
+  </Tab>
+
+  <Tab>
+
+```sh
+curl -LsSf https://github.com/oddur/yoink/releases/latest/download/yoink-installer.sh | sh
+```
+
+  </Tab>
+
+  <Tab>
+
+Re-download the `tar.xz` for your platform from the [latest release](https://github.com/oddur/yoink/releases/latest), extract, and overwrite the binary on `$PATH`.
+
+  </Tab>
+
+</Tabs>
 
 Release notes for every version are on the [GitHub releases page](https://github.com/oddur/yoink/releases). Yoink follows SemVer; minor bumps may add new fields but won't break existing `yoink.yaml` configs.
 
