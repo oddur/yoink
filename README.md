@@ -31,6 +31,15 @@ Or `cargo install --git https://github.com/oddur/yoink yoink`. Or curl-pipe-sh: 
 
 See the [install page](https://yoink.is/docs/start/install) for the full list and prerequisites.
 
+## Contributing
+
+```sh
+devbox shell        # rust + tools (pre-commit, trufflehog, …)
+task hooks:install  # wire up pre-commit + pre-push hooks
+task check          # cargo check + fmt + clippy
+task test           # unit + integration (DinD e2e excluded)
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

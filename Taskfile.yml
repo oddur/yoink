@@ -67,3 +67,14 @@ tasks:
     desc: Clean build artifacts
     cmds:
       - cargo clean
+
+  hooks:install:
+    desc: Install git pre-commit + pre-push hooks
+    cmds:
+      - pre-commit install --install-hooks
+      - pre-commit install --install-hooks --hook-type pre-push
+
+  hooks:run:
+    desc: Run all pre-commit hooks against every file
+    cmds:
+      - pre-commit run --all-files

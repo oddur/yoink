@@ -392,7 +392,7 @@ pub fn ssh_keygen_into_bundle(
     if bundle.contains_key(seal_as) {
         return Err(SealedError::SecretAlreadySealed(seal_as.to_string()));
     }
-    bundle.insert(seal_as.to_string(), Zeroizing::new((*priv_pem).to_string()));
+    bundle.insert(seal_as.to_string(), Zeroizing::new((*priv_pem).clone()));
 
     let canonical = render_dotenv(&bundle);
     let sealed_bytes = seal(canonical.as_bytes(), recipients)?;
@@ -940,7 +940,7 @@ BAZ=plain
         write_key_file(&keys, &format!("{public}.key"), &secret);
         let legacy = tmp.path().join("nonexistent-legacy.key");
 
-        let id = load_identity_resolved(None, None, &keys, &legacy, &[public.clone()])
+        let id = load_identity_resolved(None, None, &keys, &legacy, std::slice::from_ref(&public))
             .expect("scan match");
         assert_eq!(id.to_public().to_string(), public);
     }
@@ -1059,7 +1059,7 @@ BAZ=plain
             Some("\t".to_string()),
             &keys,
             &legacy,
-            &[public.clone()],
+            std::slice::from_ref(&public),
         )
         .expect("fallthrough past blank env");
         assert_eq!(id.to_public().to_string(), public);

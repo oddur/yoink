@@ -2714,6 +2714,12 @@ hosts:
     /// See issue #79.
     #[test]
     fn include_glob_resolves_when_config_dir_is_empty() {
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
         let dir = write_temp_tree(&[
             (
                 "yoink.yaml",
@@ -2741,12 +2747,6 @@ services:
         // test must not run alongside others that also tweak cwd —
         // none currently do. RAII guard restores even on panic so a
         // load failure can't leave the test runner with a dangling cwd.
-        struct CwdGuard(std::path::PathBuf);
-        impl Drop for CwdGuard {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.0);
-            }
-        }
         let _guard = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(&dir).unwrap();
         let cfg = Config::load_from_path(std::path::Path::new("yoink.yaml")).unwrap();

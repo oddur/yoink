@@ -101,7 +101,7 @@ If your image is distroless or otherwise has no shell, `!` will fail. **Fall bac
 When the dashboard / host detail / service detail / container detail view shows ⚠ on a row, press **`~`** to open a modal that explains *what* drifted, the same per-field diff `yoink up --plan` produces on the CLI side:
 
 ```
- drift: api on host-a (esc to close) 
+ drift: api on host-a (esc to close)
    image  ghcr.io/me/api  (unchanged)
    spec   a1b2c3d → e5f6a7b
     tag   v1.2.4

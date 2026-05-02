@@ -8,7 +8,9 @@
     "go-task@latest",
     "sccache@latest",
     "hugo@latest",
-    "go@1.23"
+    "go@1.23",
+    "pre-commit@latest",
+    "trufflehog@latest"
   ],
   "shell": {
     "init_hook": [

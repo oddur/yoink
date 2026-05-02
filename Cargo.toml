@@ -29,6 +29,11 @@ missing_panics_doc = "allow"
 # Test fixtures use `r#"..."#` for YAML strings; the hash count
 # uniformity is more readable than per-string trimming.
 needless_raw_string_hashes = "allow"
+# CLI subcommand handlers compose through several `await` points and end
+# up with futures > the pedantic 16 KiB threshold. Each is invoked once
+# per process, so the stack-size concern doesn't apply — boxing every
+# handler would be churn for no real win.
+large_futures = "allow"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
