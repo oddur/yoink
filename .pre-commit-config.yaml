@@ -1,0 +1,41 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^\.claude/
+      - id: end-of-file-fixer
+        exclude: ^\.claude/
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-json
+        # Claude session state is not strict JSON.
+        exclude: ^\.claude/
+      - id: check-yaml
+        # Fumadocs MDX frontmatter trips the strict YAML parser.
+        exclude: ^docs/content/
+
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+        args: ["--all"]
+        pass_filenames: false
+      # Matches CI: warnings are not yet errors. There's a pre-existing
+      # pedantic-lint backlog (audit.rs `many_single_char_names`,
+      # `items_after_statements`, etc.) that the project plans to clear
+      # before tightening to `-D warnings`. Until then, the hook fails
+      # only on actual clippy errors.
+      - id: clippy
+        args: ["--workspace", "--all-targets"]
+        pass_filenames: false
+      - id: cargo-check
+        args: ["--workspace", "--all-targets"]
+        pass_filenames: false
+
+  - repo: https://github.com/trufflesecurity/trufflehog
+    rev: v3.93.0
+    hooks:
+      - id: trufflehog
+        entry: trufflehog git file://. --since-commit HEAD --results=verified --fail --trust-local-git-config
+        stages: [pre-commit, pre-push]
