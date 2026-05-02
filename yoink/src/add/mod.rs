@@ -18,6 +18,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use zeroize::Zeroizing;
 
 use crate::config::{Config, SecretsConfig};
 use crate::sealed;
@@ -409,7 +410,6 @@ fn seal_new_secrets(config: &Config, new_secrets: &[render::RenderedSecret]) -> 
 
     // Merge with existing sealed contents if the file already exists.
     // Try-read directly (avoids a TOCTOU race between exists() and read).
-    use zeroize::Zeroizing;
     let mut values: BTreeMap<String, Zeroizing<String>> = match std::fs::read(&path) {
         Ok(bytes) => {
             let identity = sealed::load_identity(recipients)?;

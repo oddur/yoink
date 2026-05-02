@@ -21,13 +21,8 @@ repos:
       - id: fmt
         args: ["--all"]
         pass_filenames: false
-      # Matches CI: warnings are not yet errors. There's a pre-existing
-      # pedantic-lint backlog (audit.rs `many_single_char_names`,
-      # `items_after_statements`, etc.) that the project plans to clear
-      # before tightening to `-D warnings`. Until then, the hook fails
-      # only on actual clippy errors.
       - id: clippy
-        args: ["--workspace", "--all-targets"]
+        args: ["--workspace", "--all-targets", "--", "-D", "warnings"]
         pass_filenames: false
       - id: cargo-check
         args: ["--workspace", "--all-targets"]

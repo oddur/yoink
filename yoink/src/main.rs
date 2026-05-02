@@ -3377,13 +3377,13 @@ async fn cmd_audit_log(
     // Resolve `ssh_key_secret:` keypair tempfiles only when we'll
     // actually SSH out — `--origin operator` reads the local file
     // and never touches a host, so skip the bundle load entirely.
-    let ops = if origin_filter == Some("operator") {
+    let docker_ops = if origin_filter == Some("operator") {
         None
     } else {
         Some(build_real_ops(config, None).await?)
     };
     let outcome = fetch_events(&hosts, &opts, |h| {
-        ops.as_ref().and_then(|o| o.ssh_keyfile(h))
+        docker_ops.as_ref().and_then(|o| o.ssh_keyfile(h))
     })
     .await;
     for (source, msg) in &outcome.errors {
@@ -5423,6 +5423,10 @@ fn open_in_editor(initial: &str) -> Result<Option<String>> {
 /// from completing its primary operation or cleaning up.
 fn secure_wipe_tempfile(f: &mut tempfile::NamedTempFile) {
     use std::io::{Seek, SeekFrom, Write as _};
+    // Use a fixed-size zero chunk and repeat writes to avoid a u64→usize
+    // truncation on 32-bit targets (secret files are small in practice,
+    // but the cast would be unsound on platforms where usize < u64).
+    const CHUNK: usize = 4096;
     // Obtain file length; bail silently on any error.
     let Ok(meta) = f.as_file().metadata() else {
         return;
@@ -5431,10 +5435,6 @@ fn secure_wipe_tempfile(f: &mut tempfile::NamedTempFile) {
     if file_len == 0 {
         return;
     }
-    // Use a fixed-size zero chunk and repeat writes to avoid a u64→usize
-    // truncation on 32-bit targets (secret files are small in practice,
-    // but the cast would be unsound on platforms where usize < u64).
-    const CHUNK: usize = 4096;
     let zeros = [0u8; CHUNK];
     let file = f.as_file_mut();
     let _ = file.seek(SeekFrom::Start(0));

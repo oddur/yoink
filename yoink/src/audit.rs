@@ -1395,6 +1395,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::many_single_char_names)] // mirrors the variable names in unix_to_components
     fn unix_to_components_known_value() {
         // 1_777_999_321 → 2026-05-05T16:42:01Z. Sanity-check Hinnant.
         let t = 1_777_999_321_u64;

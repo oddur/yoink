@@ -130,11 +130,6 @@ impl LogsState {
         self.wrap = !self.wrap;
     }
 
-    #[cfg(test)]
-    pub fn wrap_enabled(&self) -> bool {
-        self.wrap
-    }
-
     // ─── filter input ──────────────────────────────────────────────────
 
     pub fn input_mode(&self) -> bool {
