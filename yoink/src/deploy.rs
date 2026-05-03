@@ -497,6 +497,34 @@ pub async fn reconcile_with_options(
         }
     }
 
+    // Unconditional Caddy push, after every wave has settled. The
+    // per-service path inside `deploy_to_host` already pushes when
+    // it changes containers; this final push covers the recovery
+    // case where every service is already at spec (full no-op
+    // reconcile) but Caddy's routing table is out of date — e.g.
+    // because a previous run died after replacing containers but
+    // before the in-flight push, leaving the operator with no way
+    // to reach a green state without resorting to `--force` or
+    // bumping a tag. The push is idempotent and cheap, so the
+    // redundant calls in the happy path are fine.
+    //
+    // Only run for proxy-enabled configs, and only against hosts
+    // the proxy service targets. `services_filter` is intentionally
+    // ignored: the operator may have run `yoink up --service web`
+    // on a partially-failed reconcile, and we still want Caddy
+    // resynced to actual on-host state.
+    if crate::proxy::proxy_enabled(config)
+        && let Some(proxy_svc) = config
+            .services
+            .iter()
+            .find(|s| matches!(s.kind, Some(crate::config::ServiceKind::Proxy)))
+    {
+        for host_cfg in proxy_svc.applicable_hosts(&config.hosts) {
+            let host = Host::from(host_cfg);
+            push_caddy_config(ops, &host, config, secrets, None).await?;
+        }
+    }
+
     Ok(reports)
 }
 
