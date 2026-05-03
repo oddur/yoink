@@ -339,13 +339,23 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // Caddy's host-header check by setting Host: yoink-admin
             // on every admin request. The actual routes are pushed
             // via `/load` immediately after the container is healthy.
+            //
+            // `--resume` makes Caddy fall back to its autosaved
+            // runtime config (`/config/caddy/autosave.json` on the
+            // mounted `yoink_caddy_config` volume) when one exists,
+            // ignoring the stdin bootstrap. That's how the site
+            // survives a host reboot: yoink-proxy comes back with
+            // the last-pushed routing table instead of the empty
+            // admin-only bootstrap, even before any operator runs
+            // `yoink up`. On a fresh proxy (no autosave yet) the
+            // bootstrap takes effect as before.
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
             cmd: vec![
                 concat!(
                     "echo '{\"admin\":{\"listen\":\"0.0.0.0:2019\",",
                     "\"enforce_origin\":false,",
                     "\"origins\":[\"yoink-admin\"]}}'",
-                    " | exec caddy run --config /dev/stdin",
+                    " | exec caddy run --config /dev/stdin --resume",
                 )
                 .to_string(),
             ],
