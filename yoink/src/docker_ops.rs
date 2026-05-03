@@ -806,22 +806,14 @@ const HEALTHCHECK_TCP_IMAGE: &str = "busybox:1.37";
 /// next `client_for` call drops it and reconnects.
 ///
 /// Why: bollard's ssh transport spawns a fresh openssh master per
-/// hyper pool entry; over a long TUI session the pool grows and so
-/// does the openssh process / fd footprint. Tailscale SSH server
-/// behavior also changed in recent releases (see 1.94 → 1.96), so
-/// idle ssh-tunnelled sockets go stale faster than the pool reaper
-/// notices, surfacing as `client error (Connect)` on the first call
-/// after a brief idle. Periodic eviction tears down the old hyper
-/// Client (and therefore every openssh master it pooled), bounding
-/// fd usage and the staleness window.
-///
-/// Tuned to be much longer than typical bursty call gaps so an active
-/// `yoink up` reuses the same handle, but short enough that an idle
-/// TUI cycles state in single-digit minutes.
+/// hyper pool entry; over a long session the pool — and the openssh
+/// process / fd footprint — only grows. Periodic eviction tears down
+/// the old hyper Client (and therefore every openssh master it
+/// pooled), bounding fd usage and the staleness window. Long enough
+/// that an active `yoink up` reuses the same handle; short enough
+/// that an idle TUI cycles state in single-digit minutes.
 const CLIENT_MAX_AGE: Duration = Duration::from_secs(120);
 
-/// One bollard `Docker` per host with the time it was created.
-/// Drives `CLIENT_MAX_AGE` eviction in `client_for`.
 struct CachedClient {
     docker: Docker,
     created: Instant,
@@ -869,22 +861,31 @@ impl RealDockerOps {
 
     async fn client_for(&self, host: &Host) -> Result<Docker, DockerError> {
         let key = host.ssh_url();
-        let mut clients = self.clients.lock().await;
-        if let Some(entry) = clients.get(&key) {
-            // Local-socket transport doesn't share the ssh-pool
-            // staleness / fd-leak failure modes — keep its handle for
-            // the whole process lifetime.
-            if host.is_local() || entry.created.elapsed() < CLIENT_MAX_AGE {
-                return Ok(entry.docker.clone());
+
+        // Cache hit: cheap. Local-socket transport doesn't share the
+        // ssh-pool staleness / fd-leak failure modes, so its entry
+        // never ages out.
+        {
+            let mut clients = self.clients.lock().await;
+            if let Some(entry) = clients.get(&key) {
+                if host.is_local() || entry.created.elapsed() < CLIENT_MAX_AGE {
+                    return Ok(entry.docker.clone());
+                }
+                clients.remove(&key);
             }
-            clients.remove(&key);
         }
-        // The magical "local" host (address == "local", no user)
-        // routes to the local docker socket via bollard's
-        // platform-default unix socket / npipe transport. Lets the
-        // operator run yoink against their laptop's docker without
-        // editing yoink.yaml.
+
+        // Cache miss: dial without holding the cache lock so a slow
+        // ssh probe / connect on one host doesn't stall calls to any
+        // other host. Two concurrent cache-miss callers for the same
+        // key may both dial — last writer wins, the loser's `Docker`
+        // drops harmlessly.
         let docker = if host.is_local() {
+            // The magical "local" host (address == "local", no user)
+            // routes to the local docker socket via bollard's
+            // platform-default unix socket / npipe transport. Lets
+            // the operator run yoink against their laptop's docker
+            // without editing yoink.yaml.
             Docker::connect_with_local_defaults().map_err(|source| DockerError::Connect {
                 host: host.address.clone(),
                 source,
@@ -919,8 +920,9 @@ impl RealDockerOps {
                 source,
             })?
         };
-        clients.insert(
-            key.clone(),
+
+        self.clients.lock().await.insert(
+            key,
             CachedClient {
                 docker: docker.clone(),
                 created: Instant::now(),
@@ -940,19 +942,15 @@ impl RealDockerOps {
     /// retry once with a freshly-dialed handle if it fails with a
     /// transport-level error.
     ///
-    /// Why retry: bollard's ssh transport keeps an idle hyper pool
-    /// of openssh-mux'd `docker system dial-stdio` sessions. Tailscale
-    /// SSH on the host (`tailscaled`'s built-in SSH server, not
-    /// OpenSSH) closes idle dial-stdio sessions much sooner than its
-    /// keepalive hints suggest, so any pooled connection that's been
-    /// idle for more than a couple of seconds can produce
-    /// `client error (Connect)` or `connection closed before message
-    /// completed` on first reuse — surfacing as transient red blips
-    /// in the TUI even though the next call would succeed.
-    /// Evicting the cached `Docker` (and therefore its hyper pool +
-    /// underlying ssh master) and dialing fresh papers over the
-    /// stale-pool race transparently. We retry once and only on
-    /// transport errors; real docker API errors propagate as before.
+    /// Why retry: bollard's ssh transport keeps an idle hyper pool of
+    /// openssh-mux'd `docker system dial-stdio` sessions. Pooled
+    /// connections that idle out (server-side timeout, NAT eviction,
+    /// path flap, sleep/wake) surface as `client error (Connect)` or
+    /// `connection closed before message completed` on first reuse,
+    /// even though the next call would succeed. Evicting the cached
+    /// `Docker` (and therefore its hyper pool + underlying ssh
+    /// master) and dialing fresh papers over the race transparently.
+    /// Real Docker API errors propagate as before.
     async fn with_retry<T, F, Fut>(&self, host: &Host, op: F) -> Result<T, DockerError>
     where
         F: Fn(Docker) -> Fut,
@@ -1068,15 +1066,11 @@ impl DockerOps for RealDockerOps {
                     .one_shot(false)
                     .build();
                 let mut stream = docker.stats(name, Some(opts));
-                match stream.next().await {
-                    Some(Ok(s)) => Ok(s),
-                    Some(Err(e)) => Err(e),
-                    None => Err(bollard::errors::Error::IOError {
-                        err: std::io::Error::other("stats stream yielded no item"),
-                    }),
-                }
+                stream.next().await.transpose()
             })
             .await?;
+        let stats =
+            stats.ok_or_else(|| DockerError::Invalid("stats stream yielded no item".into()))?;
         Ok(parse_stats(&stats))
     }
 
