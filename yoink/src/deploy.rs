@@ -753,6 +753,7 @@ async fn prepare_one_host(
     })
 }
 
+#[allow(clippy::too_many_lines)] // single linear finalize flow; same rationale as `reconcile`
 async fn finalize_one_host(
     ops: &dyn DockerOps,
     config: &Config,
