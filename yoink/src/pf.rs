@@ -471,42 +471,25 @@ impl SidecarHandle {
     /// only a best-effort fallback and may not complete if the
     /// tokio runtime is being torn down.
     ///
-    /// Bollard's pooled SSH connection idles out after ~10 seconds —
-    /// when the operator holds a tunnel open longer than that the
-    /// first remove attempt returns a `SendRequest` error from the
-    /// dead connection. We retry once with a tiny backoff so the
-    /// pool reopens transparently. Two failures in a row usually
-    /// mean the host is genuinely unreachable; we log and move on
-    /// so a flaky cleanup doesn't strand the operator's terminal.
+    /// Stale ssh-pool reuse is handled inside `RealDockerOps`
+    /// (`with_retry` reconnects on transport-level errors), so a
+    /// single attempt suffices here. A genuine unreachability we
+    /// log and move on; the container's `auto_remove` flag catches
+    /// up when the host comes back.
     pub async fn close(mut self) {
         if self.cleanup_done {
             return;
         }
-        let mut last_err = None;
-        for attempt in 0..3 {
-            match self
-                .ops
-                .force_remove_container(&self.host, &self.container_name)
-                .await
-            {
-                Ok(()) => {
-                    self.cleanup_done = true;
-                    return;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    if attempt < 2 {
-                        tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
-                    }
-                }
-            }
-        }
-        if let Some(e) = last_err {
+        if let Err(e) = self
+            .ops
+            .force_remove_container(&self.host, &self.container_name)
+            .await
+        {
             tracing::warn!(
                 container = %self.container_name,
                 host = %self.host.address,
                 error = %e,
-                "yoink-pf sidecar close: force-remove failed after 3 attempts; auto_remove on container exit will catch up if the host comes back"
+                "yoink-pf sidecar close: force-remove failed; auto_remove on container exit will catch up if the host comes back"
             );
         }
         self.cleanup_done = true;

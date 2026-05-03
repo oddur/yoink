@@ -37,6 +37,7 @@ humantime = "2"
 humantime-serde = "1"
 ssh-key = { version = "0.6", features = ["ed25519"] }
 indicatif = "0.18"
+libc = "0.2"
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
 ratatui = "0.30"
 throbber-widgets-tui = "0.11"
