@@ -753,6 +753,7 @@ async fn prepare_one_host(
     })
 }
 
+#[allow(clippy::too_many_lines)] // single linear finalize flow; same rationale as `reconcile`
 async fn finalize_one_host(
     ops: &dyn DockerOps,
     config: &Config,
@@ -771,14 +772,25 @@ async fn finalize_one_host(
     let expected_names: std::collections::BTreeSet<String> =
         replicas.iter().map(|r| r.name.clone()).collect();
 
-    // If every replica is already at spec, nothing to do.
+    // No fresh container to start, but a prior partial failure may
+    // have left an old generation running alongside the new — run
+    // orphan cleanup unconditionally so the second reconcile self-heals.
     if replicas.iter().all(|r| r.already_running) {
+        let stopped_old = swap_out_old_containers_by_set(
+            ops,
+            &host,
+            service.run.drain_timeout,
+            &existing,
+            &expected_names,
+            on_event,
+        )
+        .await?;
         let primary = replicas.first().map(|r| r.name.clone()).unwrap_or_default();
         return Ok(HostDeployResult {
             host: host.address,
             container: primary,
             healthcheck_attempts: 0,
-            stopped_old: vec![],
+            stopped_old,
         });
     }
 
