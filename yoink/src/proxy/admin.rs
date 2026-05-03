@@ -69,6 +69,16 @@ pub enum AdminError {
         status: reqwest::StatusCode,
         body: String,
     },
+    /// `/load` returned 200 but reading `/config/...routes/` back yielded
+    /// a different route count. Caught early so a silent under-load
+    /// doesn't end up serving 521 for routes the operator believes are
+    /// up. Triggered today (#88) only by Caddy parser quirks; cheap
+    /// insurance against future shapes of the same bug.
+    #[error(
+        "proxy /load reported success but route count mismatch: \
+         pushed {expected}, daemon reports {actual}"
+    )]
+    LoadVerifyMismatch { expected: usize, actual: usize },
 }
 
 /// Push `config` to the proxy on `host`. Looks up the proxy
@@ -140,8 +150,48 @@ pub async fn push_config(
         let body = redact_pem_blocks(&resp.text().await.unwrap_or_default());
         return Err(AdminError::LoadRejected { status, body });
     }
+
+    // Belt-and-braces: read the route count back from the daemon and
+    // compare. `/load` is synchronous, so a 200 already implies the
+    // config is live — but a future Caddy version that silently
+    // drops routes (or any third-party admin-API shim) would otherwise
+    // leave us claiming success while the proxy serves 5xx for those
+    // domains. Verifying upfront beats discovering it from a Cloudflare
+    // 521 alert.
+    let expected = route_count(config);
+    let actual = read_route_count(&client, tunnel.local_port()).await?;
     drop(tunnel);
+    if expected != actual {
+        return Err(AdminError::LoadVerifyMismatch { expected, actual });
+    }
     Ok(())
+}
+
+fn route_count(config: &Value) -> usize {
+    config
+        .pointer("/apps/http/servers/main/routes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+async fn read_route_count(client: &reqwest::Client, local_port: u16) -> Result<usize, AdminError> {
+    let url = format!("http://127.0.0.1:{local_port}/config/apps/http/servers/main/routes/");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|source| AdminError::Http { source })?;
+    // 404 = no routes object at that pointer (e.g. a config with no
+    // routed services). Treat as zero rather than an error so the
+    // verify step doesn't trip on legitimate empty configs.
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(0);
+    }
+    let routes: Value = resp
+        .json()
+        .await
+        .map_err(|source| AdminError::Http { source })?;
+    Ok(routes.as_array().map_or(0, Vec::len))
 }
 
 const REDACTED_PEM: &str = "<redacted PEM>";
