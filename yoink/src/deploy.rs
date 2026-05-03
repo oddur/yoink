@@ -497,6 +497,24 @@ pub async fn reconcile_with_options(
         }
     }
 
+    // Final unconditional Caddy push: recovers from a prior run that
+    // replaced containers and then died before the in-flight push
+    // (#88), since a follow-up reconcile finds every service already
+    // at spec and otherwise never calls `push_caddy_config`.
+    // `services_filter` is ignored on purpose — a scoped retry like
+    // `yoink up --service web` should still resync Caddy.
+    if crate::proxy::proxy_enabled(config)
+        && let Some(proxy_svc) = config
+            .services
+            .iter()
+            .find(|s| matches!(s.kind, Some(crate::config::ServiceKind::Proxy)))
+    {
+        for host_cfg in proxy_svc.applicable_hosts(&config.hosts) {
+            let host = Host::from(host_cfg);
+            push_caddy_config(ops, &host, config, secrets, None).await?;
+        }
+    }
+
     Ok(reports)
 }
 
