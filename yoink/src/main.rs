@@ -1170,8 +1170,47 @@ fn confirm_destructive(prompt: &str) -> Result<()> {
     Ok(())
 }
 
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit. macOS launches
+/// processes with `maxfiles = 256` by default (see `launchctl limit
+/// maxfiles`), regardless of what the parent shell's `ulimit -n`
+/// reports. yoink can blow through 256 fds in a long TUI session
+/// because bollard's ssh transport keeps an idle hyper pool of
+/// openssh-mux'd `docker system dial-stdio` sessions, plus each long-
+/// lived stream (logs, events) holds its own pool entry. Bumping the
+/// soft limit to the hard limit at startup is the cheap, durable fix
+/// — far simpler than wiring up an alternative transport, and works
+/// regardless of how the binary is launched.
+#[allow(unsafe_code)]
+fn raise_fd_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills `lim` from a kernel-provided value; the
+    // pointer is to a properly-aligned local `rlimit` we own.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) } != 0 {
+        return;
+    }
+    if lim.rlim_cur >= lim.rlim_max {
+        return;
+    }
+    // macOS quirk: `rlim_max` is often `RLIM_INFINITY`, but the kernel
+    // actually caps `setrlimit` to `kern.maxfilesperproc` (~12k–24k).
+    // Try the hard limit first; if that's rejected, fall back to a
+    // generous concrete value.
+    lim.rlim_cur = lim.rlim_max;
+    // SAFETY: pointer is to a local `rlimit` with both fields set.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim) } == 0 {
+        return;
+    }
+    lim.rlim_cur = 65_536;
+    // SAFETY: same as above; final fallback attempt.
+    let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim) };
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    raise_fd_limit();
     let cli = Cli::parse();
     let is_tui = matches!(cli.command, Command::Tui { .. });
     QUIET.store(cli.quiet, std::sync::atomic::Ordering::Relaxed);

@@ -4457,6 +4457,7 @@ dependencies = [
  "humantime-serde",
  "indicatif",
  "insta",
+ "libc",
  "minijinja",
  "pretty_assertions",
  "ratatui",

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bollard::Docker;
@@ -802,11 +802,48 @@ const HEALTHCHECK_CURL_IMAGE: &str = "curlimages/curl:8.10.1";
 /// is ~5 MB and doesn't change per docker host.
 const HEALTHCHECK_TCP_IMAGE: &str = "busybox:1.37";
 
+/// Maximum age of a cached bollard `Docker` handle. Past this, the
+/// next `client_for` call drops it and reconnects.
+///
+/// Why: bollard's ssh transport spawns a fresh openssh master per
+/// hyper pool entry; over a long TUI session the pool grows and so
+/// does the openssh process / fd footprint. Tailscale SSH server
+/// behavior also changed in recent releases (see 1.94 → 1.96), so
+/// idle ssh-tunnelled sockets go stale faster than the pool reaper
+/// notices, surfacing as `client error (Connect)` on the first call
+/// after a brief idle. Periodic eviction tears down the old hyper
+/// Client (and therefore every openssh master it pooled), bounding
+/// fd usage and the staleness window.
+///
+/// Tuned to be much longer than typical bursty call gaps so an active
+/// `yoink up` reuses the same handle, but short enough that an idle
+/// TUI cycles state in single-digit minutes.
+const CLIENT_MAX_AGE: Duration = Duration::from_secs(120);
+
+/// One bollard `Docker` per host with the time it was created.
+/// Drives `CLIENT_MAX_AGE` eviction in `client_for`.
+struct CachedClient {
+    docker: Docker,
+    created: Instant,
+}
+
+/// True if `e` looks like a transport-level failure (stale pooled
+/// connection, link reset, ssh stdio session closed) rather than a
+/// real Docker API error. Used by `with_retry` to decide whether
+/// retrying with a freshly-dialed `Docker` is appropriate.
+fn is_stale_transport(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::HyperLegacyError { .. }
+            | bollard::errors::Error::HyperResponseError { .. }
+    )
+}
+
 /// Real implementation. One `bollard::Docker` per host, cached for the
-/// lifetime of the process.
+/// lifetime of the process (subject to `CLIENT_MAX_AGE` eviction).
 #[derive(Default)]
 pub struct RealDockerOps {
-    clients: tokio::sync::Mutex<HashMap<String, Docker>>,
+    clients: tokio::sync::Mutex<HashMap<String, CachedClient>>,
     timeout_secs: u64,
     /// Per-host private-key tempfiles for hosts declaring
     /// `ssh_key_secret:`. Built by `crate::ssh_keys::prepare` from the
@@ -833,8 +870,14 @@ impl RealDockerOps {
     async fn client_for(&self, host: &Host) -> Result<Docker, DockerError> {
         let key = host.ssh_url();
         let mut clients = self.clients.lock().await;
-        if let Some(c) = clients.get(&key) {
-            return Ok(c.clone());
+        if let Some(entry) = clients.get(&key) {
+            // Local-socket transport doesn't share the ssh-pool
+            // staleness / fd-leak failure modes — keep its handle for
+            // the whole process lifetime.
+            if host.is_local() || entry.created.elapsed() < CLIENT_MAX_AGE {
+                return Ok(entry.docker.clone());
+            }
+            clients.remove(&key);
         }
         // The magical "local" host (address == "local", no user)
         // routes to the local docker socket via bollard's
@@ -876,7 +919,13 @@ impl RealDockerOps {
                 source,
             })?
         };
-        clients.insert(key.clone(), docker.clone());
+        clients.insert(
+            key.clone(),
+            CachedClient {
+                docker: docker.clone(),
+                created: Instant::now(),
+            },
+        );
         Ok(docker)
     }
 
@@ -884,6 +933,45 @@ impl RealDockerOps {
         DockerError::Bollard {
             host: host.address.clone(),
             source,
+        }
+    }
+
+    /// Run `op(docker)` against the cached `Docker` for `host` and
+    /// retry once with a freshly-dialed handle if it fails with a
+    /// transport-level error.
+    ///
+    /// Why retry: bollard's ssh transport keeps an idle hyper pool
+    /// of openssh-mux'd `docker system dial-stdio` sessions. Tailscale
+    /// SSH on the host (`tailscaled`'s built-in SSH server, not
+    /// OpenSSH) closes idle dial-stdio sessions much sooner than its
+    /// keepalive hints suggest, so any pooled connection that's been
+    /// idle for more than a couple of seconds can produce
+    /// `client error (Connect)` or `connection closed before message
+    /// completed` on first reuse — surfacing as transient red blips
+    /// in the TUI even though the next call would succeed.
+    /// Evicting the cached `Docker` (and therefore its hyper pool +
+    /// underlying ssh master) and dialing fresh papers over the
+    /// stale-pool race transparently. We retry once and only on
+    /// transport errors; real docker API errors propagate as before.
+    async fn with_retry<T, F, Fut>(&self, host: &Host, op: F) -> Result<T, DockerError>
+    where
+        F: Fn(Docker) -> Fut,
+        Fut: std::future::Future<Output = Result<T, bollard::errors::Error>>,
+    {
+        let docker = self.client_for(host).await?;
+        match op(docker).await {
+            Ok(v) => Ok(v),
+            Err(e) if is_stale_transport(&e) => {
+                tracing::debug!(
+                    host = %host.address,
+                    error = %e,
+                    "stale docker transport; reconnecting and retrying once",
+                );
+                self.clients.lock().await.remove(&host.ssh_url());
+                let docker = self.client_for(host).await?;
+                op(docker).await.map_err(|s| Self::err(host, s))
+            }
+            Err(e) => Err(Self::err(host, e)),
         }
     }
 
@@ -942,8 +1030,9 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn version(&self, host: &Host) -> Result<DockerVersion, DockerError> {
-        let docker = self.client_for(host).await?;
-        let v = docker.version().await.map_err(|s| Self::err(host, s))?;
+        let v = self
+            .with_retry(host, |docker| async move { docker.version().await })
+            .await?;
         Ok(DockerVersion {
             server_version: v.version,
             api_version: v.api_version,
@@ -953,8 +1042,9 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn host_info(&self, host: &Host) -> Result<HostInfo, DockerError> {
-        let docker = self.client_for(host).await?;
-        let i = docker.info().await.map_err(|s| Self::err(host, s))?;
+        let i = self
+            .with_retry(host, |docker| async move { docker.info().await })
+            .await?;
         Ok(HostInfo {
             n_cpu: i.ncpu,
             mem_total: i.mem_total,
@@ -971,17 +1061,22 @@ impl DockerOps for RealDockerOps {
         host: &Host,
         name: &str,
     ) -> Result<ContainerStats, DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = bollard::query_parameters::StatsOptionsBuilder::new()
-            .stream(false)
-            .one_shot(false)
-            .build();
-        let mut stream = docker.stats(name, Some(opts));
-        let stats = match stream.next().await {
-            Some(Ok(s)) => s,
-            Some(Err(e)) => return Err(Self::err(host, e)),
-            None => return Err(DockerError::Invalid("stats stream yielded no item".into())),
-        };
+        let stats = self
+            .with_retry(host, |docker| async move {
+                let opts = bollard::query_parameters::StatsOptionsBuilder::new()
+                    .stream(false)
+                    .one_shot(false)
+                    .build();
+                let mut stream = docker.stats(name, Some(opts));
+                match stream.next().await {
+                    Some(Ok(s)) => Ok(s),
+                    Some(Err(e)) => Err(e),
+                    None => Err(bollard::errors::Error::IOError {
+                        err: std::io::Error::other("stats stream yielded no item"),
+                    }),
+                }
+            })
+            .await?;
         Ok(parse_stats(&stats))
     }
 
@@ -990,33 +1085,32 @@ impl DockerOps for RealDockerOps {
         host: &Host,
         name: &str,
     ) -> Result<ContainerDetail, DockerError> {
-        let docker = self.client_for(host).await?;
-        let resp = docker
-            .inspect_container(name, None)
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let resp = self
+            .with_retry(host, |docker| async move {
+                docker.inspect_container(name, None).await
+            })
+            .await?;
         Ok(parse_inspect(name, &resp))
     }
 
     async fn ensure_network(&self, host: &Host, network: &str) -> Result<bool, DockerError> {
-        let docker = self.client_for(host).await?;
-        match docker.inspect_network(network, None).await {
-            Ok(_) => Ok(false),
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => {
-                let req = NetworkCreateRequest {
-                    name: network.to_string(),
-                    ..Default::default()
-                };
-                docker
-                    .create_network(req)
-                    .await
-                    .map_err(|s| Self::err(host, s))?;
-                Ok(true)
+        self.with_retry(host, |docker| async move {
+            match docker.inspect_network(network, None).await {
+                Ok(_) => Ok(false),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {
+                    let req = NetworkCreateRequest {
+                        name: network.to_string(),
+                        ..Default::default()
+                    };
+                    docker.create_network(req).await?;
+                    Ok(true)
+                }
+                Err(other) => Err(other),
             }
-            Err(other) => Err(Self::err(host, other)),
-        }
+        })
+        .await
     }
 
     async fn connect_container_network(
@@ -1026,35 +1120,39 @@ impl DockerOps for RealDockerOps {
         network: &str,
         aliases: &[String],
     ) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        let req = bollard::models::NetworkConnectRequest {
-            container: container.to_string(),
-            endpoint_config: Some(bollard::models::EndpointSettings {
-                aliases: if aliases.is_empty() {
-                    None
-                } else {
-                    Some(aliases.to_vec())
-                },
-                ..Default::default()
-            }),
-        };
-        match docker.connect_network(network, req).await {
-            // 403 = "endpoint already exists in network" — already
-            // connected, treat as success.
-            Ok(())
-            | Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 403, ..
-            }) => Ok(()),
-            Err(other) => Err(Self::err(host, other)),
-        }
+        self.with_retry(host, |docker| async move {
+            let req = bollard::models::NetworkConnectRequest {
+                container: container.to_string(),
+                endpoint_config: Some(bollard::models::EndpointSettings {
+                    aliases: if aliases.is_empty() {
+                        None
+                    } else {
+                        Some(aliases.to_vec())
+                    },
+                    ..Default::default()
+                }),
+            };
+            match docker.connect_network(network, req).await {
+                // 403 = "endpoint already exists in network" — already
+                // connected, treat as success.
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
     }
 
     async fn list_networks(&self, host: &Host) -> Result<Vec<NetworkInfo>, DockerError> {
-        let docker = self.client_for(host).await?;
-        let nets = docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let nets = self
+            .with_retry(host, |docker| async move {
+                docker
+                    .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+                    .await
+            })
+            .await?;
         Ok(nets
             .into_iter()
             .map(|n| NetworkInfo {
@@ -1073,11 +1171,13 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn list_volumes(&self, host: &Host) -> Result<Vec<VolumeInfo>, DockerError> {
-        let docker = self.client_for(host).await?;
-        let resp = docker
-            .list_volumes(None::<bollard::query_parameters::ListVolumesOptions>)
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let resp = self
+            .with_retry(host, |docker| async move {
+                docker
+                    .list_volumes(None::<bollard::query_parameters::ListVolumesOptions>)
+                    .await
+            })
+            .await?;
         Ok(resp
             .volumes
             .unwrap_or_default()
@@ -1093,14 +1193,14 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn list_images(&self, host: &Host) -> Result<Vec<ImageInfo>, DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = bollard::query_parameters::ListImagesOptionsBuilder::new()
-            .all(false)
-            .build();
-        let images = docker
-            .list_images(Some(opts))
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let images = self
+            .with_retry(host, |docker| async move {
+                let opts = bollard::query_parameters::ListImagesOptionsBuilder::new()
+                    .all(false)
+                    .build();
+                docker.list_images(Some(opts)).await
+            })
+            .await?;
         Ok(images
             .into_iter()
             .map(|img| {
@@ -1125,19 +1225,21 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn remove_image(&self, host: &Host, name: &str, force: bool) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = bollard::query_parameters::RemoveImageOptionsBuilder::new()
-            .force(force)
-            .noprune(false)
-            .build();
-        // 404 is idempotent: image already gone.
-        match docker.remove_image(name, Some(opts), None).await {
-            Ok(_)
-            | Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Ok(()),
-            Err(other) => Err(Self::err(host, other)),
-        }
+        self.with_retry(host, |docker| async move {
+            let opts = bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                .force(force)
+                .noprune(false)
+                .build();
+            // 404 is idempotent: image already gone.
+            match docker.remove_image(name, Some(opts), None).await {
+                Ok(_)
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
     }
 
     async fn prune_images(
@@ -1145,21 +1247,21 @@ impl DockerOps for RealDockerOps {
         host: &Host,
         dangling_only: bool,
     ) -> Result<PruneReport, DockerError> {
-        let docker = self.client_for(host).await?;
-        // `dangling=true` → only `<none>` images. `dangling=false` →
-        // every image with no live container reference (matches `-a`).
-        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-        filters.insert(
-            "dangling".to_string(),
-            vec![if dangling_only { "true" } else { "false" }.to_string()],
-        );
-        let opts = bollard::query_parameters::PruneImagesOptionsBuilder::new()
-            .filters(&filters)
-            .build();
-        let resp = docker
-            .prune_images(Some(opts))
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let resp = self
+            .with_retry(host, |docker| async move {
+                // `dangling=true` → only `<none>` images. `dangling=false` →
+                // every image with no live container reference (matches `-a`).
+                let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+                filters.insert(
+                    "dangling".to_string(),
+                    vec![if dangling_only { "true" } else { "false" }.to_string()],
+                );
+                let opts = bollard::query_parameters::PruneImagesOptionsBuilder::new()
+                    .filters(&filters)
+                    .build();
+                docker.prune_images(Some(opts)).await
+            })
+            .await?;
         let reclaimed = resp
             .images_deleted
             .unwrap_or_default()
@@ -1173,25 +1275,29 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn remove_volume(&self, host: &Host, name: &str, force: bool) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = bollard::query_parameters::RemoveVolumeOptionsBuilder::new()
-            .force(force)
-            .build();
-        match docker.remove_volume(name, Some(opts)).await {
-            Ok(())
-            | Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Ok(()),
-            Err(other) => Err(Self::err(host, other)),
-        }
+        self.with_retry(host, |docker| async move {
+            let opts = bollard::query_parameters::RemoveVolumeOptionsBuilder::new()
+                .force(force)
+                .build();
+            match docker.remove_volume(name, Some(opts)).await {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
     }
 
     async fn prune_volumes(&self, host: &Host) -> Result<PruneReport, DockerError> {
-        let docker = self.client_for(host).await?;
-        let resp = docker
-            .prune_volumes(None::<bollard::query_parameters::PruneVolumesOptions>)
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let resp = self
+            .with_retry(host, |docker| async move {
+                docker
+                    .prune_volumes(None::<bollard::query_parameters::PruneVolumesOptions>)
+                    .await
+            })
+            .await?;
         Ok(PruneReport {
             reclaimed: resp.volumes_deleted.unwrap_or_default(),
             space_reclaimed_bytes: resp.space_reclaimed.unwrap_or(0),
@@ -1199,22 +1305,26 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn remove_network(&self, host: &Host, name: &str) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        match docker.remove_network(name).await {
-            Ok(())
-            | Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Ok(()),
-            Err(other) => Err(Self::err(host, other)),
-        }
+        self.with_retry(host, |docker| async move {
+            match docker.remove_network(name).await {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
     }
 
     async fn prune_networks(&self, host: &Host) -> Result<PruneReport, DockerError> {
-        let docker = self.client_for(host).await?;
-        let resp = docker
-            .prune_networks(None::<bollard::query_parameters::PruneNetworksOptions>)
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let resp = self
+            .with_retry(host, |docker| async move {
+                docker
+                    .prune_networks(None::<bollard::query_parameters::PruneNetworksOptions>)
+                    .await
+            })
+            .await?;
         Ok(PruneReport {
             reclaimed: resp.networks_deleted.unwrap_or_default(),
             space_reclaimed_bytes: 0,
@@ -1227,25 +1337,24 @@ impl DockerOps for RealDockerOps {
         name: &str,
         drain: Duration,
     ) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = bollard::query_parameters::RestartContainerOptionsBuilder::new()
-            .t(i32::try_from(drain.as_secs()).unwrap_or(i32::MAX))
-            .build();
-        docker
-            .restart_container(name, Some(opts))
-            .await
-            .map_err(|s| Self::err(host, s))
+        self.with_retry(host, |docker| async move {
+            let opts = bollard::query_parameters::RestartContainerOptionsBuilder::new()
+                .t(i32::try_from(drain.as_secs()).unwrap_or(i32::MAX))
+                .build();
+            docker.restart_container(name, Some(opts)).await
+        })
+        .await
     }
 
     async fn top_container(&self, host: &Host, name: &str) -> Result<ProcessTable, DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = bollard::query_parameters::TopOptionsBuilder::new()
-            .ps_args("-ef")
-            .build();
-        let resp = docker
-            .top_processes(name, Some(opts))
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let resp = self
+            .with_retry(host, |docker| async move {
+                let opts = bollard::query_parameters::TopOptionsBuilder::new()
+                    .ps_args("-ef")
+                    .build();
+                docker.top_processes(name, Some(opts)).await
+            })
+            .await?;
         Ok(ProcessTable {
             titles: resp.titles.unwrap_or_default(),
             processes: resp.processes.unwrap_or_default(),
@@ -1295,21 +1404,27 @@ impl DockerOps for RealDockerOps {
         image: &str,
         tag: &str,
     ) -> Result<bool, DockerError> {
-        let docker = self.client_for(host).await?;
         let reference = crate::docker::image_reference(image, tag);
-        match docker.inspect_image(&reference).await {
-            Ok(_) => Ok(true),
-            // bollard surfaces "no such image" as DockerResponseServerError
-            // with status 404. Anything else is a real error worth
-            // surfacing — but for an "is it cached" check, treating ALL
-            // errors as "not present" is also safe (worst case: we
-            // re-pull, which is the existing behavior). Pick the safe
-            // form so a flaky daemon doesn't hide pull failures.
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Ok(false),
-            Err(source) => Err(Self::err(host, source)),
-        }
+        self.with_retry(host, |docker| {
+            let reference = reference.clone();
+            async move {
+                match docker.inspect_image(&reference).await {
+                    Ok(_) => Ok(true),
+                    // bollard surfaces "no such image" as DockerResponseServerError
+                    // with status 404. Anything else is a real error worth
+                    // surfacing — but for an "is it cached" check, treating ALL
+                    // errors as "not present" is also safe (worst case: we
+                    // re-pull, which is the existing behavior). Pick the safe
+                    // form so a flaky daemon doesn't hide pull failures.
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => Ok(false),
+                    Err(source) => Err(source),
+                }
+            }
+        })
+        .await
     }
 
     async fn load_image(&self, host: &Host, body: ImageTarStream) -> Result<(), DockerError> {
@@ -1391,17 +1506,17 @@ impl DockerOps for RealDockerOps {
         host: &Host,
         label: &str,
     ) -> Result<Vec<ContainerInfo>, DockerError> {
-        let docker = self.client_for(host).await?;
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![label.to_string()]);
-        let opts = ListContainersOptionsBuilder::new()
-            .all(true)
-            .filters(&filters)
-            .build();
-        let summaries = docker
-            .list_containers(Some(opts))
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let summaries = self
+            .with_retry(host, |docker| async move {
+                let mut filters = HashMap::new();
+                filters.insert("label".to_string(), vec![label.to_string()]);
+                let opts = ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&filters)
+                    .build();
+                docker.list_containers(Some(opts)).await
+            })
+            .await?;
         Ok(summaries
             .into_iter()
             .map(|s| ContainerInfo::from_summary(&host.address, s))
@@ -1412,17 +1527,17 @@ impl DockerOps for RealDockerOps {
         &self,
         host: &Host,
     ) -> Result<Vec<ContainerInfo>, DockerError> {
-        let docker = self.client_for(host).await?;
-        let mut filters = HashMap::new();
-        filters.insert("status".to_string(), vec!["running".to_string()]);
-        let opts = ListContainersOptionsBuilder::new()
-            .all(false)
-            .filters(&filters)
-            .build();
-        let summaries = docker
-            .list_containers(Some(opts))
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let summaries = self
+            .with_retry(host, |docker| async move {
+                let mut filters = HashMap::new();
+                filters.insert("status".to_string(), vec!["running".to_string()]);
+                let opts = ListContainersOptionsBuilder::new()
+                    .all(false)
+                    .filters(&filters)
+                    .build();
+                docker.list_containers(Some(opts)).await
+            })
+            .await?;
         Ok(summaries
             .into_iter()
             .map(|s| ContainerInfo::from_summary(&host.address, s))
@@ -1435,21 +1550,23 @@ impl DockerOps for RealDockerOps {
         name: &str,
         body: ContainerCreateBody,
     ) -> Result<String, DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = CreateContainerOptionsBuilder::new().name(name).build();
-        let resp = docker
-            .create_container(Some(opts), body)
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let resp = self
+            .with_retry(host, |docker| {
+                let body = body.clone();
+                async move {
+                    let opts = CreateContainerOptionsBuilder::new().name(name).build();
+                    docker.create_container(Some(opts), body).await
+                }
+            })
+            .await?;
         Ok(resp.id)
     }
 
     async fn start_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        docker
-            .start_container(name, None)
-            .await
-            .map_err(|s| Self::err(host, s))
+        self.with_retry(host, |docker| async move {
+            docker.start_container(name, None).await
+        })
+        .await
     }
 
     async fn stop_container(
@@ -1458,40 +1575,43 @@ impl DockerOps for RealDockerOps {
         name: &str,
         drain: Duration,
     ) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = StopContainerOptionsBuilder::new()
-            .t(i32::try_from(drain.as_secs()).unwrap_or(i32::MAX))
-            .build();
-        docker
-            .stop_container(name, Some(opts))
-            .await
-            .map_err(|s| Self::err(host, s))
+        self.with_retry(host, |docker| async move {
+            let opts = StopContainerOptionsBuilder::new()
+                .t(i32::try_from(drain.as_secs()).unwrap_or(i32::MAX))
+                .build();
+            docker.stop_container(name, Some(opts)).await
+        })
+        .await
     }
 
     async fn force_remove_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = RemoveContainerOptionsBuilder::new().force(true).build();
-        // 404 = container didn't exist, treat as idempotent success.
-        match docker.remove_container(name, Some(opts)).await {
-            Ok(())
-            | Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Ok(()),
-            Err(other) => Err(Self::err(host, other)),
-        }
+        self.with_retry(host, |docker| async move {
+            let opts = RemoveContainerOptionsBuilder::new().force(true).build();
+            // 404 = container didn't exist, treat as idempotent success.
+            match docker.remove_container(name, Some(opts)).await {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
     }
 
     async fn kill_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        // Default signal is SIGKILL — that's exactly what we want here.
-        match docker.kill_container(name, None).await {
-            Ok(())
-            // 409 = "container not running"; treat as idempotent.
-            | Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 409, ..
-            }) => Ok(()),
-            Err(other) => Err(Self::err(host, other)),
-        }
+        self.with_retry(host, |docker| async move {
+            // Default signal is SIGKILL — that's exactly what we want here.
+            match docker.kill_container(name, None).await {
+                Ok(())
+                // 409 = "container not running"; treat as idempotent.
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
     }
 
     async fn healthcheck(
@@ -1681,17 +1801,18 @@ impl DockerOps for RealDockerOps {
         rows: u16,
         cols: u16,
     ) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        docker
-            .resize_exec(
-                exec_id,
-                bollard::exec::ResizeExecOptions {
-                    height: rows,
-                    width: cols,
-                },
-            )
-            .await
-            .map_err(|s| Self::err(host, s))
+        self.with_retry(host, |docker| async move {
+            docker
+                .resize_exec(
+                    exec_id,
+                    bollard::exec::ResizeExecOptions {
+                        height: rows,
+                        width: cols,
+                    },
+                )
+                .await
+        })
+        .await
     }
 
     async fn resize_container_tty(
@@ -1701,15 +1822,14 @@ impl DockerOps for RealDockerOps {
         rows: u16,
         cols: u16,
     ) -> Result<(), DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = bollard::query_parameters::ResizeContainerTTYOptionsBuilder::default()
-            .h(i32::from(rows))
-            .w(i32::from(cols))
-            .build();
-        docker
-            .resize_container_tty(container, opts)
-            .await
-            .map_err(|s| Self::err(host, s))
+        self.with_retry(host, |docker| async move {
+            let opts = bollard::query_parameters::ResizeContainerTTYOptionsBuilder::default()
+                .h(i32::from(rows))
+                .w(i32::from(cols))
+                .build();
+            docker.resize_container_tty(container, opts).await
+        })
+        .await
     }
 
     async fn start_debug_sidecar(
@@ -1876,30 +1996,28 @@ impl DockerOps for RealDockerOps {
         name: &str,
         lines: u32,
     ) -> Result<Vec<String>, DockerError> {
-        let docker = self.client_for(host).await?;
-        let opts = LogsOptionsBuilder::new()
-            .stdout(true)
-            .stderr(true)
-            .follow(false)
-            .tail(&lines.to_string())
-            .build();
-        let mut stream = docker.logs(name, Some(opts));
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(log) => {
-                    let bytes = match log {
-                        bollard::container::LogOutput::StdOut { message }
-                        | bollard::container::LogOutput::StdErr { message }
-                        | bollard::container::LogOutput::Console { message }
-                        | bollard::container::LogOutput::StdIn { message } => message,
-                    };
-                    out.push(String::from_utf8_lossy(&bytes).into_owned());
-                }
-                Err(e) => return Err(Self::err(host, e)),
+        self.with_retry(host, |docker| async move {
+            let opts = LogsOptionsBuilder::new()
+                .stdout(true)
+                .stderr(true)
+                .follow(false)
+                .tail(&lines.to_string())
+                .build();
+            let mut stream = docker.logs(name, Some(opts));
+            let mut out = Vec::new();
+            while let Some(item) = stream.next().await {
+                let log = item?;
+                let bytes = match log {
+                    bollard::container::LogOutput::StdOut { message }
+                    | bollard::container::LogOutput::StdErr { message }
+                    | bollard::container::LogOutput::Console { message }
+                    | bollard::container::LogOutput::StdIn { message } => message,
+                };
+                out.push(String::from_utf8_lossy(&bytes).into_owned());
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
+        .await
     }
 
     async fn run_one_shot(
