@@ -582,6 +582,10 @@ async fn append_to_operator_log(line: &str) -> std::io::Result<()> {
         .await?;
     let payload = format!("{line}\n");
     f.write_all(payload.as_bytes()).await?;
+    // Audit is best-effort, but the on-host SSH path is atomic via
+    // `cat >> file` in a single shell — match that durability on the
+    // operator side so a SIGKILL or panic doesn't lose the tail.
+    f.sync_all().await?;
     if let Ok(meta) = f.metadata().await
         && meta.len() > ROTATE_BYTES
     {
