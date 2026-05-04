@@ -84,7 +84,41 @@ pub enum AdminError {
 /// Push `config` to the proxy on `host`. Looks up the proxy
 /// container's host-side admin port, opens an SSH tunnel to host
 /// loopback at that port, POSTs to `/load`, drops the tunnel.
+///
+/// Retries once on transport-class failures (tunnel didn't come up,
+/// readiness probe timed out, or `reqwest` errored mid-request) —
+/// each ssh tunnel is short-lived and CI environments occasionally
+/// see one drop between the readiness probe and the actual `/load`,
+/// surfacing as `error sending request`. Real Caddy errors
+/// (`LoadRejected`, `LoadVerifyMismatch`) propagate immediately
+/// without a retry.
 pub async fn push_config(
+    host: &Host,
+    ops: &dyn DockerOps,
+    config: &Value,
+) -> Result<(), AdminError> {
+    match push_config_once(host, ops, config).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_transient(&e) => {
+            tracing::debug!(
+                host = %host.address,
+                error = %e,
+                "transient proxy admin push error; reopening tunnel and retrying once",
+            );
+            push_config_once(host, ops, config).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn is_transient(e: &AdminError) -> bool {
+    matches!(
+        e,
+        AdminError::Tunnel(_) | AdminError::NotReady { .. } | AdminError::Http { .. }
+    )
+}
+
+async fn push_config_once(
     host: &Host,
     ops: &dyn DockerOps,
     config: &Value,
