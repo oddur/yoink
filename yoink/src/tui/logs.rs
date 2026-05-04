@@ -18,6 +18,66 @@ use super::ui::{FilterState, bold, pane_layout};
 
 const LINE_LIMIT: usize = 5_000;
 
+/// Log-level filter passed to `hl --level <LEVEL>` (level >= floor).
+/// Mirrors hl's accepted values exactly so we don't need to translate.
+/// `All` is the no-op default (no `--level` flag passed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogLevel {
+    #[default]
+    All,
+    Trace,
+    Debug,
+    Info,
+    Warning,
+    Error,
+}
+
+impl LogLevel {
+    /// Cycle in increasing-strictness order:
+    /// `All → Trace → Debug → Info → Warning → Error → All`. Pressing
+    /// the level key repeatedly walks through the same set the user
+    /// would write on the CLI, ending back at `All` so the binding is
+    /// reversible without a separate "decrease" key.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Trace,
+            Self::Trace => Self::Debug,
+            Self::Debug => Self::Info,
+            Self::Info => Self::Warning,
+            Self::Warning => Self::Error,
+            Self::Error => Self::All,
+        }
+    }
+
+    /// Value to pass to `hl --level=<X>`. `None` means "don't pass
+    /// the flag" — hl's default shows everything.
+    #[must_use]
+    pub fn hl_arg(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Trace => Some("trace"),
+            Self::Debug => Some("debug"),
+            Self::Info => Some("info"),
+            Self::Warning => Some("warning"),
+            Self::Error => Some("error"),
+        }
+    }
+
+    /// Compact label for the header: `all|trace|debug|info|warn|error`.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warning => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct LogsState {
     lines: Vec<RenderedLine>,
@@ -32,6 +92,10 @@ pub struct LogsState {
     filter: FilterState,
     /// Toggled by 'w'. Wraps long lines instead of truncating.
     wrap: bool,
+    /// Cycled by 'L'. Drives the `--level=<X>` flag yoink passes to
+    /// the per-container `hl` children. Stored on the state so the
+    /// label is rendered alongside the filter status.
+    level: LogLevel,
 }
 
 /// One line in the buffer. `plain` is what the filter matches against;
@@ -130,6 +194,22 @@ impl LogsState {
         self.wrap = !self.wrap;
     }
 
+    /// Step the level filter forward and clear the buffer — the
+    /// existing lines were rendered by the previous `hl` instances
+    /// without the new filter, so keeping them around would be
+    /// misleading. Caller is responsible for restarting the streams
+    /// so each container's `hl` child gets re-spawned with the new
+    /// `--level` arg.
+    pub fn cycle_level(&mut self) {
+        self.level = self.level.next();
+        self.clear();
+    }
+
+    #[must_use]
+    pub fn level(&self) -> LogLevel {
+        self.level
+    }
+
     // ─── filter input ──────────────────────────────────────────────────
 
     pub fn input_mode(&self) -> bool {
@@ -195,11 +275,12 @@ impl LogsState {
             .collect::<Vec<_>>()
             .join(",");
         let header_text = format!(
-            "yoink logs · services: {services} · {} lines{} · {}",
+            "yoink logs · services: {services} · {} lines · level: {}{} · {}",
             total,
+            self.level.label(),
             self.filter
                 .current()
-                .map(|f| format!(" (filter: {f})"))
+                .map(|f| format!(" · filter: {f}"))
                 .unwrap_or_default(),
             if self.auto_follow { "follow" } else { "paused" },
         );
@@ -241,7 +322,8 @@ impl LogsState {
 
         let wrap_hint = if self.wrap { "w wrap*" } else { "w wrap" };
         let default_help = format!(
-            "q quit · k clear · / filter · ↑↓ scroll · g top · G bottom · {wrap_hint} · d dashboard · h hosts",
+            "q quit · k clear · / filter · L level ({}) · ↑↓ scroll · g top · G bottom · {wrap_hint} · d dashboard · h hosts",
+            self.level.label(),
         );
         frame.render_widget(
             super::ui::filter_footer(&self.filter, &default_help),
@@ -353,6 +435,43 @@ mod tests {
         s.filter_cancel();
         assert!(!s.input_mode());
         assert_eq!(s.current_filter(), None);
+    }
+
+    #[test]
+    fn level_cycle_walks_full_set_and_loops() {
+        let mut s = LogsState::new();
+        assert_eq!(s.level(), LogLevel::All);
+        let order = [
+            LogLevel::Trace,
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warning,
+            LogLevel::Error,
+            LogLevel::All,
+        ];
+        for expected in order {
+            s.cycle_level();
+            assert_eq!(s.level(), expected);
+        }
+    }
+
+    #[test]
+    fn level_hl_arg_emits_none_for_all_some_for_others() {
+        assert_eq!(LogLevel::All.hl_arg(), None);
+        assert_eq!(LogLevel::Trace.hl_arg(), Some("trace"));
+        assert_eq!(LogLevel::Debug.hl_arg(), Some("debug"));
+        assert_eq!(LogLevel::Info.hl_arg(), Some("info"));
+        assert_eq!(LogLevel::Warning.hl_arg(), Some("warning"));
+        assert_eq!(LogLevel::Error.hl_arg(), Some("error"));
+    }
+
+    #[test]
+    fn level_cycle_clears_buffer() {
+        let mut s = LogsState::new();
+        s.push_line(&line("c", LogStream::Stdout, "hi"));
+        assert_eq!(s.lines.len(), 1);
+        s.cycle_level();
+        assert!(s.lines.is_empty(), "cycling level must clear stale lines");
     }
 
     #[test]
