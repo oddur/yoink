@@ -1098,8 +1098,17 @@ impl DockerOps for RealDockerOps {
                         name: network.to_string(),
                         ..Default::default()
                     };
-                    docker.create_network(req).await?;
-                    Ok(true)
+                    match docker.create_network(req).await {
+                        Ok(_) => Ok(true),
+                        // Concurrent operator created the same network
+                        // between our 404 and our create. Idempotent —
+                        // someone else already did the work.
+                        Err(bollard::errors::Error::DockerResponseServerError {
+                            status_code: 409,
+                            ..
+                        }) => Ok(false),
+                        Err(other) => Err(other),
+                    }
                 }
                 Err(other) => Err(other),
             }
