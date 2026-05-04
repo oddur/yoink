@@ -3,7 +3,7 @@ resolver = "3"
 members = ["yoink"]
 
 [workspace.package]
-version = "0.20.6"
+version = "0.20.7"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
