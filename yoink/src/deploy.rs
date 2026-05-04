@@ -753,6 +753,27 @@ async fn prepare_one_host(
     })
 }
 
+/// Connect `name` to every network in `effective` past the first
+/// (the first is set at container create time). Same alias set on
+/// every network so callers always reach the container by name.
+async fn attach_extra_networks(
+    ops: &dyn DockerOps,
+    host: &Host,
+    name: &str,
+    effective: &[String],
+    aliases: &[String],
+) -> Result<(), DeployError> {
+    for net in effective.iter().skip(1) {
+        ops.connect_container_network(host, name, net, aliases)
+            .await
+            .map_err(|source| DeployError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // single linear finalize flow; same rationale as `reconcile`
 async fn finalize_one_host(
     ops: &dyn DockerOps,
@@ -827,16 +848,20 @@ async fn finalize_one_host(
         // endpoint at create time. Connect each additional network
         // explicitly post-start, with the same alias set so the
         // container resolves by name on every network.
+        //
+        // If any attach fails partway, the container is *running*
+        // with the right name + spec_hash but is half-networked.
+        // `service_already_at_spec` only checks name/hash/running,
+        // so the next reconcile would short-circuit and leave the
+        // container half-networked forever. Force-remove on failure
+        // so the next reconcile re-creates from scratch.
         let effective = service.effective_networks(&config.deploy);
         let mut aliases = vec![replica.name.clone()];
         aliases.extend(service.run.options.network_aliases.iter().cloned());
-        for net in effective.iter().skip(1) {
-            ops.connect_container_network(&host, &replica.name, net, &aliases)
-                .await
-                .map_err(|source| DeployError::Docker {
-                    host: host.address.clone(),
-                    source,
-                })?;
+        if let Err(e) = attach_extra_networks(ops, &host, &replica.name, &effective, &aliases).await
+        {
+            let _ = ops.force_remove_container(&host, &replica.name).await;
+            return Err(e);
         }
         on_event(DeployEvent::ContainerStarted {
             host: host.address.clone(),
