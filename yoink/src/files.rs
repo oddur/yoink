@@ -9,9 +9,11 @@
 //! flows through to a redeploy via the spec hash.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::docker_ops::Host;
@@ -81,9 +83,17 @@ impl FileMount {
         })
     }
 
-    /// SHA-256 of the file's bytes — feeds the spec hash so that a
+    /// Read the file's bytes once and return them alongside their
+    /// SHA-256 hex digest. The hash feeds the spec hash so that a
     /// content change triggers a redeploy without a tag bump.
-    pub fn content_hash(&self) -> Result<String, FileError> {
+    ///
+    /// Returning the bytes (rather than re-reading at upload time)
+    /// closes a TOCTOU window: if the operator edits the file
+    /// between hash-compute and scp, the spec-hash references one
+    /// byte stream and the host receives another, then the next
+    /// reconcile sees matching `yoink.spec_hash` and silently keeps
+    /// the stale-on-disk content. Reading once eliminates the gap.
+    pub fn read_and_hash(&self) -> Result<(Vec<u8>, String), FileError> {
         let bytes = std::fs::read(&self.local).map_err(|source| FileError::LocalRead {
             path: self.local.display().to_string(),
             source,
@@ -91,7 +101,7 @@ impl FileMount {
         let mut h = Sha256::new();
         h.update(&bytes);
         let digest = h.finalize();
-        Ok(hex(&digest[..]))
+        Ok((bytes, hex(&digest[..])))
     }
 
     /// `/var/lib/yoink/files/<sha256>-<basename>`. Idempotent: same
@@ -120,56 +130,67 @@ impl FileMount {
     }
 }
 
-/// Upload a single `FileMount` to the target host. Idempotent — if a
-/// file with the same content hash already exists at the staging path
-/// we skip the scp.
-pub async fn upload(host: &Host, mount: &FileMount, content_hash: &str) -> Result<(), FileError> {
+/// Upload a single `FileMount` to the target host. Idempotent — the
+/// staging path is content-addressed, so re-uploads of the same bytes
+/// land at the same path. `bytes` is the in-memory content captured
+/// at `read_and_hash` time; piping it to `ssh ... 'cat > file'`
+/// (rather than re-reading via `scp`) closes the hash-vs-upload
+/// TOCTOU.
+pub async fn upload(
+    host: &Host,
+    mount: &FileMount,
+    content_hash: &str,
+    bytes: &[u8],
+) -> Result<(), FileError> {
     let remote = mount.remote_staging_path(content_hash);
-    let dest = format!("{}@{}:{}", host.user, host.address, remote);
     let parent = Path::new(&remote).parent().map_or_else(
         || "/var/lib/yoink/files".into(),
         |p| p.display().to_string(),
     );
 
-    // mkdir -p on the host (cheap, ssh roundtrip we do once per file).
-    let mkdir = Command::new("ssh")
+    // Single ssh roundtrip: mkdir parent, then write the bytes to a
+    // tempfile and atomic-rename into place. Atomic rename means a
+    // partial transfer (network drop) never leaves the staging path
+    // half-written for a concurrent reader.
+    let script = format!(
+        "set -e; mkdir -p {parent}; tmp={remote}.tmp.$$; cat > $tmp; chmod 0644 $tmp; mv $tmp {remote}"
+    );
+    let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg(format!("{}@{}", host.user, host.address))
-        .arg(format!("mkdir -p {parent}"))
-        .output()
-        .await
-        .map_err(|e| FileError::Mkdir {
-            host: host.address.clone(),
-            message: e.to_string(),
-        })?;
-    if !mkdir.status.success() {
-        return Err(FileError::Mkdir {
-            host: host.address.clone(),
-            message: String::from_utf8_lossy(&mkdir.stderr).into_owned(),
-        });
-    }
-
-    // scp -p preserves modification time and permissions. -o BatchMode=yes
-    // guarantees we never block on a password prompt during a deploy.
-    let scp = Command::new("scp")
-        .arg("-p")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(&mount.local)
-        .arg(&dest)
-        .output()
-        .await
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| FileError::Scp {
             host: host.address.clone(),
             remote: remote.clone(),
             message: e.to_string(),
         })?;
-    if !scp.status.success() {
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(bytes).await.map_err(|e| FileError::Scp {
+            host: host.address.clone(),
+            remote: remote.clone(),
+            message: e.to_string(),
+        })?;
+        stdin.shutdown().await.map_err(|e| FileError::Scp {
+            host: host.address.clone(),
+            remote: remote.clone(),
+            message: e.to_string(),
+        })?;
+    }
+    let output = child.wait_with_output().await.map_err(|e| FileError::Scp {
+        host: host.address.clone(),
+        remote: remote.clone(),
+        message: e.to_string(),
+    })?;
+    if !output.status.success() {
         return Err(FileError::Scp {
             host: host.address.clone(),
             remote,
-            message: String::from_utf8_lossy(&scp.stderr).into_owned(),
+            message: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
     Ok(())
