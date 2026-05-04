@@ -84,15 +84,16 @@ impl FileMount {
     }
 
     /// Read the file's bytes once and return them alongside their
-    /// SHA-256 hex digest. The hash feeds the spec hash so that a
-    /// content change triggers a redeploy without a tag bump.
+    /// SHA-256 hex digest. The hash feeds the spec hash so a content
+    /// change triggers a redeploy without a tag bump.
     ///
     /// Returning the bytes (rather than re-reading at upload time)
     /// closes a TOCTOU window: if the operator edits the file
-    /// between hash-compute and scp, the spec-hash references one
-    /// byte stream and the host receives another, then the next
-    /// reconcile sees matching `yoink.spec_hash` and silently keeps
-    /// the stale-on-disk content. Reading once eliminates the gap.
+    /// between hash compute and upload, the spec-hash would reference
+    /// one byte stream and the host would receive another, then the
+    /// next reconcile would see matching `yoink.spec_hash` and
+    /// silently keep the stale-on-disk content. Reading once
+    /// eliminates the gap.
     pub fn read_and_hash(&self) -> Result<(Vec<u8>, String), FileError> {
         let bytes = std::fs::read(&self.local).map_err(|source| FileError::LocalRead {
             path: self.local.display().to_string(),
@@ -134,8 +135,7 @@ impl FileMount {
 /// staging path is content-addressed, so re-uploads of the same bytes
 /// land at the same path. `bytes` is the in-memory content captured
 /// at `read_and_hash` time; piping it to `ssh ... 'cat > file'`
-/// (rather than re-reading via `scp`) closes the hash-vs-upload
-/// TOCTOU.
+/// closes the hash-vs-upload TOCTOU window.
 pub async fn upload(
     host: &Host,
     mount: &FileMount,
@@ -151,9 +151,19 @@ pub async fn upload(
     // Single ssh roundtrip: mkdir parent, then write the bytes to a
     // tempfile and atomic-rename into place. Atomic rename means a
     // partial transfer (network drop) never leaves the staging path
-    // half-written for a concurrent reader.
+    // half-written for a concurrent reader. Paths are passed through
+    // single-quoted shell vars so any spaces / metachars in the
+    // basename can't break parsing or inject.
     let script = format!(
-        "set -e; mkdir -p {parent}; tmp={remote}.tmp.$$; cat > $tmp; chmod 0644 $tmp; mv $tmp {remote}"
+        "set -e; \
+         P={p}; R={r}; \
+         mkdir -p \"$P\"; \
+         tmp=\"$R.tmp.$$\"; \
+         cat > \"$tmp\"; \
+         chmod 0644 \"$tmp\"; \
+         mv \"$tmp\" \"$R\"",
+        p = shell_single_quote(&parent),
+        r = shell_single_quote(&remote),
     );
     let mut child = Command::new("ssh")
         .arg("-o")
@@ -169,18 +179,20 @@ pub async fn upload(
             remote: remote.clone(),
             message: e.to_string(),
         })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(bytes).await.map_err(|e| FileError::Scp {
-            host: host.address.clone(),
-            remote: remote.clone(),
-            message: e.to_string(),
-        })?;
-        stdin.shutdown().await.map_err(|e| FileError::Scp {
-            host: host.address.clone(),
-            remote: remote.clone(),
-            message: e.to_string(),
-        })?;
-    }
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("Stdio::piped() guarantees Some on spawn");
+    stdin.write_all(bytes).await.map_err(|e| FileError::Scp {
+        host: host.address.clone(),
+        remote: remote.clone(),
+        message: e.to_string(),
+    })?;
+    stdin.shutdown().await.map_err(|e| FileError::Scp {
+        host: host.address.clone(),
+        remote: remote.clone(),
+        message: e.to_string(),
+    })?;
     let output = child.wait_with_output().await.map_err(|e| FileError::Scp {
         host: host.address.clone(),
         remote: remote.clone(),
@@ -194,6 +206,25 @@ pub async fn upload(
         });
     }
     Ok(())
+}
+
+/// POSIX-shell single-quote a string. Wraps in `'…'` and escapes any
+/// embedded single quotes via `'\''`. Used to interpolate paths into
+/// the upload script safely; without this, a basename containing a
+/// space, `;`, `$`, backtick, glob, etc. would break parsing or
+/// inject. The result is never empty (always at least `''`).
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -243,6 +274,27 @@ mod tests {
             FileMount::parse(":/etc/foo:ro", None),
             Err(FileError::BadFormat(_))
         ));
+    }
+
+    #[test]
+    fn shell_single_quote_wraps_and_escapes() {
+        assert_eq!(shell_single_quote(""), "''");
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(
+            shell_single_quote("with space"),
+            "'with space'",
+            "spaces stay literal inside single quotes"
+        );
+        assert_eq!(
+            shell_single_quote("$VAR;`backtick`"),
+            "'$VAR;`backtick`'",
+            "shell metachars stay literal inside single quotes"
+        );
+        assert_eq!(
+            shell_single_quote("it's"),
+            "'it'\\''s'",
+            "embedded single quote escapes correctly"
+        );
     }
 
     #[test]
