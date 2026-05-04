@@ -686,7 +686,7 @@ async fn prepare_one_host(
     let resolved_files = resolve_files(config, service)?;
     let file_binds: Vec<String> = resolved_files
         .iter()
-        .map(|(m, hash)| m.as_bind_string(hash))
+        .map(|(m, _bytes, hash)| m.as_bind_string(hash))
         .collect();
     let probe_spec = build_run_spec(
         config,
@@ -1072,7 +1072,7 @@ pub fn build_desired_spec(
     let resolved_files = resolve_files(config, service)?;
     let file_binds: Vec<String> = resolved_files
         .iter()
-        .map(|(m, hash)| m.as_bind_string(hash))
+        .map(|(m, _bytes, hash)| m.as_bind_string(hash))
         .collect();
     // container_name and spec_hash don't affect compute_spec_hash —
     // see docker.rs::compute_spec_hash_ignores_container_name.
@@ -1162,7 +1162,7 @@ fn docker_healthcheck_for(service: &ServiceConfig) -> Option<bollard::models::He
 pub fn resolve_files(
     config: &Config,
     service: &ServiceConfig,
-) -> Result<Vec<(FileMount, String)>, DeployError> {
+) -> Result<Vec<(FileMount, Vec<u8>, String)>, DeployError> {
     let base = config.config_dir.as_deref();
     let mut out = Vec::with_capacity(service.run.files.len());
     for spec in &service.run.files {
@@ -1170,22 +1170,22 @@ pub fn resolve_files(
             service: service.name.clone(),
             source,
         })?;
-        let hash = mount.content_hash().map_err(|source| DeployError::Files {
+        let (bytes, hash) = mount.read_and_hash().map_err(|source| DeployError::Files {
             service: service.name.clone(),
             source,
         })?;
-        out.push((mount, hash));
+        out.push((mount, bytes, hash));
     }
     Ok(out)
 }
 
 async fn upload_files(
     host: &Host,
-    files: &[(FileMount, String)],
+    files: &[(FileMount, Vec<u8>, String)],
     service_name: &str,
 ) -> Result<(), DeployError> {
-    for (mount, hash) in files {
-        files::upload(host, mount, hash)
+    for (mount, bytes, hash) in files {
+        files::upload(host, mount, hash, bytes)
             .await
             .map_err(|source| DeployError::Files {
                 service: service_name.to_string(),

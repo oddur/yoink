@@ -9,9 +9,11 @@
 //! flows through to a redeploy via the spec hash.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::docker_ops::Host;
@@ -81,9 +83,18 @@ impl FileMount {
         })
     }
 
-    /// SHA-256 of the file's bytes — feeds the spec hash so that a
-    /// content change triggers a redeploy without a tag bump.
-    pub fn content_hash(&self) -> Result<String, FileError> {
+    /// Read the file's bytes once and return them alongside their
+    /// SHA-256 hex digest. The hash feeds the spec hash so a content
+    /// change triggers a redeploy without a tag bump.
+    ///
+    /// Returning the bytes (rather than re-reading at upload time)
+    /// closes a TOCTOU window: if the operator edits the file
+    /// between hash compute and upload, the spec-hash would reference
+    /// one byte stream and the host would receive another, then the
+    /// next reconcile would see matching `yoink.spec_hash` and
+    /// silently keep the stale-on-disk content. Reading once
+    /// eliminates the gap.
+    pub fn read_and_hash(&self) -> Result<(Vec<u8>, String), FileError> {
         let bytes = std::fs::read(&self.local).map_err(|source| FileError::LocalRead {
             path: self.local.display().to_string(),
             source,
@@ -91,7 +102,7 @@ impl FileMount {
         let mut h = Sha256::new();
         h.update(&bytes);
         let digest = h.finalize();
-        Ok(hex(&digest[..]))
+        Ok((bytes, hex(&digest[..])))
     }
 
     /// `/var/lib/yoink/files/<sha256>-<basename>`. Idempotent: same
@@ -120,59 +131,100 @@ impl FileMount {
     }
 }
 
-/// Upload a single `FileMount` to the target host. Idempotent — if a
-/// file with the same content hash already exists at the staging path
-/// we skip the scp.
-pub async fn upload(host: &Host, mount: &FileMount, content_hash: &str) -> Result<(), FileError> {
+/// Upload a single `FileMount` to the target host. Idempotent — the
+/// staging path is content-addressed, so re-uploads of the same bytes
+/// land at the same path. `bytes` is the in-memory content captured
+/// at `read_and_hash` time; piping it to `ssh ... 'cat > file'`
+/// closes the hash-vs-upload TOCTOU window.
+pub async fn upload(
+    host: &Host,
+    mount: &FileMount,
+    content_hash: &str,
+    bytes: &[u8],
+) -> Result<(), FileError> {
     let remote = mount.remote_staging_path(content_hash);
-    let dest = format!("{}@{}:{}", host.user, host.address, remote);
     let parent = Path::new(&remote).parent().map_or_else(
         || "/var/lib/yoink/files".into(),
         |p| p.display().to_string(),
     );
 
-    // mkdir -p on the host (cheap, ssh roundtrip we do once per file).
-    let mkdir = Command::new("ssh")
+    // Single ssh roundtrip: mkdir parent, then write the bytes to a
+    // tempfile and atomic-rename into place. Atomic rename means a
+    // partial transfer (network drop) never leaves the staging path
+    // half-written for a concurrent reader. Paths are passed through
+    // single-quoted shell vars so any spaces / metachars in the
+    // basename can't break parsing or inject.
+    let script = format!(
+        "set -e; \
+         P={p}; R={r}; \
+         mkdir -p \"$P\"; \
+         tmp=\"$R.tmp.$$\"; \
+         cat > \"$tmp\"; \
+         chmod 0644 \"$tmp\"; \
+         mv \"$tmp\" \"$R\"",
+        p = shell_single_quote(&parent),
+        r = shell_single_quote(&remote),
+    );
+    let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg(format!("{}@{}", host.user, host.address))
-        .arg(format!("mkdir -p {parent}"))
-        .output()
-        .await
-        .map_err(|e| FileError::Mkdir {
-            host: host.address.clone(),
-            message: e.to_string(),
-        })?;
-    if !mkdir.status.success() {
-        return Err(FileError::Mkdir {
-            host: host.address.clone(),
-            message: String::from_utf8_lossy(&mkdir.stderr).into_owned(),
-        });
-    }
-
-    // scp -p preserves modification time and permissions. -o BatchMode=yes
-    // guarantees we never block on a password prompt during a deploy.
-    let scp = Command::new("scp")
-        .arg("-p")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(&mount.local)
-        .arg(&dest)
-        .output()
-        .await
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| FileError::Scp {
             host: host.address.clone(),
             remote: remote.clone(),
             message: e.to_string(),
         })?;
-    if !scp.status.success() {
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("Stdio::piped() guarantees Some on spawn");
+    stdin.write_all(bytes).await.map_err(|e| FileError::Scp {
+        host: host.address.clone(),
+        remote: remote.clone(),
+        message: e.to_string(),
+    })?;
+    stdin.shutdown().await.map_err(|e| FileError::Scp {
+        host: host.address.clone(),
+        remote: remote.clone(),
+        message: e.to_string(),
+    })?;
+    let output = child.wait_with_output().await.map_err(|e| FileError::Scp {
+        host: host.address.clone(),
+        remote: remote.clone(),
+        message: e.to_string(),
+    })?;
+    if !output.status.success() {
         return Err(FileError::Scp {
             host: host.address.clone(),
             remote,
-            message: String::from_utf8_lossy(&scp.stderr).into_owned(),
+            message: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
     Ok(())
+}
+
+/// POSIX-shell single-quote a string. Wraps in `'…'` and escapes any
+/// embedded single quotes via `'\''`. Used to interpolate paths into
+/// the upload script safely; without this, a basename containing a
+/// space, `;`, `$`, backtick, glob, etc. would break parsing or
+/// inject. The result is never empty (always at least `''`).
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -222,6 +274,27 @@ mod tests {
             FileMount::parse(":/etc/foo:ro", None),
             Err(FileError::BadFormat(_))
         ));
+    }
+
+    #[test]
+    fn shell_single_quote_wraps_and_escapes() {
+        assert_eq!(shell_single_quote(""), "''");
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(
+            shell_single_quote("with space"),
+            "'with space'",
+            "spaces stay literal inside single quotes"
+        );
+        assert_eq!(
+            shell_single_quote("$VAR;`backtick`"),
+            "'$VAR;`backtick`'",
+            "shell metachars stay literal inside single quotes"
+        );
+        assert_eq!(
+            shell_single_quote("it's"),
+            "'it'\\''s'",
+            "embedded single quote escapes correctly"
+        );
     }
 
     #[test]
