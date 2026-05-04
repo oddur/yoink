@@ -2575,7 +2575,7 @@ fn pick_healthy_replica(
 ) -> Option<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)> {
     if let Some(idx) = candidates
         .iter()
-        .position(|(_, c)| c.health_hint() == Some("healthy"))
+        .position(|(_, c)| c.health_hint() == Some(yoink::docker_ops::HealthStatus::Healthy))
     {
         return candidates.into_iter().nth(idx);
     }
@@ -2959,7 +2959,8 @@ async fn cmd_pty(
             "→ {}/{} ({})",
             host.address,
             container,
-            info.health_hint().unwrap_or("running"),
+            info.health_hint()
+                .map_or("running", yoink::docker_ops::HealthStatus::as_str),
         );
     }
 
@@ -3309,7 +3310,7 @@ async fn cmd_history(
                 host_addr.clone(),
                 c.name,
                 c.yoink_version.unwrap_or_else(|| "?".into()),
-                c.state,
+                c.state.as_str().to_string(),
                 c.yoink_deployed_by.unwrap_or_else(|| "?".into()),
             ));
         }

@@ -119,8 +119,6 @@ pub enum BuildError {
          with absolute paths and `<perms>` drawn from `r`, `w`, `m`"
     )]
     Device(String),
-    #[error("unknown restart policy {0:?}: expected one of no|always|unless-stopped|on-failure")]
-    RestartPolicy(String),
     #[error(
         "invalid publish spec {0:?}: expected \"host_port:container_port[/proto]\" or \"ip:host_port:container_port[/proto]\""
     )]
@@ -256,12 +254,11 @@ fn build_host_config(
     let network = spec.networks.first().map_or("bridge", String::as_str);
     let memory = options.memory.as_deref().map(parse_memory).transpose()?;
 
-    let restart_policy = match options.restart.as_deref().unwrap_or("unless-stopped") {
-        "no" => RestartPolicyNameEnum::NO,
-        "always" => RestartPolicyNameEnum::ALWAYS,
-        "unless-stopped" => RestartPolicyNameEnum::UNLESS_STOPPED,
-        "on-failure" => RestartPolicyNameEnum::ON_FAILURE,
-        other => return Err(BuildError::RestartPolicy(other.to_string())),
+    let restart_policy = match options.restart.unwrap_or_default() {
+        crate::config::RestartPolicy::No => RestartPolicyNameEnum::NO,
+        crate::config::RestartPolicy::Always => RestartPolicyNameEnum::ALWAYS,
+        crate::config::RestartPolicy::UnlessStopped => RestartPolicyNameEnum::UNLESS_STOPPED,
+        crate::config::RestartPolicy::OnFailure => RestartPolicyNameEnum::ON_FAILURE,
     };
 
     let tmpfs: Option<HashMap<String, String>> = if options.tmpfs.is_empty() {
@@ -619,7 +616,9 @@ pub fn compute_spec_hash(spec: &RunSpec) -> String {
     feed(
         &mut h,
         "restart",
-        opts.restart.as_deref().unwrap_or("").as_bytes(),
+        opts.restart
+            .map_or("", crate::config::RestartPolicy::as_str)
+            .as_bytes(),
     );
     feed(
         &mut h,
@@ -989,14 +988,6 @@ mod tests {
         assert!(parse_memory("").is_err());
         assert!(parse_memory("abc").is_err());
         assert!(parse_memory("12x").is_err());
-    }
-
-    #[test]
-    fn build_container_propagates_unknown_restart_policy() {
-        let mut spec = sample_spec();
-        spec.options.restart = Some("explode".into());
-        let err = build_container(&spec).unwrap_err();
-        assert!(matches!(err, BuildError::RestartPolicy(_)));
     }
 
     #[test]

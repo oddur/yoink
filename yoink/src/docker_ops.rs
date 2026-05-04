@@ -107,6 +107,99 @@ impl From<&YoinkHost> for Host {
 }
 
 /// What we surface for a container after listing/inspect. Independent of
+/// Docker container lifecycle state. Parsed from bollard's typed
+/// `state` field at the boundary so downstream code matches an enum
+/// instead of doing string-equality on `"running"`. `Unknown`
+/// captures values bollard adds in future versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerState {
+    Created,
+    Running,
+    Restarting,
+    Removing,
+    Paused,
+    Exited,
+    Dead,
+    /// Anything bollard reports that we don't recognise. Round-trips
+    /// through `Unknown` rather than mapping to a concrete variant
+    /// because misclassifying a future docker state would be worse
+    /// than rendering it as "unknown" for one yoink release.
+    Unknown,
+}
+
+impl ContainerState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Running => "running",
+            Self::Restarting => "restarting",
+            Self::Removing => "removing",
+            Self::Paused => "paused",
+            Self::Exited => "exited",
+            Self::Dead => "dead",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.to_ascii_lowercase().as_str() {
+            "created" => Self::Created,
+            "running" => Self::Running,
+            "restarting" => Self::Restarting,
+            "removing" => Self::Removing,
+            "paused" => Self::Paused,
+            "exited" => Self::Exited,
+            "dead" => Self::Dead,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for ContainerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for ContainerState {
+    fn from(s: &str) -> Self {
+        Self::parse(s)
+    }
+}
+
+impl std::fmt::Display for HealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Container healthcheck status. Bollard reports a parallel `health`
+/// field on inspect responses and embeds the status in the
+/// `status_text` line of `list_containers` (e.g. `Up 5 minutes
+/// (healthy)`). yoink reads the latter today; this enum gives that
+/// parse a typed home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthStatus {
+    Starting,
+    Healthy,
+    Unhealthy,
+}
+
+impl HealthStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Healthy => "healthy",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+}
+
 /// bollard's `ContainerSummary` so callers don't depend on bollard types.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ContainerInfo {
@@ -116,7 +209,7 @@ pub struct ContainerInfo {
     /// pulled images, sometimes `sha256:…` for content-addressed
     /// runs, or empty when docker hasn't yet resolved the image name.
     pub image: String,
-    pub state: String,
+    pub state: ContainerState,
     pub status_text: String,
     /// Container creation time as Unix epoch seconds. `None` when the
     /// daemon didn't return one (e.g. a freshly-created container the
@@ -143,18 +236,18 @@ pub struct ContainerInfo {
 impl ContainerInfo {
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.state.eq_ignore_ascii_case("running")
+        self.state == ContainerState::Running
     }
 
     #[must_use]
-    pub fn health_hint(&self) -> Option<&'static str> {
+    pub fn health_hint(&self) -> Option<HealthStatus> {
         let s = self.status_text.to_lowercase();
         if s.contains("(healthy)") {
-            Some("healthy")
+            Some(HealthStatus::Healthy)
         } else if s.contains("(unhealthy)") {
-            Some("unhealthy")
+            Some(HealthStatus::Unhealthy)
         } else if s.contains("(starting)") {
-            Some("starting")
+            Some(HealthStatus::Starting)
         } else {
             None
         }
@@ -192,10 +285,9 @@ impl ContainerInfo {
             host: host.to_string(),
             name,
             image: summary.image.unwrap_or_default(),
-            state: summary
-                .state
-                .map(|s| format!("{s:?}").to_lowercase())
-                .unwrap_or_default(),
+            state: summary.state.map_or(ContainerState::Unknown, |s| {
+                ContainerState::parse(&format!("{s:?}"))
+            }),
             status_text: summary.status.unwrap_or_default(),
             created_unix: summary.created,
             yoink_service,
@@ -3000,7 +3092,7 @@ mod tests {
         let info = ContainerInfo::from_summary("host-a", summary);
         assert_eq!(info.name, "app-a-a1b2c3d");
         assert!(info.is_running());
-        assert_eq!(info.health_hint(), Some("healthy"));
+        assert_eq!(info.health_hint(), Some(HealthStatus::Healthy));
         assert_eq!(info.yoink_service.as_deref(), Some("app-a"));
         assert_eq!(info.yoink_version.as_deref(), Some("a1b2c3d"));
         assert_eq!(

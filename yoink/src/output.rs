@@ -95,8 +95,10 @@ pub fn format_status_table(report: &StatusReport) -> String {
                 host: host.host.clone(),
                 service: c.yoink_service.clone().unwrap_or_else(|| "-".into()),
                 container: c.name.clone(),
-                state: c.state.clone(),
-                health: c.health_hint().unwrap_or("-").into(),
+                state: c.state.as_str().to_string(),
+                health: c
+                    .health_hint()
+                    .map_or_else(|| "-".to_string(), |h| h.as_str().to_string()),
                 version: c.yoink_version.clone().unwrap_or_else(|| "-".into()),
                 created: format_relative_time(c.created_unix),
             });

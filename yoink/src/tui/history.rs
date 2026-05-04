@@ -40,7 +40,7 @@ impl HistoryRow {
             host: host.to_string(),
             container: c.name.clone(),
             version: c.yoink_version.clone().unwrap_or_else(|| "?".to_string()),
-            state: c.state.clone(),
+            state: c.state.as_str().to_string(),
             deployed_by: c
                 .yoink_deployed_by
                 .clone()
@@ -188,7 +188,9 @@ impl HistoryState {
                     Row::new(vec![
                         Cell::from(when),
                         Cell::from(r.version.clone()),
-                        Cell::from(r.state.clone()).style(state_style(&r.state)),
+                        Cell::from(r.state.clone()).style(state_style(
+                            crate::docker_ops::ContainerState::parse(&r.state),
+                        )),
                         Cell::from(r.host.clone()),
                         Cell::from(r.container.clone()),
                         Cell::from(r.deployed_by.clone()),

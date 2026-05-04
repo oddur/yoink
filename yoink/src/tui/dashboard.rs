@@ -325,7 +325,9 @@ impl DashboardState {
                 if !self.filter.matches(&searchable) {
                     continue;
                 }
-                let health = c.health_hint().unwrap_or("-");
+                let health = c
+                    .health_hint()
+                    .map_or("-", crate::docker_ops::HealthStatus::as_str);
                 let stats = history
                     .get(&(host.host.clone(), c.name.clone()))
                     .and_then(StatsHistory::latest);
@@ -346,7 +348,7 @@ impl DashboardState {
                     Cell::from(host.host.clone()),
                     service_cell,
                     Cell::from(c.name.clone()),
-                    Cell::from(c.state.clone()).style(state_style(&c.state)),
+                    Cell::from(c.state.as_str()).style(state_style(c.state)),
                     Cell::from(health.to_string()).style(health_style(health)),
                     Cell::from(c.yoink_version.clone().unwrap_or_else(|| "-".into())),
                     Cell::from(format_networks(&c.networks)),

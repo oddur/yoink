@@ -266,7 +266,7 @@ fn summarize_health(containers: &[&ContainerInfo]) -> &'static str {
     let mut hints: Vec<&str> = containers
         .iter()
         .filter(|c| c.is_running())
-        .filter_map(|c| c.health_hint())
+        .filter_map(|c| c.health_hint().map(crate::docker_ops::HealthStatus::as_str))
         .collect();
     hints.sort_unstable();
     hints.dedup();
@@ -462,12 +462,15 @@ impl ServiceDetailState {
                 .iter()
                 .map(|i| {
                     let r = &self.rows[*i];
-                    let health = r.container.health_hint().unwrap_or("-");
+                    let health = r
+                        .container
+                        .health_hint()
+                        .map_or("-", crate::docker_ops::HealthStatus::as_str);
                     Row::new(vec![
                         Cell::from(r.host.address.clone()),
                         Cell::from(r.container.name.clone()),
-                        Cell::from(r.container.state.clone())
-                            .style(state_style(&r.container.state)),
+                        Cell::from(r.container.state.as_str())
+                            .style(state_style(r.container.state)),
                         Cell::from(health.to_string()).style(health_style(health)),
                         Cell::from(
                             r.container
