@@ -1304,6 +1304,25 @@ async fn run(cli: Cli) -> Result<()> {
     }
     .with_context(|| format!("loading {}", cli.config.display()))?;
 
+    // Warn (best-effort) if the config file's branch has upstream
+    // commits touching the file that aren't pulled yet — operators
+    // get bitten by deploying from a stale local copy when a
+    // teammate landed a fragment edit on `origin/main` they haven't
+    // pulled. Skipped for non-deploying commands (validate /
+    // proxy-render / completions / dump) so the noise doesn't appear
+    // when the operator is just inspecting state.
+    if !matches!(
+        cli.command,
+        Command::Validate { .. }
+            | Command::Completions { .. }
+            | Command::ProxyRender
+            | Command::ProxyDockerfile
+            | Command::Dump { .. }
+            | Command::Doctor { .. }
+    ) {
+        warn_if_config_behind_upstream(&cli.config);
+    }
+
     resolve_sealed_host_addresses(&mut config).await?;
 
     match cli.command {
@@ -2435,6 +2454,25 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
 /// to run before the bundle exists; making the resolver hard-fail
 /// here would block them. Deploy commands that actually consume
 /// `host.address` surface a clear error when it's empty.
+/// Best-effort: print one yellow line to stderr when the config file
+/// has commits on its branch's upstream that the operator hasn't
+/// pulled. Silent on non-git contexts, missing upstream, detached
+/// HEAD, etc. Does not fetch — the warning reflects the most recent
+/// `git fetch` the operator (or their IDE) ran.
+fn warn_if_config_behind_upstream(path: &std::path::Path) {
+    let Some(lag) = yoink::git::commits_behind_upstream_for_path(path) else {
+        return;
+    };
+    let plural = if lag.commits_behind == 1 { "" } else { "s" };
+    eprintln!(
+        "\x1b[33mwarning:\x1b[0m {} is {} commit{plural} behind \
+         {} — pull before deploying to avoid shipping a stale config",
+        path.display(),
+        lag.commits_behind,
+        lag.upstream,
+    );
+}
+
 async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
     if !config.any_host_address_sealed() {
         return Ok(());
