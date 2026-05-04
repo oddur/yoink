@@ -81,6 +81,16 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
     color: ColorChoice,
 
+    /// Refuse to run if the config file has commits on its branch's
+    /// upstream tracking ref that aren't in HEAD yet. Same check as
+    /// the always-on warning, but turns it into a hard error — for
+    /// CI deploys and any other context where shipping a stale
+    /// config silently would be worse than failing the run.
+    /// Equivalent to setting `YOINK_REQUIRE_LATEST_CONFIG=1` (any
+    /// truthy value: `1`, `true`, `yes`, `on`).
+    #[arg(long, global = true)]
+    require_latest_config: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -1320,7 +1330,10 @@ async fn run(cli: Cli) -> Result<()> {
             | Command::Dump { .. }
             | Command::Doctor { .. }
     ) {
-        warn_if_config_behind_upstream(&cli.config);
+        check_config_freshness(
+            &cli.config,
+            cli.require_latest_config || env_flag_truthy("YOINK_REQUIRE_LATEST_CONFIG"),
+        )?;
     }
 
     resolve_sealed_host_addresses(&mut config).await?;
@@ -2454,16 +2467,36 @@ async fn load_secrets_bundle(config: &Config) -> Result<Option<SecretsBundle>> {
 /// to run before the bundle exists; making the resolver hard-fail
 /// here would block them. Deploy commands that actually consume
 /// `host.address` surface a clear error when it's empty.
-/// Best-effort: print one yellow line to stderr when the config file
-/// has commits on its branch's upstream that the operator hasn't
-/// pulled. Silent on non-git contexts, missing upstream, detached
-/// HEAD, etc. Does not fetch — the warning reflects the most recent
-/// `git fetch` the operator (or their IDE) ran.
-fn warn_if_config_behind_upstream(path: &std::path::Path) {
+/// True when `name` is set in the env to anything operators
+/// reasonably write for "on" (`1`, `true`, `yes`, `on`, case-
+/// insensitive). Any other value (including unset) is false.
+fn env_flag_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// Best-effort: warn (or hard-fail under `--require-latest-config`)
+/// when the config file has commits on its branch's upstream that
+/// the operator hasn't pulled. Silent on non-git contexts, missing
+/// upstream, detached HEAD, etc. Does not fetch — reflects the
+/// operator's most recent `git fetch`.
+fn check_config_freshness(path: &std::path::Path, require_latest: bool) -> Result<()> {
     let Some(lag) = yoink::git::commits_behind_upstream_for_path(path) else {
-        return;
+        return Ok(());
     };
     let plural = if lag.commits_behind == 1 { "" } else { "s" };
+    if require_latest {
+        anyhow::bail!(
+            "{} is {} commit{plural} behind {} — pull before deploying \
+             (or unset --require-latest-config / YOINK_REQUIRE_LATEST_CONFIG \
+             to bypass)",
+            path.display(),
+            lag.commits_behind,
+            lag.upstream,
+        );
+    }
     eprintln!(
         "\x1b[33mwarning:\x1b[0m {} is {} commit{plural} behind \
          {} — pull before deploying to avoid shipping a stale config",
@@ -2471,6 +2504,7 @@ fn warn_if_config_behind_upstream(path: &std::path::Path) {
         lag.commits_behind,
         lag.upstream,
     );
+    Ok(())
 }
 
 async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
