@@ -860,7 +860,7 @@ async fn finalize_one_host(
         aliases.extend(service.run.options.network_aliases.iter().cloned());
         if let Err(e) = attach_extra_networks(ops, &host, &replica.name, &effective, &aliases).await
         {
-            let _ = ops.force_remove_container(&host, &replica.name).await;
+            force_remove_name(ops, &host, &replica.name).await;
             return Err(e);
         }
         on_event(DeployEvent::ContainerStarted {
