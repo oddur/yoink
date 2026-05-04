@@ -2420,6 +2420,15 @@ impl App {
                 KeyCode::Char('c') => self.logs.clear(),
                 KeyCode::Char('/') => self.logs.begin_filter_input(),
                 KeyCode::Char('w') => self.logs.toggle_wrap(),
+                // Cycle the level filter and respawn each container's
+                // `hl` child against the new floor. `cycle_level`
+                // clears the buffer, so what re-streams in is what
+                // matches the new level.
+                KeyCode::Char('L') => {
+                    self.logs.cycle_level();
+                    self.stop_log_streams();
+                    self.start_service_log_streams().await;
+                }
                 KeyCode::Up => self.logs.scroll_up(1),
                 KeyCode::Down => self.logs.scroll_down(1),
                 KeyCode::PageUp => self.logs.scroll_up(10),
@@ -3627,8 +3636,9 @@ impl App {
             }
         };
         let tx = self.log_tx.clone();
+        let level = self.logs.level();
         let task = if self.hl_available {
-            tokio::spawn(forward_through_hl(container, docker_rx, tx))
+            tokio::spawn(forward_through_hl(container, docker_rx, tx, level))
         } else {
             tokio::spawn(forward_raw(docker_rx, tx))
         };
@@ -4346,10 +4356,14 @@ async fn forward_raw(
 /// docker log message to its stdin, read the formatted (ANSI-colored)
 /// lines from its stdout, convert escapes to ratatui spans, and forward
 /// to the render channel. Owns the child via `kill_on_drop`.
+///
+/// `level` is the floor `hl --level <X>` filters at; `LogLevel::All`
+/// passes no flag (hl shows everything by default).
 async fn forward_through_hl(
     container: String,
     mut docker_rx: mpsc::UnboundedReceiver<LogLine>,
     out: UnboundedSender<RenderedLine>,
+    level: super::logs::LogLevel,
 ) {
     use ansi_to_tui::IntoText;
     use ratatui::style::{Color, Style};
@@ -4372,12 +4386,16 @@ async fn forward_through_hl(
     } else {
         "--color=always"
     };
-    let mut child = match Command::new("hl")
-        .arg(hl_color)
+    let mut cmd = Command::new("hl");
+    cmd.arg(hl_color)
         .arg("--paging=never")
         .arg("--follow")
         .arg("--sync-interval-ms=100")
-        .arg("--input-info=none")
+        .arg("--input-info=none");
+    if let Some(arg) = level.hl_arg() {
+        cmd.arg(format!("--level={arg}"));
+    }
+    let mut child = match cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
