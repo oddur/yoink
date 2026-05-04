@@ -649,6 +649,39 @@ pub enum ServiceKind {
     Proxy,
 }
 
+/// Docker restart policy. Mirrors the four values docker accepts on
+/// `--restart`. Validated at config-load time (rather than at
+/// container-create) so a typo in `restart:` fails parse instead of
+/// the first deploy.
+///
+/// YAML scalar mapping is kebab-case (`unless-stopped`, `on-failure`).
+/// **`no`** is a YAML boolean false unless quoted — write it as
+/// `restart: 'no'` if you really need it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    No,
+    Always,
+    #[default]
+    UnlessStopped,
+    OnFailure,
+}
+
+impl RestartPolicy {
+    /// Canonical wire form (matches `--restart` and the docker REST API).
+    /// Used by the spec-hash compute so the hash is stable across the
+    /// pre/post-enum-refactor cutover.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Always => "always",
+            Self::UnlessStopped => "unless-stopped",
+            Self::OnFailure => "on-failure",
+        }
+    }
+}
+
 /// `domain:` accepts either a single hostname or a list — a service
 /// can be reachable on multiple domain names (e.g. `api.example.com`
 /// + `api.example.net`).
@@ -1026,7 +1059,7 @@ pub struct RunOptions {
     #[serde(default)]
     pub tmpfs: BTreeMap<String, String>,
     #[serde(default)]
-    pub restart: Option<String>,
+    pub restart: Option<RestartPolicy>,
     /// Override the container's effective user.
     /// **Default: `"65534:65534"` (nobody:nogroup)** — yoink runs every
     /// new container as a non-root unprivileged uid so a process

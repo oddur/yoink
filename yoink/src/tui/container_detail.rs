@@ -647,10 +647,11 @@ impl ContainerDetailState {
             .split(inner);
 
         let lifecycle = inspect.state.as_deref().unwrap_or("?");
+        let lifecycle_state = crate::docker_ops::ContainerState::parse(lifecycle);
         let health = inspect.labels.get("yoink.health").map(String::as_str);
         let mut left_lines = vec![
             kv("image", inspect.image.as_deref().unwrap_or("?")),
-            kv_styled("state", lifecycle, state_style(lifecycle)),
+            kv_styled("state", lifecycle, state_style(lifecycle_state)),
         ];
         if let Some(h) = health {
             left_lines.push(kv_styled("health", h, health_style(h)));

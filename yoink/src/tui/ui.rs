@@ -141,13 +141,16 @@ pub fn health_style(health: &str) -> Style {
 /// Lifecycle (running → exited / dead) maps onto the obvious colors;
 /// transient states get yellow so they stand out at a glance.
 #[must_use]
-pub fn state_style(state: &str) -> Style {
-    match state.to_ascii_lowercase().as_str() {
-        "running" => Style::default().fg(Color::Green),
-        "exited" | "dead" => Style::default().fg(Color::DarkGray),
-        "restarting" | "removing" | "paused" => Style::default().fg(Color::Yellow),
-        "created" => Style::default().fg(Color::Cyan),
-        _ => Style::default(),
+pub fn state_style(state: crate::docker_ops::ContainerState) -> Style {
+    use crate::docker_ops::ContainerState;
+    match state {
+        ContainerState::Running => Style::default().fg(Color::Green),
+        ContainerState::Exited | ContainerState::Dead => Style::default().fg(Color::DarkGray),
+        ContainerState::Restarting | ContainerState::Removing | ContainerState::Paused => {
+            Style::default().fg(Color::Yellow)
+        }
+        ContainerState::Created => Style::default().fg(Color::Cyan),
+        ContainerState::Unknown => Style::default(),
     }
 }
 

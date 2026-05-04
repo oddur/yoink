@@ -242,7 +242,9 @@ impl HostDetailState {
                     let stats = history
                         .get(&(host_addr.clone(), c.name.clone()))
                         .and_then(StatsHistory::latest);
-                    let health = c.health_hint().unwrap_or("-");
+                    let health = c
+                        .health_hint()
+                        .map_or("-", crate::docker_ops::HealthStatus::as_str);
                     let service_cell = match c.yoink_service.as_deref() {
                         Some(svc) => {
                             let pf = forwards.is_container_forwarded(&host_addr, &c.name)
@@ -262,7 +264,7 @@ impl HostDetailState {
                         }),
                         render_drift_cell(c, config, secrets),
                         Cell::from(c.status_text.clone()),
-                        Cell::from(c.state.clone()).style(state_style(&c.state)),
+                        Cell::from(c.state.as_str()).style(state_style(c.state)),
                         Cell::from(health.to_string()).style(health_style(health)),
                         cell_cpu(stats),
                         cell_mem(stats),
