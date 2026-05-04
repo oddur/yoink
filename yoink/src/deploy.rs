@@ -445,7 +445,9 @@ pub async fn reconcile_with_options(
                             &desired_hash,
                         )
                     {
-                        let mut g = sink_ref.lock().expect("sink poisoned");
+                        let mut g = sink_ref
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         for r in &host_results {
                             for index in 0..service.run.replicas {
                                 let name = container_name(
@@ -473,7 +475,9 @@ pub async fn reconcile_with_options(
 
                     // Lock-per-event sink that injects the service tag.
                     let mut local_sink = |e: DeployEvent| {
-                        let mut g = sink_ref.lock().expect("sink poisoned");
+                        let mut g = sink_ref
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         g(Some(&svc_name), e);
                     };
                     deploy_service(
