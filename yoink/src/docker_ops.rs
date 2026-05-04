@@ -1100,9 +1100,7 @@ impl DockerOps for RealDockerOps {
                     };
                     match docker.create_network(req).await {
                         Ok(_) => Ok(true),
-                        // Concurrent operator created the same network
-                        // between our 404 and our create. Idempotent —
-                        // someone else already did the work.
+                        // 409 = raced by another operator; treat as idempotent.
                         Err(bollard::errors::Error::DockerResponseServerError {
                             status_code: 409,
                             ..
