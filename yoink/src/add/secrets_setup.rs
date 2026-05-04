@@ -156,7 +156,9 @@ mod tests {
 
     #[test]
     fn assess_no_secrets_in_template() {
-        let cfg = parse_config("secrets:\n  provider: age\n  recipients: [age1xyz]\n");
+        let cfg = parse_config(
+            "secrets:\n  provider: age\n  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]\n",
+        );
         let manifest = manifest_with_secrets(&[]);
         assert_eq!(assess(&cfg, &manifest), SetupNeed::NotApplicable);
     }
@@ -170,7 +172,9 @@ mod tests {
 
     #[test]
     fn assess_ready() {
-        let cfg = parse_config("secrets:\n  provider: age\n  recipients: [age1xyz]\n");
+        let cfg = parse_config(
+            "secrets:\n  provider: age\n  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]\n",
+        );
         let manifest = manifest_with_secrets(&["A"]);
         assert_eq!(assess(&cfg, &manifest), SetupNeed::Ready);
     }

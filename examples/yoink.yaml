@@ -33,7 +33,8 @@ secrets:
   # See `docs/recipes/sealed-secrets.md` for the full flow.
   provider: age
   recipients:
-    - age1examplepublickeyreplacewithyourown000000000000000000000000
+    # Replace with the public recipient `yoink secrets key generate` prints.
+    - age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy
 
   # Alternative: bring-your-own-tool. yoink invokes the command and
   # parses the resulting bundle from stdout (auto-detects dotenv vs
