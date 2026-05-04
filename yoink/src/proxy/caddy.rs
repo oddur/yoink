@@ -929,7 +929,7 @@ services:
         let yaml = r#"
 deploy: { networks: [n] }
 hosts: [{ address: h1, user: deploy }]
-secrets: { provider: age, recipients: [age1xxxxx] }
+secrets: { provider: age, recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy] }
 services:
   - name: api
     image: img
@@ -967,7 +967,7 @@ services:
         let yaml = r#"
 deploy: { networks: [n] }
 hosts: [{ address: h1, user: deploy }]
-secrets: { provider: age, recipients: [age1xxxxx] }
+secrets: { provider: age, recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy] }
 proxy:
   tls:
     cert_secret: CF_CERT
@@ -1047,7 +1047,7 @@ services:
         let yaml = r#"
 deploy: { networks: [n] }
 hosts: [{ address: h1, user: deploy }]
-secrets: { provider: age, recipients: [age1xxxxx] }
+secrets: { provider: age, recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy] }
 proxy:
   tls:
     cert_secret: CF_CERT

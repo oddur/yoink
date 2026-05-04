@@ -322,6 +322,17 @@ fn parse_identity(raw: &str) -> Result<x25519::Identity, SealedError> {
 }
 
 /// Generate a fresh x25519 identity. Returns the identity's secret
+/// Parse one age public recipient (`age1...`) into an x25519
+/// `Recipient`, returning a structured error on bad shape. Exposed
+/// so `Config::validate()` can reject malformed recipients at load
+/// time instead of when the operator first runs `secrets edit`.
+pub fn parse_recipient(raw: &str) -> Result<x25519::Recipient, SealedError> {
+    raw.parse().map_err(|e: &str| SealedError::RecipientParse {
+        raw: raw.to_string(),
+        reason: e.to_string(),
+    })
+}
+
 /// representation (`AGE-SECRET-KEY-1...`) and matching public
 /// recipient (`age1...`).
 #[must_use]
@@ -411,11 +422,7 @@ pub fn seal(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>, SealedEr
     let parsed: Vec<Box<dyn age::Recipient + Send>> = recipients
         .iter()
         .map(|r| {
-            let key: x25519::Recipient =
-                r.parse().map_err(|e: &str| SealedError::RecipientParse {
-                    raw: r.clone(),
-                    reason: e.to_string(),
-                })?;
+            let key = parse_recipient(r)?;
             Ok(Box::new(key) as Box<dyn age::Recipient + Send>)
         })
         .collect::<Result<_, SealedError>>()?;

@@ -1984,17 +1984,26 @@ impl Config {
             }
         }
 
-        if let Some(SecretsConfig::Age { recipients, .. }) = &self.secrets
-            && recipients.is_empty()
-        {
-            // Without recipients, every `yoink secrets edit/seal/rotate`
-            // would fail at the encrypt step with a generic "no
-            // recipients" error from the sealed module. Catch it at
-            // config-load time so the operator sees the actionable
-            // message, not the internals.
-            return Err(ConfigError::Invalid(
-                "secrets.recipients: must list at least one age public key (age1...) — `yoink secrets key generate` prints one".into(),
-            ));
+        if let Some(SecretsConfig::Age { recipients, .. }) = &self.secrets {
+            if recipients.is_empty() {
+                // Without recipients, every `yoink secrets edit/seal/rotate`
+                // would fail at the encrypt step with a generic "no
+                // recipients" error from the sealed module. Catch it at
+                // config-load time so the operator sees the actionable
+                // message, not the internals.
+                return Err(ConfigError::Invalid(
+                    "secrets.recipients: must list at least one age public key (age1...) — `yoink secrets key generate` prints one".into(),
+                ));
+            }
+            // Reject typos / malformed keys here too, not when the operator
+            // first runs `secrets edit` weeks later.
+            for r in recipients {
+                crate::sealed::parse_recipient(r).map_err(|e| {
+                    ConfigError::Invalid(format!(
+                        "secrets.recipients: {r:?} is not a valid age public key: {e}"
+                    ))
+                })?;
+            }
         }
 
         // Empty services is permitted at load time — operators may
@@ -2035,6 +2044,23 @@ impl Config {
                             service.name
                         )));
                     }
+                }
+            }
+            // canonical_domain must be exactly one of `domain:`. Catch
+            // the typo case at load time so the renderer doesn't
+            // silently skip the redirect.
+            if let Some(canonical) = service.canonical_domain.as_deref() {
+                let domains: Vec<String> = service
+                    .domain
+                    .as_ref()
+                    .map(DomainSpec::as_list)
+                    .unwrap_or_default();
+                if !domains.iter().any(|d| d == canonical) {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.canonical_domain {canonical:?} must match \
+                         one of the entries in `domain:` ({domains:?})",
+                        service.name
+                    )));
                 }
             }
             if service.run.replicas == 0 {
@@ -2664,7 +2690,7 @@ hosts:
   - { address_secret: PROD_HOST_IP, user: deploy }
 secrets:
   provider: age
-  recipients: [age1example]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
 "#,
         )]);
         let cfg = Config::load_from_path(&dir.join("yoink.yaml")).expect("loads");
@@ -2704,7 +2730,7 @@ hosts:
   - { address: 1.2.3.4, address_secret: PROD_HOST_IP, user: deploy }
 secrets:
   provider: age
-  recipients: [age1example]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
 "#,
         )]);
         let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
@@ -2724,7 +2750,7 @@ hosts:
   - { address_secret: SHARED_KEY, user: deploy }
 secrets:
   provider: age
-  recipients: [age1example]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
 "#,
         )]);
         let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
@@ -2744,7 +2770,7 @@ hosts:
   - { address_secret: PROD_HOST_IP, user: deploy }
 secrets:
   provider: age
-  recipients: [age1example]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
 "#,
         )]);
         let mut cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
@@ -2770,7 +2796,7 @@ hosts:
   - { address_secret: NOT_IN_BUNDLE, user: deploy }
 secrets:
   provider: age
-  recipients: [age1example]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
 "#,
         )]);
         let mut cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
@@ -2794,7 +2820,7 @@ hosts:
   - { address_secret: PROD_HOST_IP, user: deploy }
 secrets:
   provider: age
-  recipients: [age1example]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
 "#,
         )]);
         let mut cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
@@ -2925,6 +2951,67 @@ services:
         ]);
         let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
         assert!(format!("{err}").contains("dupe"), "got: {err}");
+    }
+
+    #[test]
+    fn malformed_age_recipient_rejected_at_load() {
+        let yaml = r#"
+hosts:
+  - { address: h1, user: root }
+secrets:
+  provider: age
+  recipients: [age1notreal]
+services:
+  - name: api
+    image: img
+    tag: v1
+    run: {}
+"#;
+        let err = Config::parse_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("age1notreal") && msg.contains("not a valid age public key"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn canonical_domain_must_match_a_domain_entry() {
+        let yaml = r#"
+hosts:
+  - { address: h1, user: root }
+services:
+  - name: web
+    image: img
+    tag: v1
+    domain: [example.com, www.example.com]
+    canonical_domain: typo.example.com
+    tls: off
+    run: { port: 8080, healthcheck_path: / }
+"#;
+        let err = Config::parse_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("canonical_domain") && msg.contains("typo.example.com"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn canonical_domain_matching_one_entry_passes() {
+        let yaml = r#"
+hosts:
+  - { address: h1, user: root }
+services:
+  - name: web
+    image: img
+    tag: v1
+    domain: [example.com, www.example.com]
+    canonical_domain: example.com
+    tls: off
+    run: { port: 8080, healthcheck_path: / }
+"#;
+        Config::parse_str(yaml).unwrap();
     }
 
     #[test]
@@ -3557,7 +3644,7 @@ services:
     run: {{ port: 80, healthcheck_path: / }}
 secrets:
   provider: age
-  recipients: [age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq8jhcsq]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
   profiles:
     terraform-backblaze:
       include: [TFSTATE_B2_KEY_ID, TFSTATE_B2_APPLICATION_KEY,
@@ -3615,7 +3702,7 @@ services:
     run: {}
 secrets:
   provider: age
-  recipients: [age1xyz]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
   profiles:
     bad:
       include: [FOO]
@@ -3644,7 +3731,7 @@ services:
     run: {}
 secrets:
   provider: age
-  recipients: [age1xyz]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
   profiles:
     bad:
       include: [FOO, BAR]
@@ -3670,7 +3757,7 @@ services:
     run: {}
 secrets:
   provider: age
-  recipients: [age1xyz]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
   profiles:
     bad:
       include: [FOO]
@@ -3695,7 +3782,7 @@ services:
     run: {}
 secrets:
   provider: age
-  recipients: [age1xyz]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
   profiles:
     "Bad Profile":
       include: [FOO]
@@ -3718,7 +3805,7 @@ services:
     run: {}
 secrets:
   provider: age
-  recipients: [age1xyz]
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
 "#;
         let cfg = parse_via_temp(yaml).unwrap();
         let Some(SecretsConfig::Age { profiles, .. }) = &cfg.secrets else {
