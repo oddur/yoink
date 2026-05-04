@@ -607,16 +607,21 @@ async fn append_to_operator_log(line: &str) -> std::io::Result<()> {
 /// appenders so the size-check + `mv` rotate sequence is atomic
 /// across operators. Without it, two concurrent appenders could
 /// both observe `sz < ROTATE_BYTES` and both skip rotation, letting
-/// the file grow past the threshold for a window. The lock file is
-/// the audit dir itself (always present after `mkdir -p`); fd 9
-/// closes on shell exit so the lock is always released.
+/// the file grow past the threshold for a window. fd 9 closes on
+/// shell exit so the lock is always released.
+///
+/// `flock` ships with util-linux on every Linux distro yoink
+/// targets but is absent on macOS / BSD; the `|| true` degrades to
+/// the previous (unlocked) behavior on those hosts rather than
+/// aborting the whole script under `set -e` and silently dropping
+/// audit lines.
 async fn append_via_ssh(host: &Host, lines: &[String]) -> std::io::Result<()> {
     let payload = lines.join("\n") + "\n";
     let script = format!(
         "set -e; \
          mkdir -p {AUDIT_DIR}; \
          exec 9>{AUDIT_DIR}/.lock; \
-         flock -x 9; \
+         flock -x 9 2>/dev/null || true; \
          cat >> {AUDIT_FILE}; \
          chmod 0640 {AUDIT_FILE} 2>/dev/null || true; \
          sz=$(wc -c < {AUDIT_FILE} 2>/dev/null || echo 0); \
