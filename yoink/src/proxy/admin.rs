@@ -39,6 +39,11 @@ const ADMIN_API_TIMEOUT: Duration = Duration::from_secs(60);
 const ADMIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Backoff between readiness probes while the proxy is coming up.
 const ADMIN_POLL_INTERVAL: Duration = Duration::from_millis(150);
+/// Pause before retrying a failed `/load` push. Short enough to be
+/// invisible to operators on the happy retry path, long enough that
+/// we don't dial a fresh ssh tunnel into the same NAT/sshd state
+/// that just dropped the previous one.
+const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Error)]
 pub enum AdminError {
@@ -89,15 +94,23 @@ pub enum AdminError {
 /// readiness probe timed out, or `reqwest` errored mid-request) —
 /// each ssh tunnel is short-lived and CI environments occasionally
 /// see one drop between the readiness probe and the actual `/load`,
-/// surfacing as `error sending request`. Real Caddy errors
-/// (`LoadRejected`, `LoadVerifyMismatch`) propagate immediately
-/// without a retry.
+/// surfacing as `error sending request`. Real Caddy errors propagate
+/// immediately without a retry.
 pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
     config: &Value,
 ) -> Result<(), AdminError> {
-    match push_config_once(host, ops, config).await {
+    // The discovery phase (label lookup + inspect + port parse +
+    // keyfile) is invariant across retries on transport-class
+    // failures, so we run it once and only re-tunnel-and-load on
+    // retry. `AdminError::Docker` deliberately stays out of the
+    // transient set: bollard's `with_retry` already covers the
+    // ssh-pool flakiness for those calls (see `RealDockerOps`),
+    // adding another retry layer here would compound the wait on
+    // genuinely down hosts.
+    let target = discover_admin_target(host, ops).await?;
+    match tunnel_and_load(host, &target, config).await {
         Ok(()) => Ok(()),
         Err(e) if is_transient(&e) => {
             tracing::debug!(
@@ -105,7 +118,8 @@ pub async fn push_config(
                 error = %e,
                 "transient proxy admin push error; reopening tunnel and retrying once",
             );
-            push_config_once(host, ops, config).await
+            tokio::time::sleep(RETRY_BACKOFF).await;
+            tunnel_and_load(host, &target, config).await
         }
         Err(e) => Err(e),
     }
@@ -118,11 +132,18 @@ fn is_transient(e: &AdminError) -> bool {
     )
 }
 
-async fn push_config_once(
+/// Resolved admin endpoint for one push attempt: the host-side TCP
+/// port docker published Caddy's `:2019` to, plus the ssh keyfile
+/// the tunnel should authenticate with.
+struct AdminTarget {
+    host_port: u16,
+    keyfile: Option<std::path::PathBuf>,
+}
+
+async fn discover_admin_target(
     host: &Host,
     ops: &dyn DockerOps,
-    config: &Value,
-) -> Result<(), AdminError> {
+) -> Result<AdminTarget, AdminError> {
     let label = format!("yoink.service={PROXY_SERVICE_NAME}");
     let containers = ops
         .list_containers_by_label(host, &label)
@@ -152,13 +173,23 @@ async fn push_config_once(
         }
     })?;
 
-    let keyfile = ops.ssh_keyfile(host);
+    Ok(AdminTarget {
+        host_port,
+        keyfile: ops.ssh_keyfile(host),
+    })
+}
+
+async fn tunnel_and_load(
+    host: &Host,
+    target: &AdminTarget,
+    config: &Value,
+) -> Result<(), AdminError> {
     let tunnel = SshTunnel::open(
         &host.user,
         &host.address,
-        host_port,
+        target.host_port,
         TUNNEL_READY_TIMEOUT,
-        keyfile.as_deref(),
+        target.keyfile.as_deref(),
     )
     .await?;
 
