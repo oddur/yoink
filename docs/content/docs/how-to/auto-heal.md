@@ -18,15 +18,20 @@ services:
     env:
       AUTOHEAL_CONTAINER_LABEL: autoheal
       AUTOHEAL_INTERVAL: "5"
+      # Wait this many checks before acting after a fresh start —
+      # avoids killing a container whose first probe is still in
+      # the image's `--start-period`. Match this to the largest
+      # `--start-period` across your healthchecked images.
+      AUTOHEAL_START_PERIOD: "30"
       AUTOHEAL_DEFAULT_STOP_TIMEOUT: "10"
     run:
-      restart: unless-stopped
       binds:
         # Read-only socket bind. The `:ro` is cosmetic — anyone who
         # reaches /var/run/docker.sock can issue `restart` regardless
         # — but it documents intent.
         - /var/run/docker.sock:/var/run/docker.sock:ro
       options:
+        restart: unless-stopped
         # autoheal needs root to read the docker socket; yoink's
         # default `nobody` user cannot. cap_drop=ALL stays — talking
         # to dockerd is privileged via socket access, not raw caps.
@@ -59,9 +64,14 @@ Auto-heal reads `State.Health.Status`. That field is `null` unless the container
 **A. Image-side (Dockerfile).** Bake one in:
 
 ```dockerfile
-HEALTHCHECK --interval=10s --timeout=2s \
-  CMD wget -qO- http://localhost:8080/health || exit 1
+# `apk add --no-cache curl` first if your base image (e.g. nginx:alpine)
+# doesn't ship a HTTP client — busybox-wget is gated on the busybox
+# config and isn't reliably present.
+HEALTHCHECK --interval=10s --timeout=2s --start-period=30s --retries=3 \
+  CMD curl -fsS -o /dev/null http://localhost:8080/health || exit 1
 ```
+
+The `--start-period=30s` covers cold-start latency before the first probe counts against `--retries`. Match the autoheal sidecar's `AUTOHEAL_START_PERIOD: "30"` env so the sidecar also waits before acting.
 
 **B. The bundled `yoink-proxy`** ships a `HEALTHCHECK` already, so the proxy is healed automatically once the sidecar is deployed.
 
