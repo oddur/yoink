@@ -43,6 +43,13 @@ services:
       context: .                      # docs/ — same dir as this yaml
     domain: yoink.is
     networks: [docs]
+    # Picked up by the autoheal sidecar below — the Dockerfile ships a
+    # HEALTHCHECK that hits / via wget, so a deadlocked nginx (or one
+    # whose tmpfs filled up and started 500ing) gets restarted without
+    # operator intervention. The yoink-side `healthcheck_path:` only
+    # gates *deploys*; this label opts into runtime auto-heal too.
+    labels:
+      autoheal: "true"
     run:
       port: 80
       replicas: 4                     # cax11 has 2 cores; 4 × 0.5 = full utilization
@@ -63,3 +70,33 @@ services:
         # Bind low port (80) — re-add the one cap, drop the rest.
         cap_add: [NET_BIND_SERVICE]
         network_aliases: [docs]
+
+  # Restart containers docker marks unhealthy. Filtered by the
+  # `autoheal: "true"` label; operator opts services in. yoink-proxy
+  # (bundled HEALTHCHECK) and the docs service (Dockerfile HEALTHCHECK)
+  # are the two heal-able containers here today. See the how-to:
+  # docs/content/docs/how-to/auto-heal.md.
+  - name: autoheal
+    image: willfarrell/autoheal
+    tag: "1.2.0"
+    description: Restart containers docker marks unhealthy.
+    env:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "5"
+      # Wait this many checks before acting after a fresh start —
+      # avoids killing a container whose first probe is still in
+      # the image's `--start-period`.
+      AUTOHEAL_START_PERIOD: "30"
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "10"
+    run:
+      binds:
+        - /var/run/docker.sock:/var/run/docker.sock:ro
+      options:
+        restart: unless-stopped
+        # autoheal needs root to read the docker socket; cap_drop=ALL
+        # stays — talking to dockerd is a privileged operation by virtue
+        # of socket access, not raw caps.
+        user: "0:0"
+        read_only: true
+        tmpfs:
+          /tmp: ""
