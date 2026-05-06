@@ -197,15 +197,9 @@ fn build_service_row<'a>(
     });
     let running = containers.iter().filter(|c| c.is_running()).count();
     // Expected = replicas × real hosts the service is configured to
-    // run on. The synthetic `local` host the TUI injects for
-    // read-only browsing must be excluded — including it inflates
-    // every service's denominator (e.g. 1-replica on 1 host → 1/2).
+    // run on.
     let expected = cfg_service.map_or(running, |s| {
-        s.applicable_hosts(&config.hosts)
-            .iter()
-            .filter(|h| h.address != crate::docker_ops::Host::LOCAL_ADDRESS)
-            .count()
-            * s.run.replicas as usize
+        s.applicable_hosts(&config.hosts).len() * s.run.replicas as usize
     });
     let running_str = format!("{running}/{expected}");
     let health = summarize_health(&containers);

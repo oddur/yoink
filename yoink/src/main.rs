@@ -3179,8 +3179,7 @@ async fn pty_session(
 
 #[allow(clippy::needless_pass_by_value)]
 async fn cmd_tui(config: &Config, config_path: PathBuf, mode: Mode, mouse: bool) -> Result<()> {
-    let mut config = config.clone();
-    config.push_local_host_if_socket();
+    let config = config.clone();
     let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
         std::sync::Arc::new(build_real_ops(&config, None).await?);
     tui::run(&config, config_path, ops, mode, mouse)
@@ -3953,7 +3952,6 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
         let mut host_obj = json!({
             "address": address,
             "user": host.user,
-            "is_local": host.is_local(),
         });
 
         match ops.version(&host).await {

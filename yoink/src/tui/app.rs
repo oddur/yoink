@@ -1203,11 +1203,6 @@ impl App {
                 return;
             }
         };
-        // Re-apply the magical local-host injection — load_from_path
-        // returns a fresh disk-shaped config that doesn't know about
-        // it, so without this the synthetic `local` host disappears
-        // every CONFIG_RELOAD_TICK.
-        new_config.push_local_host_if_socket();
         // If the config has any `address_secret:` hosts, resolve them
         // against the cached secrets bundle. The TUI loads the bundle
         // asynchronously via the `secrets` Arc; until that bundle
@@ -4115,7 +4110,7 @@ fn config_host(config: &Config, address: &str) -> Option<Host> {
 /// then sends a final `JobUpdate::Done` regardless of outcome.
 /// Same shape as `cmd_up` in main.rs but without the printlns.
 async fn reconcile_one(
-    mut config: Config,
+    config: Config,
     ops: Arc<dyn DockerOps>,
     secrets: Option<Arc<crate::secrets::SecretsBundle>>,
     service: String,
@@ -4131,15 +4126,8 @@ async fn reconcile_one(
         let _ = tx.send(JobUpdate::Done(result));
     };
 
-    // Drop the synthetic `local` host (auto-injected for read-only
-    // TUI browsing) before any destructive code runs. Operators who
-    // genuinely want to deploy to local can add `address: local` to
-    // yoink.yaml — that entry survives because it was on disk.
-    config.hosts.retain(|h| h.address != Host::LOCAL_ADDRESS);
     if config.hosts.is_empty() {
-        send_done(Err(
-            "no real hosts to deploy to (only the synthetic local host exists)".into(),
-        ));
+        send_done(Err("no hosts configured".into()));
         return;
     }
 
@@ -4194,7 +4182,7 @@ async fn reconcile_one(
 /// `yoink up` with no `--service` filter. Per-service errors stream
 /// in but the run continues; the final Done line summarizes counts.
 async fn reconcile_all(
-    mut config: Config,
+    config: Config,
     ops: Arc<dyn DockerOps>,
     secrets: Option<Arc<crate::secrets::SecretsBundle>>,
     overrides: std::collections::BTreeMap<String, String>,
@@ -4209,11 +4197,8 @@ async fn reconcile_all(
         let _ = tx.send(JobUpdate::Done(result));
     };
 
-    config.hosts.retain(|h| h.address != Host::LOCAL_ADDRESS);
     if config.hosts.is_empty() {
-        send_done(Err(
-            "no real hosts to deploy to (only the synthetic local host exists)".into(),
-        ));
+        send_done(Err("no hosts configured".into()));
         return;
     }
 
@@ -4298,7 +4283,7 @@ async fn reconcile_all(
 
 /// Background prune task. Mirrors `cmd_prune` but pipes each removed
 /// container into the progress modal as a streamed event line.
-async fn prune_all(mut config: Config, ops: Arc<dyn DockerOps>, tx: UnboundedSender<JobUpdate>) {
+async fn prune_all(config: Config, ops: Arc<dyn DockerOps>, tx: UnboundedSender<JobUpdate>) {
     use crate::prune::{self, PruneReason};
 
     let send_event = |line: String| {
@@ -4308,9 +4293,8 @@ async fn prune_all(mut config: Config, ops: Arc<dyn DockerOps>, tx: UnboundedSen
         let _ = tx.send(JobUpdate::Done(result));
     };
 
-    config.hosts.retain(|h| h.address != Host::LOCAL_ADDRESS);
     if config.hosts.is_empty() {
-        send_done(Err("no real hosts to prune".into()));
+        send_done(Err("no hosts to prune".into()));
         return;
     }
 
