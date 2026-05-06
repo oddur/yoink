@@ -3852,10 +3852,7 @@ impl App {
         if let Some((service, tag)) = &self.reconcile_target {
             let svc_line = format!("service:  {service}");
             let tag_line = format!("tag:      {tag}");
-            let host_count = format!(
-                "hosts:    {} (synthetic local skipped)",
-                self.config.hosts.len(),
-            );
+            let host_count = format!("hosts:    {}", self.config.hosts.len());
             let lines = vec![
                 "About to run `yoink up` for one service.",
                 "",

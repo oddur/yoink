@@ -198,9 +198,9 @@ impl ResourcesState {
     }
 
     /// Currently-selected target on the active tab, if any. Returns
-    /// `None` for the synthetic local host when the row points at it
-    /// (we don't want operators pruning their laptop's docker by
-    /// accident from a remote-deploy TUI session).
+    /// `None` when the row points at the `local` sentinel host —
+    /// pruning the operator's laptop docker from a remote-deploy
+    /// TUI session is almost always an accident.
     pub fn selected_target(&self, config: &Config) -> Option<ResourceTarget> {
         let visible = self.visible_indices();
         let i = self.active_table_selected()?;
