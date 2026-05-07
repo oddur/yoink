@@ -61,9 +61,11 @@ pub struct Host {
 }
 
 impl Host {
-    /// Sentinel address marking the synthetic host that talks to the
-    /// local docker socket instead of going over ssh. One constant so
-    /// the magic isn't a stringly-typed sprinkle across the codebase.
+    /// Sentinel address that routes to the operator's local docker
+    /// socket instead of going over ssh. Two callers:
+    /// `transport::unregistry` (image-push source) and `doctor` (arch
+    /// probe). Operators can also write `address: local` in
+    /// `yoink.yaml` to deploy at their own laptop.
     pub const LOCAL_ADDRESS: &'static str = "local";
 
     #[must_use]
@@ -71,16 +73,16 @@ impl Host {
         format!("ssh://{}@{}", self.user, self.address)
     }
 
-    /// True for the magical synthetic local host — bypasses ssh and
+    /// True for the local-docker sentinel host — bypasses ssh and
     /// uses bollard's platform-default unix socket / npipe transport.
     #[must_use]
     pub fn is_local(&self) -> bool {
         self.address == Self::LOCAL_ADDRESS
     }
 
-    /// Construct the synthetic local host. The empty `user` is fine —
-    /// the local-socket transport ignores it. Symmetric with
-    /// [`Self::is_local`].
+    /// Construct a `Host` that points at the operator's local docker
+    /// socket. The empty `user` is fine — the local-socket transport
+    /// ignores it.
     #[must_use]
     pub fn local() -> Self {
         Self {
@@ -973,11 +975,9 @@ impl RealDockerOps {
         // key may both dial — last writer wins, the loser's `Docker`
         // drops harmlessly.
         let docker = if host.is_local() {
-            // The magical "local" host (address == "local", no user)
-            // routes to the local docker socket via bollard's
-            // platform-default unix socket / npipe transport. Lets
-            // the operator run yoink against their laptop's docker
-            // without editing yoink.yaml.
+            // The `local` sentinel host routes to the operator's
+            // docker socket via bollard's platform-default unix-
+            // socket / npipe transport, bypassing ssh entirely.
             Docker::connect_with_local_defaults().map_err(|source| DockerError::Connect {
                 host: host.address.clone(),
                 source,

@@ -659,7 +659,7 @@ async fn append_via_ssh(host: &Host, lines: &[String]) -> std::io::Result<()> {
     }
 }
 
-/// Append directly to the local filesystem (the `local` synthetic
+/// Append directly to the local filesystem (the `local` sentinel
 /// host). Writes through the same path layout as remote hosts so a
 /// `yoink audit log --host local` reads back consistently.
 async fn append_local(lines: &[String]) -> std::io::Result<()> {
@@ -995,7 +995,7 @@ pub async fn read_operator_audit_files(include_rotated: bool) -> std::io::Result
 }
 
 /// Cat the active host audit file plus rotated files (when requested)
-/// over SSH (or locally for the synthetic `local` host). Returns the
+/// over SSH (or locally for the `local` sentinel host). Returns the
 /// concatenated JSONL bytes; missing files read as empty. `key_path`
 /// is the operator-side path to the SSH private key when the host
 /// declares `ssh_key_secret:` (decrypted by `ssh_keys::prepare`); pass
