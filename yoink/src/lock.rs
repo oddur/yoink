@@ -122,18 +122,13 @@ impl HostLock {
                 source,
             })?;
 
-        // Initial touch so the watcher sees a fresh heartbeat
-        // immediately rather than waiting up to HEARTBEAT_INTERVAL.
-        // Failure here is non-fatal: the next periodic touch will fix
-        // it; if both fail the sentinel exits within HEARTBEAT_STALE
-        // and we'll retry from scratch.
-        let _ = ops
-            .exec_oneshot(
-                &host,
-                LOCK_NAME,
-                vec!["touch".into(), HEARTBEAT_FILE.into()],
-            )
-            .await;
+        // No external initial-touch — the script itself touches
+        // `HEARTBEAT_FILE` as its first action (see
+        // `heartbeat_watcher_script`). The previous design ran a
+        // separate `exec_oneshot ["touch", …]` *after* `start_container`
+        // and raced against the script's first `[ -f $FILE ]` check;
+        // if the check lost, the loop exited immediately and every
+        // subsequent yoink heartbeat hit 409 "container not running".
 
         Ok(Self {
             host,
@@ -174,9 +169,11 @@ impl HostLock {
         self.heartbeat = Some(task);
     }
 
-    /// Release the lock. Idempotent. Aborts the heartbeat task before
-    /// removing the sentinel so a stray heartbeat can't try to touch
-    /// a freshly-reaped container.
+    /// Release the lock. Idempotent. Aborts the heartbeat task and
+    /// **awaits its completion** before removing the sentinel —
+    /// otherwise an in-flight `exec_oneshot` can race against the
+    /// `force_remove_container` and surface as a 409 "container not
+    /// running" WARN on the very last heartbeat tick.
     pub async fn release<O>(mut self, ops: &O)
     where
         O: DockerOps + ?Sized,
@@ -186,6 +183,10 @@ impl HostLock {
         }
         if let Some(task) = self.heartbeat.take() {
             task.abort();
+            // Drain the cancellation so the task is guaranteed gone
+            // before we touch the container. `JoinError` on a cancelled
+            // task is the expected outcome — discard it.
+            let _ = task.await;
         }
         let _ = ops.force_remove_container(&self.host, LOCK_NAME).await;
         self.released = true;
@@ -210,12 +211,18 @@ impl Drop for HostLock {
 }
 
 /// Tiny `sh` script that runs as PID 1 in the sentinel container.
-/// Polls `/tmp/heartbeat` every 5s; exits when the file is missing or
-/// older than `HEARTBEAT_STALE_SECS`. busybox `stat -c %Y` returns
-/// mtime as Unix epoch so the math is portable across distros.
+/// First action: `touch` the heartbeat file so the loop's first
+/// `[ -f … ]` check is unambiguous (the previous design did the
+/// initial touch from the operator side and raced against PID 1's
+/// startup, leaving the container in `exited` state by the time
+/// yoink's heartbeat task fired). Then polls every 5s; exits when
+/// the file is missing or older than `HEARTBEAT_STALE_SECS`.
+/// busybox `stat -c %Y` returns mtime as Unix epoch so the math is
+/// portable across distros.
 fn heartbeat_watcher_script() -> String {
     format!(
-        "while [ -f {HEARTBEAT_FILE} ] && \
+        "touch {HEARTBEAT_FILE}; \
+         while [ -f {HEARTBEAT_FILE} ] && \
          [ $(($(date +%s) - $(stat -c %Y {HEARTBEAT_FILE}))) -lt {HEARTBEAT_STALE_SECS} ]; do \
            sleep 5; \
          done"
