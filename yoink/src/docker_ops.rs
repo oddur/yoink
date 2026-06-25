@@ -1717,6 +1717,14 @@ impl DockerOps for RealDockerOps {
     ) -> Result<u16, DockerError> {
         let url = format!("http://{target}:{port}{path}");
         let probe_name = format!("yoink-probe-{}-{}", target, rand_hex());
+        // Pull the probe image up front (best-effort; fast no-op when cached),
+        // mirroring healthcheck_tcp's busybox pull. Without this the first HTTP
+        // probe on a fresh daemon (a just-provisioned host) 404s on
+        // create_container because curlimages/curl was never pulled.
+        let (probe_img, probe_tag) = HEALTHCHECK_CURL_IMAGE
+            .split_once(':')
+            .unwrap_or((HEALTHCHECK_CURL_IMAGE, "latest"));
+        let _ = self.pull_image(host, probe_img, probe_tag, None).await;
         let body = probe_body(
             network,
             vec![
