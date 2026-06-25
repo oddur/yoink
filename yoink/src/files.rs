@@ -193,6 +193,13 @@ pub async fn upload(
         remote: remote.clone(),
         message: e.to_string(),
     })?;
+    // Close the pipe's write end BEFORE awaiting the child. `shutdown()`
+    // flushes but does NOT close the fd — the `ChildStdin` owns it until
+    // dropped, and `wait_with_output` doesn't take it. Leaving it open means
+    // the remote `cat > tmp` never sees EOF, never exits, and the wait blocks
+    // forever. openssh tolerates the lingering half-open stdin; Tailscale SSH
+    // does not, so this deadlocks every `files:` upload to a tailnet host.
+    drop(stdin);
     let output = child.wait_with_output().await.map_err(|e| FileError::Scp {
         host: host.address.clone(),
         remote: remote.clone(),
