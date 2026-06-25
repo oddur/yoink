@@ -842,23 +842,21 @@ async fn finalize_one_host(
         if replica.already_running {
             continue;
         }
-        ops.start_container(&host, &replica.name)
-            .await
-            .map_err(|source| DeployError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
-        // Multi-network attach: docker only honors the first
-        // endpoint at create time. Connect each additional network
-        // explicitly post-start, with the same alias set so the
-        // container resolves by name on every network.
+        // Multi-network attach BEFORE start: docker only honors the first
+        // endpoint at create time, so connect the rest while the container
+        // is still created-but-not-running. Starting with every network
+        // already attached lets a container that eagerly dials its
+        // dependencies (DB, redis) on boot actually reach them. Attaching
+        // *after* start meant such a container exited before the networks
+        // landed, and the post-start connect then 404'd with "network
+        // sandbox not found" on the now-dead container — only services that
+        // connect lazily survived. The alias set is identical on every
+        // network so the container resolves by name everywhere.
         //
-        // If any attach fails partway, the container is *running*
-        // with the right name + spec_hash but is half-networked.
-        // `service_already_at_spec` only checks name/hash/running,
-        // so the next reconcile would short-circuit and leave the
-        // container half-networked forever. Force-remove on failure
-        // so the next reconcile re-creates from scratch.
+        // If any attach fails partway, force-remove so the next reconcile
+        // re-creates from scratch — service_already_at_spec only checks
+        // name/hash/running, so a half-networked container would otherwise
+        // short-circuit and persist forever.
         let effective = service.effective_networks(&config.deploy);
         let mut aliases = vec![replica.name.clone()];
         aliases.extend(service.run.options.network_aliases.iter().cloned());
@@ -867,6 +865,12 @@ async fn finalize_one_host(
             force_remove_name(ops, &host, &replica.name).await;
             return Err(e);
         }
+        ops.start_container(&host, &replica.name)
+            .await
+            .map_err(|source| DeployError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
         on_event(DeployEvent::ContainerStarted {
             host: host.address.clone(),
             container: replica.name.clone(),
