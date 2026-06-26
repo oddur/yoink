@@ -10,6 +10,12 @@ ignore = [
     # No safe upgrade exists upstream; tracked for replacement when
     # `tabled` migrates or an alternative table renderer fits.
     "RUSTSEC-2024-0370",
+    # `proc-macro-error2` — the (now also unmaintained) maintained fork of
+    # the above — is a BUILD-TIME proc-macro pulled in transitively by
+    # `age` → `i18n-embed-fl`. It never reaches the shipped binary, and no
+    # newer `i18n-embed-fl`/`age` release drops it yet. Drop this ignore when
+    # they migrate off it.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]
