@@ -1642,6 +1642,11 @@ async fn wait_until_healthy(
                     lines,
                 });
             }
+            // Remove it once the log tail is captured. A stopped
+            // container left behind is indistinguishable from a
+            // generation that was once live, and `yoink rollback`
+            // would pick it as the "previous generation".
+            force_remove_name(ops, host, new_name).await;
             Err(DeployError::Healthcheck {
                 host: host.address.clone(),
                 container: new_name.to_string(),
@@ -2142,6 +2147,50 @@ services:
         assert_eq!(
             report.hosts[0].stopped_old,
             vec!["app-a-9f8e7d6".to_string()]
+        );
+    }
+
+    /// A container that never passed its healthcheck must not survive
+    /// the failed deploy: left behind stopped, it looks like a previous
+    /// generation and `yoink rollback` redeploys the broken tag.
+    #[tokio::test(start_paused = true)]
+    async fn deploy_service_removes_container_that_fails_healthcheck() {
+        let ops = FakeDockerOps::new();
+        ops.push_ensure_network(Ok(false));
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+        ops.push_start_container(Ok(()));
+        // No healthcheck response queued: the probe errors out.
+        ops.push_stop_container(Ok(()));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_one_service();
+        let mut sink = |_e: DeployEvent| {};
+        let err = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        let DeployError::Healthcheck { container, .. } = err else {
+            panic!("expected healthcheck error, got {err:?}");
+        };
+        let calls = ops.calls();
+        let stop = calls
+            .iter()
+            .position(|c| matches!(c, crate::docker_ops::RecordedCall::StopContainer(_, n, _) if *n == container))
+            .expect("failed container is stopped");
+        assert!(
+            calls[stop..]
+                .iter()
+                .any(|c| matches!(c, crate::docker_ops::RecordedCall::ForceRemoveContainer(_, n) if *n == container)),
+            "failed container must be removed after it is stopped: {calls:?}"
         );
     }
 

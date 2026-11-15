@@ -2266,8 +2266,9 @@ async fn cmd_rollback(
     // (running + stopped). Group by `yoink.service` label. For each service
     // group, collect the running containers' spec_hashes (current generation),
     // then pick the most recently stopped container with a DIFFERENT spec_hash
-    // — that's the previous generation. Extract the image tag from its image
-    // reference and record (host, tag) pairs per service.
+    // that predates the running ones — that's the previous generation (see
+    // `previous_generation`). Take its tag from the `yoink.version` label and
+    // record (host, tag) pairs per service.
     //
     // Result: service_name -> Vec<(host_address, prev_tag)>
     let mut rollback_plan: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -2301,23 +2302,7 @@ async fn cmd_rollback(
         }
 
         for (svc_name, containers) in by_service {
-            // Collect running spec_hashes (the current generation).
-            let running_hashes: std::collections::BTreeSet<&str> = containers
-                .iter()
-                .filter(|c| c.is_running())
-                .filter_map(|c| c.yoink_spec_hash.as_deref())
-                .collect();
-
-            // Stopped containers sorted newest-first by creation time.
-            let mut stopped: Vec<_> = containers.iter().filter(|c| !c.is_running()).collect();
-            stopped.sort_by_key(|c| std::cmp::Reverse(c.created_unix.unwrap_or(0)));
-
-            // Most recently stopped container with a DIFFERENT spec_hash.
-            let prev = stopped.into_iter().find(|c| {
-                c.yoink_spec_hash
-                    .as_deref()
-                    .is_some_and(|h| !running_hashes.contains(h))
-            });
+            let prev = previous_generation(&containers);
 
             let Some(prev_container) = prev else {
                 info_eprintln!(
@@ -2327,7 +2312,7 @@ async fn cmd_rollback(
                 continue;
             };
 
-            let prev_tag = extract_image_tag(&prev_container.image).to_string();
+            let prev_tag = rollback_tag(prev_container);
             rollback_plan
                 .entry(svc_name)
                 .or_default()
@@ -2398,10 +2383,64 @@ async fn cmd_rollback(
     Ok(())
 }
 
+/// Pick the container `yoink rollback` redeploys from one service's
+/// containers on one host: the newest stopped container whose
+/// `spec_hash` differs from every running one.
+///
+/// A container that never served is not a previous generation, so two
+/// kinds are skipped: ones still in `created` state (never started),
+/// and ones created after the running generation. The latter are the
+/// leftovers of a deploy that failed after the current generation went
+/// live; anything that was live before it was necessarily created
+/// before it.
+fn previous_generation(
+    containers: &[yoink::docker_ops::ContainerInfo],
+) -> Option<&yoink::docker_ops::ContainerInfo> {
+    // Running spec_hashes (the current generation) and when the oldest
+    // running container was created.
+    let running_hashes: std::collections::BTreeSet<&str> = containers
+        .iter()
+        .filter(|c| c.is_running())
+        .filter_map(|c| c.yoink_spec_hash.as_deref())
+        .collect();
+    let running_since = containers
+        .iter()
+        .filter(|c| c.is_running())
+        .filter_map(|c| c.created_unix)
+        .min();
+
+    // Stopped containers sorted newest-first by creation time.
+    let mut stopped: Vec<_> = containers
+        .iter()
+        .filter(|c| !c.is_running() && c.state != yoink::docker_ops::ContainerState::Created)
+        .filter(|c| running_since.is_none_or(|t| c.created_unix.unwrap_or(0) < t))
+        .collect();
+    stopped.sort_by_key(|c| std::cmp::Reverse(c.created_unix.unwrap_or(0)));
+
+    // Most recently stopped container with a DIFFERENT spec_hash.
+    stopped.into_iter().find(|c| {
+        c.yoink_spec_hash
+            .as_deref()
+            .is_some_and(|h| !running_hashes.contains(h))
+    })
+}
+
+/// The tag to redeploy `container` with. The `yoink.version` label is
+/// the tag it was deployed with (a `sha256:` digest for pinned
+/// services); the image reference is only a fallback for containers
+/// that lack the label.
+fn rollback_tag(container: &yoink::docker_ops::ContainerInfo) -> String {
+    container
+        .yoink_version
+        .clone()
+        .unwrap_or_else(|| extract_image_tag(&container.image).to_string())
+}
+
 /// Extract the tag portion from a docker image reference.
 ///
 /// Examples:
 ///   `ghcr.io/user/app:abc123`  => `abc123`
+///   `repo@sha256:abc123`       => `sha256:abc123` (digest-pinned)
 ///   `myapp:def456`             => `def456`
 ///   `nginx`                    => `nginx`   (bare, no tag)
 ///   `registry:5000/img:tag`    => `tag`     (port in registry host)
@@ -2411,6 +2450,9 @@ async fn cmd_rollback(
 /// host). If the final colon belongs to a host:port segment, the whole
 /// string is returned unchanged.
 fn extract_image_tag(image: &str) -> &str {
+    if let Some((_, digest)) = image.split_once('@') {
+        return digest;
+    }
     let Some(colon_pos) = image.rfind(':') else {
         return image;
     };
@@ -5626,6 +5668,96 @@ fn chrono_like_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::parse_as_pairs;
+    use super::{extract_image_tag, previous_generation, rollback_tag};
+    use yoink::docker_ops::ContainerInfo;
+
+    fn container(name: &str, state: &str, spec_hash: &str, created: i64) -> ContainerInfo {
+        ContainerInfo {
+            host: "host-a".into(),
+            name: name.into(),
+            image: format!("registry.example.com/api:{name}"),
+            state: state.into(),
+            status_text: String::new(),
+            created_unix: Some(created),
+            yoink_service: Some("api".into()),
+            yoink_version: Some(name.into()),
+            yoink_spec_hash: Some(spec_hash.into()),
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// v2 is live and a v3 deploy failed its healthcheck, leaving a
+    /// stopped v3 container behind. Rollback must go to v1, not to the
+    /// v3 that never served.
+    #[test]
+    fn previous_generation_skips_failed_deploy_newer_than_running() {
+        let containers = vec![
+            container("v1", "exited", "h1", 100),
+            container("v2", "running", "h2", 200),
+            container("v3", "exited", "h3", 300),
+        ];
+        let prev = previous_generation(&containers).map(|c| c.name.as_str());
+        assert_eq!(prev, Some("v1"));
+    }
+
+    #[test]
+    fn previous_generation_skips_never_started_container() {
+        let containers = vec![
+            container("v1", "exited", "h1", 100),
+            container("v2", "created", "h2", 200),
+            container("v3", "running", "h3", 300),
+        ];
+        let prev = previous_generation(&containers).map(|c| c.name.as_str());
+        assert_eq!(prev, Some("v1"));
+    }
+
+    #[test]
+    fn previous_generation_picks_newest_stopped_before_running() {
+        let containers = vec![
+            container("v1", "exited", "h1", 100),
+            container("v2", "exited", "h2", 200),
+            container("v3", "running", "h3", 300),
+        ];
+        let prev = previous_generation(&containers).map(|c| c.name.as_str());
+        assert_eq!(prev, Some("v2"));
+    }
+
+    #[test]
+    fn previous_generation_none_when_only_a_failed_deploy_is_stopped() {
+        let containers = vec![
+            container("v2", "running", "h2", 200),
+            container("v3", "exited", "h3", 300),
+        ];
+        assert!(previous_generation(&containers).is_none());
+    }
+
+    /// Digest-pinned services run `repo@sha256:<hex>`. The rollback
+    /// tag must keep the `sha256:` prefix so the redeploy pulls
+    /// `repo@sha256:<hex>` instead of the nonexistent `repo:<hex>`.
+    #[test]
+    fn rollback_tag_keeps_digest_prefix() {
+        let mut c = container("v1", "exited", "h1", 100);
+        c.image = "registry.example.com/api@sha256:abc123".into();
+        c.yoink_version = Some("sha256:abc123".into());
+        assert_eq!(rollback_tag(&c), "sha256:abc123");
+        // Container without the label: fall back to the image reference.
+        c.yoink_version = None;
+        assert_eq!(rollback_tag(&c), "sha256:abc123");
+    }
+
+    #[test]
+    fn extract_image_tag_handles_tags_ports_and_digests() {
+        assert_eq!(extract_image_tag("ghcr.io/user/app:abc123"), "abc123");
+        assert_eq!(extract_image_tag("registry:5000/img:tag"), "tag");
+        assert_eq!(extract_image_tag("registry:5000/img"), "registry:5000/img");
+        assert_eq!(
+            extract_image_tag("registry:5000/img@sha256:abc123"),
+            "sha256:abc123"
+        );
+    }
 
     #[test]
     fn as_pair_literal_value() {
