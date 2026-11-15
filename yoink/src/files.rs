@@ -26,6 +26,10 @@ pub struct FileMount {
     pub local: PathBuf,
     pub container: PathBuf,
     pub read_only: bool,
+    /// The spec carried an explicit `:rw`. Kept apart from
+    /// `!read_only` because a spec with no mode must stay a bare
+    /// bind string (which the container builder defaults to `:ro`).
+    pub explicit_rw: bool,
 }
 
 #[derive(Debug, Error)]
@@ -57,10 +61,10 @@ impl FileMount {
         // by count, so container paths with colons (rare but possible)
         // aren't mangled. The trailing `:ro` (or `:rw`) is recognized
         // only when the suffix is exactly that.
-        let (head, mode) = match spec.rsplit_once(':') {
-            Some((h, "ro")) => (h, true),
-            Some((h, "rw")) => (h, false),
-            _ => (spec, false),
+        let (head, mode, explicit_rw) = match spec.rsplit_once(':') {
+            Some((h, "ro")) => (h, true, false),
+            Some((h, "rw")) => (h, false, true),
+            _ => (spec, false, false),
         };
         let Some((local, container)) = head.split_once(':') else {
             return Err(FileError::BadFormat(spec.to_string()));
@@ -80,6 +84,7 @@ impl FileMount {
             local: local_abs,
             container: PathBuf::from(container),
             read_only: mode,
+            explicit_rw,
         })
     }
 
@@ -118,13 +123,17 @@ impl FileMount {
     }
 
     /// Render as the docker-cli bind string our container builder
-    /// already understands: `<host_path>:<container_path>[:ro]`.
+    /// already understands: `<host_path>:<container_path>[:ro|:rw]`.
+    /// An explicit `:rw` must be emitted: `docker::default_bind_to_ro`
+    /// appends `:ro` to any bind string that has no mode.
     #[must_use]
     pub fn as_bind_string(&self, content_hash: &str) -> String {
         let host = self.remote_staging_path(content_hash);
         let container = self.container.display();
         if self.read_only {
             format!("{host}:{container}:ro")
+        } else if self.explicit_rw {
+            format!("{host}:{container}:rw")
         } else {
             format!("{host}:{container}")
         }
@@ -310,6 +319,7 @@ mod tests {
             local: PathBuf::from("/tmp/foo.yaml"),
             container: PathBuf::from("/etc/foo.yaml"),
             read_only: true,
+            explicit_rw: false,
         };
         let p = m.remote_staging_path("deadbeef");
         assert_eq!(p, "/var/lib/yoink/files/deadbeef-foo.yaml");
@@ -321,6 +331,7 @@ mod tests {
             local: PathBuf::from("/tmp/foo.yaml"),
             container: PathBuf::from("/etc/foo.yaml"),
             read_only: true,
+            explicit_rw: false,
         };
         assert_eq!(
             m.as_bind_string("abc123"),
@@ -331,6 +342,29 @@ mod tests {
         assert_eq!(
             rw.as_bind_string("abc123"),
             "/var/lib/yoink/files/abc123-foo.yaml:/etc/foo.yaml"
+        );
+    }
+
+    /// Regression: an explicit `:rw` was dropped from the bind string,
+    /// and `docker::default_bind_to_ro` then made the mount read-only.
+    #[test]
+    fn explicit_rw_survives_default_bind_to_ro() {
+        let rw = FileMount::parse("/tmp/data.json:/app/data.json:rw", None).unwrap();
+        assert_eq!(
+            crate::docker::default_bind_to_ro(&rw.as_bind_string("abc123")),
+            "/var/lib/yoink/files/abc123-data.json:/app/data.json:rw"
+        );
+        // No mode in the spec: the bind string stays bare, so the
+        // mount keeps the read-only default and the spec hash of
+        // existing deployments does not change.
+        let bare = FileMount::parse("/tmp/data.json:/app/data.json", None).unwrap();
+        assert_eq!(
+            bare.as_bind_string("abc123"),
+            "/var/lib/yoink/files/abc123-data.json:/app/data.json"
+        );
+        assert_eq!(
+            crate::docker::default_bind_to_ro(&bare.as_bind_string("abc123")),
+            "/var/lib/yoink/files/abc123-data.json:/app/data.json:ro"
         );
     }
 }
