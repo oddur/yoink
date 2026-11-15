@@ -1785,7 +1785,8 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         .chain(here_overrides.iter())
         .cloned()
         .collect();
-    let mut tag_overrides = parse_tag_overrides(&tag_args, services, allow_dirty)?;
+    let mut tag_overrides =
+        parse_tag_overrides(&tag_args, services, allow_dirty, &config.services)?;
 
     let services_filter = services_filter(services);
 
@@ -2123,6 +2124,23 @@ fn parse_tag_overrides(
     tag_args: &[String],
     services_filter: &[String],
     allow_dirty: bool,
+    config_services: &[yoink::config::ServiceConfig],
+) -> Result<std::collections::BTreeMap<String, String>> {
+    parse_tag_overrides_with(tag_args, services_filter, config_services, || {
+        if allow_dirty {
+            return None;
+        }
+        git::version(std::path::Path::new("."), allow_dirty).ok()
+    })
+}
+
+/// [`parse_tag_overrides`] with the git lookup injected, so tests don't
+/// depend on the state of the working tree they run in.
+fn parse_tag_overrides_with(
+    tag_args: &[String],
+    services_filter: &[String],
+    config_services: &[yoink::config::ServiceConfig],
+    git_version: impl FnOnce() -> Option<String>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
     use std::collections::BTreeMap;
     let mut out = BTreeMap::new();
@@ -2152,13 +2170,21 @@ fn parse_tag_overrides(
         }
     } else if !out.is_empty() {
         // user provided per-service tags only; nothing else to do.
-    } else if !services_filter.is_empty() && !allow_dirty {
+    } else if !services_filter.is_empty() {
         // fall back to git version for selected services. Helpful in CI
         // where you'd otherwise just `--tag $GIT_SHA`. Operator can
-        // always opt out by passing tags explicitly.
-        if let Ok(version) = git::version(std::path::Path::new("."), allow_dirty) {
+        // always opt out by passing tags explicitly. Only services
+        // without a config `tag:` get it: an implicit fallback must not
+        // shadow an explicit pin (`redis` with `tag: "7"` would otherwise
+        // be pulled as `redis:<sha>`, and only from a clean tree).
+        if let Some(version) = git_version() {
             for service in services_filter {
-                out.insert(service.clone(), version.clone());
+                let pinned = config_services
+                    .iter()
+                    .any(|s| &s.name == service && s.tag.is_some());
+                if !pinned {
+                    out.insert(service.clone(), version.clone());
+                }
             }
         }
     }
@@ -2184,7 +2210,7 @@ async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
         no_cache,
         push,
     } = build;
-    let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
+    let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty, &config.services)?;
     let services_filter = services_filter(services);
     let explicit_services = services_filter.is_some();
 
@@ -5625,7 +5651,50 @@ fn chrono_like_now() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_as_pairs;
+    use super::{parse_as_pairs, parse_tag_overrides_with};
+
+    fn tag_test_services() -> Vec<yoink::config::ServiceConfig> {
+        yoink::config::Config::parse_str(
+            r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: redis
+    image: redis
+    tag: "7"
+    run: { port: 6379, healthcheck_path: / }
+  - name: api
+    image: ghcr.io/me/api
+    run: { port: 8080, healthcheck_path: / }
+"#,
+        )
+        .unwrap()
+        .services
+    }
+
+    #[test]
+    fn service_filter_git_fallback_does_not_shadow_config_tag() {
+        let services = tag_test_services();
+        let filter = ["redis".to_string(), "api".to_string()];
+        let out =
+            parse_tag_overrides_with(&[], &filter, &services, || Some("abc1234".into())).unwrap();
+        // `redis` pins `tag: "7"` in the config; the implicit git SHA
+        // must not override it.
+        assert_eq!(out.get("redis"), None);
+        // `api` has no config tag, so it still gets the fallback.
+        assert_eq!(out.get("api").map(String::as_str), Some("abc1234"));
+    }
+
+    #[test]
+    fn explicit_bare_tag_still_overrides_config_tag() {
+        let services = tag_test_services();
+        let filter = ["redis".to_string()];
+        let out = parse_tag_overrides_with(&["8".to_string()], &filter, &services, || {
+            panic!("git must not be consulted when --tag is given")
+        })
+        .unwrap();
+        assert_eq!(out.get("redis").map(String::as_str), Some("8"));
+    }
 
     #[test]
     fn as_pair_literal_value() {
