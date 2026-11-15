@@ -748,6 +748,13 @@ pub trait DockerOps: Send + Sync {
 
     async fn force_remove_container(&self, host: &Host, name: &str) -> Result<(), DockerError>;
 
+    /// Remove a container only if it is not running (`docker rm`
+    /// without `-f`). The daemon rejects a running container with a
+    /// 409, which makes this safe to race against another operator
+    /// who may have just started a container under the same name.
+    /// A missing container is success.
+    async fn remove_stopped_container(&self, host: &Host, name: &str) -> Result<(), DockerError>;
+
     /// Send SIGKILL to a container without removing it. The exited
     /// container stays around for `docker logs` / `inspect` and can
     /// be reaped later. Used by `yoink kill` for the "stop responding
@@ -1692,6 +1699,22 @@ impl DockerOps for RealDockerOps {
         .await
     }
 
+    async fn remove_stopped_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
+        self.with_retry(host, |docker| async move {
+            let opts = RemoveContainerOptionsBuilder::new().force(false).build();
+            // 404 = container didn't exist, treat as idempotent success.
+            // 409 (container is running) propagates to the caller.
+            match docker.remove_container(name, Some(opts)).await {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
     async fn kill_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
         self.with_retry(host, |docker| async move {
             // Default signal is SIGKILL — that's exactly what we want here.
@@ -2615,6 +2638,7 @@ struct FakeState {
     start_container: VecDeque<Result<(), DockerError>>,
     stop_container: VecDeque<Result<(), DockerError>>,
     force_remove_container: VecDeque<Result<(), DockerError>>,
+    remove_stopped_container: VecDeque<Result<(), DockerError>>,
     healthcheck: VecDeque<Result<u16, DockerError>>,
     healthcheck_tcp: VecDeque<Result<(), DockerError>>,
     exec_oneshot: VecDeque<Result<OneShotResult, DockerError>>,
@@ -2640,6 +2664,7 @@ pub enum RecordedCall {
     StartContainer(Host, String),
     StopContainer(Host, String, Duration),
     ForceRemoveContainer(Host, String),
+    RemoveStoppedContainer(Host, String),
     Healthcheck(Host, String, String, u16, String),
     HealthcheckTcp(Host, String, String, u16),
     ExecOneshot(Host, String, Vec<String>),
@@ -2697,6 +2722,9 @@ impl FakeDockerOps {
     }
     pub fn push_force_remove(&self, v: Result<(), DockerError>) {
         self.lock().force_remove_container.push_back(v);
+    }
+    pub fn push_remove_stopped(&self, v: Result<(), DockerError>) {
+        self.lock().remove_stopped_container.push_back(v);
     }
     pub fn push_healthcheck(&self, v: Result<u16, DockerError>) {
         self.lock().healthcheck.push_back(v);
@@ -2892,6 +2920,14 @@ impl DockerOps for FakeDockerOps {
             name.into(),
         ));
         pop(&mut s.force_remove_container, "force_remove_container")
+    }
+    async fn remove_stopped_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::RemoveStoppedContainer(
+            host.clone(),
+            name.into(),
+        ));
+        pop(&mut s.remove_stopped_container, "remove_stopped_container")
     }
     async fn kill_container(&self, _host: &Host, _name: &str) -> Result<(), DockerError> {
         Ok(())

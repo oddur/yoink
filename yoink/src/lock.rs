@@ -73,54 +73,57 @@ impl HostLock {
     where
         O: DockerOps + ?Sized,
     {
-        let running =
-            ops.list_running_containers(&host)
-                .await
-                .map_err(|source| LockError::Docker {
-                    host: host.address.clone(),
-                    source,
-                })?;
-        if running.iter().any(|c| c.name == LOCK_NAME) {
-            return Err(LockError::Docker {
-                host: host.address.clone(),
-                source: DockerError::Invalid(format!(
-                    "lock container {LOCK_NAME} is already running on {} \
-                     (another deploy in progress)",
-                    host.address
-                )),
-            });
-        }
-        // Either nothing exists or a stopped orphan from a crashed
-        // deploy whose heartbeat task died. Sweep + start fresh.
-        let _ = ops.force_remove_container(&host, LOCK_NAME).await;
+        let docker_err = |source| LockError::Docker {
+            host: host.address.clone(),
+            source,
+        };
 
         // Pull is idempotent — no-op when the image is already
         // cached. Daemons without alpine pre-pulled (laptops, fresh
         // hosts) would otherwise 404 on create_container below.
         ops.pull_image(&host, LOCK_IMAGE_REPO, LOCK_IMAGE_TAG, None)
             .await
-            .map_err(|source| LockError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
+            .map_err(docker_err)?;
 
-        let body = ContainerCreateBody {
-            image: Some(LOCK_IMAGE.to_string()),
-            cmd: Some(vec!["sh".into(), "-c".into(), heartbeat_watcher_script()]),
-            ..Default::default()
+        // The daemon's name-uniqueness check on create is the atomic
+        // step: of N concurrent operators exactly one create succeeds.
+        // Never remove an existing sentinel before trying, and never
+        // force-remove one; that would delete a concurrent holder's
+        // live lock.
+        let id = match ops.create_container(&host, LOCK_NAME, lock_body()).await {
+            Ok(id) => id,
+            Err(e) if is_conflict(&e) => {
+                let running = ops
+                    .list_running_containers(&host)
+                    .await
+                    .map_err(docker_err)?;
+                if running.iter().any(|c| c.name == LOCK_NAME) {
+                    return Err(already_held(&host));
+                }
+                // A stopped orphan from a crashed deploy whose
+                // heartbeat task died. The non-force remove fails
+                // with a 409 if another operator started a sentinel
+                // since the list above, so it cannot reap a live lock.
+                match ops.remove_stopped_container(&host, LOCK_NAME).await {
+                    Ok(()) => {}
+                    Err(e) if is_conflict(&e) => return Err(already_held(&host)),
+                    Err(e) => return Err(docker_err(e)),
+                }
+                match ops.create_container(&host, LOCK_NAME, lock_body()).await {
+                    Ok(id) => id,
+                    // Another operator reaped the orphan too and won
+                    // the create.
+                    Err(e) if is_conflict(&e) => return Err(already_held(&host)),
+                    Err(e) => return Err(docker_err(e)),
+                }
+            }
+            Err(e) => return Err(docker_err(e)),
         };
-        ops.create_container(&host, LOCK_NAME, body)
-            .await
-            .map_err(|source| LockError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
-        ops.start_container(&host, LOCK_NAME)
-            .await
-            .map_err(|source| LockError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
+        // Start by id, not by name. If a concurrent operator took our
+        // created-but-not-started container for an orphan and replaced
+        // it, the name now points at *their* sentinel; starting by id
+        // fails with a 404 instead of silently sharing their lock.
+        ops.start_container(&host, &id).await.map_err(docker_err)?;
 
         // No external initial-touch — the script itself touches
         // `HEARTBEAT_FILE` as its first action (see
@@ -210,6 +213,40 @@ impl Drop for HostLock {
     }
 }
 
+fn lock_body() -> ContainerCreateBody {
+    ContainerCreateBody {
+        image: Some(LOCK_IMAGE.to_string()),
+        cmd: Some(vec!["sh".into(), "-c".into(), heartbeat_watcher_script()]),
+        ..Default::default()
+    }
+}
+
+fn already_held(host: &Host) -> LockError {
+    LockError::Docker {
+        host: host.address.clone(),
+        source: DockerError::Invalid(format!(
+            "lock container {LOCK_NAME} is already running on {} \
+             (another deploy in progress)",
+            host.address
+        )),
+    }
+}
+
+/// `true` for the daemon's 409: a name conflict on create, or a
+/// non-force remove of a running container.
+fn is_conflict(e: &DockerError) -> bool {
+    matches!(
+        e,
+        DockerError::Bollard {
+            source: bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                ..
+            },
+            ..
+        }
+    )
+}
+
 /// Tiny `sh` script that runs as PID 1 in the sentinel container.
 /// First action: `touch` the heartbeat file so the loop's first
 /// `[ -f … ]` check is unambiguous (the previous design did the
@@ -227,4 +264,168 @@ fn heartbeat_watcher_script() -> String {
            sleep 5; \
          done"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::docker_ops::{ContainerInfo, ContainerState, FakeDockerOps, RecordedCall};
+
+    fn host() -> Host {
+        Host {
+            user: "deploy".into(),
+            address: "10.0.0.1".into(),
+        }
+    }
+
+    fn conflict() -> DockerError {
+        DockerError::Bollard {
+            host: "10.0.0.1".into(),
+            source: bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message: "Conflict".into(),
+            },
+        }
+    }
+
+    fn sentinel() -> ContainerInfo {
+        ContainerInfo {
+            host: "10.0.0.1".into(),
+            name: LOCK_NAME.into(),
+            image: LOCK_IMAGE.into(),
+            state: ContainerState::Running,
+            status_text: "Up 2 seconds".into(),
+            created_unix: None,
+            yoink_service: None,
+            yoink_version: None,
+            yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn removals(ops: &FakeDockerOps) -> Vec<RecordedCall> {
+        ops.calls()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RecordedCall::ForceRemoveContainer(..)
+                        | RecordedCall::RemoveStoppedContainer(..)
+                )
+            })
+            .collect()
+    }
+
+    fn without_pull(ops: &FakeDockerOps) -> Vec<RecordedCall> {
+        ops.calls()
+            .into_iter()
+            .filter(|c| !matches!(c, RecordedCall::PullImage(..)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn acquire_on_clean_host_creates_and_starts_by_id() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Ok("abc123".into()));
+        ops.push_start_container(Ok(()));
+
+        let lock = HostLock::acquire(&ops, host()).await.expect("acquire");
+
+        assert_eq!(
+            without_pull(&ops),
+            vec![
+                RecordedCall::CreateContainer(host(), LOCK_NAME.into()),
+                RecordedCall::StartContainer(host(), "abc123".into()),
+            ]
+        );
+        lock.release(&ops).await;
+    }
+
+    /// Operator B loses the create to operator A. B must bail and must
+    /// not remove A's sentinel.
+    #[tokio::test]
+    async fn acquire_never_removes_a_running_sentinel() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Err(conflict()));
+        ops.push_list_containers(Ok(vec![sentinel()]));
+
+        let err = HostLock::acquire(&ops, host()).await.err().expect("held");
+
+        assert!(err.to_string().contains("another deploy in progress"));
+        assert_eq!(removals(&ops), vec![]);
+    }
+
+    /// The race from the bug report: B's "is it running" list comes
+    /// back empty because A has not started its sentinel yet. B must
+    /// only attempt the non-force remove, and bail when the daemon
+    /// refuses because A's sentinel is running by then.
+    #[tokio::test]
+    async fn acquire_does_not_force_remove_sentinel_started_after_the_check() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![]));
+        ops.push_create_container(Err(conflict()));
+        ops.push_remove_stopped(Err(conflict()));
+        // Scripted so the pre-fix sequence (force-remove, then create)
+        // has a response to pop for its force-remove.
+        ops.push_force_remove(Ok(()));
+
+        let res = HostLock::acquire(&ops, host()).await;
+
+        assert_eq!(
+            removals(&ops),
+            vec![RecordedCall::RemoveStoppedContainer(
+                host(),
+                LOCK_NAME.into()
+            )]
+        );
+        let err = res.err().expect("held");
+        assert!(err.to_string().contains("another deploy in progress"));
+    }
+
+    #[tokio::test]
+    async fn acquire_reaps_stopped_orphan() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Err(conflict()));
+        ops.push_list_containers(Ok(vec![]));
+        ops.push_remove_stopped(Ok(()));
+        ops.push_create_container(Ok("abc123".into()));
+        ops.push_start_container(Ok(()));
+
+        let lock = HostLock::acquire(&ops, host()).await.expect("acquire");
+
+        assert_eq!(
+            without_pull(&ops),
+            vec![
+                RecordedCall::CreateContainer(host(), LOCK_NAME.into()),
+                RecordedCall::ListRunningContainers(host()),
+                RecordedCall::RemoveStoppedContainer(host(), LOCK_NAME.into()),
+                RecordedCall::CreateContainer(host(), LOCK_NAME.into()),
+                RecordedCall::StartContainer(host(), "abc123".into()),
+            ]
+        );
+        lock.release(&ops).await;
+    }
+
+    /// Two operators reap the same orphan; the other one wins the
+    /// second create.
+    #[tokio::test]
+    async fn acquire_bails_when_create_after_reap_conflicts() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Err(conflict()));
+        ops.push_list_containers(Ok(vec![]));
+        ops.push_remove_stopped(Ok(()));
+        ops.push_create_container(Err(conflict()));
+
+        let err = HostLock::acquire(&ops, host()).await.err().expect("held");
+
+        assert!(err.to_string().contains("another deploy in progress"));
+    }
 }
