@@ -550,6 +550,23 @@ fn service_already_at_spec(
                 primary = Some(name);
             }
         }
+        // Extras: a running container of this service that is not one
+        // of the expected replicas (old generation left by a deploy
+        // that died before the swap, or a surplus index after scaling
+        // `replicas` down). Take the full deploy path so
+        // `finalize_one_host` stops it; skipping here would leave it
+        // running and the final Caddy push would route traffic to it.
+        let has_extra = containers.iter().any(|c| {
+            c.yoink_service.as_deref() == Some(service.name.as_str())
+                && c.is_running()
+                && !(0..service.run.replicas).any(|index| {
+                    c.name
+                        == container_name(&service.name, desired_hash, index, service.run.replicas)
+                })
+        });
+        if has_extra {
+            return None;
+        }
         results.push(HostDeployResult {
             host: host_cfg.address.clone(),
             container: primary.unwrap_or_default(),
@@ -2264,6 +2281,101 @@ services:
             e,
             DeployEvent::AlreadyAtSpec { container, .. } if container == &expected_name
         )));
+    }
+
+    fn snapshot_container(name: &str, hash: &str, state: &str) -> ContainerInfo {
+        ContainerInfo {
+            host: "host-a".into(),
+            name: name.into(),
+            image: String::new(),
+            state: state.into(),
+            status_text: String::new(),
+            created_unix: None,
+            yoink_service: Some("app-a".into()),
+            yoink_version: None,
+            yoink_spec_hash: Some(hash.into()),
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Regression: the pre-flight skip must not fire while an extra
+    /// container of the service is still running. A deploy that died
+    /// between "new healthy" and "old stopped" left the old generation
+    /// up; the next reconcile skipped the service, never reached the
+    /// orphan cleanup, and the final Caddy push load-balanced across
+    /// both generations.
+    #[test]
+    fn already_at_spec_is_false_when_old_generation_still_running() {
+        let cfg = config_one_service();
+        let service = &cfg.services[0];
+        let desired = "a".repeat(64);
+        let stale = "b".repeat(64);
+        let new_name = container_name("app-a", &desired, 0, 1);
+        let old_name = container_name("app-a", &stale, 0, 1);
+
+        let snapshot_of = |containers: Vec<ContainerInfo>| {
+            std::collections::HashMap::from([("host-a".to_string(), containers)])
+        };
+
+        // Only the expected replica: skip.
+        let snap = snapshot_of(vec![snapshot_container(&new_name, &desired, "running")]);
+        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_some());
+
+        // Old generation still running next to it: needs deploy.
+        let snap = snapshot_of(vec![
+            snapshot_container(&new_name, &desired, "running"),
+            snapshot_container(&old_name, &stale, "running"),
+        ]);
+        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_none());
+
+        // Old generation already stopped: nothing to clean up, skip.
+        let snap = snapshot_of(vec![
+            snapshot_container(&new_name, &desired, "running"),
+            snapshot_container(&old_name, &stale, "exited"),
+        ]);
+        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_some());
+
+        // A running container of another service is not an extra.
+        let mut other = snapshot_container("app-b-1234567", &stale, "running");
+        other.yoink_service = Some("app-b".into());
+        let snap = snapshot_of(vec![
+            snapshot_container(&new_name, &desired, "running"),
+            other,
+        ]);
+        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_some());
+    }
+
+    /// Regression: `replicas` is not part of the spec hash, so after
+    /// scaling 3 -> 2 the `-0` / `-1` names still match. The surplus
+    /// `-2` must force a deploy so it gets stopped.
+    #[test]
+    fn already_at_spec_is_false_when_surplus_replica_still_running() {
+        let mut cfg = config_one_service();
+        cfg.services[0].run.replicas = 2;
+        let service = &cfg.services[0];
+        let desired = "a".repeat(64);
+        let mut containers: Vec<ContainerInfo> = (0..2)
+            .map(|i| {
+                snapshot_container(
+                    &container_name("app-a", &desired, i, 2),
+                    &desired,
+                    "running",
+                )
+            })
+            .collect();
+        let snap = std::collections::HashMap::from([("host-a".to_string(), containers.clone())]);
+        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_some());
+
+        containers.push(snapshot_container(
+            &container_name("app-a", &desired, 2, 3),
+            &desired,
+            "running",
+        ));
+        let snap = std::collections::HashMap::from([("host-a".to_string(), containers)]);
+        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_none());
     }
 
     #[tokio::test(start_paused = true)]
