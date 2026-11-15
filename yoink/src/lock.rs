@@ -78,12 +78,20 @@ impl HostLock {
             source,
         };
 
-        // Pull is idempotent — no-op when the image is already
-        // cached. Daemons without alpine pre-pulled (laptops, fresh
-        // hosts) would otherwise 404 on create_container below.
-        ops.pull_image(&host, LOCK_IMAGE_REPO, LOCK_IMAGE_TAG, None)
+        // Daemons without alpine pre-pulled (laptops, fresh hosts)
+        // would otherwise 404 on create_container below. Pull only
+        // when the image is missing: a pull contacts the registry
+        // even for a cached tag, and the lock must not depend on
+        // Docker Hub being reachable.
+        if !ops
+            .image_present(&host, LOCK_IMAGE_REPO, LOCK_IMAGE_TAG)
             .await
-            .map_err(docker_err)?;
+            .map_err(docker_err)?
+        {
+            ops.pull_image(&host, LOCK_IMAGE_REPO, LOCK_IMAGE_TAG, None)
+                .await
+                .map_err(docker_err)?;
+        }
 
         // The daemon's name-uniqueness check on create is the atomic
         // step: of N concurrent operators exactly one create succeeds.
@@ -319,24 +327,17 @@ mod tests {
             .collect()
     }
 
-    fn without_pull(ops: &FakeDockerOps) -> Vec<RecordedCall> {
-        ops.calls()
-            .into_iter()
-            .filter(|c| !matches!(c, RecordedCall::PullImage(..)))
-            .collect()
-    }
-
     #[tokio::test]
     async fn acquire_on_clean_host_creates_and_starts_by_id() {
         let ops = FakeDockerOps::new();
-        ops.push_pull_image(Ok(()));
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
         ops.push_create_container(Ok("abc123".into()));
         ops.push_start_container(Ok(()));
 
         let lock = HostLock::acquire(&ops, host()).await.expect("acquire");
 
         assert_eq!(
-            without_pull(&ops),
+            ops.calls(),
             vec![
                 RecordedCall::CreateContainer(host(), LOCK_NAME.into()),
                 RecordedCall::StartContainer(host(), "abc123".into()),
@@ -350,7 +351,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_never_removes_a_running_sentinel() {
         let ops = FakeDockerOps::new();
-        ops.push_pull_image(Ok(()));
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
         ops.push_create_container(Err(conflict()));
         ops.push_list_containers(Ok(vec![sentinel()]));
 
@@ -367,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_does_not_force_remove_sentinel_started_after_the_check() {
         let ops = FakeDockerOps::new();
-        ops.push_pull_image(Ok(()));
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
         ops.push_list_containers(Ok(vec![]));
         ops.push_create_container(Err(conflict()));
         ops.push_remove_stopped(Err(conflict()));
@@ -391,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_reaps_stopped_orphan() {
         let ops = FakeDockerOps::new();
-        ops.push_pull_image(Ok(()));
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
         ops.push_create_container(Err(conflict()));
         ops.push_list_containers(Ok(vec![]));
         ops.push_remove_stopped(Ok(()));
@@ -401,7 +402,7 @@ mod tests {
         let lock = HostLock::acquire(&ops, host()).await.expect("acquire");
 
         assert_eq!(
-            without_pull(&ops),
+            ops.calls(),
             vec![
                 RecordedCall::CreateContainer(host(), LOCK_NAME.into()),
                 RecordedCall::ListRunningContainers(host()),
@@ -418,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_bails_when_create_after_reap_conflicts() {
         let ops = FakeDockerOps::new();
-        ops.push_pull_image(Ok(()));
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
         ops.push_create_container(Err(conflict()));
         ops.push_list_containers(Ok(vec![]));
         ops.push_remove_stopped(Ok(()));
@@ -427,5 +428,41 @@ mod tests {
         let err = HostLock::acquire(&ops, host()).await.err().expect("held");
 
         assert!(err.to_string().contains("another deploy in progress"));
+    }
+
+    /// Registry unreachable (outage, rate limit, air gap) must not
+    /// block a deploy when the sentinel image is already cached.
+    #[tokio::test]
+    async fn acquire_skips_pull_when_image_cached() {
+        let ops = FakeDockerOps::new();
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
+        ops.push_pull_image(Err(DockerError::Invalid("registry unreachable".into())));
+        ops.push_create_container(Ok("abc123".into()));
+        ops.push_start_container(Ok(()));
+
+        let lock = HostLock::acquire(&ops, host()).await.expect("acquire");
+
+        assert!(
+            !ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PullImage(..)))
+        );
+        lock.release(&ops).await;
+    }
+
+    #[tokio::test]
+    async fn acquire_pulls_when_image_missing() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Ok("abc123".into()));
+        ops.push_start_container(Ok(()));
+
+        let lock = HostLock::acquire(&ops, host()).await.expect("acquire");
+
+        assert_eq!(
+            ops.calls()[0],
+            RecordedCall::PullImage(host(), LOCK_IMAGE_REPO.into(), LOCK_IMAGE_TAG.into())
+        );
+        lock.release(&ops).await;
     }
 }
