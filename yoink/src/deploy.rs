@@ -337,7 +337,7 @@ pub async fn reconcile_with_options(
                 name: hook.name.clone(),
             },
         );
-        run_hook(ops, config, hook, &tag, secrets).await?;
+        run_hook(ops, config, None, hook, &tag, secrets).await?;
         on_event(
             None,
             DeployEvent::HookFinished {
@@ -608,7 +608,16 @@ pub async fn deploy_service(
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
         });
-        if let Err(e) = run_hook(ops, config, hook, &resolved_tag, secrets).await {
+        if let Err(e) = run_hook(
+            ops,
+            config,
+            Some(&service.name),
+            hook,
+            &resolved_tag,
+            secrets,
+        )
+        .await
+        {
             cleanup_prepared_replicas(ops, &prepared).await;
             return Err(e);
         }
@@ -1711,9 +1720,15 @@ fn resolve_hook_tag(
 /// merged in). Validation guarantees `image`/`tag` are both Some for
 /// container hooks and both None for subprocess hooks; the dispatch
 /// here only has to honor that invariant.
+///
+/// `service` is the owning service for a service-scoped hook, `None`
+/// for a top-level one. It goes into the container name so two
+/// services deployed in the same wave with a same-named hook at the
+/// same tag don't fight over one name.
 async fn run_hook(
     ops: &dyn DockerOps,
     config: &Config,
+    service: Option<&str>,
     hook: &HookSpec,
     tag: &str,
     secrets: Option<&SecretsBundle>,
@@ -1756,7 +1771,12 @@ async fn run_hook(
         &hook.cmd,
         &hook_env(hook, secrets),
     );
-    let container_name = format!("yoink-hook-{}-{tag}", hook.name);
+    let container_name = hook_container_name(service, &hook.name, tag);
+    // The name is deterministic, so a hook container left behind by an
+    // interrupted deploy (Ctrl-C, dropped ssh link) would fail the
+    // create with a 409 name conflict on every later deploy. The
+    // deploy lock means no live deploy owns it; reap it first.
+    force_remove_name(ops, &host, &container_name).await;
     let result = ops
         .run_one_shot(&host, &container_name, body)
         .await
@@ -1776,6 +1796,13 @@ async fn run_hook(
         });
     }
     Ok(())
+}
+
+fn hook_container_name(service: Option<&str>, hook: &str, tag: &str) -> String {
+    match service {
+        Some(service) => format!("yoink-hook-{service}-{hook}-{tag}"),
+        None => format!("yoink-hook-{hook}-{tag}"),
+    }
 }
 
 fn hook_env(hook: &HookSpec, secrets: Option<&SecretsBundle>) -> BTreeMap<String, String> {
@@ -2354,6 +2381,86 @@ hooks:
         assert_eq!(name, "migrate");
         assert!(message.contains("ERROR: connection refused"));
         assert!(message.contains("applying 0001_init"));
+    }
+
+    /// A hook container leaked by an interrupted deploy keeps its
+    /// deterministic name; without a reap before the create, every
+    /// later deploy at that tag fails with a 409 name conflict.
+    #[tokio::test(start_paused = true)]
+    async fn hook_reaps_stale_container_before_run() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+hooks:
+  pre_deploy:
+    - name: migrate
+      image: registry.example.com/app-a
+      tag: { service: app-a }
+      cmd: ["bin/migrate"]
+"#,
+        )
+        .unwrap();
+
+        let ops = FakeDockerOps::new();
+        ops.push_ensure_network(Ok(false));
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_pull_image(Ok(()));
+        ops.push_force_remove(Ok(()));
+        // Exit non-zero so the reconcile stops right after the hook.
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+
+        let mut sink = |_svc: Option<&str>, _e: DeployEvent| {};
+        let _ = reconcile(&ops, &cfg, &BTreeMap::new(), None, None, &mut sink)
+            .await
+            .unwrap_err();
+
+        let host = Host::from(&cfg.hosts[0]);
+        let name = "yoink-hook-migrate-latest";
+        let calls = ops.calls();
+        let reap = calls
+            .iter()
+            .position(|c| {
+                *c == crate::docker_ops::RecordedCall::ForceRemoveContainer(
+                    host.clone(),
+                    name.into(),
+                )
+            })
+            .expect("stale hook container is force-removed");
+        let run = calls
+            .iter()
+            .position(|c| {
+                *c == crate::docker_ops::RecordedCall::RunOneShot(host.clone(), name.into())
+            })
+            .expect("hook runs");
+        assert!(reap < run, "reap must precede the create: {calls:?}");
+    }
+
+    /// Services in one wave deploy concurrently. Two of them with a
+    /// same-named hook at the same tag must not share a container name.
+    #[test]
+    fn hook_container_name_is_scoped_by_service() {
+        assert_eq!(
+            hook_container_name(None, "migrate", "v42"),
+            "yoink-hook-migrate-v42"
+        );
+        assert_eq!(
+            hook_container_name(Some("api"), "migrate", "v42"),
+            "yoink-hook-api-migrate-v42"
+        );
+        assert_ne!(
+            hook_container_name(Some("api"), "migrate", "v42"),
+            hook_container_name(Some("web"), "migrate", "v42")
+        );
     }
 
     /// Routed-service fixture: api has `domain:` so `is_proxied(api)` is

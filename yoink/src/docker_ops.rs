@@ -2128,9 +2128,15 @@ impl DockerOps for RealDockerOps {
         body: ContainerCreateBody,
     ) -> Result<OneShotResult, DockerError> {
         let exit_code = self.create_start_wait(host, name, body).await?;
-        let docker = self.client_for(host).await?;
-        let (stdout, stderr) = collect_stdout_stderr(&docker, name).await?;
+        // Reap before propagating a log-collection error: hook names
+        // are deterministic, so a leaked container would 409 the next
+        // run.
+        let collected = match self.client_for(host).await {
+            Ok(docker) => collect_stdout_stderr(&docker, name).await,
+            Err(e) => Err(e),
+        };
         let _ = self.force_remove_container(host, name).await;
+        let (stdout, stderr) = collected?;
         Ok(OneShotResult {
             exit_code,
             stdout,
