@@ -16,22 +16,35 @@ pub enum HealthcheckError {
     #[error("docker error: {0}")]
     Docker(#[from] DockerError),
     #[error(
-        "healthcheck timed out after {budget:?} ({attempts} attempts; last status: {last_http_status:?})"
+        "healthcheck timed out after {budget:?} ({attempts} attempts; last status: {last_http_status:?}{})",
+        fmt_last_error(.last_error.as_deref())
     )]
     TimedOut {
         budget: Duration,
         attempts: u32,
         last_http_status: Option<u16>,
+        /// Most recent probe error seen during the budget, if any.
+        /// A probe error is retried like a non-200, so this is the
+        /// only place it surfaces.
+        last_error: Option<String>,
     },
+}
+
+fn fmt_last_error(last_error: Option<&str>) -> String {
+    last_error.map_or_else(String::new, |e| format!("; last probe error: {e}"))
 }
 
 /// Outcome of one probe attempt: either healthy (caller stops polling)
 /// or not-yet, with an optional HTTP status to surface in the timeout
 /// error message. The TCP probe always reports `None` since there's no
-/// HTTP code to report.
+/// HTTP code to report. `error` carries a failed probe's error (ssh
+/// blip, docker API error) so the timeout message can name it.
 enum AttemptOutcome {
     Healthy,
-    NotYet { last_http_status: Option<u16> },
+    NotYet {
+        last_http_status: Option<u16>,
+        error: Option<String>,
+    },
 }
 
 /// Generic backoff loop shared by `poll` (HTTP) and `poll_tcp` (TCP).
@@ -50,13 +63,20 @@ where
     // borrow checker on the timeout branch.
     #[allow(unused_assignments)]
     let mut last_http_status: Option<u16> = None;
+    let mut last_error: Option<String> = None;
     loop {
         attempt += 1;
         match attempt_fn(attempt).await? {
             AttemptOutcome::Healthy => return Ok(attempt),
             AttemptOutcome::NotYet {
                 last_http_status: s,
-            } => last_http_status = s,
+                error,
+            } => {
+                last_http_status = s;
+                if error.is_some() {
+                    last_error = error;
+                }
+            }
         }
         let now = Instant::now();
         if now >= deadline {
@@ -64,6 +84,7 @@ where
                 budget,
                 attempts: attempt,
                 last_http_status,
+                last_error,
             });
         }
         let remaining = deadline - now;
@@ -95,6 +116,7 @@ pub async fn poll_tcp(
                 debug!(host = %host.address, container, attempt, error = %e, "tcp probe failed");
                 Ok(AttemptOutcome::NotYet {
                     last_http_status: None,
+                    error: Some(e.to_string()),
                 })
             }
         }
@@ -104,6 +126,11 @@ pub async fn poll_tcp(
 
 /// Poll the new container's HTTP healthcheck endpoint until 200 or
 /// `budget` elapses. Returns the number of attempts on success.
+///
+/// A probe that errors (ssh transport blip, docker API error on the
+/// one-shot curl container) counts as not-yet, same as `poll_tcp`:
+/// one bad probe must not fail a deploy whose app would answer 200 on
+/// the next attempt. The last error is kept for the timeout message.
 pub async fn poll(
     ops: &dyn DockerOps,
     host: &Host,
@@ -114,17 +141,25 @@ pub async fn poll(
     budget: Duration,
 ) -> Result<u32, HealthcheckError> {
     poll_until(budget, |attempt| async move {
-        let status = ops
-            .healthcheck(host, network, container, port, path)
-            .await?;
-        if status == 200 {
-            debug!(host = %host.address, container, attempt, "healthcheck 200");
-            Ok(AttemptOutcome::Healthy)
-        } else {
-            debug!(host = %host.address, container, attempt, status, "healthcheck non-200");
-            Ok(AttemptOutcome::NotYet {
-                last_http_status: Some(status),
-            })
+        match ops.healthcheck(host, network, container, port, path).await {
+            Ok(200) => {
+                debug!(host = %host.address, container, attempt, "healthcheck 200");
+                Ok(AttemptOutcome::Healthy)
+            }
+            Ok(status) => {
+                debug!(host = %host.address, container, attempt, status, "healthcheck non-200");
+                Ok(AttemptOutcome::NotYet {
+                    last_http_status: Some(status),
+                    error: None,
+                })
+            }
+            Err(e) => {
+                debug!(host = %host.address, container, attempt, error = %e, "healthcheck probe failed");
+                Ok(AttemptOutcome::NotYet {
+                    last_http_status: None,
+                    error: Some(e.to_string()),
+                })
+            }
         }
     })
     .await
@@ -202,10 +237,12 @@ mod tests {
                 budget,
                 attempts,
                 last_http_status,
+                last_error,
             } => {
                 assert_eq!(budget, Duration::from_secs(3));
                 assert!(attempts >= 2, "got {attempts}");
                 assert_eq!(last_http_status, Some(503));
+                assert_eq!(last_error, None);
             }
             HealthcheckError::Docker(e) => panic!("expected timeout, got {e:?}"),
         }
@@ -248,8 +285,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn propagates_docker_error() {
+    async fn retries_after_probe_error_then_succeeds() {
         let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Err(DockerError::Invalid("ssh blip".into())));
+        ops.push_healthcheck(Ok(200));
+        let attempts = poll(
+            &ops,
+            &host(),
+            "yoink",
+            "c",
+            3000,
+            "/h",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn times_out_with_last_probe_error_in_message() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Ok(503));
+        for _ in 0..50 {
+            ops.push_healthcheck(Err(DockerError::Invalid("ssh blip".into())));
+        }
         let err = poll(
             &ops,
             &host(),
@@ -257,10 +317,26 @@ mod tests {
             "c",
             3000,
             "/h",
-            Duration::from_secs(1),
+            Duration::from_secs(3),
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, HealthcheckError::Docker(_)));
+        let message = err.to_string();
+        match err {
+            HealthcheckError::TimedOut {
+                attempts,
+                last_http_status,
+                last_error,
+                ..
+            } => {
+                assert!(attempts >= 2, "got {attempts}");
+                assert_eq!(last_http_status, None);
+                let last_error = last_error.expect("probe error kept");
+                assert!(last_error.contains("ssh blip"), "got {last_error}");
+                assert!(message.contains("last probe error"), "got {message}");
+                assert!(message.contains("ssh blip"), "got {message}");
+            }
+            HealthcheckError::Docker(e) => panic!("expected timeout, got {e:?}"),
+        }
     }
 }

@@ -1739,8 +1739,10 @@ impl DockerOps for RealDockerOps {
             ],
         );
         let exit_status = self.create_start_wait(host, &probe_name, body).await?;
-        let logs = self.fetch_recent_logs(host, &probe_name, 32).await?;
+        // Reap the probe before `?` so a failed log fetch can't leak it.
+        let logs = self.fetch_recent_logs(host, &probe_name, 32).await;
         let _ = self.force_remove_container(host, &probe_name).await;
+        let logs = logs?;
 
         // curl with `-w "%{http_code}"` writes the 3-digit code (no newline)
         // before any `-S` error text. Take the leading digits we see.
