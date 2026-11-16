@@ -215,9 +215,23 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         )));
     }
 
-    // Ensure both implicit networks are declared. A user can also
-    // declare them explicitly (e.g. to attach extra services to
-    // `yoink-ingress`); idempotent.
+    // Pin every service that has no `networks:` to the networks the
+    // operator declared, before the implicit ones are added below. A
+    // service without `networks:` defaults to all of `deploy.networks`,
+    // so without this pin it would also join `yoink-proxy-admin` and
+    // could reach the Caddy admin API, which has no authentication.
+    // Only the proxy belongs on that network. An operator who lists an
+    // implicit network in `deploy.networks` still gets it here.
+    let operator_networks = cfg.deploy.networks.clone();
+    for svc in &mut cfg.services {
+        if svc.networks.is_none() && !matches!(svc.kind, Some(ServiceKind::Proxy)) {
+            svc.networks = Some(operator_networks.clone());
+        }
+    }
+
+    // Ensure both implicit networks are declared, so they are created
+    // on each host. A user can also declare them explicitly (e.g. to
+    // attach extra services to `yoink-ingress`); idempotent.
     for net in [INGRESS_NETWORK, ADMIN_NETWORK] {
         if !cfg.deploy.networks.iter().any(|n| n == net) {
             cfg.deploy.networks.push(net.to_string());
@@ -233,7 +247,7 @@ pub fn inject_implicit_proxy(cfg: &mut Config) -> Result<(), ConfigError> {
         let mut nets = svc
             .networks
             .clone()
-            .unwrap_or_else(|| cfg.deploy.networks.clone());
+            .unwrap_or_else(|| operator_networks.clone());
         if !nets.iter().any(|n| n == INGRESS_NETWORK) {
             nets.push(INGRESS_NETWORK.to_string());
         }
@@ -554,6 +568,47 @@ services:
         let cfg = config_with_one_service(None, Some(8080));
         assert!(!proxy_enabled(&cfg));
         assert!(!cfg.services.iter().any(|s| s.name == PROXY_SERVICE_NAME));
+    }
+
+    /// A service without `networks:` used to default to every entry of
+    /// `deploy.networks`, which includes `yoink-proxy-admin` once the
+    /// proxy is on. It could then reach the unauthenticated Caddy
+    /// admin API. Only the proxy may be on that network.
+    #[test]
+    fn services_without_networks_stay_off_the_admin_network() {
+        let mut cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: h, user: u }
+deploy:
+  networks: [app]
+proxy:
+  email: ops@example.com
+services:
+  - name: api
+    image: example/api
+    tag: v1
+    domain: api.example.com
+    run: { port: 8080 }
+  - name: worker
+    image: example/worker
+    tag: v1
+    run: {}
+"#,
+        )
+        .expect("config parses");
+        // `parse_str` may already inject; a second call must not change it.
+        inject_implicit_proxy(&mut cfg).expect("inject ok");
+
+        let nets = |name: &str| {
+            let svc = cfg.services.iter().find(|s| s.name == name).unwrap();
+            svc.effective_networks(&cfg.deploy)
+        };
+        assert_eq!(nets("api"), ["app", INGRESS_NETWORK]);
+        assert_eq!(nets("worker"), ["app"]);
+        assert_eq!(nets(PROXY_SERVICE_NAME), [INGRESS_NETWORK, ADMIN_NETWORK]);
+        // Still declared, so each host creates it for the proxy.
+        assert!(cfg.deploy.networks.iter().any(|n| n == ADMIN_NETWORK));
     }
 
     #[test]
