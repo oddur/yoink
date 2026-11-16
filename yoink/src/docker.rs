@@ -219,7 +219,7 @@ pub fn build_hook_container(
     let mut endpoints = HashMap::new();
     endpoints.insert(network.to_string(), EndpointSettings::default());
     ContainerCreateBody {
-        image: Some(format!("{image}:{tag}")),
+        image: Some(image_reference(image, tag)),
         env: if env_pairs.is_empty() {
             None
         } else {
@@ -683,6 +683,31 @@ mod tests {
         assert_eq!(
             image_reference("registry.example.com/bt-api", "sha256:abc123"),
             "registry.example.com/bt-api@sha256:abc123",
+        );
+    }
+
+    /// Regression: hook containers formatted `{image}:{tag}` by hand,
+    /// so a digest tag produced the invalid `repo:sha256:<hex>`.
+    #[test]
+    fn hook_container_uses_at_separator_for_digest_tags() {
+        let build = |tag: &str| {
+            build_hook_container(
+                "registry.example.com/migrations",
+                tag,
+                "yoink",
+                None,
+                &[],
+                &BTreeMap::new(),
+            )
+            .image
+        };
+        assert_eq!(
+            build("sha256:abc123").as_deref(),
+            Some("registry.example.com/migrations@sha256:abc123"),
+        );
+        assert_eq!(
+            build("v1.2.3").as_deref(),
+            Some("registry.example.com/migrations:v1.2.3"),
         );
     }
 
