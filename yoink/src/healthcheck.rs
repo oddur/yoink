@@ -127,10 +127,15 @@ pub async fn poll_tcp(
 /// Poll the new container's HTTP healthcheck endpoint until 200 or
 /// `budget` elapses. Returns the number of attempts on success.
 ///
-/// A probe that errors (ssh transport blip, docker API error on the
-/// one-shot curl container) counts as not-yet, same as `poll_tcp`:
-/// one bad probe must not fail a deploy whose app would answer 200 on
-/// the next attempt. The last error is kept for the timeout message.
+/// A probe that errors (ssh transport blip, daemon 5xx on the one-shot
+/// curl container) counts as not-yet, same as `poll_tcp`: one bad
+/// probe must not fail a deploy whose app would answer 200 on the
+/// next attempt. The last error is kept for the timeout message.
+///
+/// The exception is a request the daemon rejected with a 4xx (the
+/// probe network or the probe image does not exist). The next attempt
+/// gets the same answer, so that error ends the poll at once instead
+/// of after the whole budget.
 pub async fn poll(
     ops: &dyn DockerOps,
     host: &Host,
@@ -153,6 +158,7 @@ pub async fn poll(
                     error: None,
                 })
             }
+            Err(e) if e.is_daemon_rejection() => Err(e),
             Err(e) => {
                 debug!(host = %host.address, container, attempt, error = %e, "healthcheck probe failed");
                 Ok(AttemptOutcome::NotYet {
@@ -288,6 +294,62 @@ mod tests {
     async fn retries_after_probe_error_then_succeeds() {
         let ops = FakeDockerOps::new();
         ops.push_healthcheck(Err(DockerError::Invalid("ssh blip".into())));
+        ops.push_healthcheck(Ok(200));
+        let attempts = poll(
+            &ops,
+            &host(),
+            "yoink",
+            "c",
+            3000,
+            "/h",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_rejection_fails_at_once() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Err(DockerError::Bollard {
+            host: "host-a".into(),
+            source: bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: "network yoink not found".into(),
+            },
+        }));
+        // A second attempt would get this 200. The poll must not make it.
+        ops.push_healthcheck(Ok(200));
+        let err = poll(
+            &ops,
+            &host(),
+            "yoink",
+            "c",
+            3000,
+            "/h",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            HealthcheckError::Docker(e) => {
+                assert!(e.to_string().contains("network yoink not found"), "got {e}");
+            }
+            HealthcheckError::TimedOut { .. } => panic!("expected docker error, got {err:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_server_error_is_retried() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Err(DockerError::Bollard {
+            host: "host-a".into(),
+            source: bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "daemon busy".into(),
+            },
+        }));
         ops.push_healthcheck(Ok(200));
         let attempts = poll(
             &ops,

@@ -52,6 +52,23 @@ pub enum DockerError {
     Invalid(String),
 }
 
+impl DockerError {
+    /// True when the daemon answered the request and rejected it
+    /// with a 4xx (no such network, no such image, bad request). The
+    /// same request gets the same answer, so a retry cannot help.
+    /// Transport errors, ssh failures and 5xx are not included.
+    #[must_use]
+    pub fn is_daemon_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::Bollard {
+                source: bollard::errors::Error::DockerResponseServerError { status_code, .. },
+                ..
+            } if (400..500).contains(status_code)
+        )
+    }
+}
+
 /// Minimal host identity used by the trait; converts cheaply from
 /// [`crate::config::HostConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
