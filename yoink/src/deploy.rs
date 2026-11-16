@@ -4062,6 +4062,7 @@ services:
         let host = Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
         };
         let names = build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
             .await
@@ -4133,6 +4134,7 @@ services:
         let host = Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
         };
         let names = build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
             .await
@@ -4165,6 +4167,7 @@ services:
             host: Host {
                 user: "deploy".into(),
                 address: "host-a".into(),
+                port: None,
             },
             replicas: vec![ReplicaPrep {
                 name: "api-NEWHASH".into(),
@@ -4203,6 +4206,7 @@ services:
             host: Host {
                 user: "deploy".into(),
                 address: "host-a".into(),
+                port: None,
             },
             replicas: vec![ReplicaPrep {
                 name: "app-a-NEWHASH".into(),

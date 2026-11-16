@@ -185,8 +185,7 @@ async fn tunnel_and_load(
     config: &Value,
 ) -> Result<(), AdminError> {
     let tunnel = SshTunnel::open(
-        &host.user,
-        &host.address,
+        host,
         target.host_port,
         TUNNEL_READY_TIMEOUT,
         target.keyfile.as_deref(),

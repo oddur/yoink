@@ -369,6 +369,8 @@ struct WizardPlan {
     image: ImageSource,
     tag: String,
     host_address: String,
+    /// SSH port split out of `user@host:port`. Renders as `port:`.
+    host_port: Option<u16>,
     host_user: String,
     host_user_origin: HostUserOrigin,
     port: Option<u16>,
@@ -416,6 +418,10 @@ fn infer_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
     let (image, image_origin) = resolve_image(opts, detection, &service, dockerfile.is_some());
 
     let (host_address, host_user, host_user_origin, host_origin) = resolve_host(opts, detection)?;
+    // `yoink init deploy@host:2200`: the port goes to `port:`, never
+    // into `address:`.
+    let (host_address, host_port) = crate::config::split_address_port(&host_address)
+        .map_err(|e| anyhow::anyhow!("ssh host: {e}"))?;
 
     let port = if opts.no_port {
         None
@@ -446,6 +452,7 @@ fn infer_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
         image,
         tag: "latest".to_string(),
         host_address,
+        host_port,
         host_user,
         host_user_origin,
         port,
@@ -488,8 +495,10 @@ fn prompt_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
         ImageSource::Bare(image)
     };
 
-    let host = ask("ssh host (address)", &plan.host_address)?;
-    plan.host_address = host;
+    let suggested = crate::config::join_address_port(&plan.host_address, plan.host_port);
+    let host = ask("ssh host (address or address:port)", &suggested)?;
+    (plan.host_address, plan.host_port) =
+        crate::config::split_address_port(&host).map_err(|e| anyhow::anyhow!("ssh host: {e}"))?;
     let user = ask("ssh user", &plan.host_user)?;
     plan.host_user = user;
     plan.host_user_origin = HostUserOrigin::HostArg;
@@ -516,6 +525,7 @@ fn fallback_plan(detection: &Detection) -> Result<WizardPlan> {
         image: ImageSource::Bare("app".into()),
         tag: "latest".into(),
         host_address: String::new(),
+        host_port: None,
         host_user: DEFAULT_SSH_USER.into(),
         host_user_origin: HostUserOrigin::Default,
         port: Some(DEFAULT_PORT),
@@ -597,13 +607,18 @@ fn resolve_host(
         ));
     }
     if let Some(host) = opts.host.as_deref() {
+        // The ssh-config hint is keyed by the bare alias. The caller
+        // splits the port off afterwards, so `prod:2200` must match
+        // the hint for `prod` here.
+        let alias = crate::config::split_address_port(host)
+            .map_or_else(|_| host.to_string(), |(bare, _)| bare);
         let (user, addr) = match host.split_once('@') {
             Some((u, a)) => (u.to_string(), a.to_string()),
             None => {
                 let user = detection
                     .ssh_host
                     .as_ref()
-                    .filter(|h| h.address == host)
+                    .filter(|h| h.address == alias)
                     .and_then(|h| h.user.clone())
                     .unwrap_or_else(|| DEFAULT_SSH_USER.to_string());
                 (user, host.to_string())
@@ -614,7 +629,7 @@ fn resolve_host(
         } else if detection
             .ssh_host
             .as_ref()
-            .is_some_and(|h| h.address == host && h.user.is_some())
+            .is_some_and(|h| h.address == alias && h.user.is_some())
         {
             HostUserOrigin::SshConfig
         } else {
@@ -741,12 +756,19 @@ fn render(plan: &WizardPlan) -> String {
     } else if let Some(name) = &plan.ssh_key_secret {
         out.push_str("hosts:\n");
         out.push_str(&format!("  - address: {}\n", plan.host_address));
+        if let Some(port) = plan.host_port {
+            out.push_str(&format!("    port: {port}\n"));
+        }
         out.push_str(&format!("    user: {}\n", plan.host_user));
         out.push_str(&format!("    ssh_key_secret: {name}\n\n"));
     } else {
         out.push_str("hosts:\n");
+        let port = plan
+            .host_port
+            .map(|p| format!("port: {p}, "))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  - {{ address: {}, user: {} }}\n\n",
+            "  - {{ address: {}, {port}user: {} }}\n\n",
             plan.host_address, plan.host_user
         ));
     }
@@ -864,6 +886,8 @@ fn print_summary(plan: &WizardPlan, path: &Path, line_count: usize) {
     );
     let host_target = if plan.host_address.is_empty() {
         "(none — populate via `yoink hosts add`)".to_string()
+    } else if let Some(port) = plan.host_port {
+        format!("{}@{} (port {port})", plan.host_user, plan.host_address)
     } else {
         format!("{}@{}", plan.host_user, plan.host_address)
     };
@@ -1041,6 +1065,7 @@ mod tests {
             image: ImageSource::Registry("ghcr.io/oddur/demo".into()),
             tag: "latest".into(),
             host_address: "prod-eu-1".into(),
+            host_port: None,
             host_user: "deploy".into(),
             host_user_origin: HostUserOrigin::SshConfig,
             port: Some(8080),
@@ -1063,6 +1088,7 @@ mod tests {
             image: ImageSource::Bare("demo".into()),
             tag: "latest".into(),
             host_address: "h".into(),
+            host_port: None,
             host_user: "u".into(),
             host_user_origin: HostUserOrigin::Default,
             port: None,
@@ -1155,6 +1181,7 @@ mod tests {
             image: ImageSource::Bare("demo".into()),
             tag: "latest".into(),
             host_address: "h".into(),
+            host_port: None,
             host_user: "u".into(),
             host_user_origin: HostUserOrigin::Default,
             port: Some(8080),
@@ -1222,5 +1249,92 @@ mod tests {
             }
         }
         hints
+    }
+
+    fn plan_with_host_port(ssh_key_secret: Option<String>) -> WizardPlan {
+        WizardPlan {
+            service: "demo".into(),
+            image: ImageSource::Registry("ghcr.io/oddur/demo".into()),
+            tag: "latest".into(),
+            host_address: "100.122.184.6".into(),
+            host_port: Some(2200),
+            host_user: "root".into(),
+            host_user_origin: HostUserOrigin::HostArg,
+            port: Some(8080),
+            user_override: None,
+            sources: InferredSources::default(),
+            age_recipient: None,
+            ssh_key_secret,
+            proxy_email: None,
+        }
+    }
+
+    #[test]
+    fn render_writes_host_port_as_its_own_field() {
+        let yaml = render(&plan_with_host_port(None));
+        assert!(
+            yaml.contains("  - { address: 100.122.184.6, port: 2200, user: root }\n"),
+            "{yaml}"
+        );
+        let cfg = Config::parse_str(&yaml).expect("parse + validate");
+        assert_eq!(cfg.hosts[0].address, "100.122.184.6");
+        assert_eq!(cfg.hosts[0].port, Some(2200));
+    }
+
+    #[test]
+    fn render_writes_host_port_in_block_form_with_ssh_key() {
+        let yaml = render(&plan_with_host_port(Some("DEPLOY_SSH_KEY".into())));
+        assert!(
+            yaml.contains("  - address: 100.122.184.6\n    port: 2200\n    user: root\n"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn infer_plan_splits_port_from_positional_host() {
+        let opts = InitOpts {
+            host: Some("root@100.122.184.6:2200".into()),
+            force: false,
+            interactive: false,
+            service: Some("demo".into()),
+            port: None,
+            no_port: false,
+            image: None,
+            no_secrets: true,
+            create_ssh_key: None,
+            proxy_email: None,
+        };
+        let plan = infer_plan(&Detection::default(), &opts).expect("plan");
+        assert_eq!(plan.host_address, "100.122.184.6");
+        assert_eq!(plan.host_port, Some(2200));
+        assert_eq!(plan.host_user, "root");
+    }
+
+    #[test]
+    fn infer_plan_takes_ssh_config_user_for_alias_with_port() {
+        let detection = Detection {
+            ssh_host: Some(SshHostHint {
+                address: "prod".into(),
+                user: Some("admin".into()),
+            }),
+            ..Detection::default()
+        };
+        let opts = InitOpts {
+            host: Some("prod:2200".into()),
+            force: false,
+            interactive: false,
+            service: Some("demo".into()),
+            port: None,
+            no_port: false,
+            image: None,
+            no_secrets: true,
+            create_ssh_key: None,
+            proxy_email: None,
+        };
+        let plan = infer_plan(&detection, &opts).expect("plan");
+        assert_eq!(plan.host_address, "prod");
+        assert_eq!(plan.host_port, Some(2200));
+        assert_eq!(plan.host_user, "admin");
+        assert!(matches!(plan.host_user_origin, HostUserOrigin::SshConfig));
     }
 }

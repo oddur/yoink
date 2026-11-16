@@ -33,7 +33,6 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(8);
 /// return the partial stderr (which usually has the actionable
 /// signal already, e.g. Tailscale's auth URL).
 pub async fn probe(host: &Host, keyfile_override: Option<&str>) -> Result<(), String> {
-    let target = format!("{}@{}", host.user, host.address);
     let mut cmd = tokio::process::Command::new("ssh");
     if let Some(keyfile) = keyfile_override {
         // When the host uses `ssh_key_secret:`, route this probe at
@@ -50,9 +49,9 @@ pub async fn probe(host: &Host, keyfile_override: Option<&str>) -> Result<(), St
         "ConnectTimeout=5",
         "-o",
         "StrictHostKeyChecking=accept-new",
-        &target,
-        "true",
     ])
+    .args(host.ssh_args())
+    .arg("true")
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
     let mut child = cmd
@@ -117,7 +116,7 @@ pub fn classify(stderr: &str) -> String {
     }
     if stderr.contains("Could not resolve hostname") || stderr.contains("Name or service not known")
     {
-        return "could not resolve hostname — typo in `address:`, or DNS / Tailscale magicDNS not reachable".into();
+        return "could not resolve hostname — typo in `address:`, or DNS / Tailscale magicDNS not reachable. An SSH port goes in `port:`, not in `address:`".into();
     }
     if stderr.contains("Connection refused") {
         return "connection refused — sshd not listening on the target port".into();

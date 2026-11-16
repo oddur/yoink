@@ -25,6 +25,12 @@ ansi-to-tui = "8"
 anyhow = "1"
 async-trait = "0.1"
 bollard = { version = "0.20", features = ["ssh"] }
+# Direct deps of `bollard_ssh` (yoink's copy of bollard's ssh connector,
+# needed for `hosts[].port`). Same crates bollard's `ssh` feature pulls in.
+hyper = { version = "1.3", features = ["client", "http1"] }
+hyper-util = { version = "0.1.5", features = ["http1", "client-legacy", "tokio"] }
+openssh = "0.11.5"
+tower-service = "0.3"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }

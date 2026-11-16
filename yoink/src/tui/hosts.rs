@@ -31,6 +31,7 @@ pub struct HostsState {
 pub struct HostRow {
     address: String,
     user: String,
+    port: Option<u16>,
     status: HostStatus,
 }
 
@@ -100,6 +101,7 @@ impl HostsState {
             .map(|r| Host {
                 user: r.user.clone(),
                 address: r.address.clone(),
+                port: r.port,
             })
     }
 
@@ -218,6 +220,7 @@ async fn fetch_rows(ops: &dyn DockerOps, hosts: &[HostConfig]) -> Vec<HostRow> {
         .map(|(cfg, (version, info, usage, err))| HostRow {
             address: cfg.address.clone(),
             user: cfg.user.clone(),
+            port: cfg.port,
             status: match (version, err) {
                 (Some(version), _) => HostStatus::Ok(Box::new(OkRow {
                     version,

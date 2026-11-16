@@ -165,6 +165,7 @@ mod tests {
         Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
         }
     }
 
