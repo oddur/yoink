@@ -437,33 +437,34 @@ pub async fn reconcile_with_options(
                     // admin state even when nothing has drifted.
                     let desired = build_desired_spec(config_ref, service, &tag, secrets_ref)?;
                     let desired_hash = docker::compute_spec_hash(&desired);
-                    if !options.force
-                        && let Some(host_results) = service_already_at_spec(
-                            snapshot_ref,
-                            config_ref,
-                            service,
-                            &desired_hash,
-                        )
-                    {
+                    let status = if options.force {
+                        SpecStatus::NotAtSpec
+                    } else {
+                        service_already_at_spec(snapshot_ref, config_ref, service, &desired_hash)
+                    };
+                    drop(desired);
+
+                    if let SpecStatus::AtSpec(hosts) = &status {
                         let mut g = sink_ref
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        for r in &host_results {
-                            for index in 0..service.run.replicas {
-                                let name = container_name(
-                                    &service.name,
-                                    &desired_hash,
-                                    index,
-                                    service.run.replicas,
-                                );
+                        let mut host_results = Vec::with_capacity(hosts.len());
+                        for h in hosts {
+                            for name in &h.expected {
                                 g(
                                     Some(&svc_name),
                                     DeployEvent::AlreadyAtSpec {
-                                        host: r.host.clone(),
-                                        container: name,
+                                        host: h.host.address.clone(),
+                                        container: name.clone(),
                                     },
                                 );
                             }
+                            host_results.push(HostDeployResult {
+                                host: h.host.address.clone(),
+                                container: h.expected.first().cloned().unwrap_or_default(),
+                                healthcheck_attempts: 0,
+                                stopped_old: vec![],
+                            });
                         }
                         return Ok(ServiceDeployReport {
                             service: service.name.clone(),
@@ -471,7 +472,6 @@ pub async fn reconcile_with_options(
                             hosts: host_results,
                         });
                     }
-                    drop(desired);
 
                     // Lock-per-event sink that injects the service tag.
                     let mut local_sink = |e: DeployEvent| {
@@ -480,6 +480,24 @@ pub async fn reconcile_with_options(
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         g(Some(&svc_name), e);
                     };
+
+                    // The expected replicas run at spec, but an old
+                    // generation or a surplus replica is still up.
+                    // Stop it without a deploy: no image pull and no
+                    // `pre_deploy` hooks.
+                    if let SpecStatus::AtSpecWithExtras(hosts) = status {
+                        return cleanup_extra_containers(
+                            ops_ref,
+                            config_ref,
+                            service,
+                            &tag,
+                            secrets_ref,
+                            hosts,
+                            &mut local_sink,
+                        )
+                        .await;
+                    }
+
                     deploy_service(
                         ops_ref,
                         config_ref,
@@ -522,54 +540,223 @@ pub async fn reconcile_with_options(
     Ok(reports)
 }
 
-/// Pre-flight equality check: returns `Some(host_results)` when every
-/// applicable host already runs the expected replicas with matching
-/// `yoink.spec_hash`. `None` means "needs deploy" — at least one host
-/// has missing/extra/mismatched replicas.
+/// What one host runs for a service, measured against the desired
+/// spec. Shared by the reconcile skip decision, the cleanup-only
+/// route and the dry-run diff, so the three cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostSpecState {
+    /// Replica names the desired spec calls for, in index order.
+    pub expected: Vec<String>,
+    /// The subset of `expected` that is running with the desired
+    /// `yoink.spec_hash`.
+    pub present: Vec<String>,
+    /// Running containers labelled with the service that are not in
+    /// `expected`: an old generation left by a deploy that died
+    /// before the swap, or a surplus index after scaling `replicas`
+    /// down. Stopped containers do not count.
+    pub extras: Vec<String>,
+}
+
+impl HostSpecState {
+    /// Every expected replica runs at the desired spec.
+    pub(crate) fn all_present(&self) -> bool {
+        self.present.len() == self.expected.len()
+    }
+}
+
+/// Classify `containers` (one host's yoink-managed containers) for
+/// `service` at `desired_hash`.
+pub(crate) fn host_spec_state(
+    containers: &[ContainerInfo],
+    service: &ServiceConfig,
+    desired_hash: &str,
+) -> HostSpecState {
+    let replicas = service.run.replicas;
+    let expected: Vec<String> = (0..replicas)
+        .map(|index| container_name(&service.name, desired_hash, index, replicas))
+        .collect();
+    let present = expected
+        .iter()
+        .filter(|name| {
+            containers.iter().any(|c| {
+                c.name == **name
+                    && c.is_running()
+                    && c.yoink_spec_hash.as_deref() == Some(desired_hash)
+            })
+        })
+        .cloned()
+        .collect();
+    let extras = containers
+        .iter()
+        .filter(|c| {
+            c.yoink_service.as_deref() == Some(service.name.as_str())
+                && c.is_running()
+                && !expected.contains(&c.name)
+        })
+        .map(|c| c.name.clone())
+        .collect();
+    HostSpecState {
+        expected,
+        present,
+        extras,
+    }
+}
+
+/// One host of a service whose expected replicas all run at spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostAtSpec {
+    host: Host,
+    /// Expected replica names, in index order.
+    expected: Vec<String>,
+    /// Running containers of the service to stop. See
+    /// [`HostSpecState::extras`].
+    extras: Vec<String>,
+}
+
+/// Result of the pre-flight check in [`service_already_at_spec`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpecStatus {
+    /// At least one host has a missing or mismatched replica (or was
+    /// not in the snapshot): the service needs a deploy.
+    NotAtSpec,
+    /// Every applicable host runs exactly the expected replicas.
+    /// Nothing to do.
+    AtSpec(Vec<HostAtSpec>),
+    /// Every applicable host runs the expected replicas, and at least
+    /// one host also runs extras. The service needs a cleanup, not a
+    /// deploy.
+    AtSpecWithExtras(Vec<HostAtSpec>),
+}
+
+/// Pre-flight equality check against the reconcile snapshot.
 fn service_already_at_spec(
     snapshot: &std::collections::HashMap<String, Vec<ContainerInfo>>,
     config: &Config,
     service: &ServiceConfig,
     desired_hash: &str,
-) -> Option<Vec<HostDeployResult>> {
-    let mut results = Vec::new();
+) -> SpecStatus {
+    let mut hosts = Vec::new();
     for host_cfg in service.applicable_hosts(&config.hosts) {
-        let containers = snapshot.get(&host_cfg.address)?;
-        let expected: Vec<String> = (0..service.run.replicas)
-            .map(|index| container_name(&service.name, desired_hash, index, service.run.replicas))
-            .collect();
-        for name in &expected {
-            let found = containers.iter().any(|c| {
-                c.name == *name
-                    && c.is_running()
-                    && c.yoink_spec_hash.as_deref() == Some(desired_hash)
-            });
-            if !found {
-                return None;
-            }
+        let Some(containers) = snapshot.get(&host_cfg.address) else {
+            return SpecStatus::NotAtSpec;
+        };
+        let state = host_spec_state(containers, service, desired_hash);
+        if !state.all_present() {
+            return SpecStatus::NotAtSpec;
         }
-        // Extras: a running container of this service that is not one
-        // of the expected replicas (old generation left by a deploy
-        // that died before the swap, or a surplus index after scaling
-        // `replicas` down). Take the full deploy path so
-        // `finalize_one_host` stops it; skipping here would leave it
-        // running and the final Caddy push would route traffic to it.
-        let has_extra = containers.iter().any(|c| {
-            c.yoink_service.as_deref() == Some(service.name.as_str())
-                && c.is_running()
-                && !expected.contains(&c.name)
-        });
-        if has_extra {
-            return None;
-        }
-        results.push(HostDeployResult {
-            host: host_cfg.address.clone(),
-            container: expected.into_iter().next().unwrap_or_default(),
-            healthcheck_attempts: 0,
-            stopped_old: vec![],
+        hosts.push(HostAtSpec {
+            host: Host::from(host_cfg),
+            expected: state.expected,
+            extras: state.extras,
         });
     }
-    Some(results)
+    if hosts.iter().any(|h| !h.extras.is_empty()) {
+        SpecStatus::AtSpecWithExtras(hosts)
+    } else {
+        SpecStatus::AtSpec(hosts)
+    }
+}
+
+/// Cleanup-only route for a service that is at spec but has extra
+/// containers running. Per host: route Caddy to the expected replicas,
+/// then stop the extras. No image pull, no `pre_deploy` hooks, no
+/// container is created or started.
+///
+/// The Caddy push comes first for the same reason as in
+/// `finalize_one_host`: the extras may be what Caddy routes to today
+/// (the earlier deploy may have died at its own Caddy push). If the
+/// push fails, nothing is stopped and the error is returned.
+///
+/// A stop failure is an error here, unlike in the deploy path. The
+/// stop is the whole job of this route, and an extra that stays up
+/// would be picked up again by the final Caddy push in `reconcile`.
+async fn cleanup_extra_containers(
+    ops: &dyn DockerOps,
+    config: &Config,
+    service: &ServiceConfig,
+    tag: &str,
+    secrets: Option<&SecretsBundle>,
+    hosts: Vec<HostAtSpec>,
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<ServiceDeployReport, DeployError> {
+    let push_caddy = triggers_caddy_load(config, service);
+    let mut host_results = Vec::with_capacity(hosts.len());
+    for HostAtSpec {
+        host,
+        expected,
+        extras,
+    } in hosts
+    {
+        let primary = expected.first().cloned().unwrap_or_default();
+        // Same event sequence a deploy emits for this host, minus the
+        // pull: `Started` ... `Done`. Consumers that track per-service
+        // progress (the TUI reconcile table) need the closing `Done`.
+        // A host with no extras ends on `AlreadyAtSpec`, as in the
+        // plain skip.
+        if !extras.is_empty() {
+            on_event(DeployEvent::Started {
+                service: service.name.clone(),
+                tag: tag.to_string(),
+                host: host.address.clone(),
+            });
+        }
+        for name in &expected {
+            on_event(DeployEvent::AlreadyAtSpec {
+                host: host.address.clone(),
+                container: name.clone(),
+            });
+        }
+        let mut stopped_old = Vec::with_capacity(extras.len());
+        if !extras.is_empty() {
+            if push_caddy {
+                let keep: std::collections::BTreeSet<String> = expected.iter().cloned().collect();
+                push_caddy_config(
+                    ops,
+                    &host,
+                    config,
+                    secrets,
+                    Some((service.name.as_str(), &keep)),
+                )
+                .await?;
+            }
+            for name in extras {
+                stop_old_container(ops, &host, service.run.drain_timeout, &name, on_event)
+                    .await
+                    .map_err(|source| DeployError::Custom {
+                        host: host.address.clone(),
+                        detail: format!(
+                            "service {:?}: failed to stop extra container {name}: {source}",
+                            service.name
+                        ),
+                    })?;
+                stopped_old.push(name);
+            }
+            on_event(DeployEvent::Done {
+                host: host.address.clone(),
+                container: primary.clone(),
+            });
+        }
+        host_results.push(HostDeployResult {
+            host: host.address,
+            container: primary,
+            healthcheck_attempts: 0,
+            stopped_old,
+        });
+    }
+    Ok(ServiceDeployReport {
+        service: service.name.clone(),
+        tag: tag.to_string(),
+        hosts: host_results,
+    })
+}
+
+/// True when a change to `service`'s containers must be followed by a
+/// Caddy config push: the proxy is on, and the service is the proxy
+/// itself or is routed by it.
+fn triggers_caddy_load(config: &Config, service: &ServiceConfig) -> bool {
+    crate::proxy::proxy_enabled(config)
+        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
+            || crate::proxy::is_proxied(service))
 }
 
 /// Reconcile a single service across its applicable hosts.
@@ -809,9 +996,7 @@ async fn finalize_one_host(
     let expected_names: std::collections::BTreeSet<String> =
         replicas.iter().map(|r| r.name.clone()).collect();
 
-    let triggers_caddy_load = crate::proxy::proxy_enabled(config)
-        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
-            || crate::proxy::is_proxied(service));
+    let triggers_caddy_load = triggers_caddy_load(config, service);
 
     // No fresh container to start, but a prior partial failure may
     // have left an old generation running alongside the new — run
@@ -1709,17 +1894,31 @@ async fn swap_out_old_containers_by_set(
         .iter()
         .filter(|c| !keep.contains(&c.name) && c.is_running())
     {
-        if let Err(e) = ops.stop_container(host, &old.name, drain).await {
+        if let Err(e) = stop_old_container(ops, host, drain, &old.name, on_event).await {
             warn!(host = %host.address, old = %old.name, error = %e, "failed to stop old container");
             continue;
         }
-        on_event(DeployEvent::OldContainerStopped {
-            host: host.address.clone(),
-            container: old.name.clone(),
-        });
         stopped.push(old.name.clone());
     }
     Ok(stopped)
+}
+
+/// Stop one container and emit `OldContainerStopped`. The caller
+/// decides what a failure means: the deploy path warns and moves on,
+/// the cleanup-only route fails the service.
+async fn stop_old_container(
+    ops: &dyn DockerOps,
+    host: &Host,
+    drain: Duration,
+    name: &str,
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<(), DockerError> {
+    ops.stop_container(host, name, drain).await?;
+    on_event(DeployEvent::OldContainerStopped {
+        host: host.address.clone(),
+        container: name.to_string(),
+    });
+    Ok(())
 }
 
 /// Resolve a container hook's tag. Subprocess hooks have no tag —
@@ -2307,22 +2506,36 @@ services:
         )));
     }
 
-    fn snapshot_container(name: &str, hash: &str, state: &str) -> ContainerInfo {
+    fn snapshot_container(service: &str, name: &str, hash: &str, state: &str) -> ContainerInfo {
         ContainerInfo {
-            yoink_service: Some("app-a".into()),
+            yoink_service: Some(service.into()),
             yoink_spec_hash: Some(hash.into()),
             ..container_with_state(name, state)
         }
     }
 
-    /// Regression: the pre-flight skip must not fire while an extra
-    /// container of the service is still running. A deploy that died
-    /// between "new healthy" and "old stopped" left the old generation
-    /// up; the next reconcile skipped the service, never reached the
-    /// orphan cleanup, and the final Caddy push load-balanced across
-    /// both generations.
+    fn snapshot_of(
+        containers: Vec<ContainerInfo>,
+    ) -> std::collections::HashMap<String, Vec<ContainerInfo>> {
+        std::collections::HashMap::from([("host-a".to_string(), containers)])
+    }
+
+    fn extras_of(status: &SpecStatus) -> Vec<String> {
+        match status {
+            SpecStatus::AtSpecWithExtras(hosts) => {
+                hosts.iter().flat_map(|h| h.extras.clone()).collect()
+            }
+            other => panic!("expected AtSpecWithExtras, got {other:?}"),
+        }
+    }
+
+    /// The pre-flight check must report a running old generation as an
+    /// extra instead of a plain "at spec". A deploy that died between
+    /// "new healthy" and "old stopped" left the old generation up; the
+    /// next reconcile skipped the service and the final Caddy push
+    /// load-balanced across both generations.
     #[test]
-    fn already_at_spec_is_false_when_old_generation_still_running() {
+    fn already_at_spec_reports_running_old_generation_as_extra() {
         let cfg = config_one_service();
         let service = &cfg.services[0];
         let desired = "a".repeat(64);
@@ -2330,43 +2543,65 @@ services:
         let new_name = container_name("app-a", &desired, 0, 1);
         let old_name = container_name("app-a", &stale, 0, 1);
 
-        let snapshot_of = |containers: Vec<ContainerInfo>| {
-            std::collections::HashMap::from([("host-a".to_string(), containers)])
-        };
+        // Only the expected replica: at spec, nothing to clean up.
+        let snap = snapshot_of(vec![snapshot_container(
+            "app-a", &new_name, &desired, "running",
+        )]);
+        assert!(matches!(
+            service_already_at_spec(&snap, &cfg, service, &desired),
+            SpecStatus::AtSpec(_)
+        ));
 
-        // Only the expected replica: skip.
-        let snap = snapshot_of(vec![snapshot_container(&new_name, &desired, "running")]);
-        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_some());
-
-        // Old generation still running next to it: needs deploy.
+        // Old generation still running next to it: cleanup.
         let snap = snapshot_of(vec![
-            snapshot_container(&new_name, &desired, "running"),
-            snapshot_container(&old_name, &stale, "running"),
+            snapshot_container("app-a", &new_name, &desired, "running"),
+            snapshot_container("app-a", &old_name, &stale, "running"),
         ]);
-        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_none());
+        let status = service_already_at_spec(&snap, &cfg, service, &desired);
+        assert_eq!(extras_of(&status), vec![old_name.clone()]);
 
-        // Old generation already stopped: nothing to clean up, skip.
+        // Old generation already stopped: not an extra.
         let snap = snapshot_of(vec![
-            snapshot_container(&new_name, &desired, "running"),
-            snapshot_container(&old_name, &stale, "exited"),
+            snapshot_container("app-a", &new_name, &desired, "running"),
+            snapshot_container("app-a", &old_name, &stale, "exited"),
         ]);
-        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_some());
+        assert!(matches!(
+            service_already_at_spec(&snap, &cfg, service, &desired),
+            SpecStatus::AtSpec(_)
+        ));
 
         // A running container of another service is not an extra.
-        let mut other = snapshot_container("app-b-1234567", &stale, "running");
-        other.yoink_service = Some("app-b".into());
         let snap = snapshot_of(vec![
-            snapshot_container(&new_name, &desired, "running"),
-            other,
+            snapshot_container("app-a", &new_name, &desired, "running"),
+            snapshot_container("app-b", "app-b-1234567", &stale, "running"),
         ]);
-        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_some());
+        assert!(matches!(
+            service_already_at_spec(&snap, &cfg, service, &desired),
+            SpecStatus::AtSpec(_)
+        ));
+
+        // Expected replica missing: a deploy, even with the old
+        // generation running.
+        let snap = snapshot_of(vec![snapshot_container(
+            "app-a", &old_name, &stale, "running",
+        )]);
+        assert_eq!(
+            service_already_at_spec(&snap, &cfg, service, &desired),
+            SpecStatus::NotAtSpec
+        );
+
+        // Host absent from the snapshot: a deploy.
+        assert_eq!(
+            service_already_at_spec(&std::collections::HashMap::new(), &cfg, service, &desired),
+            SpecStatus::NotAtSpec
+        );
     }
 
-    /// Regression: `replicas` is not part of the spec hash, so after
-    /// scaling 3 -> 2 the `-0` / `-1` names still match. The surplus
-    /// `-2` must force a deploy so it gets stopped.
+    /// `replicas` is not part of the spec hash, so after scaling
+    /// 3 -> 2 the `-0` / `-1` names still match. The surplus `-2` must
+    /// be reported as an extra.
     #[test]
-    fn already_at_spec_is_false_when_surplus_replica_still_running() {
+    fn already_at_spec_reports_surplus_replica_as_extra() {
         let mut cfg = config_one_service();
         cfg.services[0].run.replicas = 2;
         let service = &cfg.services[0];
@@ -2374,22 +2609,336 @@ services:
         let mut containers: Vec<ContainerInfo> = (0..2)
             .map(|i| {
                 snapshot_container(
+                    "app-a",
                     &container_name("app-a", &desired, i, 2),
                     &desired,
                     "running",
                 )
             })
             .collect();
-        let snap = std::collections::HashMap::from([("host-a".to_string(), containers.clone())]);
-        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_some());
-
-        containers.push(snapshot_container(
-            &container_name("app-a", &desired, 2, 3),
-            &desired,
-            "running",
+        assert!(matches!(
+            service_already_at_spec(&snapshot_of(containers.clone()), &cfg, service, &desired),
+            SpecStatus::AtSpec(_)
         ));
-        let snap = std::collections::HashMap::from([("host-a".to_string(), containers)]);
-        assert!(service_already_at_spec(&snap, &cfg, service, &desired).is_none());
+
+        let surplus = container_name("app-a", &desired, 2, 3);
+        containers.push(snapshot_container("app-a", &surplus, &desired, "running"));
+        let status = service_already_at_spec(&snapshot_of(containers), &cfg, service, &desired);
+        assert_eq!(extras_of(&status), vec![surplus]);
+    }
+
+    /// `app-a` with a service-scoped `pre_deploy` hook, so the
+    /// cleanup-only tests can prove the hook does not run.
+    fn config_service_with_hook(replicas: u32) -> Config {
+        Config::parse_str(&format!(
+            r#"
+hosts:
+  - {{ address: host-a, user: deploy }}
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/app-a
+        tag: {{ service: app-a }}
+        cmd: ["bin/migrate"]
+    run:
+      replicas: {replicas}
+      port: 3000
+      healthcheck_path: /health
+      healthcheck_timeout: 60s
+      drain_timeout: 10s
+"#
+        ))
+        .unwrap()
+    }
+
+    fn desired_hash_of(cfg: &Config, service: &str) -> String {
+        let svc = cfg.services.iter().find(|s| s.name == service).unwrap();
+        docker::compute_spec_hash(&build_desired_spec(cfg, svc, "latest", None).unwrap())
+    }
+
+    /// Fake primed for a reconcile whose pre-flight snapshot returns
+    /// `snapshot`. Nothing else is queued except what the caller adds,
+    /// so an unexpected pull, hook run or stop fails the reconcile
+    /// with `FakeExhausted`.
+    fn ops_with_snapshot(cfg: &Config, snapshot: Vec<ContainerInfo>) -> FakeDockerOps {
+        let ops = FakeDockerOps::new();
+        for _ in &cfg.deploy.networks {
+            ops.push_ensure_network(Ok(false));
+        }
+        ops.push_list_containers(Ok(snapshot));
+        ops
+    }
+
+    type TaggedEvents = Vec<(Option<String>, DeployEvent)>;
+
+    async fn reconcile_collect(
+        ops: &FakeDockerOps,
+        cfg: &Config,
+        filter: Option<&[String]>,
+    ) -> (Result<Vec<ServiceDeployReport>, DeployError>, TaggedEvents) {
+        let mut events: TaggedEvents = Vec::new();
+        let mut sink =
+            |svc: Option<&str>, e: DeployEvent| events.push((svc.map(str::to_string), e));
+        let result = reconcile(ops, cfg, &BTreeMap::new(), filter, None, &mut sink).await;
+        (result, events)
+    }
+
+    fn stopped_names(calls: &[crate::docker_ops::RecordedCall]) -> Vec<String> {
+        calls
+            .iter()
+            .filter_map(|c| match c {
+                crate::docker_ops::RecordedCall::StopContainer(_, name, _) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The cleanup-only route must not do any deploy work.
+    fn assert_no_deploy_calls(calls: &[crate::docker_ops::RecordedCall]) {
+        use crate::docker_ops::RecordedCall;
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::PullImage(..)
+                    | RecordedCall::RunOneShot(..)
+                    | RecordedCall::CreateContainer(..)
+                    | RecordedCall::StartContainer(..)
+                    | RecordedCall::ForceRemoveContainer(..)
+            )),
+            "cleanup-only route did deploy work: {calls:?}"
+        );
+    }
+
+    /// Service events of a successful cleanup: `Started`, one
+    /// `AlreadyAtSpec` per expected replica, one `OldContainerStopped`
+    /// per extra, then `Done`.
+    fn assert_cleanup_events(events: &TaggedEvents, expected: &[String], extras: &[String]) {
+        let got: Vec<&DeployEvent> = events
+            .iter()
+            .filter(|(svc, _)| svc.as_deref() == Some("app-a"))
+            .map(|(_, e)| e)
+            .collect();
+        let mut want = vec![DeployEvent::Started {
+            service: "app-a".into(),
+            tag: "latest".into(),
+            host: "host-a".into(),
+        }];
+        want.extend(expected.iter().map(|c| DeployEvent::AlreadyAtSpec {
+            host: "host-a".into(),
+            container: c.clone(),
+        }));
+        want.extend(extras.iter().map(|c| DeployEvent::OldContainerStopped {
+            host: "host-a".into(),
+            container: c.clone(),
+        }));
+        want.push(DeployEvent::Done {
+            host: "host-a".into(),
+            container: expected[0].clone(),
+        });
+        assert_eq!(got, want.iter().collect::<Vec<_>>());
+    }
+
+    /// At spec with an old generation still running: reconcile stops
+    /// the old container and nothing else. No image pull and no
+    /// service-scoped `pre_deploy` hook (a migration must not rerun
+    /// just to stop a leftover container).
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_stops_old_generation_without_redeploying() {
+        let cfg = config_service_with_hook(1);
+        let hash = desired_hash_of(&cfg, "app-a");
+        let new_name = container_name("app-a", &hash, 0, 1);
+        let old_name = container_name("app-a", &"b".repeat(64), 0, 1);
+        let ops = ops_with_snapshot(
+            &cfg,
+            vec![
+                snapshot_container("app-a", &new_name, &hash, "running"),
+                snapshot_container("app-a", &old_name, &"b".repeat(64), "running"),
+            ],
+        );
+        ops.push_stop_container(Ok(()));
+
+        let (result, events) = reconcile_collect(&ops, &cfg, None).await;
+        let reports = result.unwrap();
+
+        let calls = ops.calls();
+        assert_no_deploy_calls(&calls);
+        assert_eq!(stopped_names(&calls), vec![old_name.clone()]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].hosts[0].container, new_name);
+        assert_eq!(reports[0].hosts[0].stopped_old, vec![old_name.clone()]);
+        assert!(
+            crate::output::format_deploy_summary(&reports).contains("stopped 1 old"),
+            "summary must report the stopped container"
+        );
+        assert_cleanup_events(&events, &[new_name], &[old_name]);
+    }
+
+    /// At spec with a surplus replica after scaling 3 -> 2: reconcile
+    /// stops `-2` and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_stops_surplus_replica_without_redeploying() {
+        let cfg = config_service_with_hook(2);
+        let hash = desired_hash_of(&cfg, "app-a");
+        let expected: Vec<String> = (0..2)
+            .map(|i| container_name("app-a", &hash, i, 2))
+            .collect();
+        let surplus = container_name("app-a", &hash, 2, 3);
+        let ops = ops_with_snapshot(
+            &cfg,
+            expected
+                .iter()
+                .chain(std::iter::once(&surplus))
+                .map(|n| snapshot_container("app-a", n, &hash, "running"))
+                .collect(),
+        );
+        ops.push_stop_container(Ok(()));
+
+        let (result, events) = reconcile_collect(&ops, &cfg, None).await;
+        let reports = result.unwrap();
+
+        let calls = ops.calls();
+        assert_no_deploy_calls(&calls);
+        assert_eq!(stopped_names(&calls), vec![surplus.clone()]);
+        assert_eq!(reports[0].hosts[0].container, expected[0]);
+        assert_eq!(reports[0].hosts[0].stopped_old, vec![surplus.clone()]);
+        assert_cleanup_events(&events, &expected, &[surplus]);
+    }
+
+    /// The cleanup-only route pushes Caddy before it stops anything.
+    /// The old generation may be the only thing Caddy routes to (the
+    /// earlier deploy may have died at its own Caddy push). Here the
+    /// push fails because no proxy container is running, so nothing
+    /// may be stopped and the error must reach the caller.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_cleanup_stops_nothing_when_caddy_push_fails() {
+        use crate::docker_ops::RecordedCall;
+        let cfg = config_proxied_service();
+        let hash = desired_hash_of(&cfg, "api");
+        let new_name = container_name("api", &hash, 0, 1);
+        let old_name = container_name("api", &"b".repeat(64), 0, 1);
+        let ops = ops_with_snapshot(
+            &cfg,
+            vec![
+                snapshot_container("api", &new_name, &hash, "running"),
+                snapshot_container("api", &old_name, &"b".repeat(64), "running"),
+            ],
+        );
+        // Proxy container lookup at the start of the push: none running.
+        ops.push_list_containers(Ok(Vec::new()));
+        // Would let the stop succeed if the route got that far.
+        ops.push_stop_container(Ok(()));
+
+        let (result, _events) = reconcile_collect(&ops, &cfg, Some(&["api".to_string()])).await;
+
+        let err = result.expect_err("the failed Caddy push must fail the reconcile");
+        assert!(
+            err.to_string().contains("push Caddy config"),
+            "unexpected error: {err}"
+        );
+        let calls = ops.calls();
+        let proxy_label = format!("yoink.service={}", crate::proxy::PROXY_SERVICE_NAME);
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, RecordedCall::ListContainersByLabel(_, l) if *l == proxy_label)
+            ),
+            "the Caddy push was never attempted: {calls:?}"
+        );
+        assert_eq!(stopped_names(&calls), Vec::<String>::new());
+        assert_no_deploy_calls(&calls);
+    }
+
+    /// On the cleanup-only route a failed stop is an error, not a
+    /// warning: the stop is the whole job, and the error must name the
+    /// host and the container.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_cleanup_fails_when_extra_cannot_be_stopped() {
+        let cfg = config_service_with_hook(1);
+        let hash = desired_hash_of(&cfg, "app-a");
+        let new_name = container_name("app-a", &hash, 0, 1);
+        let old_name = container_name("app-a", &"b".repeat(64), 0, 1);
+        let ops = ops_with_snapshot(
+            &cfg,
+            vec![
+                snapshot_container("app-a", &new_name, &hash, "running"),
+                snapshot_container("app-a", &old_name, &"b".repeat(64), "running"),
+            ],
+        );
+        ops.push_stop_container(Err(DockerError::Invalid("daemon said no".into())));
+
+        let (result, events) = reconcile_collect(&ops, &cfg, None).await;
+
+        let msg = result
+            .expect_err("a failed stop must fail the reconcile")
+            .to_string();
+        assert!(msg.contains(&old_name), "container not named: {msg}");
+        assert!(msg.contains("host-a"), "host not named: {msg}");
+        assert!(msg.contains("daemon said no"), "cause not shown: {msg}");
+        assert!(
+            !events.iter().any(|(_, e)| matches!(
+                e,
+                DeployEvent::OldContainerStopped { .. } | DeployEvent::Done { .. }
+            )),
+            "no stop succeeded, got {events:?}"
+        );
+        assert_no_deploy_calls(&ops.calls());
+    }
+
+    /// At spec with no extras: the skip is unchanged. Reconcile makes
+    /// no call beyond the network check and the snapshot, and emits
+    /// only `AlreadyAtSpec`.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_skips_service_at_spec_without_extras() {
+        use crate::docker_ops::RecordedCall;
+        let cfg = config_service_with_hook(1);
+        let hash = desired_hash_of(&cfg, "app-a");
+        let new_name = container_name("app-a", &hash, 0, 1);
+        let ops = ops_with_snapshot(
+            &cfg,
+            vec![
+                snapshot_container("app-a", &new_name, &hash, "running"),
+                // Stopped old generation and another service's
+                // container: neither is an extra.
+                snapshot_container("app-a", "app-a-0ld0ld0", &"b".repeat(64), "exited"),
+                snapshot_container("app-b", "app-b-1234567", &"c".repeat(64), "running"),
+            ],
+        );
+
+        let (result, events) = reconcile_collect(&ops, &cfg, None).await;
+        let reports = result.unwrap();
+
+        let calls = ops.calls();
+        assert!(
+            calls.iter().all(|c| matches!(
+                c,
+                RecordedCall::EnsureNetwork(..) | RecordedCall::ListContainersByLabel(..)
+            )),
+            "unexpected calls: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::ListContainersByLabel(..)))
+                .count(),
+            1,
+            "only the snapshot may list containers: {calls:?}"
+        );
+        assert_eq!(reports[0].hosts[0].container, new_name);
+        assert!(reports[0].hosts[0].stopped_old.is_empty());
+        let service_events: Vec<&DeployEvent> = events
+            .iter()
+            .filter(|(svc, _)| svc.is_some())
+            .map(|(_, e)| e)
+            .collect();
+        assert_eq!(
+            service_events,
+            vec![&DeployEvent::AlreadyAtSpec {
+                host: "host-a".into(),
+                container: new_name,
+            }]
+        );
     }
 
     #[tokio::test(start_paused = true)]
