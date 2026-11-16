@@ -8,7 +8,7 @@ description: Merge the operator-side and on-host JSONL logs to see every state c
 | Side | File | Events |
 |---|---|---|
 | Operator | `$XDG_STATE_HOME/yoink/audit/events.jsonl` (default `~/.local/state/yoink/audit/`) | Fleet-wide: `RunStarted`, `RunFinished`, and validation or build failures that never reach a host. |
-| Host | `/var/lib/yoink/audit/events.jsonl` on each managed host | Per-host, for example `LockAcquired`, `LockReleased`, `ContainerStarted`, `ContainerCreated`, and `DeployFailed`. |
+| Host | `~/.local/state/yoink/host-audit/events.jsonl` on each managed host, in the home directory of the SSH user | Per-host, for example `LockAcquired`, `LockReleased`, `ContainerStarted`, `ContainerCreated`, and `DeployFailed`. |
 
 Each line has an `event_id` (`UUIDv7`), and the merged view uses it to remove duplicates. The `origin` field (`"operator"` or `"host"`) shows which file the line came from.
 

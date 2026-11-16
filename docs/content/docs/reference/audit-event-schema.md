@@ -1,6 +1,6 @@
 ---
 title: Audit event schema
-description: The JSON fields of each event variant in /var/lib/yoink/audit/events.jsonl.
+description: The JSON fields of each event variant in the yoink audit log.
 ---
 
 Each line in an audit log file is one JSON object: the envelope fields, and the fields of the variant that `event` names.
@@ -195,7 +195,9 @@ The two files have the same line shape and different paths:
 | origin | path | who writes |
 |---|---|---|
 | `operator` | `$XDG_STATE_HOME/yoink/audit/events.jsonl` (defaults to `~/.local/state/yoink/audit/`) | The `yoink` process of the operator, as a local file write. Holds `RunStarted`, `RunFinished`, `HookStarted`, `HookFinished`, and `WebhookFired`. |
-| `host` | `/var/lib/yoink/audit/events.jsonl` on each host | The operator over SSH (`cat >>`). Permissions are `0640`, and the owner is the SSH deploy user. Holds all other events. |
+| `host` | `~/.local/state/yoink/host-audit/events.jsonl` on each host (`$XDG_STATE_HOME/yoink/host-audit/` when the variable is set) | The operator over SSH (`cat >>`). The file is in the home directory of the SSH deploy user, so no root access and no host setup are necessary. Permissions are `0640`. Holds all other events. |
+
+Before v0.21, the host log was in `/var/lib/yoink/audit/`, which only root can create. yoink does not write there now. `yoink audit log` and `yoink audit gc` still read that directory, so the history of a host that has it stays visible.
 
 - **Rotation**: when an active file is larger than 5 MiB after a write, yoink renames it to `events-<UTC-timestamp>.jsonl`. The next write starts a new active file.
 - **Retention**: yoink does not enforce one. `yoink audit gc --keep <DURATION>` removes rotated files that are older than the duration (default `90d`), only on hosts. It never removes the active file. A cron job can run it. Rotated files on the operator side accumulate until you remove them manually.

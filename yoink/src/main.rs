@@ -608,7 +608,7 @@ enum Command {
         format: TableFormat,
     },
     /// Read or prune the on-host audit log — the JSONL stream yoink
-    /// appends to `/var/lib/yoink/audit/events.jsonl` on each managed
+    /// appends to `~/.local/state/yoink/host-audit/events.jsonl` on each managed
     /// host on every state-changing run (`up`, `rollback`, `prune`,
     /// `secrets rotate`). Survives `docker rm`, so it remembers
     /// containers no longer on the host.
@@ -3849,13 +3849,14 @@ async fn audit_gc_one(
     cutoff_unix: u64,
     dry_run: bool,
 ) -> Result<usize> {
-    use yoink::audit::{AUDIT_DIR, run_audit_shell};
-    // POSIX-portable enough for the fleet we target. `-printf '%T@ %f'`
-    // gives `<float-mtime> <basename>` per line.
+    use yoink::audit::{HOST_AUDIT_DIR_SH, LEGACY_HOST_AUDIT_DIR, run_audit_shell};
+    // POSIX-portable enough for the fleet we target. `-printf '%T@ %p'`
+    // gives `<float-mtime> <path>` per line. Both the current and the
+    // legacy directory are covered, so the path is the full one.
     let list_script = format!(
-        "cd {AUDIT_DIR} 2>/dev/null && \
-         find . -maxdepth 1 -type f -name 'events-*.jsonl' -printf '%T@ %f\\n' 2>/dev/null \
-         || true"
+        "D={HOST_AUDIT_DIR_SH}; L={LEGACY_HOST_AUDIT_DIR}; \
+         find \"$D\" \"$L\" -maxdepth 1 -type f -name 'events-*.jsonl' \
+              -printf '%T@ %p\\n' 2>/dev/null || true"
     );
     let listing = run_audit_shell(host, key_path, &list_script).await?;
 
@@ -3873,7 +3874,7 @@ async fn audit_gc_one(
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let mtime_secs = mtime_str.parse::<f64>().unwrap_or(0.0) as u64;
         if mtime_secs < cutoff_unix {
-            to_remove.push(name.trim_start_matches("./").to_string());
+            to_remove.push(name.to_string());
         }
     }
     if to_remove.is_empty() || dry_run {
@@ -3885,7 +3886,7 @@ async fn audit_gc_one(
         .map(|n| format!("'{}'", n.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ");
-    let rm_script = format!("cd {AUDIT_DIR} && rm -f {names}");
+    let rm_script = format!("rm -f {names}");
     run_audit_shell(host, key_path, &rm_script).await?;
     Ok(to_remove.len())
 }
