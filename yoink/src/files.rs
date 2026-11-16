@@ -24,13 +24,25 @@ use crate::docker_ops::Host;
 pub struct FileMount {
     pub local: PathBuf,
     pub container: PathBuf,
+    /// The spec carried an explicit `:ro`. A `files:` mount is always
+    /// read-only in the container: `false` only means the bind string
+    /// stays bare, and the container builder defaults a bare bind to
+    /// `:ro`. There is no writable state (`parse` rejects `:rw`).
     pub read_only: bool,
 }
 
 #[derive(Debug, Error)]
 pub enum FileError {
-    #[error("invalid file mount {0:?}: expected \"local:container[:ro]\"")]
+    #[error(
+        "invalid file mount {0:?}: expected \"local:container[:ro]\" \
+         (`files:` mounts are always read-only; `:rw` is rejected)"
+    )]
     BadFormat(String),
+    #[error(
+        "invalid file mount {0:?}: `:rw` is not allowed, `files:` mounts are always \
+         read-only; use `binds:` or a volume for data the container must write"
+    )]
+    ReadWrite(String),
     #[error("local file {path:?} does not exist or is not readable: {source}")]
     LocalRead {
         path: String,
@@ -47,18 +59,33 @@ pub enum FileError {
     Mkdir { host: String, message: String },
 }
 
+/// True when a `files:` spec ends in an explicit `:rw` mode. Config
+/// validation and `FileMount::parse` both reject such a spec, and
+/// share this check so they cannot disagree on what counts as `:rw`.
+#[must_use]
+pub fn has_rw_mode(spec: &str) -> bool {
+    matches!(spec.rsplit_once(':'), Some((_, "rw")))
+}
+
 impl FileMount {
-    /// Parse `"local:container[:ro]"`. Local paths may be relative —
-    /// they're resolved against `base_dir` (typically the config file's
-    /// directory).
+    /// Parse `"local:container[:ro]"`. The mount is always read-only:
+    /// `:ro` is an explicit no-op, and `:rw` is an error
+    /// (`FileError::ReadWrite`). A writable `files:` mount would lose
+    /// its writes on the next deploy (the local copy is uploaded
+    /// again), share one staged host file between replicas, and be
+    /// unwritable for the default non-root container user. Local paths
+    /// may be relative — they're resolved against `base_dir` (typically
+    /// the config file's directory).
     pub fn parse(spec: &str, base_dir: Option<&Path>) -> Result<Self, FileError> {
+        if has_rw_mode(spec) {
+            return Err(FileError::ReadWrite(spec.to_string()));
+        }
         // Split deliberately on the *first* and *last* `:` rather than
         // by count, so container paths with colons (rare but possible)
-        // aren't mangled. The trailing `:ro` (or `:rw`) is recognized
-        // only when the suffix is exactly that.
+        // aren't mangled. The trailing `:ro` is recognized only when
+        // the suffix is exactly that.
         let (head, mode) = match spec.rsplit_once(':') {
             Some((h, "ro")) => (h, true),
-            Some((h, "rw")) => (h, false),
             _ => (spec, false),
         };
         let Some((local, container)) = head.split_once(':') else {
@@ -118,15 +145,16 @@ impl FileMount {
 
     /// Render as the docker-cli bind string our container builder
     /// already understands: `<host_path>:<container_path>[:ro]`.
+    /// A spec with no mode renders bare, and
+    /// `docker::default_bind_to_ro` then appends `:ro`. Do not
+    /// normalise the two forms: the string feeds the spec hash, so a
+    /// change here rerolls every service that has a `files:` entry.
     #[must_use]
     pub fn as_bind_string(&self, content_hash: &str) -> String {
         let host = self.remote_staging_path(content_hash);
         let container = self.container.display();
-        if self.read_only {
-            format!("{host}:{container}:ro")
-        } else {
-            format!("{host}:{container}")
-        }
+        let mode = if self.read_only { ":ro" } else { "" };
+        format!("{host}:{container}{mode}")
     }
 }
 
@@ -332,6 +360,54 @@ mod tests {
         assert_eq!(
             rw.as_bind_string("abc123"),
             "/var/lib/yoink/files/abc123-foo.yaml:/etc/foo.yaml"
+        );
+    }
+
+    /// An explicit `:rw` used to parse and then mount read-only. It is
+    /// now an error, so a `FileMount` never stands for a writable mount.
+    #[test]
+    fn parse_rejects_rw() {
+        let err = FileMount::parse("/tmp/data.json:/app/data.json:rw", None).unwrap_err();
+        assert!(matches!(&err, FileError::ReadWrite(s) if s == "/tmp/data.json:/app/data.json:rw"));
+        let msg = err.to_string();
+        assert!(msg.contains("always read-only"), "{msg}");
+        assert!(msg.contains("`binds:` or a volume"), "{msg}");
+        // The mode is rejected before the shape is checked.
+        assert!(matches!(
+            FileMount::parse("nocolon:rw", None),
+            Err(FileError::ReadWrite(_))
+        ));
+    }
+
+    #[test]
+    fn bad_format_error_says_rw_is_rejected() {
+        let msg = FileMount::parse("nocolon", None).unwrap_err().to_string();
+        assert!(msg.contains("local:container[:ro]"), "{msg}");
+        assert!(msg.contains("`:rw` is rejected"), "{msg}");
+    }
+
+    /// Pins the bind strings for a spec with no mode and a spec with
+    /// `:ro`. They feed the spec hash, so they must stay byte-identical
+    /// across releases or every service with a `files:` entry rerolls.
+    #[test]
+    fn bind_strings_for_no_mode_and_ro_are_pinned() {
+        let bare = FileMount::parse("/tmp/data.json:/app/data.json", None).unwrap();
+        assert_eq!(
+            bare.as_bind_string("abc123"),
+            "/var/lib/yoink/files/abc123-data.json:/app/data.json"
+        );
+        assert_eq!(
+            crate::docker::default_bind_to_ro(&bare.as_bind_string("abc123")),
+            "/var/lib/yoink/files/abc123-data.json:/app/data.json:ro"
+        );
+        let ro = FileMount::parse("/tmp/data.json:/app/data.json:ro", None).unwrap();
+        assert_eq!(
+            ro.as_bind_string("abc123"),
+            "/var/lib/yoink/files/abc123-data.json:/app/data.json:ro"
+        );
+        assert_eq!(
+            crate::docker::default_bind_to_ro(&ro.as_bind_string("abc123")),
+            "/var/lib/yoink/files/abc123-data.json:/app/data.json:ro"
         );
     }
 }

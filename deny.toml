@@ -16,6 +16,11 @@ ignore = [
     # newer `i18n-embed-fl`/`age` release drops it yet. Drop this ignore when
     # they migrate off it.
     "RUSTSEC-2026-0173",
+    # `basic-toml` is archived. It is a BUILD-TIME dependency of the same
+    # i18n proc-macros (`age` → `i18n-embed-fl` → `i18n-config`), so it
+    # never reaches the shipped binary, and no newer `age` release drops it
+    # yet. Drop this ignore together with the one above.
+    "RUSTSEC-2026-0374",
 ]
 
 [licenses]
