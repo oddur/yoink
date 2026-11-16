@@ -52,6 +52,23 @@ pub enum DockerError {
     Invalid(String),
 }
 
+impl DockerError {
+    /// True when the daemon answered the request and rejected it
+    /// with a 4xx (no such network, no such image, bad request). The
+    /// request reached the daemon, so this is not a transport blip.
+    /// Transport errors, ssh failures and 5xx are not included.
+    #[must_use]
+    pub fn is_daemon_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::Bollard {
+                source: bollard::errors::Error::DockerResponseServerError { status_code, .. },
+                ..
+            } if (400..500).contains(status_code)
+        )
+    }
+}
+
 /// Minimal host identity used by the trait; converts cheaply from
 /// [`crate::config::HostConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1065,6 +1082,20 @@ impl RealDockerOps {
         }
     }
 
+    /// Make sure a healthcheck probe image (`repo:tag`) is in the
+    /// daemon's store. Best-effort: a failure here surfaces on the
+    /// probe's `create_container` instead. The `image_present` check
+    /// is a local daemon stat; without it every probe attempt asks
+    /// the registry for the manifest, which is slow and counts
+    /// against Docker Hub's pull rate limit.
+    async fn ensure_probe_image(&self, host: &Host, reference: &str) {
+        let (image, tag) = reference.split_once(':').unwrap_or((reference, "latest"));
+        if self.image_present(host, image, tag).await.unwrap_or(false) {
+            return;
+        }
+        let _ = self.pull_image(host, image, tag, None).await;
+    }
+
     /// Create + start a container, then wait for it to exit. Returns
     /// the exit code. The caller owns inspecting the container (logs)
     /// and the final `force_remove_container` — this helper only
@@ -1717,14 +1748,9 @@ impl DockerOps for RealDockerOps {
     ) -> Result<u16, DockerError> {
         let url = format!("http://{target}:{port}{path}");
         let probe_name = format!("yoink-probe-{}-{}", target, rand_hex());
-        // Pull the probe image up front (best-effort; fast no-op when cached),
-        // mirroring healthcheck_tcp's busybox pull. Without this the first HTTP
-        // probe on a fresh daemon (a just-provisioned host) 404s on
-        // create_container because curlimages/curl was never pulled.
-        let (probe_img, probe_tag) = HEALTHCHECK_CURL_IMAGE
-            .split_once(':')
-            .unwrap_or((HEALTHCHECK_CURL_IMAGE, "latest"));
-        let _ = self.pull_image(host, probe_img, probe_tag, None).await;
+        // Without this the first probe on a fresh daemon (a
+        // just-provisioned host) 404s on create_container.
+        self.ensure_probe_image(host, HEALTHCHECK_CURL_IMAGE).await;
         let body = probe_body(
             network,
             vec![
@@ -1739,8 +1765,10 @@ impl DockerOps for RealDockerOps {
             ],
         );
         let exit_status = self.create_start_wait(host, &probe_name, body).await?;
-        let logs = self.fetch_recent_logs(host, &probe_name, 32).await?;
+        // Reap the probe before `?` so a failed log fetch can't leak it.
+        let logs = self.fetch_recent_logs(host, &probe_name, 32).await;
         let _ = self.force_remove_container(host, &probe_name).await;
+        let logs = logs?;
 
         // curl with `-w "%{http_code}"` writes the 3-digit code (no newline)
         // before any `-S` error text. Take the leading digits we see.
@@ -2062,10 +2090,9 @@ impl DockerOps for RealDockerOps {
         // protocol). curl's `--connect-only` is HTTP-scheme-bound
         // and `telnet://` reads after connect — both fall over on
         // those.
-        // Pull the busybox image best-effort. Idempotent — no-op
-        // when already cached. Without this the first probe on a
-        // fresh daemon 404s on create_container.
-        let _ = self.pull_image(host, "busybox", "1.37", None).await;
+        // Without this the first probe on a fresh daemon (a
+        // just-provisioned host) 404s on create_container.
+        self.ensure_probe_image(host, HEALTHCHECK_TCP_IMAGE).await;
         let probe_name = format!("yoink-tcp-probe-{}-{}", target, rand_hex());
         let body = probe_body_with_image(
             HEALTHCHECK_TCP_IMAGE,
