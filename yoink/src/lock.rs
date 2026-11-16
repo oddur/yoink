@@ -312,6 +312,7 @@ mod tests {
         Host {
             user: "deploy".into(),
             address: "10.0.0.1".into(),
+            port: None,
         }
     }
 

@@ -30,6 +30,7 @@ Each host needs an address; that can be either a literal `address:` or, for case
 |---|---|---|
 | `address` | string | Hostname or IP. Anything your local SSH client accepts: a raw IP, a DNS name, a `~/.ssh/config` alias, or a tailnet hostname. Mutually exclusive with `address_secret`. |
 | `address_secret` | string (optional) | Name of an entry in your sealed-secrets bundle holding the host's address (IP or hostname). Resolved at config-load time after the bundle decrypts. Use this when the deploy config sits in a public repo and the host's address is sensitive. Mutually exclusive with `address`. |
+| `port` | integer (optional) | SSH port, 1 to 65535. When unset, yoink passes no port and your SSH client decides (22, or a `Port` line in `~/.ssh/config`). Applies to every SSH connection yoink makes to this host. Do not put the port in `address`: `address: host:2200` is rejected at config load. Ignored for `address: local`. |
 | `user` | string | SSH user. Must be in the `docker` group on the host (or be `root`). |
 | `ssh_key_secret` | string (optional) | Name of an entry in your sealed-secrets bundle holding a PEM-formatted SSH private key. When set, yoink decrypts the key into a per-process tempfile (mode `0o600`) and uses it for this host's SSH connections, both the docker daemon connection and the pre-flight ssh probe. Lets you ship the deploy key with the repo (encrypted at rest in `secrets.age`) instead of relying on every operator's personal `ssh-agent`. |
 

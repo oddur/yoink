@@ -145,6 +145,82 @@ pub enum OnFailure {
     Continue,
 }
 
+/// Split an operator-typed `host[:port]` into the bare host and its
+/// SSH port. A trailing `:digits` is a port only after a hostname or
+/// an IPv4 address (exactly one colon), or after a bracketed IPv6
+/// address (`[::1]:2200`). A bare IPv6 address has several colons and
+/// no port. Brackets are dropped from the returned host because ssh
+/// wants the bare address.
+///
+/// Errors when the port is not in 1-65535 or a bracket is unbalanced.
+pub fn split_address_port(input: &str) -> Result<(String, Option<u16>), String> {
+    fn parse_port(digits: &str) -> Result<u16, String> {
+        match digits.parse::<u16>() {
+            Ok(p) if p != 0 => Ok(p),
+            _ => Err(format!("port {digits:?} must be a number in 1-65535")),
+        }
+    }
+    let input = input.trim();
+    if let Some(rest) = input.strip_prefix('[') {
+        let Some((v6, tail)) = rest.split_once(']') else {
+            return Err("`[` has no closing `]`".to_string());
+        };
+        if tail.is_empty() {
+            return Ok((v6.to_string(), None));
+        }
+        let Some(digits) = tail.strip_prefix(':') else {
+            return Err("expected `:port` after `]`".to_string());
+        };
+        return Ok((v6.to_string(), Some(parse_port(digits)?)));
+    }
+    match input.rsplit_once(':') {
+        Some((host, digits))
+            if !host.is_empty()
+                && !host.contains(':')
+                && !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            Ok((host.to_string(), Some(parse_port(digits)?)))
+        }
+        _ => Ok((input.to_string(), None)),
+    }
+}
+
+/// Inverse of [`split_address_port`]: `address[:port]`, with brackets
+/// around an IPv6 address when a port follows it.
+#[must_use]
+pub fn join_address_port(address: &str, port: Option<u16>) -> String {
+    match port {
+        Some(port) if address.contains(':') => format!("[{address}]:{port}"),
+        Some(port) => format!("{address}:{port}"),
+        None => address.to_string(),
+    }
+}
+
+/// `Some(reason)` when `address` carries a `:port` suffix. ssh takes
+/// the whole string as a hostname and fails with "Could not resolve
+/// hostname", so config load rejects it and points at `port:`.
+/// `sealed` is true for a value that came from `address_secret`: the
+/// value stays out of the message, and the hint keeps the address
+/// sealed instead of telling the operator to write `address:`.
+fn address_port_error(address: &str, sealed: bool) -> Option<String> {
+    match split_address_port(address) {
+        Ok((_, Some(port))) if sealed => Some(format!(
+            "includes a port, and ssh would read the whole string as a hostname. \
+             Seal the value again without the port and set `port: {port}` \
+             next to `address_secret:`"
+        )),
+        Ok((bare, Some(port))) => Some(format!(
+            "includes a port, and ssh would read the whole string as a hostname. \
+             Move the port into `port:` (`address: {bare}`, `port: {port}`)"
+        )),
+        Ok((_, None)) => None,
+        Err(e) => Some(format!(
+            "is not a valid address ({e}). Set the SSH port with `port:`"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
@@ -163,6 +239,13 @@ pub struct HostConfig {
     /// literal `address:` field — set exactly one.
     #[serde(default)]
     pub address_secret: Option<String>,
+    /// Optional: SSH port for this host. `None` leaves the choice to
+    /// ssh (the default 22, or a `Port` line in `~/.ssh/config`), so
+    /// yoink emits no port flag. `address:` stays the host's identity
+    /// and display label; the port is never part of it. Ignored for
+    /// the `local` sentinel host.
+    #[serde(default)]
+    pub port: Option<u16>,
     pub user: String,
     /// Optional: name of a sealed-secret entry holding an SSH private
     /// key (PEM format) to use when connecting to this host. When set,
@@ -1578,6 +1661,14 @@ impl Config {
                     "hosts[{i}].address_secret = {key:?} resolved to an empty value"
                 )));
             }
+            // Same rule as the literal `address:` check in `validate`,
+            // applied here because a sealed address is only readable
+            // now. The value itself stays out of the message.
+            if let Some(reason) = address_port_error(value, true) {
+                return Err(ConfigError::Invalid(format!(
+                    "hosts[{i}].address_secret = {key:?} resolved to a value that {reason}"
+                )));
+            }
             host.address = value.to_string();
         }
         Ok(())
@@ -1948,6 +2039,17 @@ impl Config {
             if host.user.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
                     "hosts[{i}].user must not be empty"
+                )));
+            }
+            if has_literal && let Some(reason) = address_port_error(&host.address, false) {
+                return Err(ConfigError::Invalid(format!(
+                    "hosts[{i}].address = {:?} {reason}",
+                    host.address
+                )));
+            }
+            if host.port == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "hosts[{i}].port must be in 1-65535"
                 )));
             }
         }
@@ -4319,5 +4421,163 @@ hooks:
         // Profile reference is preserved so the runner can re-read
         // the `unset:` list at hook-run time.
         assert_eq!(h.secrets_profile.as_deref(), Some("needs-unset"));
+    }
+
+    #[test]
+    fn split_address_port_hostname_and_ipv4() {
+        assert_eq!(
+            split_address_port("prod-eu-1:2200"),
+            Ok(("prod-eu-1".to_string(), Some(2200)))
+        );
+        assert_eq!(
+            split_address_port("100.122.184.6:2200"),
+            Ok(("100.122.184.6".to_string(), Some(2200)))
+        );
+    }
+
+    #[test]
+    fn split_address_port_without_port_is_unchanged() {
+        for addr in ["prod-eu-1", "100.122.184.6", "local", "host.example.com"] {
+            assert_eq!(split_address_port(addr), Ok((addr.to_string(), None)));
+        }
+    }
+
+    #[test]
+    fn split_address_port_bracketed_ipv6() {
+        assert_eq!(
+            split_address_port("[2001:db8::1]:2200"),
+            Ok(("2001:db8::1".to_string(), Some(2200)))
+        );
+        // Brackets without a port: just the address.
+        assert_eq!(
+            split_address_port("[2001:db8::1]"),
+            Ok(("2001:db8::1".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn split_address_port_bare_ipv6_has_no_port() {
+        // The trailing group is all digits, but with several colons
+        // it is part of the address, not a port.
+        for addr in [
+            "2001:db8::1",
+            "::1",
+            "fe80::1:2200",
+            "2001:db8:0:0:0:0:0:22",
+        ] {
+            assert_eq!(split_address_port(addr), Ok((addr.to_string(), None)));
+        }
+    }
+
+    #[test]
+    fn split_address_port_rejects_bad_ports_and_brackets() {
+        assert!(split_address_port("host:0").is_err());
+        assert!(split_address_port("host:65536").is_err());
+        assert!(split_address_port("[::1]:").is_err());
+        assert!(split_address_port("[::1]:ssh").is_err());
+        assert!(split_address_port("[::1").is_err());
+        assert!(split_address_port("[::1]2200").is_err());
+        // Not all digits after the colon: not a port, left alone.
+        assert_eq!(
+            split_address_port("host:22a"),
+            Ok(("host:22a".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn host_port_field_parses_and_defaults_to_none() {
+        let cfg = Config::parse_str(
+            "hosts:\n  - { address: h1, port: 2200, user: u }\n  - { address: h2, user: u }\nservices: []\n",
+        )
+        .expect("parse");
+        assert_eq!(cfg.hosts[0].address, "h1");
+        assert_eq!(cfg.hosts[0].port, Some(2200));
+        assert_eq!(cfg.hosts[1].port, None);
+    }
+
+    #[test]
+    fn address_with_port_is_rejected_and_points_at_port_field() {
+        // The exact shape `yoink hosts add --address 100.122.184.6:2200`
+        // used to write.
+        for addr in [
+            "100.122.184.6:2200",
+            "prod-eu-1:2200",
+            "\"[2001:db8::1]:2200\"",
+        ] {
+            let s = format!("hosts:\n  - {{ address: {addr}, user: root }}\nservices: []\n");
+            let msg = format!("{}", Config::parse_str(&s).unwrap_err());
+            assert!(msg.contains("hosts[0].address"), "got: {msg}");
+            assert!(msg.contains("includes a port"), "got: {msg}");
+            assert!(msg.contains("`port: 2200`"), "got: {msg}");
+        }
+        let msg = format!(
+            "{}",
+            Config::parse_str(
+                "hosts:\n  - { address: 100.122.184.6:2200, user: root }\nservices: []\n"
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains("`address: 100.122.184.6`"), "got: {msg}");
+    }
+
+    #[test]
+    fn address_with_port_is_rejected_even_when_port_is_set() {
+        let s = "hosts:\n  - { address: h:2200, port: 2200, user: root }\nservices: []\n";
+        let msg = format!("{}", Config::parse_str(s).unwrap_err());
+        assert!(msg.contains("includes a port"), "got: {msg}");
+    }
+
+    #[test]
+    fn bare_ipv6_address_is_not_mistaken_for_a_port() {
+        let s = "hosts:\n  - { address: \"2001:db8::22\", user: root }\nservices: []\n";
+        let cfg = Config::parse_str(s).expect("bare ipv6 loads");
+        assert_eq!(cfg.hosts[0].address, "2001:db8::22");
+        assert_eq!(cfg.hosts[0].port, None);
+    }
+
+    #[test]
+    fn host_port_zero_is_rejected() {
+        let s = "hosts:\n  - { address: h, port: 0, user: root }\nservices: []\n";
+        let msg = format!("{}", Config::parse_str(s).unwrap_err());
+        assert!(msg.contains("hosts[0].port"), "got: {msg}");
+    }
+
+    #[test]
+    fn local_host_with_port_loads() {
+        let s = "hosts:\n  - { address: local, port: 2200, user: u }\nservices: []\n";
+        let cfg = Config::parse_str(s).expect("local + port loads");
+        assert_eq!(cfg.hosts[0].port, Some(2200));
+    }
+
+    #[test]
+    fn sealed_address_with_port_is_rejected_without_leaking_it() {
+        use crate::secrets::SecretsBundle;
+        let dir = write_temp_tree(&[(
+            "yoink.yaml",
+            r#"
+deploy:
+  networks: [main]
+hosts:
+  - { address_secret: PROD_HOST_IP, user: deploy }
+secrets:
+  provider: age
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
+"#,
+        )]);
+        let mut cfg = Config::load_from_path(&dir.join("yoink.yaml")).unwrap();
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            "PROD_HOST_IP".to_string(),
+            zeroize::Zeroizing::new("10.0.0.42:2200".to_string()),
+        );
+        let bundle = SecretsBundle::new(values);
+        let msg = format!("{}", cfg.resolve_host_addresses(Some(&bundle)).unwrap_err());
+        assert!(msg.contains("PROD_HOST_IP"), "got: {msg}");
+        assert!(msg.contains("`port: 2200`"), "got: {msg}");
+        assert!(!msg.contains("10.0.0.42"), "address leaked: {msg}");
+        // The hint must keep the address sealed, not move it into a
+        // plaintext `address:`.
+        assert!(msg.contains("next to `address_secret:`"), "got: {msg}");
+        assert!(!msg.contains("`address: "), "got: {msg}");
     }
 }

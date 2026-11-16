@@ -4,6 +4,7 @@
 //! a child `ssh` process. The tunnel lives for the duration of one
 //! image push and is killed via `Drop` (also on panic).
 
+use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -12,6 +13,8 @@ use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tracing::warn;
+
+use crate::docker_ops::Host;
 
 /// How often to retry the local-port TCP connect while waiting for
 /// the SSH tunnel to come up. 100 ms balances responsiveness against
@@ -44,7 +47,8 @@ pub struct SshTunnel {
 
 impl SshTunnel {
     /// `127.0.0.1:<local_port>` on the operator forwards to
-    /// `127.0.0.1:<remote_port>` on `<user>@<host>`. Picks a free local
+    /// `127.0.0.1:<remote_port>` on `host` (reached on its `port:` when
+    /// one is set). Picks a free local
     /// port via a transient `bind(0)`, then asks the kernel to release
     /// it before handing the number to ssh — there's a short race window
     /// where another process could grab the same port; in practice the
@@ -53,13 +57,12 @@ impl SshTunnel {
     /// Returns once a TCP connect to the local port succeeds, so the
     /// caller can immediately `docker push` against it.
     pub async fn open(
-        user: &str,
-        host: &str,
+        host: &Host,
         remote_port: u16,
         ready_timeout: Duration,
         keyfile: Option<&std::path::Path>,
     ) -> Result<Self, TunnelError> {
-        Self::open_to(user, host, "127.0.0.1", remote_port, ready_timeout, keyfile).await
+        Self::open_to(host, "127.0.0.1", remote_port, ready_timeout, keyfile).await
     }
 
     /// Generalized form: forward `local:0` to an arbitrary
@@ -67,15 +70,13 @@ impl SshTunnel {
     /// Used by the proxy admin client to dial the Caddy container's
     /// IP on the host's docker bridge (loopback wouldn't reach it).
     pub async fn open_to(
-        user: &str,
-        host: &str,
+        host: &Host,
         remote_dial_host: &str,
         remote_port: u16,
         ready_timeout: Duration,
         keyfile: Option<&std::path::Path>,
     ) -> Result<Self, TunnelError> {
         Self::open_with_local_port(
-            user,
             host,
             remote_dial_host,
             remote_port,
@@ -93,8 +94,7 @@ impl SshTunnel {
     /// sessions); `None` is the implicit-port shortcut and the
     /// shape every other yoink caller uses.
     pub async fn open_with_local_port(
-        user: &str,
-        host: &str,
+        host: &Host,
         remote_dial_host: &str,
         remote_port: u16,
         local_port: Option<u16>,
@@ -107,38 +107,23 @@ impl SshTunnel {
         };
 
         let mut cmd = Command::new("ssh");
-        if let Some(key) = keyfile {
-            // Match the key the bollard daemon connection + ssh_probe
-            // are using for this host (see `RealDockerOps::ssh_keyfile`).
-            // `IdentitiesOnly=yes` stops ssh from trying agent keys
-            // first.
-            cmd.arg("-i").arg(key).arg("-o").arg("IdentitiesOnly=yes");
-        }
-        cmd.arg("-N")
-            // Fail fast on stale ControlMaster sockets / unreachable host.
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            // Prevent ssh from prompting on first connection — caller's
-            // ssh_probe should have run first to seed known_hosts.
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ExitOnForwardFailure=yes")
-            .arg("-L")
-            .arg(format!("{local_port}:{remote_dial_host}:{remote_port}"))
-            .arg(format!("{user}@{host}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            // Capture stderr so a forwarding error (port already in use,
-            // remote refused, etc.) makes it into the eventual error
-            // message rather than vanishing into /dev/null.
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        cmd.args(tunnel_args(
+            host,
+            &format!("{local_port}:{remote_dial_host}:{remote_port}"),
+            keyfile,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // Capture stderr so a forwarding error (port already in use,
+        // remote refused, etc.) makes it into the eventual error
+        // message rather than vanishing into /dev/null.
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
         let child = cmd.spawn().map_err(TunnelError::Spawn)?;
         let mut tunnel = Self { child, local_port };
 
-        wait_until_ready(&mut tunnel, host, remote_port, ready_timeout).await?;
+        wait_until_ready(&mut tunnel, &host.address, remote_port, ready_timeout).await?;
         Ok(tunnel)
     }
 
@@ -157,6 +142,42 @@ impl Drop for SshTunnel {
             warn!("failed to kill ssh tunnel child: {e}");
         }
     }
+}
+
+/// The `ssh` argv for a `-N -L <forward>` tunnel to `host`.
+fn tunnel_args(host: &Host, forward: &str, keyfile: Option<&std::path::Path>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
+    if let Some(key) = keyfile {
+        // Match the key the bollard daemon connection + ssh_probe
+        // are using for this host (see `RealDockerOps::ssh_keyfile`).
+        // `IdentitiesOnly=yes` stops ssh from trying agent keys
+        // first.
+        args.extend([
+            "-i".into(),
+            key.into(),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+        ]);
+    }
+    args.extend(
+        [
+            "-N",
+            // Fail fast on stale ControlMaster sockets / unreachable host.
+            "-o",
+            "ConnectTimeout=10",
+            // Prevent ssh from prompting on first connection — caller's
+            // ssh_probe should have run first to seed known_hosts.
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-L",
+            forward,
+        ]
+        .map(OsString::from),
+    );
+    args.extend(host.ssh_args().into_iter().map(OsString::from));
+    args
 }
 
 /// Bind to `127.0.0.1:0` to let the kernel pick a free port, then drop
@@ -237,5 +258,63 @@ mod tests {
         // back-to-back ephemeral picks differ — this guards against an
         // accidental constant return.
         assert_ne!(a, b);
+    }
+
+    fn host(port: Option<u16>) -> Host {
+        Host {
+            user: "deploy".into(),
+            address: "host-a".into(),
+            port,
+        }
+    }
+
+    #[test]
+    fn tunnel_args_without_port() {
+        assert_eq!(
+            tunnel_args(&host(None), "5050:127.0.0.1:80", None),
+            [
+                "-N",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-L",
+                "5050:127.0.0.1:80",
+                "deploy@host-a",
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn tunnel_args_with_port_and_keyfile() {
+        assert_eq!(
+            tunnel_args(
+                &host(Some(2200)),
+                "5050:127.0.0.1:80",
+                Some(std::path::Path::new("/tmp/key")),
+            ),
+            [
+                "-i",
+                "/tmp/key",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-N",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-L",
+                "5050:127.0.0.1:80",
+                "-p",
+                "2200",
+                "deploy@host-a",
+            ]
+            .map(OsString::from)
+        );
     }
 }

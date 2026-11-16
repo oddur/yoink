@@ -46,7 +46,7 @@ impl KeyManager {
 /// (`files::upload`, the host audit sink). The `local` sentinel host
 /// has nothing to ssh to, so it runs `sh -c <script>` on the operator
 /// machine. Every other host runs `ssh -o BatchMode=yes [-i keyfile]
-/// user@address <script>`; `keyfile` is the path from
+/// [-p port] user@address <script>`; `keyfile` is the path from
 /// `DockerOps::ssh_keyfile` (`KeyManager::key_for`), so the shell-out
 /// authenticates with the same `ssh_key_secret:` key as the bollard
 /// connection and `ssh_probe`. Stdio is left for the caller to set.
@@ -69,8 +69,9 @@ pub fn host_shell_command(
         // it reaches `-i`).
         cmd.arg("-o").arg("IdentitiesOnly=yes").arg("-i").arg(key);
     }
-    cmd.arg(format!("{}@{}", host.user, host.address))
-        .arg(script);
+    // `[-p <port>] user@address`, so a host with `port:` is reached
+    // the same way as by every other ssh shell-out.
+    cmd.args(host.ssh_args()).arg(script);
     cmd
 }
 
@@ -194,7 +195,35 @@ services:
         Host {
             user: "deploy".into(),
             address: "h1".into(),
+            port: None,
         }
+    }
+
+    #[test]
+    fn host_shell_command_passes_both_the_keyfile_and_the_port() {
+        // `files::upload` and the host audit sink on a host with both
+        // `ssh_key_secret:` and `port:`.
+        let host = Host {
+            port: Some(2200),
+            ..remote_host()
+        };
+        let cmd = host_shell_command(&host, Some(Path::new("/tmp/yoink-key-h1.pem")), "true");
+        assert_eq!(
+            argv(&cmd),
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-i",
+                "/tmp/yoink-key-h1.pem",
+                "-p",
+                "2200",
+                "deploy@h1",
+                "true",
+            ],
+        );
     }
 
     #[test]
@@ -244,6 +273,7 @@ services:
     fn prepare_returns_none_when_no_host_declares_secret() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            port: None,
             address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: None,
@@ -256,6 +286,7 @@ services:
     fn prepare_errors_when_secret_missing_from_bundle() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            port: None,
             address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: Some("h1_key".into()),
@@ -273,6 +304,7 @@ services:
     fn prepare_errors_when_no_secrets_block() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            port: None,
             address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: Some("h1_key".into()),
@@ -287,12 +319,14 @@ services:
         let cfg = config_with_hosts(vec![
             HostConfig {
                 address: "h1".into(),
+                port: None,
                 address_secret: None,
                 user: "deploy".into(),
                 ssh_key_secret: Some("h1_key".into()),
             },
             HostConfig {
                 address: "h2".into(),
+                port: None,
                 address_secret: None,
                 user: "deploy".into(),
                 ssh_key_secret: None,
@@ -312,10 +346,12 @@ services:
             .expect("some");
         let h1 = Host {
             address: "h1".into(),
+            port: None,
             user: "deploy".into(),
         };
         let h2 = Host {
             address: "h2".into(),
+            port: None,
             user: "deploy".into(),
         };
         assert!(mgr.key_for(&h1).is_some());

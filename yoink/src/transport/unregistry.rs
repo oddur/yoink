@@ -147,14 +147,7 @@ pub async fn push(
     ssh_probe::probe(host, keyfile.as_deref().and_then(|p| p.to_str()))
         .await
         .map_err(UnregistryError::SshProbe)?;
-    let tunnel = SshTunnel::open(
-        &host.user,
-        &host.address,
-        host_port,
-        READY_TIMEOUT,
-        keyfile.as_deref(),
-    )
-    .await?;
+    let tunnel = SshTunnel::open(host, host_port, READY_TIMEOUT, keyfile.as_deref()).await?;
 
     // End-to-end probe: a TCP-level readiness check on the SSH tunnel
     // returns Ok the instant ssh starts listening locally, BEFORE the
