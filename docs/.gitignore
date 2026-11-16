@@ -1,6 +1,3 @@
-# Vite / Node build outputs + caches — regenerated on every build.
-.output/
+dist/
 node_modules/
-.cache/
-.tanstack/
-.source/
+.astro/

@@ -1,0 +1,48 @@
+---
+interface Props { src: string }
+const { src } = Astro.props;
+---
+<div class="term" data-cast={src}><noscript>The recording needs JavaScript to play.</noscript></div>
+
+<script>
+  import playerCss from 'asciinema-player/dist/bundle/asciinema-player.css?url';
+
+  for (const el of document.querySelectorAll<HTMLElement>('[data-cast]')) {
+    const io = new IntersectionObserver(
+      async ([entry]) => {
+        if (!entry.isIntersecting) return;
+        io.disconnect();
+        // The stylesheet is fetched here, not in the page head, so it does
+        // not hold up the first paint of a page whose player is off screen.
+        const [{ create }] = await Promise.all([
+          // @ts-expect-error: the player ships no types
+          import('asciinema-player'),
+          new Promise<void>((done) => {
+            const link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.href = playerCss;
+            link.onload = link.onerror = () => done();
+            document.head.append(link);
+          }),
+        ]);
+        const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+        // On a narrow screen an 80-column recording scaled to fit is
+        // unreadable. Keep the type at 12px and let the terminal scroll.
+        const narrow = el.clientWidth < 560;
+        create(el.dataset.cast, el, {
+          ...(narrow ? { terminalFontSize: '12px' } : {}),
+          autoPlay: !still,
+          loop: true,
+          preload: true,
+          controls: true,
+          fit: narrow ? false : 'width',
+          rows: 18,
+          terminalFontFamily: "'Commit Mono', ui-monospace, Menlo, monospace",
+          theme: 'yoink',
+        });
+      },
+      { rootMargin: '200px' },
+    );
+    io.observe(el);
+  }
+</script>

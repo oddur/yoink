@@ -1,0 +1,27 @@
+{
+  "title": "Explanation",
+  "pages": [
+    "---About yoink---",
+    "what-and-why",
+    "compared",
+    "ai-agents",
+    "---How it works---",
+    "architecture",
+    "deploy-modes",
+    "image-shipping",
+    "hooks",
+    "watch-polling",
+    "---Security & secrets---",
+    "security",
+    "secrets",
+    "defense-in-depth",
+    "---Proxy & networking---",
+    "proxy",
+    "xcaddy-builds",
+    "cloudflare-origin-certs",
+    "networking",
+    "---Templates & storage---",
+    "templates",
+    "volume-backups"
+  ]
+}

@@ -1,0 +1,1530 @@
+/* The card front and the back of the pack: the home page. */
+
+/* The card front is printed stock: it does not follow the OS theme. */
+.pack,
+.dock {
+  color-scheme: light;
+}
+.pack {
+  background: var(--yellow);
+  color: var(--ink);
+  overflow-x: clip;
+}
+.panel h2 {
+  font-size: clamp(2.75rem, 6.2vw, 5.25rem);
+}
+.pack .lead {
+  font-size: clamp(1.125rem, 1.5vw, 1.3125rem);
+  line-height: 1.45;
+  max-width: 45ch;
+  font-weight: 500;
+}
+
+/* ── Front of the card ───────────────────────────────────────────────── */
+.front {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  grid-template-areas: 'copy demo' 'strip strip' 'alt alt';
+}
+.front__copy {
+  grid-area: copy;
+  position: relative;
+  padding: 0.5rem 0 2.25rem var(--edge);
+  align-self: end;
+}
+.front__mark {
+  position: relative;
+  width: fit-content;
+}
+.front__name {
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: clamp(7.5rem, 24vw, 22rem);
+  line-height: 0.78;
+  letter-spacing: -0.02em;
+  margin-left: -0.035em;
+  user-select: none;
+}
+.front__band {
+  position: relative;
+  width: fit-content;
+  max-width: calc(100% + var(--edge));
+  margin: 0 0 0 calc(-1 * var(--edge));
+  padding: 1.1rem 2.25rem 0.95rem var(--edge);
+  background: var(--ink);
+  color: var(--yellow);
+  font-size: clamp(2rem, 4.4vw, 3.9rem);
+}
+.front__sub {
+  margin-top: 1.25rem;
+  font-size: clamp(1.125rem, 1.55vw, 1.375rem);
+  line-height: 1.4;
+  font-weight: 600;
+  max-width: 36ch;
+}
+.burst {
+  position: absolute;
+  left: calc(100% - 5.25rem);
+  top: 0.35rem;
+  width: clamp(7.5rem, 13.5vw, 12.5rem);
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  rotate: -11deg;
+  z-index: 2;
+}
+.burst svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.burst span {
+  position: relative;
+  color: var(--white);
+  font-size: clamp(1.15rem, 2.15vw, 2rem);
+  text-align: center;
+  line-height: 0.92;
+}
+
+
+/* ── The working model ───────────────────────────────────────────────── */
+.front__demo {
+  grid-area: demo;
+  align-self: end;
+  padding: 0.25rem var(--edge) 2rem 1.5rem;
+  position: relative;
+  z-index: 1;
+}
+.sim {
+  background: var(--white);
+  color: var(--ink);
+  border: 4px solid var(--ink);
+  padding: 0.7rem 0.9rem 0.75rem;
+  display: grid;
+  gap: 0.5rem;
+}
+.sim__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.1rem 0.75rem;
+  /* wraps only when text is enlarged or the panel is very narrow */
+  flex-wrap: wrap;
+  border-bottom: 2px solid var(--ink);
+  padding-bottom: 0.3rem;
+}
+.sim__head h2 {
+  font-size: var(--display-l);
+}
+.sim__head p {
+  font-size: var(--text-label-s);
+  color: var(--ink-soft);
+}
+.sim__file {
+  position: relative;
+  overflow-x: auto;
+  background: var(--ink);
+  color: var(--cream);
+  padding: 0.55rem 0.85rem 0.6rem;
+  font-family: var(--mono);
+  font-size: var(--text-s);
+  line-height: 1.6;
+}
+.sim__name {
+  position: absolute;
+  right: 0.6rem;
+  top: 0.5rem;
+  font-family: var(--font);
+  font-size: var(--text-label-s);
+  color: var(--yellow);
+}
+.sim__line {
+  white-space: pre;
+}
+.sim__step {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  white-space: normal;
+  border: 2px solid var(--yellow);
+}
+.sim__step output {
+  min-width: 2.6em;
+  text-align: center;
+  font-weight: 700;
+  color: var(--yellow);
+  font-variant-numeric: tabular-nums;
+}
+.sim__step button {
+  border: 0;
+  background: var(--yellow);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-weight: 700;
+  width: 1.75rem;
+  height: 1.6rem;
+  line-height: 1;
+  transition: background-color 0.15s var(--ease);
+}
+.sim__step button:hover:not(:disabled) {
+  background: var(--white);
+}
+.sim__step button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.sim__file :focus-visible {
+  outline-color: var(--white);
+}
+.sim__break {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: var(--text-s);
+  font-weight: 600;
+}
+.sim__break input {
+  width: 1.05rem;
+  height: 1.05rem;
+  accent-color: var(--red);
+}
+.sim__diff {
+  min-height: calc(2.9em + 0.8rem);
+  font-family: var(--mono);
+  font-size: var(--text-s);
+  font-weight: 700;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  background: #fff3a8;
+  padding: 0.4rem 0.6rem;
+}
+.sim__diff[data-empty='true'] {
+  background: transparent;
+  padding-inline: 0;
+  font-family: var(--font);
+  font-weight: 500;
+  color: var(--ink-soft);
+}
+.sim__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.sim__actions .btn {
+  font-family: var(--mono);
+  font-stretch: 100%;
+  font-weight: 700;
+  font-size: var(--text-s);
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 0.65em 0.9em;
+}
+.sim__actions .btn--line {
+  background: transparent;
+  color: var(--ink);
+  box-shadow: inset 0 0 0 2px var(--ink);
+}
+.sim__actions .btn--line:hover:not(:disabled) {
+  background: var(--ink);
+  color: var(--yellow);
+}
+.sim__actions .btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+  background: var(--ink);
+  color: var(--yellow);
+}
+.sim__actions .btn--line:disabled {
+  background: transparent;
+  color: var(--ink);
+}
+.sim__host {
+  border-top: 2px solid var(--ink);
+  padding-top: 0.5rem;
+}
+.sim__host > p {
+  font-size: var(--text-label-s);
+  margin-bottom: 0.4rem;
+}
+.sim__slots,
+.sim__slot ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.sim__slots {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+.sim__slot {
+  /* room for the old and the new container side by side in time */
+  min-height: 3.15rem;
+  background: repeating-linear-gradient(135deg, transparent 0 5px, #ece8d8 5px 6px);
+}
+.sim__slot ul {
+  display: grid;
+  gap: 0.2rem;
+}
+.sim__chip {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.4rem;
+  padding: 0.12rem 0.45rem 0.1rem;
+  font-family: var(--mono);
+  font-size: var(--text-label-s);
+  line-height: 1.3;
+  background: var(--ink);
+  color: var(--cream);
+  border: 2px solid var(--ink);
+  overflow: hidden;
+  animation: chip-in 0.3s var(--ease);
+  transition:
+    background-color 0.2s var(--ease),
+    color 0.2s var(--ease),
+    opacity 0.18s linear,
+    transform 0.18s var(--ease);
+}
+.sim__chip b {
+  color: var(--yellow);
+}
+@keyframes chip-in {
+  from {
+    opacity: 0;
+    transform: translateY(-0.5rem);
+  }
+}
+/* starting: an outline, with the healthcheck running along its base */
+.sim__chip[data-state='starting'] {
+  background: var(--white);
+  color: var(--ink);
+  border-style: dashed;
+}
+.sim__chip[data-state='starting'] b {
+  color: var(--blue);
+}
+.sim__chip[data-state='starting']::after {
+  content: '';
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 3px;
+  background: var(--blue);
+  transform-origin: 0 50%;
+  animation: health 0.62s linear both;
+}
+@keyframes health {
+  from {
+    transform: scaleX(0);
+  }
+}
+.sim__chip[data-state='failed'] {
+  background: var(--red);
+  border-color: var(--red);
+  color: var(--white);
+}
+.sim__chip[data-state='failed'] b {
+  color: var(--white);
+}
+.sim__chip[data-state='draining'] {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+.sim__chip[data-state='stopped'] {
+  opacity: 0;
+  transform: translateY(0.4rem);
+}
+.sim__log {
+  min-height: 2.7em;
+  font-size: var(--text-s);
+  line-height: 1.35;
+  font-weight: 600;
+  text-wrap: balance;
+}
+
+/* fingers need larger targets than pointers do */
+@media (pointer: coarse) {
+  .fig__play,
+  .fig__modes button,
+  .flow summary,
+  .receipt__head button,
+  .agent-prompt button {
+    min-height: 2.75rem;
+  }
+  .sim__step button {
+    width: 2.75rem;
+    height: 2.75rem;
+  }
+  .sim__file {
+    line-height: 2.2;
+  }
+  .sim__actions .btn {
+    min-height: 2.75rem;
+  }
+  .sim__break {
+    min-height: 2.75rem;
+  }
+  .sim__break input {
+    width: 1.4rem;
+    height: 1.4rem;
+  }
+}
+
+/* ── Load sequence ─────────────────────────────────────────────────────
+   The card front is finished in two passes, the way a pack is: the black
+   band is printed across from the bleed edge, then the seal is slapped
+   on. Under a second, once per load, and the page is complete without
+   it (the from-states exist only inside the keyframes). */
+.front__band {
+  animation: band-print 0.55s var(--ease) 0.08s both;
+}
+@keyframes band-print {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0);
+  }
+}
+.burst {
+  animation: seal-stamp 0.4s cubic-bezier(0.55, 0, 0.9, 0.5) 0.52s both;
+}
+@keyframes seal-stamp {
+  /* comes down fast and flat, lands a touch compressed, relaxes */
+  from {
+    opacity: 0;
+    scale: 1.9;
+    rotate: -27deg;
+  }
+  70% {
+    opacity: 1;
+    scale: 0.95;
+    rotate: -11deg;
+    animation-timing-function: var(--ease);
+  }
+  to {
+    scale: 1;
+    rotate: -11deg;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* no travel: the seal fades in where it sits, the band is simply there */
+  .front__band {
+    animation: none;
+  }
+  .burst {
+    animation: seal-fade 0.3s linear both !important;
+    animation-duration: 0.3s !important;
+  }
+  @keyframes seal-fade {
+    from {
+      opacity: 0;
+    }
+  }
+}
+
+/* ── The tear-off strip ──────────────────────────────────────────────── */
+.tear {
+  grid-area: strip;
+  position: relative;
+  background: var(--ink);
+  overflow-x: clip;
+}
+.tear__stub {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.25rem;
+  padding-inline: var(--edge);
+  color: var(--cream);
+  font-size: 1.125rem;
+  font-weight: 600;
+}
+.tear__stub strong {
+  color: var(--yellow);
+  font-size: clamp(2rem, 4vw, 3.25rem);
+}
+.tear__strip {
+  position: relative;
+  background: var(--white);
+  transform-origin: 0 50%;
+  transition: transform 0.75s var(--ease);
+}
+.tear__strip::before,
+.tear__strip::after {
+  /* perforation: a row of punched holes along each edge */
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 10px;
+  background: radial-gradient(circle at 50% 50%, var(--ink) 0 3.2px, transparent 3.7px) 0 0 / 16px 10px repeat-x;
+}
+.tear__strip::before {
+  top: -5px;
+}
+.tear__strip::after {
+  bottom: -5px;
+}
+.tear.is-torn .tear__strip {
+  /* leaves faster than the next one feeds in */
+  transition-duration: 0.5s;
+  transform: translate(104%, 1.25rem) rotate(2.5deg);
+}
+.tear.is-feeding .tear__strip {
+  transition: none;
+  transform: translateX(-104%);
+}
+.tear__in {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem clamp(1.25rem, 2.5vw, 2.5rem);
+  padding: 1.6rem var(--edge) 1.5rem;
+}
+.tear__label {
+  background: var(--blue);
+  color: var(--white);
+  font-size: clamp(1.5rem, 2.3vw, 2.1rem);
+  padding: 0.5em 0.6em 0.42em;
+  max-width: 7.2em;
+}
+.tear__prompt {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: clamp(1rem, 1.55vw, 1.3125rem);
+  line-height: 1.4;
+  user-select: all;
+}
+.tear__prompt code {
+  font-size: 1em;
+}
+.tear__prompt code::before {
+  content: '$ ';
+  opacity: 0.55;
+}
+.tear__btn {
+  font-size: clamp(1.4rem, 2.1vw, 1.9rem);
+  white-space: nowrap;
+}
+
+.front__alt {
+  grid-area: alt;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 2rem;
+  padding: 1.5rem var(--edge) 2.5rem;
+  font-weight: 600;
+}
+.front__alt a {
+  font-weight: 800;
+}
+.front__alt .cmd .or {
+  font-family: var(--font);
+  font-weight: 600;
+  font-size: var(--text-body);
+}
+.front__alt .or {
+  color: var(--on-yellow-soft);
+}
+
+/* the strip stays in reach once the card front has scrolled away */
+.dock {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 30;
+  background: var(--white);
+  color: var(--ink);
+  border-top: 3px dashed var(--ink);
+  box-shadow: 0 -0.75rem 1.5rem -0.75rem rgba(0, 0, 0, 0.35);
+  transform: translateY(110%);
+  transition: transform 0.45s var(--ease);
+}
+.dock.is-shown {
+  transform: none;
+}
+.dock__in {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  padding-block: 0.6rem;
+}
+.dock__in .spec-type {
+  flex: none;
+  background: var(--blue);
+  color: var(--white);
+  padding: 0.45em 0.7em 0.38em;
+}
+.dock__prompt {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: var(--text-s);
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dock .btn {
+  flex: none;
+  font-size: var(--display-xs);
+}
+.dock__go {
+  display: none;
+}
+/* a phone cannot run the command: offer the next thing to read */
+@media (pointer: coarse) {
+  .dock [data-copy],
+  .dock__prompt,
+  .dock .spec-type {
+    display: none;
+  }
+  .dock .dock__go {
+    display: inline-flex;
+    min-height: 2.75rem;
+  }
+  .dock__in {
+    justify-content: center;
+  }
+}
+
+/* ── Back of the pack ────────────────────────────────────────────────── */
+.panel {
+  padding-block: clamp(4rem, 9vw, 7.5rem);
+}
+.panel__head {
+  display: grid;
+  gap: 1.25rem;
+  margin-bottom: clamp(2.25rem, 4vw, 3.5rem);
+}
+
+/* the loop: printed instructions on blue */
+.loop {
+  background: var(--blue);
+  color: var(--white);
+}
+.loop__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  gap: 3rem clamp(2rem, 5vw, 5rem);
+  align-items: start;
+}
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: step;
+}
+.steps li {
+  counter-increment: step;
+  display: grid;
+  grid-template-columns: 3.4rem minmax(0, 1fr);
+  column-gap: 1rem;
+  padding: 1.15rem 0 1.2rem;
+  border-top: 2px solid rgba(255, 255, 255, 0.4);
+}
+.steps li:last-child {
+  border-bottom: 2px solid rgba(255, 255, 255, 0.4);
+}
+.steps li::before {
+  content: counter(step);
+  grid-row: span 2;
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: 3.6rem;
+  line-height: 0.85;
+  color: var(--yellow);
+}
+.steps code {
+  font-weight: 700;
+  font-size: 1.125rem;
+}
+.steps code span {
+  /* a command wraps between arguments, never inside a flag */
+  white-space: nowrap;
+}
+.steps p {
+  margin-top: 0.3rem;
+  color: var(--blue-pale);
+  font-weight: 440;
+  max-width: 46ch;
+}
+.demo {
+  margin: 0;
+  position: sticky;
+  top: 2rem;
+}
+.term {
+  overflow-x: auto;
+  background: var(--ink);
+  border: 3px solid var(--ink);
+  min-height: 16rem;
+  color: #cfcab5;
+}
+.term .ap-wrapper {
+  display: block;
+}
+.term .ap-player:focus-visible {
+  outline: 3px solid var(--yellow);
+  outline-offset: 3px;
+}
+.term .ap-player {
+  border-radius: 0;
+  box-shadow: none;
+}
+.asciinema-player-theme-yoink {
+  --term-color-foreground: var(--cream);
+  --term-color-background: #111111;
+  --term-color-0: #111111;
+  --term-color-1: #ff6b5e;
+  --term-color-2: #ffd400;
+  --term-color-3: #ffd400;
+  --term-color-4: #7fb8f0;
+  --term-color-5: #f0a3d8;
+  --term-color-6: #8fd9d0;
+  --term-color-7: var(--cream);
+  --term-color-8: #6b6756;
+  --term-color-9: #ff8d83;
+  --term-color-10: #ffe45c;
+  --term-color-11: #ffe45c;
+  --term-color-12: #a8d0f7;
+  --term-color-13: #f7c4e7;
+  --term-color-14: #b5ebe4;
+  --term-color-15: #ffffff;
+}
+.demo figcaption {
+  margin-top: 0.9rem;
+  color: var(--blue-pale);
+  font-size: var(--text-m);
+  max-width: 52ch;
+}
+.demo figcaption a {
+  color: var(--white);
+  font-weight: 700;
+}
+
+/* how it works: two instruction-leaflet figures */
+.how {
+  background: var(--white);
+}
+/* one frame, four tabs: only one figure is ever on screen */
+.how__tabs {
+  display: none;
+  flex-wrap: wrap;
+  border-bottom: 4px solid var(--ink);
+}
+.how.is-ready .how__tabs {
+  display: flex;
+}
+.how__tabs button {
+  border: 0;
+  background: transparent;
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: clamp(1.4rem, 2.2vw, 1.9rem);
+  line-height: 1;
+  text-transform: uppercase;
+  padding: 0.6em 0.9em 0.5em;
+  min-height: 2.75rem;
+  transition:
+    background-color 0.15s var(--ease),
+    color 0.15s var(--ease);
+}
+.how__tabs button:hover {
+  background: var(--stock-pale);
+}
+.how__tabs button[aria-selected='true'] {
+  background: var(--ink);
+  color: var(--yellow);
+}
+.how__frame {
+  display: grid;
+  gap: 3rem;
+  padding-top: 1.5rem;
+}
+.fig {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0.9rem clamp(2rem, 4vw, 4rem);
+  align-content: start;
+  min-width: 0;
+}
+.fig[hidden] {
+  display: none;
+}
+.fig figcaption {
+  grid-column: 1 / -1;
+}
+.fig__art {
+  grid-column: 1;
+  grid-row: 2 / span 4;
+  align-self: start;
+}
+.fig__modes,
+.fig__steps,
+.fig .flow {
+  grid-column: 2;
+}
+.fig figcaption {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 2px solid var(--ink);
+  padding-bottom: 0.5rem;
+}
+.fig h3 {
+  font-size: clamp(1.75rem, 2.6vw, 2.25rem);
+}
+.fig__play,
+.fig__modes button {
+  border: 2px solid var(--ink);
+  background: transparent;
+  padding: 0.4em 0.7em 0.34em;
+  font-size: var(--text-label-s);
+  transition:
+    background-color 0.15s var(--ease),
+    color 0.15s var(--ease);
+}
+.fig__play {
+  flex: none;
+  min-width: 4.4rem;
+}
+.fig__play:hover,
+.fig__modes button:hover {
+  background: var(--ink);
+  color: var(--yellow);
+}
+.fig__modes {
+  display: flex;
+}
+.fig__modes button + button {
+  border-left: 0;
+}
+.fig__modes button[aria-pressed='true'] {
+  background: var(--ink);
+  color: var(--yellow);
+}
+/* keep the two figures level: the first has no mode switch */
+.fig__art {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: var(--stock-pale);
+  border: 2px solid var(--ink);
+}
+
+/* line art in the pack's inks */
+.fig__art .s-paper {
+  fill: var(--white);
+  stroke: var(--ink);
+  stroke-width: 3;
+}
+.fig__art .s-yellow {
+  fill: var(--yellow);
+  stroke: var(--ink);
+  stroke-width: 3;
+}
+.fig__art .s-ink {
+  fill: var(--ink);
+}
+.fig__art .s-line {
+  fill: none;
+  stroke: var(--ink);
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+.fig__art .s-wire {
+  fill: none;
+  stroke: var(--blue);
+  stroke-width: 3;
+  stroke-dasharray: 7 6;
+}
+.fig__art .s-box,
+.fig__art .s-box-flat {
+  fill: var(--ink);
+}
+.fig__art .s-new {
+  fill: var(--red);
+}
+.fig__art .s-chip {
+  fill: var(--ink);
+  stroke: var(--ink);
+  stroke-width: 3;
+  transition: stroke 0.25s var(--ease) var(--delay, 0s);
+}
+.fig__art .s-dashed {
+  fill: var(--white);
+  stroke: var(--ink);
+  stroke-width: 3;
+  stroke-dasharray: 6 5;
+}
+.fig__art text {
+  font-family: var(--font);
+  fill: var(--ink);
+}
+.fig__art .t-label {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.fig__art .t-small {
+  font-size: 14px;
+  font-weight: 700;
+}
+.fig__art .t-mono {
+  font-family: var(--mono);
+  font-size: 13.5px;
+  font-weight: 700;
+}
+.fig__art .t-soft {
+  fill: var(--ink-soft);
+  font-weight: 400;
+}
+.fig__art .t-yellow {
+  fill: var(--yellow);
+}
+.fig__art .t-blue {
+  fill: var(--blue);
+}
+
+/* Parts appear with their step. Without the script everything shows. */
+.fig.is-ready [data-from],
+.fig.is-ready [data-only] {
+  opacity: 0;
+  transition: opacity 0.35s var(--ease) var(--delay, 0s);
+}
+.fig.is-ready .is-on {
+  opacity: 1;
+}
+.fig.is-ready .s-box {
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+  scale: 1 0.2;
+  transition:
+    opacity 0.3s var(--ease) var(--delay, 0s),
+    scale 0.45s var(--ease) var(--delay, 0s);
+}
+.fig.is-ready .s-box.is-on {
+  scale: 1;
+}
+/* the part the current step is about */
+.fig .n {
+  transition: stroke 0.25s var(--ease), stroke-width 0.25s var(--ease);
+}
+.fig .is-lit.s-chip,
+.fig .is-lit.s-dashed,
+.fig .is-lit.s-paper,
+.fig .is-lit.s-yellow,
+.fig .is-lit > .s-paper,
+.fig .is-lit > .s-yellow {
+  stroke: var(--red);
+  stroke-width: 5;
+}
+/* mode switch */
+.fig[data-mode='le'] [data-mode='cf'],
+.fig[data-mode='cf'] [data-mode='le'] {
+  display: none;
+}
+
+/* things in transit: commands, a certificate, requests */
+.fig .pkt {
+  fill: var(--red);
+  opacity: 0;
+}
+.fig .pkt--cert {
+  fill: var(--blue);
+}
+.fig .pkt--new {
+  fill: var(--red);
+  stroke: var(--ink);
+  stroke-width: 1.5;
+}
+.fig .is-on.pkt,
+.fig .is-on > .pkt {
+  animation: travel var(--dur, 1.25s) linear var(--delay, 0s) infinite;
+}
+.fig .is-on.pkt--req {
+  animation: travel-via 1.6s linear var(--delay, 0s) infinite;
+}
+.fig:not(.is-live) .pkt {
+  animation-play-state: paused;
+}
+@keyframes travel {
+  0% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  12%,
+  88% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(calc(var(--dx) * 1px), calc(var(--dy) * 1px));
+  }
+}
+/* a request: along the wire to Caddy, then out to one replica */
+@keyframes travel-via {
+  0% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  8%,
+  92% {
+    opacity: 1;
+  }
+  62% {
+    transform: translate(calc(var(--mx) * 1px), 0);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(calc(var(--dx) * 1px), calc(var(--dy) * 1px));
+  }
+}
+
+.fig__steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: fig;
+}
+.fig__steps li {
+  counter-increment: fig;
+  border-bottom: 1px solid var(--ink);
+}
+.fig__steps button {
+  display: grid;
+  grid-template-columns: 2.1rem minmax(0, 1fr);
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 0.7rem 0.6rem 0.75rem 0.5rem;
+  font-size: var(--text-m);
+  line-height: 1.45;
+  font-weight: 500;
+  transition: background-color 0.2s var(--ease);
+}
+.fig__steps button::before {
+  content: counter(fig);
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: 1.6rem;
+  line-height: 0.95;
+}
+.fig__steps button:hover {
+  background: var(--stock-pale);
+}
+.fig__steps button[aria-current] {
+  background: var(--yellow);
+  font-weight: 700;
+}
+.fig__steps code {
+  font-weight: 700;
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+.flow summary {
+  display: inline-block;
+  cursor: pointer;
+  border: 2px solid var(--ink);
+  padding: 0.55em 0.8em 0.48em;
+  font-size: var(--text-label-s);
+  list-style: none;
+}
+.flow summary::-webkit-details-marker {
+  display: none;
+}
+.flow summary::after {
+  content: ' +';
+}
+.flow[open] summary::after {
+  content: ' −';
+}
+.flow summary:hover,
+.flow[open] summary {
+  background: var(--ink);
+  color: var(--yellow);
+}
+.receipt--flow {
+  margin-top: 0.75rem;
+  background: var(--ink);
+  color: var(--cream);
+}
+.receipt__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 0.75rem 0.5rem 1.1rem;
+  background: var(--white);
+  color: var(--ink);
+  border: 3px solid var(--ink);
+  border-bottom: 0;
+}
+.receipt__head button {
+  border: 2px solid var(--ink);
+  background: transparent;
+  padding: 0.35em 0.7em 0.3em;
+  min-width: 4.4rem;
+  font-size: var(--text-label-s);
+}
+.receipt__head button:hover {
+  background: var(--ink);
+  color: var(--yellow);
+}
+.receipt--flow pre {
+  font-size: var(--text-s);
+  scrollbar-color: #6b6756 transparent;
+}
+.how__more {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 2rem;
+  margin-top: 2.5rem;
+  font-weight: 800;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* nothing travels: a thing in transit is shown where it arrives */
+  .fig .is-on.pkt,
+  .fig .is-on > .pkt,
+  .fig .is-on.pkt--req {
+    animation: none !important;
+    opacity: 1;
+    transform: translate(calc(var(--dx) * 1px), calc(var(--dy) * 1px));
+  }
+}
+
+/* batteries included: a facts label beside the contents list */
+.facts-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 21rem) minmax(0, 1fr);
+  gap: 3rem clamp(2rem, 5vw, 5rem);
+  align-items: start;
+}
+.facts {
+  position: sticky;
+  top: 2rem;
+  background: var(--white);
+  border: 4px solid var(--ink);
+  padding: 0.9rem 1rem 1rem;
+  rotate: -1.2deg;
+}
+.facts h3 {
+  font-size: 3.1rem;
+  border-bottom: 2px solid var(--ink);
+  padding-bottom: 0.3rem;
+}
+.facts .serving {
+  font-size: var(--text-s);
+  line-height: 1.35;
+  padding-block: 0.5rem;
+  border-bottom: 0.7rem solid var(--ink);
+}
+.facts dl {
+  margin: 0;
+}
+.facts dl div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.38rem 0;
+  border-bottom: 1px solid var(--ink);
+  font-weight: 700;
+}
+.facts dd {
+  margin: 0;
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: var(--display-m);
+  line-height: 1;
+}
+.facts .foot {
+  margin-top: 0.6rem;
+  font-size: var(--text-label);
+  line-height: 1.4;
+}
+.contents {
+  margin: 0;
+  border-top: 4px solid var(--ink);
+}
+.contents div {
+  display: grid;
+  grid-template-columns: 11rem minmax(0, 1fr);
+  gap: 0.2rem 1.5rem;
+  padding: 0.85rem 0 0.9rem;
+  border-bottom: 2px solid var(--ink);
+}
+.contents dt {
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: var(--display-m);
+  line-height: 1.05;
+  text-transform: uppercase;
+}
+.contents dd {
+  margin: 0;
+  font-weight: 500;
+  max-width: 50ch;
+}
+.contents code,
+.shelf code,
+.excluded code {
+  /* A flag or a file name never breaks at its hyphen. If one is wider
+     than its column (large text, narrow screen) it scrolls in place. */
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  vertical-align: bottom;
+  white-space: nowrap;
+  font-weight: 700;
+  font-size: 0.9em;
+}
+
+/* the shelf guide */
+.shelf {
+  background: var(--white);
+}
+.shelf table {
+  width: 100%;
+  border-collapse: collapse;
+  border-top: 4px solid var(--ink);
+}
+.shelf th,
+.shelf td {
+  text-align: left;
+  vertical-align: baseline;
+  padding: 0.85rem 1rem 0.8rem 0;
+  border-bottom: 1px solid var(--ink);
+}
+.shelf thead th {
+  font-weight: 800;
+  font-size: var(--text-label-s);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  padding-block: 0.5rem;
+  color: var(--ink-soft);
+}
+.shelf tbody th {
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: var(--display-l);
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+  width: 1%;
+  padding-right: 2.5rem;
+}
+.shelf tbody th a {
+  text-decoration-thickness: 0.07em;
+}
+.shelf tr.is-yoink th,
+.shelf tr.is-yoink td {
+  background: var(--yellow);
+  border-block: 4px solid var(--ink);
+  padding-block: 1.2rem 1.1rem;
+  font-weight: 700;
+}
+.shelf tr.is-yoink th {
+  /* the name as the wordmark: lowercase, pack weight */
+  font-weight: 900;
+  text-transform: none;
+  font-size: 2.9rem;
+  padding-left: 1rem;
+}
+.shelf__more {
+  margin-top: 1.75rem;
+  font-weight: 800;
+}
+
+/* not included */
+.excluded {
+  background: var(--ink);
+  color: var(--cream);
+}
+.excluded h2 {
+  color: var(--yellow);
+}
+.excluded__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  gap: 2.5rem clamp(2rem, 6vw, 6rem);
+  align-items: start;
+}
+.excluded ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.excluded li {
+  font-size: clamp(2rem, 4.4vw, 3.6rem);
+  padding: 0.28em 0 0.2em;
+  border-bottom: 2px solid var(--ink-soft);
+  text-decoration: line-through;
+  text-decoration-color: var(--red);
+  text-decoration-thickness: 0.07em;
+}
+.excluded li:first-child {
+  border-top: 2px solid var(--ink-soft);
+}
+.excluded__notes > * + * {
+  margin-top: 1.1rem;
+}
+.excluded__notes p {
+  max-width: 46ch;
+  color: #dcd7c2;
+  font-weight: 440;
+}
+.agent-prompt {
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+  padding: 0.9rem 1rem 1rem;
+  border: 2px solid var(--ink-soft);
+}
+.excluded .agent-prompt code {
+  /* a sentence, not a flag: it wraps */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-size: var(--text-s);
+  line-height: 1.5;
+  color: var(--cream);
+}
+.agent-prompt button {
+  border: 2px solid var(--yellow);
+  background: transparent;
+  color: var(--yellow);
+  font-weight: 800;
+  font-size: var(--text-label-s);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  padding: 0.5em 0.8em 0.42em;
+  min-width: 11rem;
+}
+.agent-prompt button:hover {
+  background: var(--yellow);
+  color: var(--ink);
+}
+.excluded__notes a {
+  color: var(--yellow);
+  font-weight: 700;
+}
+
+/* proof of purchase */
+.proof {
+  background: var(--white);
+}
+.proof__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 3rem clamp(2rem, 6vw, 6rem);
+  align-items: start;
+}
+.receipt {
+  margin: 0;
+  background: var(--ink);
+  color: var(--cream);
+}
+.receipt figcaption {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.7rem 1.1rem 0.6rem;
+  background: var(--white);
+  color: var(--ink);
+  border: 3px solid var(--ink);
+  border-bottom: 0;
+}
+.receipt figcaption a {
+  flex: none;
+  white-space: nowrap;
+  font-weight: 800;
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+}
+.receipt pre {
+  margin: 0;
+  padding: 1.2rem 1.25rem 1.35rem;
+  overflow-x: auto;
+  font-size: var(--text-m);
+  line-height: 1.6;
+}
+.receipt pre .k {
+  color: var(--yellow);
+}
+.proof blockquote {
+  margin: 0;
+}
+.proof blockquote p {
+  font-size: clamp(1.35rem, 2.3vw, 1.9rem);
+  line-height: 1.3;
+  font-weight: 600;
+  text-wrap: pretty;
+  max-width: 28ch;
+}
+.proof blockquote footer {
+  margin-top: 1.25rem;
+  font-weight: 600;
+}
+.proof__more {
+  margin-top: 2.25rem;
+  max-width: 44ch;
+  font-weight: 500;
+}
+
+/* the close */
+.takeaway {
+  background: var(--red);
+  color: var(--white);
+  text-align: center;
+  padding-bottom: clamp(5rem, 11vw, 9rem);
+}
+.pack .takeaway h2 {
+  font-size: clamp(3.5rem, 11vw, 10rem);
+  line-height: 0.86;
+}
+.takeaway p {
+  margin: 1.5rem auto 0;
+  max-width: 44ch;
+  font-size: 1.1875rem;
+  font-weight: 500;
+}
+.takeaway__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 2.25rem;
+}
+.takeaway__status {
+  min-height: 1.6em;
+  margin-top: 1.25rem !important;
+  font-weight: 700 !important;
+}
+.takeaway .btn {
+  background: var(--ink);
+  color: var(--yellow);
+}
+.takeaway .btn:hover {
+  background: var(--yellow);
+  color: var(--ink);
+}
+.takeaway .btn--light {
+  background: var(--white);
+  color: var(--ink);
+}
+
+/* ── Narrow screens ──────────────────────────────────────────────────── */
+@media (max-width: 60rem) {
+  .front {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: 'copy' 'strip' 'alt' 'demo';
+  }
+  .front__demo {
+    padding: 0 var(--gutter) 3rem;
+  }
+  .sim {
+    max-width: 28rem;
+  }
+  .front__copy {
+    padding-right: var(--gutter);
+    padding-bottom: 1.75rem;
+  }
+  .front__band {
+    max-width: calc(100% + var(--edge) - 3rem);
+    padding-right: 1.25rem;
+  }
+  .burst {
+    left: calc(100% - 1.25rem);
+    top: 0;
+  }
+  .tear__in {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: start;
+    padding-block: 1.4rem 1.5rem;
+  }
+  .tear__label {
+    max-width: none;
+  }
+  .fig,
+  .loop__grid,
+  .facts-grid,
+  .excluded__grid,
+  .proof__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .demo {
+    position: static;
+  }
+  .how .fig > * {
+    grid-column: 1;
+    grid-row: auto;
+  }
+  .how__tabs button {
+    flex: 1 1 auto;
+  }
+  .facts {
+    position: static;
+    max-width: 21rem;
+  }
+  .dock__in .spec-type,
+  .dock__prompt {
+    display: none;
+  }
+  .dock__in {
+    justify-content: center;
+  }
+}
+@media (max-width: 40rem) {
+  .front__alt .cmd {
+    font-size: var(--text-label);
+    gap: 0.5rem;
+  }
+  .front__alt .cmd code {
+    white-space: nowrap;
+  }
+  .contents div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .shelf thead {
+    display: none;
+  }
+  .shelf tbody tr {
+    display: block;
+    border-bottom: 1px solid var(--ink);
+    padding-block: 0.8rem;
+  }
+  .shelf tbody th,
+  .shelf tbody td {
+    display: block;
+    width: auto;
+    border: 0;
+    padding: 0;
+  }
+  .shelf tbody td {
+    margin-top: 0.3rem;
+  }
+  .shelf tr.is-yoink {
+    background: var(--yellow);
+    border-block: 4px solid var(--ink);
+    padding: 1rem;
+    margin-inline: -1rem;
+  }
+  .shelf tr.is-yoink th,
+  .shelf tr.is-yoink td {
+    border: 0;
+    padding: 0;
+  }
+}

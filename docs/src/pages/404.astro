@@ -1,0 +1,27 @@
+---
+import Base from '@/layouts/Base.astro';
+import '@/styles/leaflet.css';
+---
+<Base title="Page not found" description="This page is not in the pack.">
+  <main class="leaflet" id="main">
+    <div class="sheet">
+      <svg class="empty-hook" viewBox="0 0 60 150" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M30 0V86" stroke-width="2.5" />
+        <circle cx="30" cy="92" r="5.5" />
+        <path d="M30 98v22a13.5 13.5 0 0 1-27 0v-7l7.6 7.6" />
+      </svg>
+      <header class="page-head">
+        <h1>Not in the pack</h1>
+        <p class="lede">The hook came back empty: there is no page at this address. I rebuilt the site, so it may have moved.</p>
+      </header>
+      <div class="prose">
+        <ul class="cards">
+          <li><a href="/docs"><strong>Docs</strong><span>Every section, from first deploy to the full reference.</span></a></li>
+          <li><a href="/docs/tutorials/first-deploy"><strong>First deploy</strong><span>A fresh VPS to a running container in five minutes.</span></a></li>
+          <li><a href="/"><strong>Home</strong><span>What yoink is and how to install it.</span></a></li>
+        </ul>
+        <p>Press <kbd>/</kbd> to search the docs.</p>
+      </div>
+    </div>
+  </main>
+</Base>

@@ -1,0 +1,215 @@
+---
+// A working model of a yoink deploy for the card front. It is an
+// illustration: nothing leaves the page. What it shows is how yoink
+// behaves: the dry-run diff, new replicas started one at a time and
+// gated by a healthcheck, old replicas stopped only after every new one
+// passes, a failed attempt removed while the old version keeps serving,
+// and rollback to the previous version.
+---
+<section class="sim" data-sim aria-labelledby="sim-title">
+  <header class="sim__head">
+    <h2 class="pack-type" id="sim-title">Try a deploy</h2>
+    <p class="spec-type">Illustration only</p>
+  </header>
+
+  <div class="sim__file" role="group" aria-label="yoink.yaml">
+    <p class="sim__name spec-type">yoink.yaml</p>
+    <div class="sim__line">services:</div>
+    <div class="sim__line">  - name: api</div>
+    <div class="sim__line">    tag: <span class="sim__step">
+        <button type="button" data-step="tag:-1" aria-label="Previous tag">−</button><output data-out="tag">v42</output><button type="button" data-step="tag:1" aria-label="Next tag">+</button>
+      </span></div>
+    <div class="sim__line">    run:</div>
+    <div class="sim__line">      replicas: <span class="sim__step">
+        <button type="button" data-step="replicas:-1" aria-label="Fewer replicas">−</button><output data-out="replicas">4</output><button type="button" data-step="replicas:1" aria-label="More replicas">+</button>
+      </span></div>
+    <div class="sim__line">      healthcheck_path: /health</div>
+  </div>
+
+  <label class="sim__break"><input type="checkbox" data-break /> This build fails its healthcheck</label>
+
+  <p class="sim__diff" data-diff role="status"></p>
+
+  <div class="sim__actions">
+    <button class="btn" type="button" data-up>yoink up</button>
+    <button class="btn btn--line" type="button" data-rollback disabled>yoink rollback api</button>
+  </div>
+
+  <div class="sim__host">
+    <p class="spec-type">box-1</p>
+    <ul class="sim__slots" data-slots aria-label="Containers on box-1"></ul>
+  </div>
+
+  <p class="sim__log" role="log" aria-live="polite" data-log></p>
+</section>
+
+<script>
+  type Chip = { el: HTMLLIElement; tag: number; slot: number };
+
+  const root = document.querySelector<HTMLElement>('[data-sim]');
+  if (root) {
+    const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const slots = $<HTMLUListElement>('[data-slots]');
+    const diffEl = $('[data-diff]');
+    const logEl = $('[data-log]');
+    const upBtn = $<HTMLButtonElement>('[data-up]');
+    const backBtn = $<HTMLButtonElement>('[data-rollback]');
+    const breakBox = $<HTMLInputElement>('[data-break]');
+    const out = {
+      tag: $<HTMLOutputElement>('[data-out="tag"]'),
+      replicas: $<HTMLOutputElement>('[data-out="replicas"]'),
+    };
+
+    const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const T = still ? { check: 140, gap: 60, stop: 80 } : { check: 620, gap: 150, stop: 190 };
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    const MAX = 6;
+    const file = { tag: 42, replicas: 4 }; // what yoink.yaml says
+    let running: Chip[] = []; // what runs on the host
+    let previous: number | null = null; // the version before the current one
+    let busy = false;
+
+    const cells: HTMLLIElement[] = [];
+    for (let i = 0; i < MAX; i++) {
+      const li = document.createElement('li');
+      li.className = 'sim__slot';
+      slots.append(li);
+      cells.push(li);
+    }
+
+    function chip(slot: number, tag: number, state: string): Chip {
+      const el = document.createElement('li');
+      el.className = 'sim__chip';
+      el.dataset.state = state;
+      el.innerHTML = `<span>api-${slot}</span><b>v${tag}</b>`;
+      const list = cells[slot].querySelector('ul') ?? cells[slot].appendChild(document.createElement('ul'));
+      list.prepend(el);
+      return { el, tag, slot };
+    }
+    const say = (text: string) => (logEl.textContent = text);
+    const liveTag = () => running[0]?.tag ?? null;
+
+    function plan() {
+      const lines: string[] = [];
+      const tag = liveTag();
+      if (tag !== null && tag !== file.tag) {
+        lines.push(`~ api  tag v${tag} → v${file.tag}`);
+      }
+      if (running.length !== file.replicas) {
+        lines.push(`~ api  replicas ${running.length} → ${file.replicas}`);
+      }
+      return lines;
+    }
+
+    function render() {
+      out.tag.textContent = `v${file.tag}`;
+      out.replicas.textContent = String(file.replicas);
+      const lines = plan();
+      diffEl.textContent = lines.length ? lines.join('\n') : 'No changes. What runs matches the file.';
+      diffEl.dataset.empty = String(!lines.length);
+      upBtn.disabled = busy || !lines.length;
+      backBtn.disabled = busy || previous === null || previous === liveTag();
+      root!.querySelectorAll<HTMLButtonElement>('[data-step]').forEach((b) => {
+        const [key, by] = b.dataset.step!.split(':') as ['tag' | 'replicas', string];
+        const next = file[key] + Number(by);
+        const max = key === 'tag' ? 99 : MAX;
+        b.disabled = busy || next < 1 || next > max;
+      });
+      breakBox.disabled = busy;
+    }
+
+    async function remove(c: Chip) {
+      c.el.dataset.state = 'stopped';
+      await wait(T.stop);
+      c.el.remove();
+    }
+
+    // Start `count` replicas at `tag`, one at a time, each gated by its
+    // healthcheck. On a failure the whole attempt is removed.
+    async function start(tag: number, from: number, count: number, fail: boolean): Promise<Chip[] | null> {
+      const made: Chip[] = [];
+      for (let slot = from; slot < from + count; slot++) {
+        const c = chip(slot, tag, 'starting');
+        made.push(c);
+        say(`started api-${slot} at v${tag}. Waiting for /health.`);
+        await wait(T.check);
+        if (fail) {
+          c.el.dataset.state = 'failed';
+          say(`api-${slot} failed its healthcheck.`);
+          await wait(T.check);
+          await Promise.all(made.map(remove));
+          return null;
+        }
+        c.el.dataset.state = 'healthy';
+        await wait(T.gap);
+      }
+      return made;
+    }
+
+    async function deploy(tag: number, replicas: number, fail: boolean) {
+      busy = true;
+      render();
+      const old = running;
+      const from = liveTag();
+
+      if (from === tag) {
+        // Same version: only the count changed.
+        if (replicas < old.length) {
+          const extra = old.slice(replicas);
+          for (const c of [...extra].reverse()) {
+            say(`stopped api-${c.slot}.`);
+            await remove(c);
+          }
+          running = old.slice(0, replicas);
+          say(`${replicas} replicas of api run v${tag}.`);
+        } else {
+          const more = await start(tag, old.length, replicas - old.length, fail);
+          if (more) {
+            running = [...old, ...more];
+            say(`${replicas} replicas of api run v${tag}.`);
+          } else {
+            say(`The new replicas were removed. ${old.length} replicas of v${tag} keep serving.`);
+          }
+        }
+      } else {
+        const next = await start(tag, 0, replicas, fail);
+        if (!next) {
+          say(`The failed attempt was removed. v${from} keeps serving, and nothing was routed to v${tag}.`);
+        } else {
+          say(`Every replica is healthy. The proxy now routes to v${tag}.`);
+          await wait(T.check);
+          for (const c of [...old].reverse()) {
+            c.el.dataset.state = 'draining';
+            await wait(T.gap);
+            await remove(c);
+          }
+          previous = from;
+          running = next;
+          say(`${replicas} replicas of api run v${tag}. v${from} is kept for rollback.`);
+        }
+      }
+      busy = false;
+      render();
+    }
+
+    root.addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-step]');
+      if (!b || busy) return;
+      const [key, by] = b.dataset.step!.split(':') as ['tag' | 'replicas', string];
+      const next = file[key] + Number(by);
+      if (key === 'tag') file.tag = Math.max(1, Math.min(99, next));
+      else file.replicas = Math.max(1, Math.min(MAX, next));
+      render();
+    });
+    upBtn.addEventListener('click', () => deploy(file.tag, file.replicas, breakBox.checked));
+    backBtn.addEventListener('click', () => {
+      if (previous !== null) deploy(previous, running.length, false);
+    });
+
+    // Start with v41 running and v42 in the file, so there is a change to apply.
+    for (let i = 0; i < file.replicas; i++) running.push(chip(i, 41, 'healthy'));
+    say('4 replicas of api run v41. The file says v42.');
+    render();
+  }
+</script>

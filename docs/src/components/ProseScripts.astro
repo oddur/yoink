@@ -1,0 +1,67 @@
+---
+// Behaviour for rendered Markdown: heading anchors, copy buttons on code
+// blocks, tabs. The content reads fine without any of it.
+---
+<script>
+  for (const h of document.querySelectorAll<HTMLElement>('.prose :is(h2, h3, h4)[id]')) {
+    if (h.querySelector('a')) continue;
+    const a = document.createElement('a');
+    a.className = 'anchor';
+    a.href = `#${h.id}`;
+    a.append(...h.childNodes);
+    h.append(a);
+  }
+
+  // A table region is a tab stop only when it scrolls, and it is named
+  // after the heading it sits under.
+  for (const wrap of document.querySelectorAll<HTMLElement>('.prose .table-wrap')) {
+    let el: Element | null = wrap;
+    let heading: Element | null = null;
+    while (el && !heading) {
+      let prev = el.previousElementSibling;
+      while (prev && !/^H[1-6]$/.test(prev.tagName)) prev = prev.previousElementSibling;
+      heading = prev;
+      el = el.parentElement?.closest('.prose') ? el.parentElement : null;
+    }
+    const name = heading?.textContent?.trim();
+    if (wrap.scrollWidth > wrap.clientWidth) {
+      wrap.setAttribute('aria-label', name ? `Table: ${name}` : 'Table');
+    } else {
+      wrap.removeAttribute('tabindex');
+      wrap.removeAttribute('role');
+      wrap.removeAttribute('aria-label');
+    }
+  }
+
+  for (const pre of document.querySelectorAll<HTMLElement>('.prose pre')) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'code-copy';
+    b.textContent = 'Copy';
+    b.dataset.copy = pre.querySelector('code')?.textContent ?? pre.textContent ?? '';
+    pre.append(b);
+  }
+
+  for (const tabs of document.querySelectorAll<HTMLElement>('[data-tabs]')) {
+    const buttons = [...tabs.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    const panels = [...tabs.querySelectorAll<HTMLElement>(':scope > .tabs__panel')];
+    if (!buttons.length) continue;
+    const select = (n: number, focus = false) => {
+      buttons.forEach((b, i) => {
+        b.setAttribute('aria-selected', String(i === n));
+        b.tabIndex = i === n ? 0 : -1;
+      });
+      panels.forEach((p, i) => (p.hidden = i !== n));
+      if (focus) buttons[n].focus();
+    };
+    buttons.forEach((b, i) => {
+      b.addEventListener('click', () => select(i));
+      b.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowRight') select((i + 1) % buttons.length, true);
+        if (e.key === 'ArrowLeft') select((i - 1 + buttons.length) % buttons.length, true);
+      });
+    });
+    tabs.classList.add('is-ready');
+    select(0);
+  }
+</script>

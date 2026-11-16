@@ -1,0 +1,83 @@
+---
+title: Connect to a host over SSH
+description: Give yoink SSH access to a host that has a root password, a non-default key, a deploy key in the repo, Tailscale, or a local VM.
+---
+
+yoink uses the SSH client of your operating system. Each section is one SSH config and is independent of the others.
+
+## Fresh VPS, root password only
+
+Copy your SSH key to the host one time. yoink then uses the key.
+
+```sh
+ssh-copy-id root@1.2.3.4                  # asks for the root password once
+yoink up --build
+```
+
+## Non-default key
+
+Add an entry to `~/.ssh/config`:
+
+```text
+Host my-server
+  HostName 1.2.3.4
+  User root
+  IdentityFile ~/.ssh/my-server.pem
+```
+
+Then use the `Host` name as the address in `yoink.yaml`:
+
+```yaml
+hosts:
+  - { address: my-server, user: root }
+```
+
+## SSH on a port other than 22
+
+Set `port:` on the host. Do not put the port in `address:`, because config load rejects `address: host:2200`.
+
+```yaml
+hosts:
+  - { address: 1.2.3.4, user: deploy, port: 2200 }
+```
+
+## Ship the deploy key with the repo
+
+If a team must not keep the host key in each personal `ssh-agent`, use this config. The key lives in [sealed secrets](/docs/explanation/secrets).
+
+1. Reference the secret from the host:
+
+   ```yaml
+   secrets:
+     provider: age
+     recipients: [age1…]
+
+   hosts:
+     - address: 1.2.3.4
+       user: root
+       ssh_key_secret: PROD_HOST_SSH_KEY    # name in secrets.age
+   ```
+
+2. Run `yoink secrets edit`.
+3. Add the key value under the name `PROD_HOST_SSH_KEY`.
+
+At deploy time, yoink decrypts the key to a `0o600` temporary file and uses it for the SSH connection. yoink removes the file on exit.
+
+## Tailscale (opt-in)
+
+If you are on Tailscale, set `address:` to the tailnet hostname. See [Networking](/docs/explanation/networking).
+
+## Local VM
+
+To use yoink with a local VM (Colima, OrbStack), expose the docker daemon of the VM over SSH. Then add the VM as a host. No special syntax is necessary.
+
+To deploy to the docker daemon of your laptop without SSH, set `address: local`.
+
+For a local development loop without a host, Docker Compose is the correct tool.
+
+## See also
+
+- [First deploy](/docs/tutorials/first-deploy): the tutorial that uses plain key-based SSH to one host.
+- [Sealed secrets](/docs/explanation/secrets): how yoink seals and decrypts the deploy key.
+- [Networking](/docs/explanation/networking): the connectivity layer, Tailscale, and multi-host distribution.
+- [Configuration](/docs/reference/config): the `hosts:` fields, for example `ssh_key_secret`.

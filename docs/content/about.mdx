@@ -1,6 +1,5 @@
 ---
 title: About
-layout: docs
 toc: false
 weight: 99
 ---
@@ -13,7 +12,7 @@ I'd spent years deep in the CNCF / Kubernetes world, and there are real things t
 
 So yoink is a swiss army pocket knife of the utilities I missed, mixed with my own opinions about how to operate a handful of services on a handful of hosts without drowning in complexity. It's the deploy tool I wanted to have, and didn't.
 
-There are good tools in this neighborhood already: Kamal, Dokku, Coolify, plain `docker compose`, hand-rolled bash. None of them quite did what I wanted in the way I wanted it. See the [comparison page](/docs/intro/compared) for the honest version of where each one sits and where yoink ends up.
+There are good tools in this neighborhood already: Kamal, Dokku, Coolify, plain `docker compose`, hand-rolled bash. None of them quite did what I wanted in the way I wanted it. See the [comparison page](/docs/explanation/compared) for the honest version of where each one sits and where yoink ends up.
 
 It was originally meant for small side projects, sharing a prototype, running an experiment cheaply on a VPS without spinning up a registry and a CI pipeline first. It still is. But the same primitives (healthcheck-gated swaps, pre-deploy migrations, sealed secrets, multi-host fan-out) also operate a production-quality setup if you wield it that way.
 

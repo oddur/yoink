@@ -1,0 +1,201 @@
+---
+title: Proxy config
+description: "The per-service proxy fields and the top-level proxy block, with the handler order, the merge rules, and the xcaddy build behavior."
+---
+
+yoink starts the managed Caddy proxy when a service sets `domain:`. For the design of the proxy, see [Reverse proxy](/docs/explanation/proxy).
+
+## Per service
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `domain` | string \| list | none | One or more hostnames. Enables the proxy for the service. Requires `run.port:`, the container port that the proxy forwards to. |
+| `path_prefix` | string | none | A path glob that the route matches in addition to `domain:`. Multiple services can then share a hostname. yoink puts routes with a path before catch-all routes. |
+| `tls` | `auto` \| `off` \| `cert` | `auto` | `auto` is ACME through Let's Encrypt. `off` is HTTP only. `cert` is an inline cert from sealed secrets. |
+| `tls_cert_secret` | string | none | Name of the sealed secret that holds the PEM cert (for `tls: cert`). |
+| `tls_key_secret` | string | none | Name of the sealed secret that holds the PEM private key (for `tls: cert`). |
+| `upstream_h2c` | bool | `false` | The proxy speaks HTTP/2 cleartext to the backend. Required for native gRPC backends (Tonic, grpc-go, grpc-java). |
+| `compression` | bool | `false` | Emits `encode gzip zstd`. Has no effect behind a CDN. |
+| `canonical_domain` | string | none | One of the `domain:` entries. yoink sends a 308 redirect from every other entry to it (apex and www patterns). |
+| `hsts` | bool | `true` for TLS sites | Emits `Strict-Transport-Security: max-age=31536000; includeSubDomains`. |
+| `caddy_extra_json` | string (JSON) | none | Raw Caddy handler JSON that yoink merges into the route. yoink wraps route objects in a `subroute`. See the [Caddy snippets cookbook](/docs/how-to/caddy-snippets). |
+| `caddy_extra_caddyfile` | string (Caddyfile) | none | Same as `caddy_extra_json:`, in Caddyfile syntax. yoink runs `caddy adapt` when it builds the config, which needs Docker on your computer. Mutually exclusive with `caddy_extra_json:`. |
+
+If `run.healthcheck_path:` is set, Caddy uses it as the URI of its active health check.
+
+### Per-route handler order
+
+The handler chain on a routed service runs in a fixed order:
+
+1. The handlers of your `caddy_extra_json:` snippet, in declaration order.
+2. The `compression` handler (`encode gzip zstd`), if `compression: true`.
+3. The HSTS header handler, if `hsts: true` and the service serves TLS (`tls: auto`, `tls: cert`, or proxy-level TLS).
+4. `reverse_proxy` to the upstream.
+
+A handler cannot go between the handlers that yoink manages. For a different order (for example compress, then auth-gate, then forward), the `caddy_extra_json:` snippet must contain the full chain, with `reverse_proxy` at the end. `compression: false` then stops yoink from adding compression a second time.
+
+Chains that run on every request (CrowdSec, Coraza, fleet-wide rate limit) go in [`proxy.global_handlers:`](#proxyglobal_handlers-block-proxy-wide-middleware-chain).
+
+## Top-level `proxy:` block
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | implicit when any service has `domain:` | |
+| `email` | string | none | Registration email for Let's Encrypt. **Required when any service uses `tls: auto`.** Not used when `proxy.tls:` is set. |
+| `image` | string | `caddy:2` | Your own Caddy image, pulled from a registry. Mutually exclusive with `xcaddy:`. |
+| `xcaddy` | block | none | Builds a custom Caddy on each host with [`xcaddy`](https://github.com/caddyserver/xcaddy). Mutually exclusive with `image:`. See the [`xcaddy:` block](#proxyxcaddy-block-caddy-plugins-without-a-registry). |
+| `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. It persists across proxy restarts. |
+| `bind` | string | none (all interfaces) | Host IP that `:80` and `:443` bind to, for example a Tailscale IP. The admin port stays on `127.0.0.1` in all cases. |
+| `tls` | block | none | Proxy-level TLS. Every routed service inherits this cert (and the optional mTLS) by default. See the [`tls:` block](#proxytls-block). |
+| `config_extra` | string (JSON) | none | Top-level Caddy JSON that yoink deep-merges into the generated config. See the [`config_extra:` block](#proxyconfig_extra-block-global-caddy-config-escape-hatch). |
+| `global_handlers` | list of strings (JSON) | `[]` | Caddy handlers that run for every request before any service route matches. See the [`global_handlers:` block](#proxyglobal_handlers-block-proxy-wide-middleware-chain). |
+| `global_handlers_after` | list of strings (JSON) | `[]` | Same shape as `global_handlers:`. These handlers run after the handlers of the matched service route. |
+
+## `proxy.config_extra:` block: global Caddy config escape hatch
+
+`config_extra:` takes a raw JSON snippet. yoink deep-merges it into the generated Caddy config before it pushes the config to `/load`. It holds global values that yoink does not model as typed fields: `trusted_proxies`, `storage`, and the app blocks of plugins.
+
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/WeidiDeng/caddy-cloudflare-ip
+  config_extra: |
+    {
+      "apps": {
+        "http": {
+          "servers": {
+            "main": {
+              "trusted_proxies": {"source": "cloudflare"},
+              "client_ip_headers": ["CF-Connecting-IP"]
+            }
+          }
+        }
+      }
+    }
+```
+
+<Callout type="warn">
+
+**The server that yoink generates has the name `main`, not `srv0`.** The Caddy docs use `srv0`. A snippet that sets `apps.http.servers.srv0.trusted_proxies` creates a second server block that listens on nothing. The value has no effect, and yoink shows no error. Put server-scoped values under `apps.http.servers.main.<…>`.
+
+</Callout>
+
+Merge rules:
+
+- yoink parses the string as JSON when it loads the config. The top level must be an object.
+- The merge is recursive on objects. If the two sides have an object at the same key, yoink merges their children. If not, your value wins.
+- The keys of yoink at paths that do not overlap stay. For example, `apps.http.servers.main.trusted_proxies` does not overwrite the generated `routes` array.
+- Your value wins on every leaf conflict. For example, your own `admin.listen` value overrides the yoink default `0.0.0.0:2019`.
+- **Two paths are reserved for yoink.** A write to either path fails when yoink loads the config. The error names the typed field to use.
+
+| Reserved path | Effect of a write | Use |
+|---|---|---|
+| `apps.http.servers.main.routes` | removes every per-service route | `proxy.global_handlers:` or `caddy_extra_json:` |
+| `apps.http.servers.main.tls_connection_policies` | disables the mTLS from `proxy.tls.client_auth:` | `proxy.tls.client_auth:` |
+
+`config_extra:` also holds the top-level config of plugins:
+
+- `caddy-storage-redis`, for shared ACME state ([how-to](/docs/how-to/multi-host-redis-storage)).
+- The backends of `caddyserver/cache-handler`.
+- The global directives of `coraza`.
+- The agent connection values of `crowdsec`.
+
+## `proxy.global_handlers:` block: proxy-wide middleware chain
+
+`global_handlers:` holds Caddy handlers that run on every request before any service route matches. yoink wraps the per-service routes in a `subroute` handler and puts your handlers in front of it. The result is one wildcard-match route.
+
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/hslatman/caddy-crowdsec-bouncer
+      - github.com/corazawaf/coraza-caddy/v3
+  global_handlers:
+    - |
+      {"handler": "crowdsec", "appsec_url": "http://crowdsec:8080"}
+    - |
+      {
+        "handler": "waf",
+        "directives": [
+          "Include @coraza.conf-recommended",
+          "Include @crs-setup.conf.example",
+          "Include @owasp_crs/*.conf",
+          "SecRuleEngine On"
+        ]
+      }
+```
+
+Each entry is a JSON snippet in one of three shapes, the same shapes as the per-service `caddy_extra_json:`:
+
+- One handler object (`{"handler": "x", ...}`).
+- One route object (`{"match": ..., "handle": ...}`).
+- An array that mixes the two.
+
+Entries run in the order written. The order for one request is `global_handlers:`, then the handlers of the matched service route (with its `caddy_extra_json:`), then `global_handlers_after:`.
+
+## `proxy.xcaddy:` block: caddy plugins without a registry
+
+The steps to add, rebuild, and debug plugins are in [Caddy plugins (xcaddy, no registry)](/docs/how-to/caddy-plugins).
+
+```yaml
+proxy:
+  email: ops@example.com
+  xcaddy:
+    plugins:
+      - github.com/caddyserver/caddy-l4
+      - github.com/mholt/caddy-ratelimit@v0.1.0      # `module@version` to pin
+      - github.com/caddy-dns/cloudflare
+```
+
+On the next `yoink up`, each proxy host runs a two-stage xcaddy build (`caddy:2-builder` to `caddy:2`) and tags the result locally as `yoink-caddy:<hash>`. The proxy runs from that tag, and no registry is necessary. The hash covers the build inputs. Later `yoink up` runs skip the build until an input changes.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `plugins` | list of strings | required (non-empty) | One entry for each Caddy module: a bare module path or `module@version`, the same syntax as `xcaddy build --with`. yoink sorts the list before it hashes and builds, so the order does not change the tag. |
+| `caddy_version` | string | unset: the latest tagged release that xcaddy finds | Caddy git tag to compile (for example `v2.8.4`). Must be a real tag in [caddyserver/caddy](https://github.com/caddyserver/caddy/tags). |
+| `base_image` | string | `caddy:2` | Runtime stage of the Dockerfile (the final `FROM`). |
+| `builder_image` | string | `caddy:2-builder` | Builder stage, which carries xcaddy and the Go toolchain. A pin to `caddy:<v>-builder` also pins the version of the xcaddy CLI. |
+| `env` | map | `{}` | Environment variables for the builder stage, for example `GOPRIVATE` or `GOPROXY` for private Go modules. |
+| `replace` | list of strings | `[]` | Go-module replace directives, passed as `xcaddy build --replace <entry>`. |
+
+Build behavior:
+
+- **Each host needs egress to `proxy.golang.org`.** xcaddy fetches Go modules during the build. The build fails on an air-gapped host.
+- **The first `up` is slow** on each fresh host (~2-5 min for the compile).
+- **A plugin change leaves stale images.** The old `yoink-caddy:<old-hash>` stays on the host. `docker image prune -a` on the host, or the image prune of the TUI, reclaims the space. Each build has the label `yoink.caddy.xcaddy_hash=...`.
+- **Caddyfile snippets and plugin directives do not mix.** yoink adapts `caddy_extra_caddyfile:` with the `caddy:2` adapter on your computer. That adapter does not know plugin directives such as `rate_limit { ... }`. Such a snippet must be `caddy_extra_json:`. The [Caddy snippets cookbook](/docs/how-to/caddy-snippets) has the JSON shapes.
+- **`yoink validate` skips the Caddy schema check** when `xcaddy:` is set, because the image exists only on hosts. The config generation still runs. Caddy refuses a bad config at `/load` time on the host.
+- **`yoink up --rebuild-proxy`** builds the image again when the hash did not change, for example after an unpinned plugin changed upstream.
+- **`yoink proxy-dockerfile`** prints the generated Dockerfile and does not run docker.
+
+## `proxy.tls:` block
+
+When `proxy.tls:` is set, all routed services use the same TLS config by default. The per-service `tls_cert_secret:` and `tls_key_secret:` override it for a service that needs a different cert. ACME is off, and yoink emits a `:80 → :443` redirect.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `cert_secret` | string | required | Name of the sealed secret that holds the PEM cert (full chain). |
+| `key_secret` | string | required | Name of the sealed secret that holds the PEM private key. |
+| `client_auth` | block | none | Optional mTLS (for example Cloudflare origin-pull). |
+| `client_auth.mode` | enum | `require_and_verify` | `request` / `require` / `verify_if_given` / `require_and_verify`. |
+| `client_auth.trust_pool_secret` | string | required (when `client_auth` is set) | Name of the sealed secret that holds the trust-pool CA bundle (PEM). |
+
+```yaml
+proxy:
+  tls:
+    cert_secret: CF_ORIGIN_CERT
+    key_secret:  CF_ORIGIN_KEY
+    client_auth:
+      mode: require_and_verify
+      trust_pool_secret: CF_ORIGIN_PULL_CA
+```
+
+## See also
+
+- [Configuration reference](/docs/reference/config): the full `yoink.yaml` schema.
+- [Caddy snippets cookbook](/docs/how-to/caddy-snippets): snippets for `caddy_extra_json:` and `caddy_extra_caddyfile:`.
+- [Caddy plugins (xcaddy, no registry)](/docs/how-to/caddy-plugins): the task page for `proxy.xcaddy:`.
+- [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs): a full `proxy.tls:` config with origin-pull mTLS.

@@ -1,0 +1,30 @@
+---
+import { getCollection } from 'astro:content';
+import Base from '@/layouts/Base.astro';
+import '@/styles/leaflet.css';
+const posts = (await getCollection('blog')).sort((a, b) => +b.data.date - +a.data.date);
+const day = (d: Date) => d.toISOString().slice(0, 10);
+---
+<Base title="Blog" description="Release notes and design notes for yoink." current="blog">
+  <main class="leaflet" id="main">
+    <div class="sheet">
+      <header class="page-head">
+        <h1>Blog</h1>
+        <p class="lede">I post release notes and design notes here.</p>
+      </header>
+      <ul class="post-list">
+        {posts.map((p) => (
+          <li>
+            <a href={`/blog/${p.id}`}>
+              <time datetime={day(p.data.date)}>{day(p.data.date)}</time>
+              <div>
+                <strong>{p.data.title}</strong>
+                {p.data.description && <span>{p.data.description}</span>}
+              </div>
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  </main>
+</Base>

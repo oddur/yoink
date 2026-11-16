@@ -1,0 +1,55 @@
+---
+title: Run multiple projects on one host
+description: Use one yoink.yaml for each host and include the service fragments of each project repo.
+---
+
+Use one `yoink.yaml` for each host. This central config collects the service fragments of each project repo through `include:`.
+
+## Prerequisites
+
+- A host config directory with a `yoink.yaml` for the host.
+- Each project repo is checked out next to the host config directory.
+- The age identity of the host config is available where you run the deploy.
+
+## Collect the project fragments
+
+1. Keep a `services/<project>.yaml` fragment in each project repo, next to the code.
+2. Add one `include:` entry for each project to the `yoink.yaml` of the host:
+
+   ```yaml
+   # host-prod/yoink.yaml — the canonical config for `your-host`
+   hosts:
+     - { address: your-host, user: root }
+   secrets:
+     provider: age
+     recipients: [age1…]
+
+   include:
+     - "services/*.yaml"
+     - "../project-a/services/*.yaml"   # mount each project's services
+     - "../project-b/services/*.yaml"   # alongside its own repo
+   ```
+
+3. Go to the directory that contains the central `yoink.yaml`.
+4. Run `yoink up`.
+
+yoink deploys the services of all projects as one cluster.
+
+## Deploy one project
+
+Run the deploy for one service from the directory that contains the central `yoink.yaml`:
+
+```sh
+yoink up --service project-a-app
+```
+
+## Coordination cost
+
+The CI runner of each project needs the age identity of the host config. A fragment cannot contain a `secrets:` block: the secrets config lives only in the central `yoink.yaml`.
+
+## See also
+
+- [TanStack Start + postgres from scratch](/docs/tutorials/tanstack-stack): a tutorial that builds one project with a `services/*.yaml` fragment.
+- [Staging alongside prod](/docs/how-to/staging-alongside-prod): two environments on the same hosts.
+- [Sealed secrets](/docs/explanation/secrets): age identities and `provider: command`.
+- [Configuration](/docs/reference/config): the `include:` field.

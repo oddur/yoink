@@ -1,0 +1,134 @@
+---
+import { getCollection, render } from 'astro:content';
+import Base from '@/layouts/Base.astro';
+import ProseScripts from '@/components/ProseScripts.astro';
+import { mdxComponents } from '@/components/mdx';
+import { getNav, docHref, plain } from '@/lib/nav';
+import { REPO } from '@/lib/site';
+import { mdPath } from '@/lib/llms';
+import '@/styles/leaflet.css';
+
+export async function getStaticPaths() {
+  const entries = await getCollection('docs');
+  return entries.map((entry) => ({
+    params: { slug: entry.id === 'index' ? undefined : entry.id },
+    props: { entry },
+  }));
+}
+
+const { entry } = Astro.props;
+const { Content, headings } = await render(entry);
+const { sections, order } = await getNav();
+const here = docHref(entry.id);
+const title = plain(entry.data.title);
+const description = entry.data.description && plain(entry.data.description);
+const at = order.findIndex((l) => l.id === entry.id);
+const prev = at > 0 ? order[at - 1] : undefined;
+const next = at >= 0 && at < order.length - 1 ? order[at + 1] : undefined;
+const section = sections.find((s) => s.id === entry.id || s.items.some((i) => i.kind === 'link' && i.id === entry.id));
+// On a section landing page: the section's pages, grouped by sidebar label.
+const index = section && section.id === entry.id
+  ? section.items.reduce<{ label?: string; links: Extract<(typeof section.items)[number], { kind: 'link' }>[] }[]>((groups, item) => {
+      if (item.kind === 'label') groups.push({ label: item.title, links: [] });
+      else if (item.id !== entry.id) (groups.at(-1) ?? groups[groups.push({ links: [] }) - 1]).links.push(item);
+      return groups;
+    }, [])
+  : undefined;
+const toc = [
+  ...headings.filter((h) => h.depth === 2 || h.depth === 3),
+  ...(index ?? []).filter((g) => g.label).map((g) => ({ depth: 2, slug: g.label!.toLowerCase().replace(/[^a-z0-9]+/g, '-'), text: g.label! })),
+];
+const mdUrl = mdPath(entry.id);
+const editUrl = entry.filePath ? `${REPO}/edit/main/docs/${entry.filePath}` : undefined;
+---
+<Base title={title} description={description} current="docs">
+  <div class="leaflet">
+    <div class="docs">
+      <div class="docs__side">
+        <button class="side-toggle" type="button" aria-expanded="false" aria-controls="side-nav" data-side-toggle>
+          <span>{section ? `${section.title}: ${title}` : 'Contents'}</span><span aria-hidden="true">▾</span>
+        </button>
+        <nav class="side-nav" id="side-nav" aria-label="Documentation">
+          {sections.map((s) => (
+            <section>
+              <p class="side-title">{s.href ? <a href={s.href} aria-current={s.href === here ? 'page' : undefined}>{s.title}</a> : s.title}</p>
+              <ul>
+                {s.items.map((i) =>
+                  i.kind === 'label' ? (
+                    <li class="label">{i.title}</li>
+                  ) : (
+                    <li><a href={i.href} aria-current={i.href === here ? 'page' : undefined}>{i.title}</a></li>
+                  ),
+                )}
+              </ul>
+            </section>
+          ))}
+        </nav>
+      </div>
+
+      <main class="docs__main" id="main" data-pagefind-body>
+        <header class="page-head">
+          <h1>{title}</h1>
+          {description && <p class="lede">{description}</p>}
+          <p class="page-meta" data-pagefind-ignore>
+            <a href={mdUrl}>Read as Markdown</a>
+            {editUrl && <a href={editUrl}>Edit on GitHub</a>}
+          </p>
+        </header>
+        <div class="prose">
+          <Content components={mdxComponents} />
+          {/* A section landing page lists its pages from the sidebar, so the list cannot go stale. */}
+          {index && index.map((g) => (
+            <>
+              {g.label && <h2 id={g.label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}>{g.label}</h2>}
+              <ul class="cards">
+                {g.links.map((l) => (
+                  <li><a href={l.href}><strong>{l.title}</strong>{l.description && <span>{l.description}</span>}</a></li>
+                ))}
+              </ul>
+            </>
+          ))}
+        </div>
+        <nav class="pager" aria-label="Previous and next page" data-pagefind-ignore>
+          {prev ? <a href={prev.href}><small>Previous</small><strong>{prev.title}</strong></a> : <span></span>}
+          {next && <a href={next.href}><small>Next</small><strong>{next.title}</strong></a>}
+        </nav>
+      </main>
+
+      <aside class="docs__toc">
+        {toc.length > 1 && (
+          <nav class="toc" aria-label="On this page">
+            <p class="toc-title">On this page</p>
+            <ul>
+              {toc.map((h) => <li><a class={`d${h.depth}`} href={`#${h.slug}`}>{h.text}</a></li>)}
+            </ul>
+          </nav>
+        )}
+      </aside>
+    </div>
+  </div>
+  <ProseScripts />
+  <script>
+    const toggle = document.querySelector<HTMLButtonElement>('[data-side-toggle]');
+    toggle?.addEventListener('click', () =>
+      toggle.setAttribute('aria-expanded', String(toggle.getAttribute('aria-expanded') !== 'true')),
+    );
+
+    // Keep the current page visible in a long sidebar.
+    document.querySelector('.side-nav [aria-current="page"]')?.scrollIntoView({ block: 'nearest' });
+
+    // Mark the section being read in the table of contents.
+    const links = [...document.querySelectorAll<HTMLAnchorElement>('.toc a')];
+    if (links.length) {
+      const byId = new Map(links.map((a) => [decodeURIComponent(a.hash.slice(1)), a]));
+      const heads = [...byId.keys()].map((id) => document.getElementById(id)).filter(Boolean) as HTMLElement[];
+      const mark = () => {
+        let current = heads[0];
+        for (const h of heads) if (h.getBoundingClientRect().top < 120) current = h;
+        links.forEach((a) => a.classList.toggle('is-active', a === byId.get(current.id)));
+      };
+      addEventListener('scroll', mark, { passive: true });
+      mark();
+    }
+  </script>
+</Base>

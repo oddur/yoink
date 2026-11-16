@@ -1,36 +1,48 @@
 ---
 title: Edit-save-deploy with `--watch`
-description: Poll the config for changes and redeploy automatically on every save — hot-reload for prod-like local dev.
+description: Poll the config for changes and deploy again automatically on every save, for hot reload in prod-like local development.
 weight: 8
 ---
 
-`yoink up --watch` re-reconciles whenever the config file (or any include fragment) changes on disk. Combined with `--build`, it gives you a hot-reload loop for prod-like development without CI, a registry, or a deploy command in your shell history.
+`yoink up --watch` runs one reconcile. Then it reconciles again each time the config file, or an include fragment, changes on disk. With `--build`, it gives an edit, save, deploy loop with no CI and no registry.
 
-## The loop
+## Start the watch loop
+
+### Start the loop [step]
 
 ```sh
 yoink up --watch --build --service my-tool
 ```
 
-Edit `yoink.yaml` (or the Dockerfile for `my-tool`). On save, yoink rebuilds, ships, and rolls the container behind its healthcheck. Ctrl-C exits.
+### Edit and save [step]
 
-Polling cadence and reload-failure semantics live in the [Why polling?](#why-polling) section below; the underlying ship + swap mechanics are in [deploy modes](/docs/guide/deploy-modes) and [architecture](/docs/guide/architecture).
+Edit `yoink.yaml` or an include fragment. Save the file.
 
-## Why polling?
+yoink loads the config again every 2 s. If the loaded config changed, yoink builds the image, ships it, and rolls the container behind its healthcheck. A change to a different file, for example the Dockerfile, does not start a reconcile.
 
-Yoink's TUI uses the same 2 s tick to reload the config. Polling avoids a `notify`/`fsnotify`-style file-watcher dependency and is plenty fast for an operator typing in their editor; the reconcile latency itself dominates anything below ~500 ms.
+### Stop the loop [step]
 
-If the reload fails (yaml syntax error, missing required field), the watch loop prints the error and keeps polling. Fix the file and the next save tries again. There's no need to restart `yoink up`.
+Press Ctrl-C.
+
+## If a reload fails
+
+A reload can fail, for example on a YAML syntax error or a missing required field. Then the watch loop prints the error and continues to poll. A failed reconcile has the same effect.
+
+Correct the file and save it. A restart of `yoink up` is not necessary.
 
 ## Common patterns
 
-**Iterating on a single service** — pin it with `--service` so unrelated services aren't redeployed on every save:
+### Iterate on a single service
+
+Pass `--service`. Then a save does not redeploy unrelated services.
 
 ```sh
 yoink up --watch --build --service api
 ```
 
-**Iterating on an include fragment** — the `include:` glob is re-resolved on every reload, so a fresh `services/new-thing.yaml` is picked up automatically:
+### Iterate on an include fragment
+
+yoink resolves the `include:` glob again on every reload, so it finds a new `services/new-thing.yaml` automatically.
 
 ```yaml
 # yoink.yaml
@@ -42,21 +54,18 @@ include:
 yoink up --watch --build        # all services, re-resolve includes on save
 ```
 
-**Plan first, watch second** — `yoink up --plan` is a one-shot read-only view; `--watch` cannot be combined with `--plan` (the watch loop is for the apply path):
+### Plan first, watch second
+
+`yoink up --plan` is a one-shot, read-only view. yoink rejects `--watch` together with `--plan` or `--dry-run`. Run the plan first. Then start the watch loop.
 
 ```sh
 yoink up --plan                                # what would change?
 yoink up --watch --build                       # ok, ship it on every save
 ```
 
-## Tradeoffs vs. an inotify-based watcher
-
-Polling means up to 2 s of latency between save and reconcile. For an editor flow that's typically below the threshold of "did I actually save?", but if you're chaining `yoink up --watch` into a tighter feedback loop (test runner, screen recorder), be aware of the floor.
-
-The reconcile itself is cheap when nothing changed: yoink computes a [`yoink.spec_hash`](/docs/guide/architecture#drift-detection) from the desired spec and short-circuits when the running container's label already matches. So the cost of a fired but no-op reconcile is one round-trip per host.
-
 ## See also
 
-- [TanStack Start + postgres](/docs/how-to/tanstack-stack) — uses `--build` as the deploy loop; pair with `--watch` for save-to-deploy.
-- [Three deploy modes](/docs/guide/deploy-modes) — when local-build vs. CI-build vs. standalone fits.
-- [CLI reference: up](/docs/reference/cli) — `--watch` and the rest of the `yoink up` flag surface.
+- [Why `--watch` polls](/docs/explanation/watch-polling): the reason for the 2 s tick and the trade-offs against a file watcher.
+- [TanStack Start + postgres](/docs/tutorials/tanstack-stack): uses `--build` as the deploy loop. Add `--watch` for save-to-deploy.
+- [Deploy modes](/docs/explanation/deploy-modes): when local-build, CI-build, or standalone fits, and how yoink ships the image.
+- [CLI reference: up](/docs/reference/cli): `--watch` and the other `yoink up` flags.

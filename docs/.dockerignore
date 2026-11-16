@@ -1,10 +1,9 @@
-# Vite / Node build artifacts — regenerated inside the builder stage.
-.output/
+# Build artifacts: regenerated inside the builder stage.
+dist/
 node_modules/
-.cache/
-.tanstack/
+.astro/
 
-# Yoink deploy artifacts that sit alongside the docs source — must not
+# Yoink deploy artifacts that sit alongside the docs source. They must not
 # end up in the container image.
 yoink.yaml
 secrets.age

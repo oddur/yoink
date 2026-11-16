@@ -1,0 +1,87 @@
+---
+import '@/styles/global.css';
+import Header from '@/components/Header.astro';
+import Footer from '@/components/Footer.astro';
+import Search from '@/components/Search.astro';
+import { SITE, DESCRIPTION } from '@/lib/site';
+import archivoLatin from '@fontsource-variable/archivo/files/archivo-latin-wdth-normal.woff2?url';
+interface Props { title?: string; description?: string; card?: boolean; current?: string }
+const { title, description = DESCRIPTION, card = false, current } = Astro.props;
+const fullTitle = title ? `${title} · yoink` : 'yoink: container deploys without the headaches';
+const path = Astro.url.pathname.replace(/\/$/, '');
+const canonical = SITE + path;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="preload" href={archivoLatin} as="font" type="font/woff2" crossorigin />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="alternate" type="text/plain" href="/llms.txt" title="llms.txt" />
+    <meta name="theme-color" content="#ffd400" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="yoink" />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content={`${SITE}/og.png`} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content={`${SITE}/og.png`} />
+    <script is:inline>
+      (function () {
+        var t = null;
+        try { t = localStorage.getItem('theme'); } catch (e) {}
+        if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        document.documentElement.dataset.theme = t;
+      })();
+    </script>
+    <slot name="head" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <Header card={card} current={current} />
+    <slot />
+    <Footer />
+    <Search />
+    <script>
+      import { init, trackEvent } from '@aptabase/web';
+
+      // Page views, same key and event as before the rebuild.
+      if (import.meta.env.PROD) {
+        init('A-EU-6868521188');
+        trackEvent('page_view', { path: location.pathname });
+      }
+
+      // Light / dark for the leaflet pages.
+      document.querySelectorAll('[data-theme-toggle]').forEach((b) =>
+        b.addEventListener('click', () => {
+          const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+          document.documentElement.dataset.theme = next;
+          try { localStorage.setItem('theme', next); } catch {}
+        }),
+      );
+
+      // Any element with data-copy copies that text and says so.
+      document.addEventListener('click', async (e) => {
+        const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-copy]');
+        if (!btn || btn.hasAttribute('data-tear-btn')) return;
+        const was = btn.dataset.label ?? (btn.dataset.label = btn.textContent ?? 'Copy');
+        let done = btn.dataset.done ?? 'Copied';
+        let ok = true;
+        try {
+          await navigator.clipboard.writeText(btn.dataset.copy!);
+        } catch {
+          done = 'Copy failed';
+          ok = false;
+        }
+        btn.dispatchEvent(new CustomEvent('copy-result', { bubbles: true, detail: { ok } }));
+        btn.textContent = done;
+        setTimeout(() => (btn.textContent = was), 1600);
+      });
+    </script>
+  </body>
+</html>

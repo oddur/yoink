@@ -1,0 +1,116 @@
+---
+---
+<dialog class="search" data-search aria-label="Search the docs">
+  <form method="dialog" role="search">
+    <input type="search" name="q" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-label="Search the docs" />
+    <button type="button" data-search-close>Close</button>
+  </form>
+  <ul class="search__results" data-search-results></ul>
+  <p class="search__note" data-search-note role="status">Type a flag, a config field, or a task.</p>
+</dialog>
+
+<script>
+  const dialog = document.querySelector<HTMLDialogElement>('[data-search]')!;
+  const input = dialog.querySelector('input')!;
+  const list = dialog.querySelector<HTMLUListElement>('[data-search-results]')!;
+  const note = dialog.querySelector<HTMLParagraphElement>('[data-search-note]')!;
+  const HINT = 'Type a flag, a config field, or a task.';
+  let pagefind: any;
+  let run = 0;
+
+  async function load() {
+    if (pagefind !== undefined) return pagefind;
+    try {
+      const path = '/pagefind/pagefind.js';
+      pagefind = await import(/* @vite-ignore */ path);
+      await pagefind.init();
+    } catch {
+      pagefind = null;
+    }
+    return pagefind;
+  }
+
+  function open() {
+    if (dialog.open) return;
+    dialog.showModal();
+    input.select();
+    load();
+  }
+
+  async function search() {
+    const q = input.value.trim();
+    const mine = ++run;
+    if (!q) {
+      list.replaceChildren();
+      note.textContent = HINT;
+      return;
+    }
+    const pf = await load();
+    if (mine !== run) return;
+    if (!pf) {
+      list.replaceChildren();
+      note.textContent = 'Search only works in a production build.';
+      return;
+    }
+    const res = await pf.search(q);
+    const data = await Promise.all(res.results.slice(0, 8).map((r: any) => r.data()));
+    if (mine !== run) return;
+    list.replaceChildren(
+      ...data.map((d: any) => {
+        const li = document.createElement('li');
+        const a = document.createElement('a');
+        a.href = d.url.length > 1 ? d.url.replace(/\/$/, '') : d.url;
+        const t = document.createElement('strong');
+        t.textContent = d.meta?.title ?? d.url;
+        const e = document.createElement('span');
+        e.innerHTML = d.excerpt; // pagefind escapes content and adds <mark>
+        a.append(t, e);
+        li.append(a);
+        return li;
+      }),
+    );
+    note.textContent = data.length ? '' : `The hook came back empty for "${q}". Try a command name, like rollback.`;
+  }
+
+  let timer: number | undefined;
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = window.setTimeout(search, 120);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      list.querySelector('a')?.focus();
+    }
+  });
+  list.addEventListener('keydown', (e) => {
+    const links = [...list.querySelectorAll('a')];
+    const i = links.indexOf(document.activeElement as HTMLAnchorElement);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      links[Math.min(i + 1, links.length - 1)]?.focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (i <= 0) input.focus();
+      else links[i - 1].focus();
+    }
+  });
+  // Enter opens the first result. It must not close the dialog.
+  dialog.querySelector('form')!.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const first = list.querySelector('a');
+    if (first) location.href = first.href;
+  });
+  dialog.querySelector('[data-search-close]')!.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('click', (e) => {
+    if (e.target === dialog) dialog.close();
+  });
+  document.querySelectorAll('[data-search-open]').forEach((b) => b.addEventListener('click', open));
+  document.addEventListener('keydown', (e) => {
+    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((e.target as HTMLElement).tagName);
+    if ((e.key === 'k' && (e.metaKey || e.ctrlKey)) || (e.key === '/' && !typing)) {
+      e.preventDefault();
+      open();
+    }
+  });
+</script>

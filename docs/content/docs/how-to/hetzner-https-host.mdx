@@ -1,0 +1,78 @@
+---
+title: Provision a Hetzner host with HTTPS
+description: Provision a Hetzner cx23 and deploy a service behind HTTPS with one block of commands, then change it for your app or your hostname.
+---
+
+This page has the commands of the [Hetzner tutorial](/docs/tutorials/hetzner-quickstart) as one block, the changes for your own app, and the fixes for failures.
+
+## Prerequisites
+
+- A Hetzner Cloud account and an API token with read+write scope.
+- Homebrew.
+- The two files `services/yoink-hello.yaml` and `cloud-init.yaml` from the [tutorial](/docs/tutorials/hetzner-quickstart), in `./services/` and `./`.
+
+## Provision and deploy
+
+Run the block in the directory that contains the two files:
+
+```bash
+# one-time
+brew install hcloud oddur/yoink/yoink   # yoink ≥ 0.15.0
+
+# init: AGE identity + sealed deploy key + skeleton yoink.yaml
+yoink init --create-ssh-key DEPLOY_SSH_KEY --proxy-email you@example.com
+
+# provision a cx23 in nbg1, baked with cloud-init
+hcloud context create bt-scratch
+hcloud ssh-key create --name yoink-scratch \
+  --public-key-from-file <(yoink secrets ssh-key public --name DEPLOY_SSH_KEY)
+hcloud server create --name bt-scratch-01 --type cx23 \
+  --image ubuntu-24.04 --location nbg1 \
+  --ssh-key yoink-scratch \
+  --user-data-from-file cloud-init.yaml
+
+# register host with yoink + deploy
+IP=$(hcloud server ip bt-scratch-01)
+yoink hosts add --address $IP --user root --ssh-key-secret DEPLOY_SSH_KEY
+HOST_IP=$IP yoink preflight --wait 90s
+HOST_IP=$IP yoink up
+
+# verify
+curl https://$IP.nip.io   # → yoink!
+```
+
+The last command prints `yoink!`.
+
+At the time of writing, `cx23` is available only in `nbg1`. `hcloud server-type describe cx23` shows the current locations. For multi-arch workloads, the ARM type `cax11` costs €4.49/mo (Helsinki / Falkenstein).
+
+## Use your own app
+
+1. Remove `cmd:` and the loose `options:` from `services/yoink-hello.yaml`.
+2. Set `image:` and `tag:` to your image.
+
+The Caddy and ACME config stays the same.
+
+To build the image on your laptop, add a `build:` block. Then run `yoink up --build`. See [Deploy modes](/docs/explanation/deploy-modes).
+
+## Use a real hostname
+
+1. Replace the `domain:` value in the service fragment with your hostname.
+2. Point an A record at `$IP`.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Permission denied (publickey)` on `yoink up` | Cause 1: Hetzner used an IP again and your `~/.ssh/known_hosts` has the old host key. Run `ssh-keygen -R $IP`. Cause 2: the sealed key in `secrets.age` does not match the key in the Hetzner DB. Generate a new key with `yoink secrets ssh-key generate --seal-as DEPLOY_SSH_KEY` and upload it again. |
+| `cannot connect to docker daemon` | Cloud-init still installs Docker. Increase the wait: `yoink preflight --wait 120s`. |
+| Cert error on `curl https://…` | ACME is not complete. Read the proxy log: `ssh root@$IP "docker logs yoink-proxy-… 2>&1 \| grep -iE 'acme\|cert'"`. |
+| `nip.io` does not resolve | The cause is captive-portal DNS. Run `curl --resolve $IP.nip.io:443:$IP https://$IP.nip.io`. |
+| `no matching age identity` | The AGE identity of your laptop is not in `secrets.recipients:`. Add it. Then a person with an existing identity must seal the secrets again with `yoink secrets edit`. |
+
+## See also
+
+- [Hetzner → HTTPS in ~90 seconds](/docs/tutorials/hetzner-quickstart): the tutorial that explains each command, with the cleanup steps.
+- [Drop-in templates with `yoink add`](/docs/explanation/templates): add postgres, redis, or restic backups as a service fragment with one command.
+- [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs): Cloudflare origin certs and origin-pull mTLS for a real domain.
+- [Multi-host Let's Encrypt with Redis](/docs/how-to/multi-host-redis-storage): multiple hosts that share one ACME state pool.
+- [Troubleshooting](/docs/how-to/troubleshooting): errors that are not specific to Hetzner.

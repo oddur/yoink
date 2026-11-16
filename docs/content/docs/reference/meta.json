@@ -1,11 +1,30 @@
 {
   "title": "Reference",
-  "icon": "BookMarked",
   "pages": [
+    "---Commands---",
     "cli",
-    "config",
+    "agent-commands",
     "tui",
+    "yoink-add",
+    "port-forward",
+    "vscode-sidecar",
+    "---Config---",
+    "config",
+    "proxy",
+    "xcaddy",
+    "secrets",
+    "security-defaults",
+    "webhooks",
+    "template-manifest",
+    "---Behavior---",
+    "deploy-mechanics",
     "audit-event-schema",
-    "glossary"
+    "audit-log-coverage",
+    "glossary",
+    "---Example configs---",
+    "examples",
+    "examples/hobby-tool",
+    "examples/polyglot-stack",
+    "examples/production"
   ]
 }

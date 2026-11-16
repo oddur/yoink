@@ -1,0 +1,725 @@
+@import '@fontsource-variable/archivo/wdth.css';
+/* Italic is a separate file, fetched only by pages that use emphasis. */
+@import '@fontsource-variable/archivo/wdth-italic.css';
+
+/* Arial scaled to Archivo's average width, so text set in the fallback
+   wraps where the web font will and the swap does not reflow the page. */
+@font-face {
+  font-family: 'Archivo Fallback';
+  src: local('Arial');
+  size-adjust: 97.85%;
+}
+@import '@fontsource/commit-mono/latin-400.css';
+@import '@fontsource/commit-mono/latin-700.css';
+
+/* ── Inks ───────────────────────────────────────────────────────────────
+   Four printed spot colours on card stock. Yellow is the stock itself. */
+:root {
+  --yellow: #ffd400;
+  --ink: #111111;
+  --red: #d9231a;
+  --blue: #0b5fb0;
+  --white: #ffffff;
+  /* fixed tints of the stock and the inks; they do not change with the theme */
+  --cream: #f1eedf; /* text on ink, blue or red */
+  --ink-soft: #4a4636; /* quieter text on white or yellow */
+  --stock-pale: #f4f2ea; /* the unprinted side of the card */
+  --blue-pale: #dbe9f7; /* body text on blue */
+
+  /* text on yellow that is quieter than ink, tinted from the stock */
+  --on-yellow-soft: #3b3100;
+
+  --font: 'Archivo Variable', 'Archivo Fallback', 'Helvetica Neue', Arial, sans-serif;
+  --mono: 'Commit Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Type roles. Labels are wide-tracked capitals; display is Archivo at
+     its narrowest and heaviest. */
+  --text-label-s: 0.75rem; /* floor: nothing on the site is set smaller */
+  --text-label: 0.8125rem;
+  --text-s: 0.875rem; /* metadata, table of contents, code blocks */
+  --text-m: 0.9375rem; /* navigation, captions, card descriptions */
+  --text-body: 1.0625rem;
+  --text-lede: 1.1875rem;
+  --track-label: 0.09em;
+  --display-xs: 1.125rem;
+  --display-s: 1.3125rem;
+  --display-m: 1.5rem;
+  --display-l: 1.75rem;
+  --display-xl: 2.125rem;
+  /* Reading measure. Archivo runs about 7.8px per character at body
+     size, so `ch` overstates the line: 34rem is about 70 characters. */
+  --measure: 34rem;
+  --body-weight: 400;
+  --body-leading: 1.6;
+
+  --gutter: clamp(1.25rem, 4vw, 3.5rem);
+  --wrap: 82rem;
+  /* page margin: the gutter, or whatever centres an 82rem measure */
+  --edge: max(var(--gutter), calc((100vw - var(--wrap)) / 2 + var(--gutter)));
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* leaflet (docs, blog, about) */
+  --paper: #ffffff;
+  --paper-2: #f4f2ea;
+  --text: #111111;
+  --text-soft: #4a4636;
+  --rule: #111111;
+  --rule-soft: #d8d4c4;
+  --link: #0b5fb0;
+  --code-bg: #111111;
+  --code-fg: #f1eedf;
+  --inline-code-bg: #f1eccf;
+  --mark: #ffd400;
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --paper: #131312;
+  --paper-2: #1d1c19;
+  --text: #f1eedf;
+  --text-soft: #b9b39b;
+  --rule: #f1eedf;
+  --rule-soft: #3a382f;
+  --link: #ffd400;
+  --code-bg: #000000;
+  --inline-code-bg: #2a281f;
+  /* Light text on a dark ground reads thinner and tighter: one notch
+     more weight, leading and tracking. */
+  --body-weight: 430;
+  --body-leading: 1.66;
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scroll-padding-top: 5.5rem;
+  scrollbar-color: var(--ink) var(--yellow);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font);
+  font-size: var(--text-body);
+  font-weight: var(--body-weight);
+  line-height: var(--body-leading);
+  color: var(--text);
+  background: var(--paper);
+  -webkit-font-smoothing: antialiased;
+  caret-color: var(--red);
+}
+
+::selection {
+  background: var(--ink);
+  color: var(--yellow);
+}
+
+:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 3px;
+}
+/* Yellow ring only on dark grounds. The header, the home page and the
+   search bar stay yellow or white in the dark theme, so they keep blue. */
+[data-theme='dark'] .leaflet :focus-visible,
+.on-dark :focus-visible {
+  outline-color: var(--yellow);
+}
+
+img,
+svg,
+video {
+  max-width: 100%;
+  height: auto;
+}
+
+a {
+  color: inherit;
+  text-underline-offset: 0.18em;
+  text-decoration-thickness: 0.09em;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  text-wrap: balance;
+  margin: 0;
+}
+
+p {
+  margin: 0;
+  text-wrap: pretty;
+}
+
+/* Figures line up in columns only where they are read as data. */
+table,
+time,
+pre,
+.facts dl {
+  font-variant-numeric: tabular-nums;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
+.wrap {
+  width: 100%;
+  padding-inline: var(--edge);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.skip {
+  position: absolute;
+  left: var(--gutter);
+  top: -4rem;
+  z-index: 100;
+  background: var(--ink);
+  color: var(--yellow);
+  padding: 0.6rem 1rem;
+  font-weight: 800;
+}
+.skip:focus {
+  top: 0.5rem;
+}
+
+/* Pack lettering: Archivo at its narrowest and heaviest. */
+.pack-type {
+  font-family: var(--font);
+  font-weight: 900;
+  font-stretch: 62%;
+  text-transform: uppercase;
+  line-height: 0.95;
+  letter-spacing: 0.005em;
+}
+
+/* Spec-panel text: small, tight, wide-tracked capitals. */
+.spec-type {
+  font-weight: 800;
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  line-height: 1.3;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6em;
+  border: 0;
+  background: var(--ink);
+  color: var(--yellow);
+  font-family: var(--font);
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: 1.5rem;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 0.7em 1.1em 0.62em;
+  text-decoration: none;
+  transition:
+    background-color 0.18s var(--ease),
+    color 0.18s var(--ease),
+    transform 0.18s var(--ease);
+}
+.btn:hover {
+  background: var(--red);
+  color: var(--white);
+}
+.btn:active {
+  transform: translateY(2px);
+}
+.btn--light {
+  background: var(--white);
+  color: var(--ink);
+}
+.btn--light:hover {
+  background: var(--yellow);
+  color: var(--ink);
+}
+
+/* A command you can copy: `$ brew install …` with a copy control. */
+.cmd {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  max-width: 100%;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 1rem;
+}
+.cmd code {
+  font-size: 1em;
+  overflow-wrap: anywhere;
+}
+.cmd code::before {
+  content: '$ ';
+  opacity: 0.6;
+}
+.cmd button {
+  flex: none;
+  border: 2px solid currentColor;
+  background: transparent;
+  font-family: var(--font);
+  font-weight: 800;
+  font-size: var(--text-label-s);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  padding: 0.35em 0.7em 0.3em;
+  min-width: 4.6rem;
+  transition:
+    background-color 0.18s var(--ease),
+    color 0.18s var(--ease);
+}
+.cmd button:hover {
+  background: var(--ink);
+  color: var(--yellow);
+  border-color: var(--ink);
+}
+
+/* ── Site header ─────────────────────────────────────────────────────── */
+.site-header {
+  background: var(--yellow);
+  color: var(--ink);
+  border-bottom: 3px solid var(--ink);
+  position: sticky;
+  top: 0;
+  z-index: 40;
+}
+.site-header__in {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  min-height: 4rem;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  text-decoration: none;
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: 1.9rem;
+  line-height: 1;
+  letter-spacing: 0;
+  margin-right: auto;
+}
+.brand svg {
+  width: 1.35rem;
+  height: 1.55rem;
+  flex: none;
+  transform-origin: 65% 10%;
+}
+/* The yoink: the hook dips, then snatches upward and settles. */
+.brand:hover svg,
+.brand:focus-visible svg {
+  animation: yoink 0.5s var(--ease);
+}
+@keyframes yoink {
+  30% {
+    transform: translateY(3px) rotate(-10deg);
+  }
+  62% {
+    transform: translateY(-6px) rotate(7deg);
+  }
+}
+.site-nav {
+  display: flex;
+  align-items: center;
+  gap: clamp(0.9rem, 2.2vw, 1.9rem);
+}
+.site-nav a {
+  font-weight: 800;
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  text-decoration: none;
+  padding: 0.4rem 0;
+  border-bottom: 3px solid transparent;
+}
+.site-nav a:hover,
+.site-nav a[aria-current] {
+  border-bottom-color: var(--ink);
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  border: 2px solid var(--ink);
+  background: transparent;
+  font-weight: 800;
+  font-size: var(--text-label-s);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  padding: 0.4rem 0.65rem 0.34rem;
+  line-height: 1;
+  transition:
+    background-color 0.18s var(--ease),
+    color 0.18s var(--ease);
+}
+.chip:hover {
+  background: var(--ink);
+  color: var(--yellow);
+}
+.chip kbd {
+  font-size: var(--text-label-s);
+  opacity: 0.7;
+}
+.chip {
+  flex: none;
+}
+.chip svg {
+  flex: none;
+  width: 0.95rem;
+  height: 0.95rem;
+}
+/* The smallest phones, and any screen at high zoom: the nav drops to its
+   own row instead of pushing the page wider than the screen. */
+@media (max-width: 24rem) {
+  .site-header__in {
+    flex-wrap: wrap;
+    row-gap: 0;
+    padding-block: 0.35rem;
+  }
+  .site-nav {
+    flex-wrap: wrap;
+    row-gap: 0;
+  }
+}
+@media (pointer: coarse) {
+  .site-nav a,
+  .chip {
+    min-height: 2.75rem;
+    display: inline-flex;
+    align-items: center;
+  }
+}
+@media (max-width: 46rem) {
+  .site-header__in {
+    gap: 0.75rem;
+  }
+  .brand {
+    font-size: 1.6rem;
+  }
+  .site-nav {
+    gap: 0.7rem;
+  }
+  .site-nav a {
+    font-size: var(--text-label-s);
+    letter-spacing: 0.05em;
+  }
+  .chip {
+    padding-inline: 0.5rem;
+  }
+  .site-nav .hide-s {
+    display: none;
+  }
+  .chip span,
+  .chip kbd {
+    display: none;
+  }
+}
+
+/* Leaflet pages line the header up with the docs frame. */
+.site-header:not(.site-header--card) .wrap {
+  max-width: 96rem;
+  margin-inline: auto;
+  padding-inline: var(--gutter);
+}
+
+/* The home page is the card front: no band, and a hang hole on a peg. */
+.site-header--card {
+  position: relative;
+  border-bottom: 0;
+}
+.site-header--card .site-header__in {
+  min-height: 5.25rem;
+}
+.hang {
+  position: absolute;
+  left: 50%;
+  top: 1.15rem;
+  width: 8.5rem;
+  height: 2.6rem;
+  translate: -50% 0;
+  border-radius: 1.3rem;
+  background: #2b2a26;
+  box-shadow:
+    inset 0 5px 6px rgba(0, 0, 0, 0.55),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.25);
+  pointer-events: none;
+}
+.hang::after {
+  /* the steel peg the card hangs from */
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: -1.15rem;
+  width: 0.8rem;
+  height: 2.7rem;
+  translate: -50% 0;
+  border-radius: 0 0 0.4rem 0.4rem;
+  background: linear-gradient(90deg, #8b9198, #e4e8ec 45%, #9aa0a7);
+  box-shadow: 0 3px 4px rgba(0, 0, 0, 0.4);
+}
+@media (max-width: 60rem) {
+  /* no room between the brand and the links: the hole gets its own row */
+  .site-header--card {
+    padding-top: 2.6rem;
+  }
+  .site-header--card .site-header__in {
+    min-height: 3.5rem;
+  }
+  .hang {
+    top: 0.75rem;
+    width: 6rem;
+    height: 1.85rem;
+  }
+  .hang::after {
+    top: -0.75rem;
+    height: 1.95rem;
+    width: 0.65rem;
+  }
+}
+
+/* ── Site footer ─────────────────────────────────────────────────────── */
+.site-footer {
+  margin-top: auto;
+  background: var(--ink);
+  color: var(--cream);
+  padding-block: 3rem 2.5rem;
+}
+.site-footer__in {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2rem 3rem;
+  align-items: end;
+}
+.site-footer nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.75rem;
+  margin-top: 1.25rem;
+}
+.site-footer nav a {
+  font-weight: 800;
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  text-decoration: none;
+  color: var(--yellow);
+}
+.site-footer nav a:hover {
+  text-decoration: underline;
+}
+.site-footer p {
+  max-width: 44ch;
+  color: #cfcab5;
+  font-size: var(--text-m);
+}
+.site-footer .brand {
+  color: var(--yellow);
+  font-size: 2.6rem;
+  margin-bottom: 0.9rem;
+}
+.barcode {
+  display: grid;
+  justify-items: center;
+  gap: 0.35rem;
+  background: var(--white);
+  color: var(--ink);
+  padding: 0.7rem 0.9rem 0.5rem;
+  font-family: var(--mono);
+  font-size: var(--text-label-s);
+  letter-spacing: 0.3em;
+}
+.barcode svg {
+  display: block;
+  width: 11rem;
+  height: 3.4rem;
+}
+@media (max-width: 46rem) {
+  .site-footer__in {
+    grid-template-columns: 1fr;
+  }
+  .barcode {
+    justify-self: start;
+  }
+}
+
+/* ── Search ──────────────────────────────────────────────────────────── */
+.search {
+  width: min(42rem, calc(100vw - 2rem));
+  max-height: min(34rem, calc(100vh - 6rem));
+  margin-top: 5rem;
+  padding: 0;
+  border: 3px solid var(--ink);
+  background: var(--white);
+  color: var(--ink);
+  box-shadow: 0 1.5rem 3rem -0.75rem rgba(0, 0, 0, 0.45);
+}
+.search[open] {
+  display: flex;
+  flex-direction: column;
+  animation: search-in 0.24s var(--ease);
+}
+.search::backdrop {
+  background: rgba(17, 17, 17, 0.6);
+}
+@keyframes search-in {
+  from {
+    opacity: 0;
+    transform: translateY(-0.75rem);
+  }
+}
+.search form {
+  display: flex;
+  align-items: center;
+  background: var(--yellow);
+  border-bottom: 3px solid var(--ink);
+}
+.search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 1.25rem;
+  font-weight: 600;
+  padding: 1rem 1.1rem;
+  color: var(--ink);
+}
+.search input::placeholder {
+  color: var(--on-yellow-soft);
+  opacity: 1;
+}
+.search input::-webkit-search-cancel-button {
+  appearance: none;
+}
+.search input:focus {
+  outline: none;
+}
+.search form:focus-within {
+  box-shadow: inset 0 -4px 0 var(--blue);
+}
+.search form button {
+  border: 0;
+  background: var(--ink);
+  color: var(--yellow);
+  align-self: stretch;
+  padding: 0 1rem;
+  font-weight: 800;
+  font-size: var(--text-label-s);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+}
+.search__results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--ink) var(--white);
+}
+.search__results a {
+  display: block;
+  padding: 0.85rem 1.1rem;
+  text-decoration: none;
+  border-bottom: 1px solid #d8d4c4;
+}
+.search__results a:hover,
+.search__results a:focus-visible {
+  background: var(--ink);
+  color: var(--white);
+  outline: none;
+}
+.search__results strong {
+  display: block;
+  font-weight: 800;
+}
+.search__results span {
+  display: block;
+  font-size: var(--text-s);
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+.search__results a:hover span,
+.search__results a:focus-visible span {
+  color: #e6e1cc;
+}
+.search__results mark {
+  background: var(--yellow);
+  color: var(--ink);
+  padding: 0 0.1em;
+}
+.search__note {
+  padding: 1.1rem;
+  font-size: var(--text-m);
+  color: var(--ink-soft);
+}
+.search__note:empty {
+  display: none;
+}
+
+/* Moving between pages: the header stays where it is and the page under
+   it changes with a short cross-fade, so the docs read as one document.
+   Browsers without cross-document view transitions navigate as usual. */
+@view-transition {
+  navigation: auto;
+}
+.site-header {
+  view-transition-name: site-header;
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.16s;
+}
+::view-transition-group(site-header) {
+  animation-duration: 0.3s;
+  animation-timing-function: var(--ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @view-transition {
+    navigation: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    /* nothing travels or scales, but colour and opacity still ease, so a
+       state change stays readable */
+    transition-property: color, background-color, border-color, outline-color, opacity, fill, stroke !important;
+    scroll-behavior: auto !important;
+  }
+}

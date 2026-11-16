@@ -1,0 +1,27 @@
+---
+import { getCollection, render } from 'astro:content';
+import Base from '@/layouts/Base.astro';
+import ProseScripts from '@/components/ProseScripts.astro';
+import { mdxComponents } from '@/components/mdx';
+import '@/styles/leaflet.css';
+
+export async function getStaticPaths() {
+  return (await getCollection('blog')).map((entry) => ({ params: { slug: entry.id }, props: { entry } }));
+}
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+const day = entry.data.date.toISOString().slice(0, 10);
+---
+<Base title={entry.data.title} description={entry.data.description} current="blog">
+  <main class="leaflet" id="main" data-pagefind-body>
+    <article class="sheet">
+      <header class="page-head">
+        <h1>{entry.data.title}</h1>
+        {entry.data.description && <p class="lede">{entry.data.description}</p>}
+        <p class="page-meta"><time datetime={day}>{day}</time>{entry.data.author && <span>{entry.data.author}</span>}</p>
+      </header>
+      <div class="prose"><Content components={mdxComponents} /></div>
+    </article>
+  </main>
+  <ProseScripts />
+</Base>

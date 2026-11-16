@@ -1,0 +1,23 @@
+---
+title: Examples
+description: Three complete annotated yoink.yaml configs for a hobby tool, a polyglot stack, and production.
+weight: 6
+sidebar:
+  open: true
+---
+
+Three complete annotated `yoink.yaml` configs. Each one is a real deploy pattern.
+
+<Cards>
+  <Card href="/docs/reference/examples/hobby-tool" title="Hobby tool / utility" description="Single host, single service, local build, no registry. The minimal yoink.yaml." />
+  <Card href="/docs/reference/examples/polyglot-stack" title="Polyglot stack" description="Rust API + Node web + Redis behind the bundled Caddy proxy on a single host with per-tier networks." />
+  <Card href="/docs/reference/examples/production" title="Production-shape" description="Multiple hosts, replicas, secrets, pre-deploy hooks, and drift detection." />
+</Cards>
+
+## See also
+
+- [`examples/yoink.yaml` in the repo](https://github.com/oddur/yoink/blob/main/examples/yoink.yaml): one config with a comment on each field.
+- [Sealed-secrets fixture](https://github.com/oddur/yoink/tree/main/examples/sealed-secrets): a self-contained example that runs against the docker daemon of your laptop, with no remote host.
+- [Configuration](/docs/reference/config): the schema for each field in these examples.
+- [First deploy](/docs/tutorials/first-deploy): a tutorial that builds the smallest of these configs.
+- [Deploy modes](/docs/explanation/deploy-modes): why the examples use local builds or registry images.

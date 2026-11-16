@@ -1,38 +1,38 @@
 ---
 title: Configuration
-description: Complete yoink.yaml schema reference — every field, its type, and its default.
+description: The complete yoink.yaml schema with every field, its type, and its default.
 weight: 5
 ---
 
-Full schema for `yoink.yaml`. Canonical source: [`yoink/src/config.rs`](https://github.com/oddur/yoink/blob/main/yoink/src/config.rs).
+The canonical source of the `yoink.yaml` schema is [`yoink/src/config.rs`](https://github.com/oddur/yoink/blob/main/yoink/src/config.rs).
 
 ## Top level
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `slug` | string (optional) | unset | Banner shown in the TUI's top chrome; use to mark a config (e.g. `"PRODUCTION — TREAD CAREFULLY"`) so the operator can't miss which environment they're pointed at. Keep it short (single line). |
-| `hosts` | list of [Host](#host) | required | One or more deploy targets. |
-| `deploy` | [Deploy](#deploy) | `{}` | Cross-service defaults (networks, etc.). |
-| `secrets` | [Secrets](#secrets) | unset | Secret provider config. Required if any service uses `secrets:` / `env_from_secrets:`. |
-| `registry` | [Registry](#registry) | unset | Image-pull credentials. Skip when every service is locally-built (yoink ships build artifacts from your docker daemon, no auth needed) or when pulling exclusively from public registries. |
+| `slug` | string | unset | One short line that the TUI shows as a banner in its top chrome. It marks the environment, for example `"PRODUCTION — TREAD CAREFULLY"`. |
+| `hosts` | list of [Host](#host) | `[]` | Deploy targets. Config load accepts an empty list. A command that connects to a host needs a minimum of one entry. |
+| `deploy` | [Deploy](#deploy) | `networks: [yoink]` | Defaults that apply across services (networks). |
+| `secrets` | [Secrets](#secrets) | unset | Secret provider config. Required if a service uses `secrets:` or `env_from_secrets:`. |
 | `registries` | list of [Registry](#registry) | `[]` | Image-pull credentials for more than one registry. Mutually exclusive with `registry`. |
-| `proxy` | [Proxy](#proxy) | unset | Bundled Caddy reverse proxy. Implicitly enabled when any service has a `domain:` set. |
-| `services` | list of [Service](#service) | `[]` | Services to deploy. Can be defined inline or split via `include:`. |
-| `hooks` | [Hooks](#hooks) | `{}` | Top-level hooks not scoped to a single service. Currently: `pre_deploy:`. |
-| `webhooks` | list of [Webhook](#webhooks) | `[]` | Outbound HTTP notifications fired on run-level events. Operator-side, best-effort. |
-| `include` | list of glob | `[]` | Glob paths (relative to the config file) merged into `services`. |
+| `registry` | [Registry](#registry) | unset | Image-pull credentials for one registry. Not necessary when yoink builds every service locally, or when all pulls come from public registries. |
+| `proxy` | [Proxy](#proxy) | unset | Bundled Caddy reverse proxy. A service with `domain:` enables it. |
+| `services` | list of [Service](#service) | `[]` | Services to deploy, inline or in fragments that `include:` loads. |
+| `hooks` | [Hooks](#hooks) | `{}` | Top-level hooks that do not belong to one service. Only `pre_deploy:` exists. |
+| `webhooks` | list of [Webhook](#webhooks) | `[]` | Outbound HTTP notifications on run-level events. The computer that runs yoink sends them, best-effort. |
+| `include` | list of glob | `[]` | Glob paths, relative to the config file, of the fragments to merge. See [Includes](#includes). |
 
 ## Host
 
-Each host needs an address; that can be either a literal `address:` or, for cases where the address itself is sensitive (a public IP that you front through Cloudflare, a tailnet hostname you'd rather not commit), a sealed-secret reference via `address_secret:`. Set exactly one; neither or both is rejected at config load.
+Each host has exactly one of `address:` and `address_secret:`. Config load rejects a host that has neither field or both fields.
 
 | Field | Type | Notes |
 |---|---|---|
-| `address` | string | Hostname or IP. Anything your local SSH client accepts: a raw IP, a DNS name, a `~/.ssh/config` alias, or a tailnet hostname. Mutually exclusive with `address_secret`. |
-| `address_secret` | string (optional) | Name of an entry in your sealed-secrets bundle holding the host's address (IP or hostname). Resolved at config-load time after the bundle decrypts. Use this when the deploy config sits in a public repo and the host's address is sensitive. Mutually exclusive with `address`. |
-| `port` | integer (optional) | SSH port, 1 to 65535. When unset, yoink passes no port and your SSH client decides (22, or a `Port` line in `~/.ssh/config`). Applies to every SSH connection yoink makes to this host. Do not put the port in `address`: `address: host:2200` is rejected at config load. Ignored for `address: local`. |
+| `address` | string | Hostname or IP. Any value that your local SSH client accepts: a raw IP, a DNS name, a `~/.ssh/config` alias, or a tailnet hostname. |
+| `address_secret` | string (optional) | Name of the sealed-secret entry that holds the address (IP or hostname). yoink resolves it at config-load time, after the bundle decrypts. It is for a sensitive address in a public repo, for example a public IP behind Cloudflare. |
 | `user` | string | SSH user. Must be in the `docker` group on the host (or be `root`). |
-| `ssh_key_secret` | string (optional) | Name of an entry in your sealed-secrets bundle holding a PEM-formatted SSH private key. When set, yoink decrypts the key into a per-process tempfile (mode `0o600`) and uses it for this host's SSH connections, both the docker daemon connection and the pre-flight ssh probe. Lets you ship the deploy key with the repo (encrypted at rest in `secrets.age`) instead of relying on every operator's personal `ssh-agent`. |
+| `port` | integer (optional) | SSH port, 1 to 65535. If unset, yoink passes no port and your SSH client selects it (22, or a `Port` line in `~/.ssh/config`). The port applies to every SSH connection that yoink makes to this host. Config load rejects a port in `address` (`address: host:2200`). yoink ignores `port` for `address: local`. |
+| `ssh_key_secret` | string (optional) | Name of the sealed-secret entry that holds a PEM SSH private key. yoink decrypts the key into a per-process tempfile (mode `0o600`). yoink uses it for the docker daemon connection and the pre-flight ssh probe of this host. The deploy key can thus ship in the repo, encrypted in `secrets.age`, and your `ssh-agent` does not need it. |
 
 ```yaml
 hosts:
@@ -52,49 +52,49 @@ hosts:
     ssh_key_secret: DOCS_DEPLOY_SSH_KEY
 ```
 
-`yoink hosts add --address-secret <KEY> --user <USER> --name <NAME>` writes the sealed-address fragment shape. `--name` is required (no literal address to derive a fragment filename from).
+`yoink hosts add --address-secret <KEY> --user <USER> --name <NAME>` writes a host fragment with a sealed address. `--name` is required, because no literal address exists to make the fragment filename from.
 
 ## Deploy
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `networks` | list of string | `[]` | Declared docker networks. Services attach via `services[].networks:`. Yoink creates each one if missing. |
+| `networks` | list of string | `[yoink]` when `deploy:` is absent | Declared docker networks. Required when `deploy:` is present, with a minimum of one entry. Services attach to them with `services[].networks:`. yoink creates each network that does not exist. |
 
 ## Secrets
 
-Two providers, selected by the `provider:` tag.
+The `provider:` field selects one of two providers.
 
 ### `provider: age` (default, batteries-included)
 
-A single sealed dotenv file committed alongside `yoink.yaml`, decrypted at deploy time with the operator's age **identity** (private half) resolved in priority order:
-
-1. `YOINK_AGE_KEY` env (raw key): CI / managed-env contexts
-2. `YOINK_AGE_KEY_FILE` env (path): explicit override
-3. `~/.config/yoink/keys/*.key`: laptop default; yoink scans the dir and picks whichever key's public half matches one of `recipients:` below
-4. `~/.config/yoink/age.key`: legacy single-key fallback
-
-The keys-dir scan (#3) is what makes `yoink secrets key generate` work without per-project env-var setup; multiple projects with distinct identities coexist there, picked by recipient match.
+One sealed dotenv file sits in the repo next to `yoink.yaml`. At deploy time, yoink decrypts the file with your age **identity** (the private half of the keypair). [Identity resolution](/docs/reference/secrets#identity-resolution) gives the order in which yoink looks for the identity.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `provider` | string | required | `age` |
-| `recipients` | list of string | `[]` | Public age **recipients** (`age1...`), one per principal that needs to decrypt. New writes are sealed against every entry; decryption only needs *one* matching identity. Validates non-empty at config-load. |
-| `file` | string | `secrets.age` | Sealed file path, relative to the config file's directory. `..` and absolute paths are rejected. |
-| `profiles` | map of [SecretsProfile](#secretsprofile) | `{}` | Named env-shape recipes for downstream consumers (Terraform state-backend creds, provider tokens, CI shell exports). Consumed by `yoink secrets env --profile <NAME>` and by `hooks.pre_deploy[].secrets_profile`. See [Secrets profiles](#secrets-profiles). |
+| `recipients` | list of string | `[]` | Public age **recipients** (`age1...`), one for each principal that must decrypt. yoink seals new writes against every entry. Decryption needs only one matching identity. Config load rejects an empty list. |
+| `file` | string | `secrets.age` | Path of the sealed file, relative to the directory of the config file. yoink rejects `..` and absolute paths. |
+| `profiles` | map of [SecretsProfile](#secretsprofile) | `{}` | Named env-shape recipes for downstream consumers (Terraform state-backend creds, provider tokens, CI shell exports). `yoink secrets env --profile <NAME>` and `hooks.pre_deploy[].secrets_profile` use them. See [Secrets profiles](#secrets-profiles). |
 
-The recipient/identity split is the asymmetric-keypair mental model; see [Sealed secrets (age)](/docs/guide/secrets#sealed-secrets-age--the-default) in the secrets guide for the full explanation.
+[Sealed secrets (age)](/docs/explanation/secrets#sealed-secrets-age) explains the recipient and identity model.
+
+`yoink secrets key generate` writes a new identity to `~/.config/yoink/keys/<recipient>.key` (mode 0600). It prints the matching recipient (`age1…`), which goes into `recipients:`.
+
+- `--out PATH` writes the identity to a specific file at mode 0600 instead.
+- `--print` sends the identity to stdout, for a pipe into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`).
+
+`yoink secrets key public` prints the recipient of the identity that yoink resolves. The output shows if the key in your shell is the key that `yoink.yaml` expects.
 
 #### Secrets profiles
 
-A profile names "what env shape does one downstream tool expect" and lets the same recipe drive both an operator shell (Taskfile, CI workflow) and a yoink pre-deploy hook. Without profiles, the same `bundle-key → env-var-name` mapping is hand-encoded in N Taskfiles plus N CI workflows, with a separate `unset` block per consumer for env-leak cleanup; profiles consolidate it next to the bundle that supplies the values.
+A profile names the env shape that one downstream tool expects. One profile drives a shell (Taskfile, CI workflow) and a yoink pre-deploy hook. The `bundle-key → env-var-name` mapping is thus in one place, next to the bundle.
 
 ##### `SecretsProfile`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `include` | list of string | `[]` | Allowlist of bundle keys this consumer cares about. Empty = "every key in the bundle." A listed key missing from the bundle is a hard error at resolve time — loud-fail beats silently feeding empty creds. |
-| `rename` | map of string→string | `{}` | `bundle_key → env_var_name`. Renames apply after `include`; keys not in the map keep their original name. Targets must be POSIX env-var names (`[A-Za-z_][A-Za-z0-9_]*`); mixed case is allowed because Terraform's `TF_VAR_<varname>` puts the (lowercase) variable name in the suffix. |
-| `unset` | list of string | `[]` | Env vars to clear in the importing shell *before* the exports land. Solves the "devbox `init_hook` leaks `B2_ENDPOINT` and the b2 SDK underneath the terraform provider mis-routes auth" class of issue. **Operator-shell-only** — a hook runs in a fresh container with no parent env to clear; referencing an `unset` profile from a hook is a config-validation error. |
+| `include` | list of string | `[]` | Allowlist of the bundle keys that this consumer uses. An empty list means every key in the bundle. If a listed key is not in the bundle, resolution stops with an error. |
+| `rename` | map of string→string | `{}` | `bundle_key → env_var_name`. yoink applies the renames after `include`. Keys that are not in the map keep their name. Targets must match `[A-Za-z_][A-Za-z0-9_]*`. Lowercase is permitted for `TF_VAR_<varname>`. |
+| `unset` | list of string | `[]` | Env vars that the importing shell clears before the exports arrive. For example, it clears a `B2_ENDPOINT` that a devbox `init_hook` leaked. Config load rejects a container hook that references a profile with `unset`, because a new container has no parent env to clear. |
 
 Profile names must match `[a-z0-9-]+` (lowercase letters, digits, hyphens).
 
@@ -112,7 +112,7 @@ secrets:
       unset: [B2_ENDPOINT, B2_BUCKET_NAME]
 ```
 
-Use it from a Taskfile:
+The profile in a Taskfile:
 
 ```yaml
 env:
@@ -124,7 +124,7 @@ tasks:
       - eval "$YOINK_TF" && terraform plan
 ```
 
-Or from a yoink pre-deploy hook (subprocess flavor — runs on the operator's machine):
+The profile in a subprocess pre-deploy hook:
 
 ```yaml
 hooks:
@@ -136,21 +136,19 @@ hooks:
       secrets_profile: terraform-cloudflare
 ```
 
-The profile's `unset:` applies on subprocess hooks (yoink calls `Command::env_remove` for each entry); container hooks reject it because there's no parent env to clear. See [Run Terraform from a hook](/docs/how-to/terraform-from-hooks) for the full walkthrough.
+On a subprocess hook, yoink calls `Command::env_remove` for each `unset:` entry of the profile. [Run Terraform from a hook](/docs/how-to/terraform-from-hooks) gives the full procedure.
 
-In CI, when `GITHUB_ENV` is set in the environment, `yoink secrets env` auto-prepends `echo '::add-mask::<value>'` lines for every revealed value — no per-key copy-paste needed; new keys added to the profile are masked automatically.
-
-Bootstrap: `yoink secrets key generate` writes a fresh **identity** to `~/.config/yoink/keys/<recipient>.key` (mode 0600) by default and prints the matching **recipient** (`age1…`, public; paste into `recipients:` above). `--out PATH` writes to a specific file at mode 0600 instead. `--print` sends the secret to stdout for piping into a CI secret store (`… --print | gh secret set YOINK_AGE_KEY`). `yoink secrets key public` re-derives the recipient from whichever identity yoink would use right now (handy "is the key in my shell the same one yoink.yaml expects?" check). See the [secrets guide](/docs/guide/secrets).
+When `GITHUB_ENV` is set, `yoink secrets env` puts one `echo '::add-mask::<value>'` line for each revealed value before the exports. A new key in the profile thus needs no mask line in the CI workflow.
 
 ### `provider: command` (bring-your-own-tool)
 
-Yoink invokes the configured command and reads a secrets bundle from stdout. Format auto-detects between dotenv and JSON. Lets operators wire any external manager (Doppler, 1Password, HashiCorp Vault, AWS Secrets Manager, the Infisical CLI, Bitwarden, …) without yoink growing first-party integrations for each.
+yoink runs the configured command and reads a secrets bundle (dotenv or JSON) from stdout. Any external manager with a CLI connects this way: Doppler, 1Password, HashiCorp Vault, AWS Secrets Manager, Infisical, Bitwarden.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `provider` | string | required | `command` |
-| `command` | list of string | required | Argv to spawn. First element is the binary, the rest are arguments. No shell interpretation; wrap in `["sh", "-c", "..."]` if you need pipes. |
-| `format` | string | `auto` | `auto` inspects the first non-whitespace byte (`{` → JSON, else dotenv). `dotenv` / `json` force the parser. |
+| `command` | list of string | required | Argv to spawn. The first element is the binary. No shell interprets the command. Pipes need the form `["sh", "-c", "..."]`. |
+| `format` | string | `auto` | `auto` looks at the first non-whitespace byte (`{` → JSON, else dotenv). `dotenv` and `json` force the parser. |
 
 ```yaml
 secrets:
@@ -158,108 +156,103 @@ secrets:
   command: ["doppler", "secrets", "download", "--no-file", "--format", "env"]
 ```
 
-See the [secrets guide](/docs/guide/secrets) for per-tool wiring.
+[`provider: command`](/docs/reference/secrets#provider-command) gives the run rules and the bundle formats. The [secrets guide](/docs/explanation/secrets) has the config for each tool.
 
 ## Registry
 
 | Field | Type | Notes |
 |---|---|---|
-| `server` | string | Registry hostname (e.g. `ghcr.io`). |
-| `username_secret` | string | Name of the secret in your provider holding the username. |
-| `password_secret` | string | Name of the secret holding the token/password. |
+| `server` | string | Registry hostname (for example `ghcr.io`). |
+| `username_secret` | string | Name of the secret in your provider that holds the username. |
+| `password_secret` | string | Name of the secret that holds the token or password. |
 
-Yoink resolves these at deploy time and passes them as `X-Registry-Auth` on each pull of an image from `server`. A pull from another registry is anonymous, so a public image such as the default proxy image `caddy:2` still pulls.
+yoink resolves these secrets at deploy time. It passes them as `X-Registry-Auth` on each pull of an image from `server`. A pull from another registry is anonymous. As a result, a public image such as the default proxy image `caddy:2` still pulls.
 
-To pull from more than one private registry, use `registries:`. It is a list of the same fields:
+To pull from more than one private registry, use the `registries:` list. Each pull uses the entry whose `server` hosts the image. Config load rejects a config that sets `registry:` and `registries:`, and a list that names one registry two times.
 
 ```yaml
 registries:
-  - server: ghcr.io
-    username_secret: GHCR_USERNAME
-    password_secret: GHCR_TOKEN
-  - server: docker.io
-    username_secret: DOCKERHUB_USERNAME
-    password_secret: DOCKERHUB_TOKEN
+  - { server: ghcr.io, username_secret: GHCR_USERNAME, password_secret: GHCR_TOKEN }
+  - { server: quay.io, username_secret: QUAY_USERNAME, password_secret: QUAY_TOKEN }
 ```
-
-Each pull uses the entry whose `server` hosts the image. A pull from a registry that is not in the list is anonymous. `registry:` is the same as a list with one entry. A config that sets both `registry:` and `registries:` is invalid, and each registry can appear only once in the list (`docker.io` and `index.docker.io` are the same registry).
 
 ## Proxy
 
-The bundled Caddy reverse proxy. See the [proxy guide](/docs/guide/proxy) for the full operator-side picture.
+The [proxy guide](/docs/explanation/proxy) explains how the bundled Caddy reverse proxy operates.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `enabled` | bool | implicit when any service has `domain:` | Force-on when no service has a domain (e.g. routes are only configured via `global_handlers:`). |
-| `email` | string | unset | Let's Encrypt registration email. **Required when any service uses `tls: auto`.** Not used when `proxy.tls:` is set. |
-| `image` | string | `caddy:2` | Pre-built caddy image (registry-pulled). Mutually exclusive with `xcaddy:`. |
-| `xcaddy` | [Xcaddy](#xcaddy) | unset | Compile a custom caddy on each proxy host with plugins. Mutually exclusive with `image:`. |
-| `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. Don't delete casually — Let's Encrypt rate-limits aggressively. |
-| `bind` | string | unset (all interfaces) | Host IP to bind `:80` and `:443` to. Common use: bind to a Tailscale IP so the proxy is reachable only over the tailnet. The admin port stays on `127.0.0.1` regardless. |
-| `tls` | [ProxyTls](#proxytls) | unset | Proxy-level TLS — every routed service inherits this cert (and optional mTLS) by default. ACME implicitly off when set. |
-| `config_extra` | string (JSON) | unset | Top-level Caddy JSON snippet, deep-merged into the rendered config before `/load`. Escape hatch for global settings yoink doesn't model as typed fields — `trusted_proxies`, `storage`, plugin app blocks. |
-| `global_handlers` | list of string (JSON) | `[]` | Caddy handlers (and/or routes) that run for every request *before* any per-service route matches. The natural place for proxy-wide concerns: CrowdSec bouncer, Coraza WAF, fleet-wide rate limiting. |
-| `global_handlers_after` | list of string (JSON) | `[]` | Same shape as `global_handlers:`, but the chain runs *after* per-service routes match. Use for concerns that need the upstream's response (response headers, access-log shaping, post-processing). |
+| `enabled` | bool | `true` when a service has `domain:` | Forces the proxy on or off. For example, `true` when only `global_handlers:` configures the routes. |
+| `email` | string | unset | Registration email for Let's Encrypt. **Required when a service uses `tls: auto`.** Not used when `proxy.tls:` is set. |
+| `image` | string | `caddy:2` | Pre-built caddy image that yoink pulls from a registry. Mutually exclusive with `xcaddy:`. |
+| `xcaddy` | [Xcaddy](#xcaddy) | unset | Compiles a custom caddy with plugins on each proxy host. Mutually exclusive with `image:`. |
+| `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. If you remove the volume, Caddy requests new certs, and Let's Encrypt has strict rate limits. |
+| `bind` | string | unset (all interfaces) | Host IP that `:80` and `:443` bind to. For example, a Tailscale IP makes the proxy reachable only over the tailnet. The admin port always stays on `127.0.0.1`. |
+| `tls` | [ProxyTls](#proxytls) | unset | Proxy-level TLS. Every routed service inherits this cert (and the optional mTLS) by default. When the field is set, ACME is off. |
+| `config_extra` | string (JSON) | unset | Top-level Caddy JSON object. yoink deep-merges it into the rendered config before `/load`. It is for global Caddy config that has no typed field: `trusted_proxies`, `storage`, plugin app blocks. |
+| `global_handlers` | list of string (JSON) | `[]` | Caddy handlers or routes that run for every request before a per-service route matches. It is for proxy-wide concerns: CrowdSec bouncer, Coraza WAF, fleet-wide rate limiting. |
+| `global_handlers_after` | list of string (JSON) | `[]` | Same shape as `global_handlers:`, but the chain runs after the per-service routes match. It is for concerns that need the upstream response (response headers, access-log shaping). |
 
 ### Xcaddy
 
-Builds a custom caddy on each proxy host using `xcaddy`. Content-addressed by build inputs, tagged locally as `yoink-caddy:<hash>`; subsequent `up` runs short-circuit until plugins or version change. No registry needed.
+`xcaddy` builds a custom caddy on each proxy host, with no registry. The local tag is `yoink-caddy:<hash>`, where the hash covers the build inputs. Later `up` runs skip the build until an input changes.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `plugins` | list of string | required (non-empty) | One entry per caddy module. Bare module path or pinned (`module@version`) — same syntax as `xcaddy build --with`. Sorted alphabetically before hashing/rendering. |
-| `caddy_version` | string | xcaddy's latest tagged release | Caddy git tag to compile (e.g. `v2.8.4`). Pinned values pass verbatim to `xcaddy build`. |
-| `base_image` | string | `caddy:2` | Runtime image. Override only to bind to a specific caddy patch version. |
-| `builder_image` | string | `caddy:2-builder` | Build stage (carries xcaddy + Go toolchain). Pin to `caddy:<v>-builder` to also pin the xcaddy CLI. |
-| `replace` | list of string | `[]` | Forwarded as `xcaddy build --replace` entries. Useful for testing a local fork of a plugin. |
+| `plugins` | list of string | required (non-empty) | One entry for each caddy module: a bare module path or a pinned one (`module@version`), as in `xcaddy build --with`. yoink sorts the entries before it hashes and renders them. |
+| `caddy_version` | string | xcaddy's latest tagged release | Caddy git tag to compile (for example `v2.8.4`). yoink passes the value verbatim to `xcaddy build`. |
+| `base_image` | string | `caddy:2` | Runtime image. An override is necessary only to pin a specific caddy patch version. |
+| `builder_image` | string | `caddy:2-builder` | Build stage (contains xcaddy and the Go toolchain). A pin to `caddy:<v>-builder` also pins the xcaddy CLI. |
+| `env` | map of string | `{}` | Env vars for the build stage, set before `xcaddy build` runs. For example `GOPRIVATE` or `GOPROXY` for private Go modules. |
+| `replace` | list of string | `[]` | yoink forwards these as `xcaddy build --replace` entries. For example, an entry builds a fork of a plugin. |
 
 ### ProxyTls
 
-When set, every routed service uses this cert by default. Per-service `tls_cert_secret:` / `tls_key_secret:` overrides remain available for the rare different-cert-per-service case. `:80 → :443` redirect auto-emitted.
+When `proxy.tls:` is set, every routed service uses this cert by default, and yoink emits a `:80 → :443` redirect. The per-service fields `tls_cert_secret:` and `tls_key_secret:` override the cert for one service.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `cert_secret` | string | required | Sealed-secret name holding the PEM cert (full chain). |
-| `key_secret` | string | required | Sealed-secret name holding the PEM private key. |
-| `client_auth` | [ClientAuth](#clientauth) | unset | Optional mTLS (e.g. Cloudflare origin-pull). |
+| `cert_secret` | string | required | Sealed-secret name that holds the PEM cert (full chain). |
+| `key_secret` | string | required | Sealed-secret name that holds the PEM private key. |
+| `client_auth` | [ClientAuth](#clientauth) | unset | Optional mTLS (for example Cloudflare origin-pull). |
 
 ### ClientAuth
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `mode` | enum | `require_and_verify` | `request` / `require` / `verify_if_given` / `require_and_verify`. Most setups want the strict default. |
-| `trust_pool_secret` | string | required | Sealed-secret name holding the PEM CA bundle that signs accepted client certs. |
+| `mode` | enum | `require_and_verify` | `request` / `require` / `verify_if_given` / `require_and_verify`. The default is the strictest mode. |
+| `trust_pool_secret` | string | required | Sealed-secret name that holds the PEM CA bundle that signs the accepted client certs. |
 
 ## Service
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `name` | string | required | Used as container name and DNS alias. Unique within the config. |
-| `image` | string | required | Image reference. Bare names (no `/`) trigger no-registry mode. |
-| `tag` | string | unset | Literal tag. Overridable at deploy via `--tag <name>=<value>`. |
-| `build` | [Build](#build) | unset | Local-build config. Required for `--build` flow. |
-| `hosts` | list of string | all hosts | Restrict which hosts run this service. Strings match `hosts[].address`. |
-| `depends_on` | list of string | `[]` | Other service names. Topological-sort drives wave ordering. Must be a DAG. |
-| `networks` | list of string | `[<deploy.network default>]` | Docker networks to attach. Must be declared in `deploy.networks`. |
-| `secrets` | list of string | `[]` | Secret names exposed as env vars of the same name. |
-| `env_from_secrets` | map of string | `{}` | `ENV_VAR_NAME: SECRET_NAME` — exposes a secret under a different env name. |
-| `env` | map of string | `{}` | Plain env vars. **Don't put secrets here** — they end up in container labels. |
+| `name` | string | required | The container name and the DNS alias. Unique in the config. |
+| `image` | string | required | Image reference, without the tag. |
+| `tag` | string | unset | Literal tag. See [Tag overrides at deploy time](#tag-overrides-at-deploy-time). |
+| `build` | [Build](#build) | unset | Local-build config. Required for the `--build` flow. |
+| `hosts` | list of string | all hosts | Restricts the hosts that run this service. The strings match `hosts[].address`. |
+| `depends_on` | list of string | `[]` | Names of other services. A topological sort of these names gives the wave order. Must be a DAG. |
+| `networks` | list of string | every network in `deploy.networks` | Docker networks to attach. Each one must be declared in `deploy.networks`. Config load rejects an empty list. |
+| `secrets` | list of string | `[]` | Secret names. Each secret becomes an env var of the same name. |
+| `env_from_secrets` | map of string | `{}` | `ENV_VAR_NAME: SECRET_NAME`. Exposes a secret under a different env name. |
+| `env` | map of string | `{}` | Plain env vars. **Do not put secrets here.** |
 | `labels` | map of string | `{}` | Extra docker labels. |
-| `description` | string | unset | Written to the container as `org.opencontainers.image.description`; surfaced in the TUI. |
-| `kind` | enum | unset | Internal marker used by yoink-synthesized services (the proxy). Operators don't set this. |
-| `pre_deploy` | list of [Hook](#hook) | `[]` | One-shot hooks that run before the swap (per service-wave; see [Hook](#hook) for the once-per-up vs once-per-wave distinction). |
-| `domain` | string \| list of string | unset | Hostname(s) for the bundled proxy to route. Presence enables proxying. List form is the apex+www / multi-domain pattern. See the [proxy guide](/docs/guide/proxy). |
-| `path_prefix` | string | unset | Match this path glob in addition to `domain:` so multiple services can share a hostname. Yoink orders routes so path-constrained ones come before catch-alls. |
-| `tls` | enum | `auto` (when `domain:` set) | `auto` = ACME via Let's Encrypt; `off` = HTTP only; `cert` = inline cert from sealed secrets (set `tls_cert_secret:` / `tls_key_secret:`). |
-| `tls_cert_secret` | string | unset | Sealed-secret name holding the PEM cert. Required when `tls: cert`. |
-| `tls_key_secret` | string | unset | Sealed-secret name holding the PEM private key. Required when `tls: cert`. |
-| `upstream_h2c` | bool | `false` | Talk to backend over HTTP/2 cleartext. Required for native gRPC backends (Tonic, grpc-go, grpc-java). |
-| `compression` | bool | `false` | Emit `encode gzip zstd`. No-op behind a CDN. |
-| `canonical_domain` | string | unset | One of the `domain:` entries. Yoink 308-redirects every other entry to it (apex/www patterns). |
-| `hsts` | bool | `true` for TLS sites | Emit `Strict-Transport-Security: max-age=31536000; includeSubDomains`. |
-| `caddy_extra_json` | string (JSON) | unset | Raw Caddy handler JSON merged into the route. Routes auto-wrapped in `subroute`. See the [snippets cookbook](/docs/guide/proxy#snippets-cookbook). |
-| `caddy_extra_caddyfile` | string (Caddyfile) | unset | Same as above but in Caddyfile syntax. Yoink shells out to `caddy adapt` at render time (needs docker on operator). Mutually exclusive with `caddy_extra_json:`. |
-| `run` | [Run](#run) | required | Runtime config (port, replicas, healthcheck, options). |
+| `description` | string | unset | yoink writes it to the container as `org.opencontainers.image.description`. The TUI shows it. |
+| `kind` | enum | unset | Internal marker for services that yoink synthesizes (the proxy). You do not set this field. |
+| `pre_deploy` | list of [Hook](#hook) | `[]` | One-shot hooks that run before yoink starts the new containers of this service. See [Hooks](#hooks). |
+| `domain` | string \| list of string | unset | One or more hostnames that the bundled proxy routes to this service. The field enables the proxy. Requires `run.port`. See the [proxy guide](/docs/explanation/proxy). |
+| `path_prefix` | string | unset | Matches this path glob in addition to `domain:`, so that many services can share a hostname. yoink puts routes with a path constraint before the catch-all routes. |
+| `tls` | enum | `auto` (when `domain:` set) | `auto` = ACME with Let's Encrypt. `off` = HTTP only. `cert` = inline cert from sealed secrets (with `tls_cert_secret:` and `tls_key_secret:`). |
+| `tls_cert_secret` | string | unset | Sealed-secret name that holds the PEM cert. Required when `tls: cert`. |
+| `tls_key_secret` | string | unset | Sealed-secret name that holds the PEM private key. Required when `tls: cert`. |
+| `upstream_h2c` | bool | `false` | The proxy connects to the backend over HTTP/2 cleartext. Required for native gRPC backends (Tonic, grpc-go, grpc-java). |
+| `compression` | bool | `false` | Emits `encode gzip zstd`. Has no effect behind a CDN. |
+| `canonical_domain` | string | unset | One of the `domain:` entries. yoink sends a 308 redirect from every other entry to it (apex and www patterns). |
+| `hsts` | bool | `true` for TLS sites | Emits `Strict-Transport-Security: max-age=31536000; includeSubDomains`. |
+| `caddy_extra_json` | string (JSON) | unset | Raw Caddy handler JSON that yoink merges into the route. yoink wraps routes in `subroute`. See the [snippets cookbook](/docs/explanation/proxy#snippets-cookbook). |
+| `caddy_extra_caddyfile` | string (Caddyfile) | unset | The same as `caddy_extra_json:`, but in Caddyfile syntax. yoink runs `caddy adapt` at render time, which needs docker on your computer. Mutually exclusive with `caddy_extra_json:`. |
+| `run` | [Run](#run) | required | Runtime config (port, replicas, healthcheck, run options). |
 
 ## Build
 
@@ -269,53 +262,55 @@ When set, every routed service uses this cert by default. Per-service `tls_cert_
 | `dockerfile` | string | `Dockerfile` | Dockerfile path, relative to the context. |
 | `target` | string | unset | Multi-stage build target. |
 | `args` | map of string | `{}` | `--build-arg KEY=VALUE` pairs. |
-| `extra_args` | list of string | `[]` | Raw extra args passed to the build command. |
+| `extra_args` | list of string | `[]` | Raw extra args that yoink passes to the build command. |
 
 ## Run
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `port` | u16 | required | Container port to healthcheck and route to. |
-| `healthcheck_path` | string | unset | HTTP path. If unset, yoink does a TCP-connect probe instead. |
-| `healthcheck_timeout` | duration | `60s` | How long to wait for a healthy response on the new container. |
-| `replicas` | u32 | `1` | Number of containers per host. ≥2 enables rolling swap. |
-| `drain_timeout` | duration | `30s` | Grace period before SIGKILL on the old container. |
-| `entrypoint` | list of string | image default | Override `ENTRYPOINT`. |
-| `cmd` | list of string | image default | Override `CMD`. |
+| `port` | u16 | unset | Container port for the healthcheck and for proxy routes. Required when `healthcheck_path:` or `domain:` is set. Without a port, yoink skips the healthcheck. |
+| `healthcheck_path` | string | unset | HTTP path for the probe. If the field is unset, yoink does a TCP-connect probe on `port`. |
+| `healthcheck_timeout` | duration | `60s` | The time that yoink waits for a healthy response from the new container. |
+| `replicas` | u32 | `1` | Number of containers on each host. A value ≥2 enables the rolling swap. |
+| `drain_timeout` | duration | `15s` | Grace period before SIGKILL on the old container. |
+| `entrypoint` | list of string | image default | Overrides `ENTRYPOINT`. |
+| `cmd` | list of string | image default | Overrides `CMD`. |
 | `publish` | list of string | `[]` | Host port mappings (`"80:80"`, `"443:443/udp"`). |
-| `binds` | list of string | `[]` | Host bind mounts (`"src:dst:mode"`). Default mode is `:ro`. |
+| `binds` | list of string | `[]` | Host bind mounts (`"src:dst:mode"`). The default mode is `:ro`. |
 | `volumes` | list of string | `[]` | Named docker volumes. |
-| `files` | list of string | `[]` | Same shape as `binds`, but the source content is hashed into `spec_hash` (config files trigger a redeploy on edit). `files` mounts are always read-only: `:ro` is optional, and `:rw` is rejected at validation. Use `binds` or `volumes` for data the container must write. |
-| `options` | [RunOptions](#runoptions) | hardened defaults | Resource limits + security flags. |
+| `files` | list of string | `[]` | Files that yoink uploads to the host and mounts read-only (`"local_path:container_path[:ro]"`). `:ro` is optional. Validation rejects `:rw`. yoink hashes the content into `spec_hash`, so an edit triggers a redeploy. For data that the container must write, use `binds` or `volumes`. |
+| `options` | [RunOptions](#runoptions) | hardened defaults | Resource limits and security flags. |
 
 ## RunOptions
 
-The hardened defaults make new containers prod-safe out of the box. Override per-service when needed.
+The defaults are a hardened profile. Each service can override them.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `memory` | string | unset | Memory limit (`"512Mi"`, `"1Gi"`). |
-| `cpus` | string | unset | CPU limit (`"1.5"` = 1.5 cores; `"2"` = 2 dedicated cores). |
-| `pids_limit` | u32 | `1024` | Fork-bomb bound. |
-| `cap_drop` | list of string | `["ALL"]` | Linux capabilities dropped. |
-| `cap_add` | list of string | `[]` | Capabilities re-added. Use sparingly (e.g. `NET_BIND_SERVICE` for Caddy). |
+| `cpus` | string | unset | CPU limit in cores of CPU time (`"1.5"` = 1.5 cores). |
+| `pids_limit` | integer | `1024` | Limit against fork bombs. |
+| `cap_drop` | list of string | `["ALL"]` | Linux capabilities that the container loses. |
+| `cap_add` | list of string | `[]` | Capabilities that the container gets back, for example `NET_BIND_SERVICE` for Caddy. |
 | `security_opt` | list of string | `["no-new-privileges:true"]` | Docker security options. |
-| `read_only` | bool | `true` | Read-only rootfs. Combine with `tmpfs:` for writable scratch. |
-| `init` | bool | `true` | Run with tini as PID 1 (zombie reaping + proper SIGTERM). |
-| `tmpfs` | map of string | `{}` | `mount_path: "size=N,mode=NNNN"`. Auto-applies `noexec,nosuid,nodev`. |
-| `restart` | string | unset (docker default `no`) | Docker restart policy. Common values: `unless-stopped` (recommended for long-running services), `on-failure`, `always`. Set explicitly; yoink doesn't impose a default. |
-| `user` | string | `"65534:65534"` (nobody) | UID/GID. Default runs non-root. Override with `"0:0"` for images that genuinely need root, or a specific uid:gid (`"1000:1000"`, `"redis"`) when the image has pre-baked file ownership. |
-| `network_aliases` | list of string | `[]` | Extra DNS aliases on the attached networks. The container always gets the service `name` as an alias regardless; this field adds *more* names (e.g. for legacy hostname compat). |
-| `devices` | list of string | `[]` | Host devices to expose. Each entry is `<host-path>[:<container-path>[:<perms>]]` (docker's `--device` syntax). `<perms>` is some combination of `r`, `w`, `m`; defaults to `rwm`. Both bind-mounts the device file and adds it to the cgroup `devices.allow` list. Narrower than `--privileged` — only the listed devices become accessible. Common uses: `/dev/nvidia*` (GPU), `/dev/dri` (Intel/AMD VAAPI), `/dev/ttyUSB*` (USB serial), `/dev/fuse` (with `cap_add: [SYS_ADMIN]`), `/dev/snd` (audio). |
+| `read_only` | bool | `true` | Read-only rootfs. `tmpfs:` adds writable scratch space. |
+| `init` | bool | `true` | Runs tini as PID 1 (zombie reaping and correct SIGTERM). |
+| `tmpfs` | map of string | `{}` | `mount_path: "size=N,mode=NNNN"`. yoink applies `noexec,nosuid,nodev` automatically. |
+| `restart` | enum | `unless-stopped` | Docker restart policy: `no`, `always`, `unless-stopped`, or `on-failure`. Write `'no'` with quotes, because YAML reads a bare `no` as a boolean. |
+| `user` | string | `"65534:65534"` (nobody) | UID/GID. The default is non-root. `"0:0"` is for images that need root. A specific value (`"1000:1000"`, `"redis"`) is for images with pre-baked file ownership. |
+| `network_aliases` | list of string | `[]` | Extra DNS aliases on the attached networks, in addition to the service `name`. For example, a legacy hostname. |
+| `devices` | list of string | `[]` | Host devices to expose. Each entry is `<host-path>[:<container-path>[:<perms>]]` (the `--device` syntax of docker). `<perms>` is a combination of `r`, `w`, `m`, and the default is `rwm`. An entry bind-mounts the device file and adds it to the cgroup `devices.allow` list. Only the listed devices become accessible, which is narrower than `--privileged`. Examples: `/dev/nvidia*` (GPU), `/dev/dri` (Intel/AMD VAAPI), `/dev/ttyUSB*` (USB serial), `/dev/fuse` (with `cap_add: [SYS_ADMIN]`), `/dev/snd` (audio). |
 
-See [Security defaults](/docs/guide/security) for the full picture.
+[Security defaults](/docs/explanation/security) explains the reasons for these defaults.
 
 ## Hooks
 
-Two places hooks live:
+Hooks are in two places. Each hook runs once for each `up`.
 
-- **Per-service** `services[].pre_deploy:` runs before *that service's* wave starts (so a database migration finishes before the api container that depends on it is even pulled). Once per `up`, on the first host that has the service.
-- **Top-level** `hooks.pre_deploy:` runs before *any* service-wave starts. Once per `up`, on the first host overall. Use for cluster-wide concerns that don't belong to a single service.
+| Place | When it runs |
+|---|---|
+| Top-level `hooks.pre_deploy:` | Before any service wave starts. It is for cluster-wide concerns that do not belong to one service. |
+| Per-service `services[].pre_deploy:` | After yoink pulls the image and creates the new containers of that service, before yoink starts them. A database migration thus completes before the new api container starts. |
 
 ```yaml
 hooks:
@@ -325,31 +320,31 @@ hooks:
       tag: v1
 ```
 
-Both shapes use the same [Hook](#hook) entry shape below. A non-zero exit aborts the deploy before the swap; the old container stays live.
+The two places use the same [Hook](#hook) entry shape. A non-zero exit stops the deploy before the swap, and the old container stays live.
 
 ## Hook
 
-A hook runs in one of two flavors, distinguished by the presence of `image:`:
+The presence of `image:` selects one of two flavors:
 
-- **Container hook** (`image:` + `tag:` set): yoink pulls the image and runs `cmd:` inside docker on the first host. Use for pinned tool images or isolation from the operator's filesystem.
-- **Subprocess hook** (no `image:`, no `tag:`): yoink invokes `cmd[0]` directly on the operator's machine (or the CI runner). Inherits the parent env. Use for tools already on PATH (`terraform`, `dbmate`, `alembic`, `gcloud`, …) — see [Run Terraform from a hook](/docs/how-to/terraform-from-hooks).
+- **Container hook** (`image:` and `tag:` set): yoink pulls the image and runs `cmd:` in docker on the first host in `hosts:`. It is for pinned tool images, or for isolation from your filesystem.
+- **Subprocess hook** (no `image:`, no `tag:`): yoink runs `cmd[0]` directly on your computer (or on the CI runner). The hook inherits the parent env. It is for tools that are already on PATH, for example `terraform`, `dbmate`, `alembic`, `gcloud`. See [Run Terraform from a hook](/docs/how-to/terraform-from-hooks).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `name` | string | required | Hook identifier (used in logs, lock label). |
-| `image` | string | unset | Container hook only. Usually the same as the runtime service. |
-| `tag` | string \| `{service: <name>}` | unset | Container hook only. Literal tag, or `{service: api}` to mirror the runtime tag. Required when `image:` is set; rejected otherwise. |
-| `entrypoint` | list of string | image default | Container hook only. Override `ENTRYPOINT`. |
-| `cmd` | list of string | image default | Container: override `CMD`. Subprocess: required; `cmd[0]` is the binary, the rest are args. |
-| `working_dir` | string (path) | yoink.yaml's dir | Subprocess hook only. Resolved relative to `yoink.yaml`'s directory. |
+| `name` | string | required | Hook identifier. It appears in logs and in the name of the hook container. |
+| `image` | string | unset | Container hook only. Usually the same image as the runtime service. |
+| `tag` | string \| `{service: <name>}` | unset | Container hook only. A literal tag, or `{service: api}` to use the tag that yoink resolves for the service `api`. Required when `image:` is set. Rejected when `image:` is not set. |
+| `entrypoint` | list of string | image default | Container hook only. Overrides `ENTRYPOINT`. |
+| `cmd` | list of string | image default | Container: overrides `CMD`. Subprocess: required. `cmd[0]` is the binary and the other elements are args. |
+| `working_dir` | string (path) | directory of `yoink.yaml` | Subprocess hook only. yoink resolves it relative to the directory of `yoink.yaml`. |
 | `env` | map of string | `{}` | Plain env vars. |
-| `secrets` | list of string | `[]` | Secret names exposed as env vars of the same name. Often a different role than the runtime (e.g. a migrate role). |
+| `secrets` | list of string | `[]` | Secret names. Each secret becomes an env var of the same name. |
 | `env_from_secrets` | map of string | `{}` | `ENV_NAME: SECRET_NAME` mapping. |
-| `secrets_profile` | string | unset | Reference a named recipe from `secrets.profiles`. Profile's `include` joins `secrets`; profile's `rename` joins `env_from_secrets`. Profile's `unset:` applies on subprocess hooks (via `Command::env_remove`); rejected on container hooks (no parent env to clear). See [Secrets profiles](#secrets-profiles). |
+| `secrets_profile` | string | unset | Name of a profile in `secrets.profiles`, for `hooks.pre_deploy` entries. The `include` of the profile joins `secrets`, and its `rename` joins `env_from_secrets`. `unset:` applies only on subprocess hooks. See [Secrets profiles](#secrets-profiles). |
 
 ## Webhooks
 
-Outbound HTTP calls fired on `RunStarted` / `RunFinished`. Operator-side: the request goes from the box running `yoink up`, not from each host. Best-effort: every fire records a `WebhookFired` audit event whose `ok` field carries the outcome; a failure never aborts the deploy. See [Notify chat / paging / observability on deploy](/docs/how-to/notify-on-deploy) for templating, secrets, and worked receiver examples (ntfy, Slack, Grafana).
+yoink sends webhooks on `RunStarted` and `RunFinished`, from the computer that runs `yoink up`, not from each host. Webhooks are best-effort: a failure never stops the deploy. Each call records a `WebhookFired` audit event, and its `ok` field holds the outcome. [Notify chat / paging / observability on deploy](/docs/how-to/notify-on-deploy) has receiver examples (ntfy, Slack, Grafana).
 
 ```yaml
 webhooks:
@@ -363,29 +358,41 @@ webhooks:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `name` | string | required | Unique across the `webhooks:` list. Appears in `WebhookFired.name`. |
-| `url` | string | required | Templated. Must resolve to `http(s)://…` after `${secret:NAME}` substitution. |
-| `on` | list of trigger | required | Subset of `run_started`, `run_succeeded`, `run_failed`. At least one entry required. |
+| `name` | string | required | Unique in the `webhooks:` list. Appears in `WebhookFired.name`. |
+| `url` | string | required | Templated. Must resolve to `http(s)://…` after the `${secret:NAME}` substitution. |
+| `on` | list of trigger | required | Subset of `run_started`, `run_succeeded`, `run_failed`. A minimum of one entry is required. |
 | `method` | `GET` \| `POST` \| `PUT` | `POST` |  |
 | `timeout` | duration | `10s` | `humantime` syntax. |
-| `headers` | map of string | `{}` | Each value templated. |
-| `body` | string | unset | Templated. Omit for GET-style receivers. |
+| `headers` | map of string | `{}` | Each value is templated. |
+| `body` | string | unset | Templated. Not necessary for GET-style receivers. |
 
-Templating runs in two passes per field: `${secret:NAME}` literal substitution from the sealed bundle, then minijinja rendering with `UndefinedBehavior::Strict`. Available template variables: `event`, `ok`, `command`, `services`, `deploy_id`, `actor`, `host`, `git_sha`, `yoink_version`, `error`, `ts`. See [Notify chat / paging / observability on deploy: Template context](/docs/how-to/notify-on-deploy#template-context) for the full table.
+Templating runs in two passes for each field:
+
+1. The literal `${secret:NAME}` substitution from the sealed bundle.
+2. minijinja rendering with `UndefinedBehavior::Strict`.
+
+The template variables are `event`, `ok`, `command`, `services`, `deploy_id`, `actor`, `host`, `git_sha`, `yoink_version`, `error`, `ts`. [Webhooks: Template context](/docs/reference/webhooks#template-context) describes each one.
 
 ## Tag overrides at deploy time
 
-Any service or hook with `tag:` unset (or set to a literal that you want to override) accepts `--tag` at the CLI:
+`yoink up` resolves the tag of each selected service in this order:
+
+1. `--tag <name>=<value>`.
+2. A bare `--tag <value>`, which applies to every selected service.
+3. `tag:` in the service config.
+4. With `--service` and no `--tag`: the git short SHA, for each selected service that has no `tag:`. This rule needs a clean working tree and does not apply with `--allow-dirty`.
+
+`--here` applies the git short SHA to every selected service, also over a config `tag:`. `--here` does not look for uncommitted changes.
 
 ```sh
 yoink up --tag api=$(git rev-parse HEAD) --tag web=$(git rev-parse HEAD)
 ```
 
-`tag: { service: api }` mirrors the runtime tag, useful for `pre_deploy` migrations that must use the exact image being deployed.
+On a hook, `tag: { service: api }` resolves to the tag that yoink deploys for the service `api`. A `pre_deploy` migration thus uses the exact image that yoink deploys.
 
 ## Includes
 
-`include:` globs are resolved relative to the config file's directory. Each matched file is parsed as a partial config; only `services:` and `hooks.pre_deploy:` are permitted in fragments and they merge into the entry config's lists. All other top-level fields (`hosts`, `deploy`, `secrets`, `registry`, `registries`, `proxy`, `slug`) belong only in the entry config.
+yoink resolves `include:` globs relative to the directory of the config file and parses each matched file as a fragment. A fragment can contain only `services:`, `hosts:`, and `hooks.pre_deploy:`. yoink appends these lists to the lists of the entry config. All other top-level fields (`deploy`, `secrets`, `registry`, `registries`, `proxy`, `slug`) belong only in the entry config.
 
 ```yaml
 # yoink.prod.yaml
@@ -405,7 +412,7 @@ services:
 
 ## Environment-variable substitution
 
-Any `${VAR}` reference in `yoink.yaml` (or in a fragment loaded via `include:`) is substituted against the process environment at config-load time, before YAML parsing.
+At config-load time, before YAML parsing, yoink substitutes each `${VAR}` reference against the process environment. This applies to `yoink.yaml` and to each fragment that `include:` loads.
 
 ```yaml
 hosts:
@@ -417,19 +424,19 @@ services:
       - ${HOST_IP}.nip.io
 ```
 
-Run with `HOST_IP=1.2.3.4 yoink up …`. Useful for throwaway-host recipes, ephemeral preview environments, and any other case where one of the values isn't known until invocation time.
+The command for this config is `HOST_IP=1.2.3.4 yoink up …`. Substitution is for values that are not known before the run, for example the IP of a throwaway host or of a preview environment.
 
 Rules:
 
-- Only the unambiguous `${NAME}` form is recognized. Bare `$NAME` and lone `$` characters pass through unchanged so values containing literal dollar signs are unaffected.
-- `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`. Anything else (including `${HOST-IP}`, `${1BAD}`, or unterminated `${`) errors with a snippet pointing at the bad reference.
-- Missing variables are a hard error rather than silent empty substitution; a quietly-empty `address:` produces baffling failures further down the deploy.
-- The POSIX `${NAME:-default}` form supplies a fallback when `NAME` is unset. Useful for commands that parse the full config but don't actually use the value (e.g. `yoink secrets seal` against a config whose hosts/domains reference `${HOST_IP}`). Set the var explicitly when you do mean to use it.
-- For long-lived secrets, prefer `secrets:` (sealed or `provider: command`) over passing values via env. The substitution path is intended for routing parameters (host IPs, hostnames, port numbers), not credentials.
+- yoink recognizes only the `${NAME}` form. Bare `$NAME` and lone `$` characters pass through unchanged.
+- `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`. Any other reference (`${HOST-IP}`, `${1BAD}`, an unterminated `${`) gives an error with a snippet of the bad reference.
+- A missing variable is an error, not an empty substitution.
+- The POSIX `${NAME:-default}` form supplies a fallback when `NAME` is unset. It is for commands that parse the full config but do not use the value. An example is `yoink secrets seal` against a config that references `${HOST_IP}`.
+- Substitution is for routing parameters (host IPs, hostnames, port numbers). Credentials belong in `secrets:`.
 
 ## See also
 
-- [CLI reference](/docs/reference/cli) — every subcommand and flag.
-- [Examples](/docs/examples) — three complete annotated `yoink.yaml`s (hobby, polyglot, production).
-- [Secrets](/docs/guide/secrets) — the mental model behind the `secrets:` block.
-- [Reverse proxy](/docs/guide/proxy) — the schema and behavior of the `proxy:` block.
+- [CLI reference](/docs/reference/cli): every subcommand and flag.
+- [Examples](/docs/reference/examples): three complete annotated `yoink.yaml` files (hobby, polyglot, production).
+- [Glossary](/docs/reference/glossary): definitions of the terms on this page.
+- [Secrets resolution and bundle formats](/docs/reference/secrets): identity lookup order and the rules for `provider: command`.

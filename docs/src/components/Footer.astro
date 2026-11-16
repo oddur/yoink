@@ -1,0 +1,39 @@
+---
+import HookMark from './HookMark.astro';
+import { REPO } from '@/lib/site';
+// A barcode drawn from the letters of "yoink.is": each character's bits
+// set the bar widths. Decorative, but not arbitrary.
+const bars: { x: number; w: number }[] = [];
+let x = 0;
+for (const ch of 'yoink.is') {
+  const bits = ch.charCodeAt(0).toString(2).padStart(8, '0');
+  for (let i = 0; i < 8; i += 2) {
+    const w = bits[i] === '1' ? 3 : 1.5;
+    bars.push({ x, w });
+    x += w + (bits[i + 1] === '1' ? 3 : 1.5);
+  }
+}
+---
+<footer class="site-footer on-dark">
+  <div class="wrap site-footer__in">
+    <div>
+      <a class="brand" href="/"><HookMark />yoink</a>
+      <p>I build yoink on my own and license it under MIT. This site is a static build in an nginx container, and I deploy it with <code>yoink up --build</code>.</p>
+      <nav aria-label="Footer">
+        <a href="/docs">Docs</a>
+        <a href="/docs/tutorials/first-deploy">First deploy</a>
+        <a href="/docs/explanation/compared">Compared</a>
+        <a href="/blog">Blog</a>
+        <a href="/about">About</a>
+        <a href={REPO}>GitHub</a>
+        <a href="/llms.txt">llms.txt</a>
+      </nav>
+    </div>
+    <div class="barcode" aria-hidden="true">
+      <svg viewBox={`0 0 ${x} 40`} preserveAspectRatio="none">
+        {bars.map((b) => <rect x={b.x} y="0" width={b.w} height="40" fill="#111" />)}
+      </svg>
+      yoink.is
+    </div>
+  </div>
+</footer>
