@@ -52,6 +52,18 @@ pub enum DockerError {
     Invalid(String),
 }
 
+/// Outcome of [`DockerOps::remove_stopped_container`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoppedRemoval {
+    /// The container existed, was not running, and is now removed.
+    Removed,
+    /// No container has that name.
+    Absent,
+    /// The container is running, restarting or paused. It was not
+    /// touched.
+    Running,
+}
+
 /// Minimal host identity used by the trait; converts cheaply from
 /// [`crate::config::HostConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -747,6 +759,17 @@ pub trait DockerOps: Send + Sync {
     ) -> Result<(), DockerError>;
 
     async fn force_remove_container(&self, host: &Host, name: &str) -> Result<(), DockerError>;
+
+    /// Remove a container only if it is not running. The daemon makes
+    /// the decision in one step (a remove without `force` is refused
+    /// for a running, restarting or paused container), so there is no
+    /// window between a state check and the remove in which the
+    /// container could be killed.
+    async fn remove_stopped_container(
+        &self,
+        host: &Host,
+        name: &str,
+    ) -> Result<StoppedRemoval, DockerError>;
 
     /// Send SIGKILL to a container without removing it. The exited
     /// container stays around for `docker logs` / `inspect` and can
@@ -1692,6 +1715,49 @@ impl DockerOps for RealDockerOps {
         .await
     }
 
+    async fn remove_stopped_container(
+        &self,
+        host: &Host,
+        name: &str,
+    ) -> Result<StoppedRemoval, DockerError> {
+        self.with_retry(host, |docker| async move {
+            let conflict = match docker.remove_container(name, None).await {
+                Ok(()) => return Ok(StoppedRemoval::Removed),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => return Ok(StoppedRemoval::Absent),
+                Err(
+                    e @ bollard::errors::Error::DockerResponseServerError {
+                        status_code: 409, ..
+                    },
+                ) => e,
+                Err(other) => return Err(other),
+            };
+            // The daemon answers 409 for a running container, but also
+            // for a removal that is already in progress. Inspect to
+            // tell them apart instead of matching on the message text.
+            match docker.inspect_container(name, None).await {
+                Ok(resp) => {
+                    // `running` stays true while a container is paused
+                    // or waits for a restart.
+                    let state = resp.state.unwrap_or_default();
+                    let live =
+                        [state.running, state.paused, state.restarting].contains(&Some(true));
+                    if live {
+                        Ok(StoppedRemoval::Running)
+                    } else {
+                        Err(conflict)
+                    }
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(StoppedRemoval::Absent),
+                Err(_) => Err(conflict),
+            }
+        })
+        .await
+    }
+
     async fn kill_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
         self.with_retry(host, |docker| async move {
             // Default signal is SIGKILL — that's exactly what we want here.
@@ -2621,6 +2687,7 @@ struct FakeState {
     start_container: VecDeque<Result<(), DockerError>>,
     stop_container: VecDeque<Result<(), DockerError>>,
     force_remove_container: VecDeque<Result<(), DockerError>>,
+    remove_stopped_container: VecDeque<Result<StoppedRemoval, DockerError>>,
     healthcheck: VecDeque<Result<u16, DockerError>>,
     healthcheck_tcp: VecDeque<Result<(), DockerError>>,
     exec_oneshot: VecDeque<Result<OneShotResult, DockerError>>,
@@ -2646,6 +2713,7 @@ pub enum RecordedCall {
     StartContainer(Host, String),
     StopContainer(Host, String, Duration),
     ForceRemoveContainer(Host, String),
+    RemoveStoppedContainer(Host, String),
     Healthcheck(Host, String, String, u16, String),
     HealthcheckTcp(Host, String, String, u16),
     ExecOneshot(Host, String, Vec<String>),
@@ -2703,6 +2771,9 @@ impl FakeDockerOps {
     }
     pub fn push_force_remove(&self, v: Result<(), DockerError>) {
         self.lock().force_remove_container.push_back(v);
+    }
+    pub fn push_remove_stopped(&self, v: Result<StoppedRemoval, DockerError>) {
+        self.lock().remove_stopped_container.push_back(v);
     }
     pub fn push_healthcheck(&self, v: Result<u16, DockerError>) {
         self.lock().healthcheck.push_back(v);
@@ -2898,6 +2969,18 @@ impl DockerOps for FakeDockerOps {
             name.into(),
         ));
         pop(&mut s.force_remove_container, "force_remove_container")
+    }
+    async fn remove_stopped_container(
+        &self,
+        host: &Host,
+        name: &str,
+    ) -> Result<StoppedRemoval, DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::RemoveStoppedContainer(
+            host.clone(),
+            name.into(),
+        ));
+        pop(&mut s.remove_stopped_container, "remove_stopped_container")
     }
     async fn kill_container(&self, _host: &Host, _name: &str) -> Result<(), DockerError> {
         Ok(())
