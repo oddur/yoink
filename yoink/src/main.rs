@@ -1785,10 +1785,21 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         .chain(here_overrides.iter())
         .cloned()
         .collect();
-    let mut tag_overrides =
+    let (mut tag_overrides, git_fallback_failure) =
         parse_tag_overrides(&tag_args, services, allow_dirty, &config.services)?;
 
     let services_filter = services_filter(services);
+
+    // A real `--build` run gives an untagged `build:` service a
+    // content-digest tag further down, so that service does not need the
+    // git fallback. A dry run returns before the build and does need it.
+    check_git_fallback(
+        config.selected_services(services_filter),
+        &tag_overrides,
+        git_fallback_failure.as_ref(),
+        build && !dry_run,
+        true,
+    )?;
 
     if dry_run {
         return run_dry_run(
@@ -2120,20 +2131,97 @@ fn services_filter(services: &[String]) -> Option<&[String]> {
 /// is either `name=tag` (override that named service's tag) or a bare
 /// `tag` (applies to every `--service`-selected service). A bare tag
 /// without `--service` is rejected as ambiguous in multi-service mode.
-/// With `--service` and no `--tag` at all, each selected service that
-/// has no `tag:` in the config gets the git short SHA (clean tree only).
+///
+/// Git SHA fallback: with `--service` and no `--tag` at all, each
+/// selected service that has no `tag:` in the config gets the git short
+/// SHA. This is the lowest-priority rule and never replaces a config
+/// `tag:`. It needs a clean working tree and is off under
+/// `--allow-dirty`. When the fallback was wanted but git gave no SHA,
+/// the reason comes back next to the map (the map then has no entry for
+/// those services) so [`check_git_fallback`] can explain it. `--here` is
+/// the explicit form of the same thing.
 fn parse_tag_overrides(
     tag_args: &[String],
     services_filter: &[String],
     allow_dirty: bool,
     config_services: &[yoink::config::ServiceConfig],
-) -> Result<std::collections::BTreeMap<String, String>> {
+) -> Result<(
+    std::collections::BTreeMap<String, String>,
+    Option<GitFallbackFailure>,
+)> {
     parse_tag_overrides_with(tag_args, services_filter, config_services, || {
         if allow_dirty {
-            return None;
+            return Err(GitFallbackFailure::AllowDirty);
         }
-        git::version(std::path::Path::new("."), false).ok()
+        git::version(std::path::Path::new("."), false).map_err(|e| match e {
+            git::GitError::Dirty => GitFallbackFailure::Dirty,
+            other => GitFallbackFailure::Git(other.to_string().trim().to_string()),
+        })
     })
+}
+
+/// Why the git SHA fallback of [`parse_tag_overrides`] gave no tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitFallbackFailure {
+    /// `--allow-dirty` was passed, which turns the fallback off.
+    AllowDirty,
+    /// The working tree has uncommitted changes.
+    Dirty,
+    /// git gave no SHA: not a repository, no commits, or git is missing.
+    Git(String),
+}
+
+/// Fail with an explanation when a selected service needed the git SHA
+/// fallback and did not get it. Without this the user only sees the
+/// generic "no tag" error later, with no word about the fallback.
+///
+/// `build_tags_untagged`: the caller gives an untagged `build:` service
+/// a content-digest tag later (`up --build`), so such a service is fine.
+/// `here_available`: the command has a `--here` flag to suggest.
+fn check_git_fallback<'a>(
+    selected: impl IntoIterator<Item = &'a yoink::config::ServiceConfig>,
+    tag_overrides: &std::collections::BTreeMap<String, String>,
+    failure: Option<&GitFallbackFailure>,
+    build_tags_untagged: bool,
+    here_available: bool,
+) -> Result<()> {
+    let Some(failure) = failure else {
+        return Ok(());
+    };
+    let Some(svc) = selected.into_iter().find(|svc| {
+        let tagged_by_build = build_tags_untagged && svc.build.is_some();
+        !yoink::build::has_tag(svc, tag_overrides) && !tagged_by_build
+    }) else {
+        return Ok(());
+    };
+    let name = &svc.name;
+    let intro = format!(
+        "service {name:?} has no `tag:` in config and no `--tag` was given. \
+         With `--service`, yoink falls back to the git commit SHA"
+    );
+    let here_hint = if here_available {
+        ", or pass `--here` to use the SHA of the current commit \
+         (`--here` does not look at uncommitted changes)"
+    } else {
+        ""
+    };
+    match failure {
+        GitFallbackFailure::Dirty => anyhow::bail!(
+            "{intro}, but only from a clean working tree, and this tree has \
+             uncommitted changes. Pass `--tag {name}=<tag>`, commit or stash \
+             your changes{here_hint}."
+        ),
+        GitFallbackFailure::AllowDirty => anyhow::bail!(
+            "{intro}, but `--allow-dirty` turns that fallback off. \
+             Pass `--tag {name}=<tag>`{here_hint}."
+        ),
+        // `--here` asks the same git for the same SHA, so it would fail too.
+        GitFallbackFailure::Git(err) => anyhow::bail!(
+            "{intro}, but git gave no SHA in this directory \
+             (is it a git repository with a commit?): {err}. \
+             Pass `--tag {name}=<tag>`."
+        ),
+    }
 }
 
 /// [`parse_tag_overrides`] with the git lookup injected, so tests don't
@@ -2142,10 +2230,14 @@ fn parse_tag_overrides_with(
     tag_args: &[String],
     services_filter: &[String],
     config_services: &[yoink::config::ServiceConfig],
-    git_version: impl FnOnce() -> Option<String>,
-) -> Result<std::collections::BTreeMap<String, String>> {
+    git_version: impl FnOnce() -> Result<String, GitFallbackFailure>,
+) -> Result<(
+    std::collections::BTreeMap<String, String>,
+    Option<GitFallbackFailure>,
+)> {
     use std::collections::BTreeMap;
     let mut out = BTreeMap::new();
+    let mut git_failure = None;
     let mut bare: Option<String> = None;
     for arg in tag_args {
         if let Some((name, tag)) = arg.split_once('=') {
@@ -2189,15 +2281,20 @@ fn parse_tag_overrides_with(
             .collect();
         // Only ask git when some service needs the answer: the lookup
         // spawns `git status`, and `--watch` repeats it every pass.
-        if !unpinned.is_empty()
-            && let Some(version) = git_version()
-        {
-            for service in unpinned {
-                out.insert(service.clone(), version.clone());
+        if !unpinned.is_empty() {
+            match git_version() {
+                Ok(version) => {
+                    for service in unpinned {
+                        out.insert(service.clone(), version.clone());
+                    }
+                }
+                // Not an error yet: `up --build` can still tag an
+                // untagged `build:` service. `check_git_fallback` decides.
+                Err(why) => git_failure = Some(why),
             }
         }
     }
-    Ok(out)
+    Ok((out, git_failure))
 }
 
 struct BuildOptions<'a> {
@@ -2219,7 +2316,8 @@ async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
         no_cache,
         push,
     } = build;
-    let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty, &config.services)?;
+    let (tag_overrides, git_fallback_failure) =
+        parse_tag_overrides(tag_args, services, allow_dirty, &config.services)?;
     let services_filter = services_filter(services);
     let explicit_services = services_filter.is_some();
 
@@ -2238,6 +2336,14 @@ async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
             }
             continue;
         }
+        // `yoink build` has no `--here` and no content-digest tag.
+        check_git_fallback(
+            [svc],
+            &tag_overrides,
+            git_fallback_failure.as_ref(),
+            false,
+            false,
+        )?;
         let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
         yoink::build::build_service(config, svc, &tag, no_cache, push)
             .await
@@ -5660,7 +5766,7 @@ fn chrono_like_now() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_as_pairs, parse_tag_overrides_with};
+    use super::{GitFallbackFailure, check_git_fallback, parse_as_pairs, parse_tag_overrides_with};
 
     fn tag_test_services() -> Vec<yoink::config::ServiceConfig> {
         yoink::config::Config::parse_str(
@@ -5675,18 +5781,134 @@ services:
   - name: api
     image: ghcr.io/me/api
     run: { port: 8080, healthcheck_path: / }
+  - name: web
+    image: ghcr.io/me/web
+    build: { context: . }
+    run: { port: 3000, healthcheck_path: / }
 "#,
         )
         .unwrap()
         .services
     }
 
+    /// Run the parse and the fallback check the way `yoink up` does,
+    /// with the git lookup failing with `why`.
+    fn up_with_failed_git(
+        filter: &[&str],
+        why: GitFallbackFailure,
+        build: bool,
+    ) -> anyhow::Result<()> {
+        let services = tag_test_services();
+        let filter: Vec<String> = filter.iter().map(ToString::to_string).collect();
+        let (out, failure) = parse_tag_overrides_with(&[], &filter, &services, || Err(why))?;
+        assert!(out.is_empty(), "a failed lookup must not add overrides");
+        check_git_fallback(
+            services.iter().filter(|s| filter.contains(&s.name)),
+            &out,
+            failure.as_ref(),
+            build,
+            true,
+        )
+    }
+
+    #[test]
+    fn dirty_tree_explains_the_git_fallback() {
+        let err = up_with_failed_git(&["redis", "api"], GitFallbackFailure::Dirty, false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "service \"api\" has no `tag:` in config and no `--tag` was given. \
+             With `--service`, yoink falls back to the git commit SHA, but only \
+             from a clean working tree, and this tree has uncommitted changes. \
+             Pass `--tag api=<tag>`, commit or stash your changes, or pass \
+             `--here` to use the SHA of the current commit (`--here` does not \
+             look at uncommitted changes)."
+        );
+    }
+
+    #[test]
+    fn git_failure_explains_the_fallback_without_suggesting_here() {
+        let why = GitFallbackFailure::Git("fatal: not a git repository".into());
+        let err = up_with_failed_git(&["api"], why, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service \"api\""), "got: {err}");
+        assert!(err.contains("fatal: not a git repository"), "got: {err}");
+        assert!(err.contains("`--tag api=<tag>`"), "got: {err}");
+        // `--here` needs the same git SHA, so it is not a way out.
+        assert!(!err.contains("--here"), "got: {err}");
+    }
+
+    #[test]
+    fn allow_dirty_explains_the_fallback_is_off() {
+        let err = up_with_failed_git(&["api"], GitFallbackFailure::AllowDirty, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`--allow-dirty` turns that fallback off"));
+        assert!(err.contains("`--tag api=<tag>`"), "got: {err}");
+        assert!(err.contains("`--here`"), "got: {err}");
+    }
+
+    #[test]
+    fn failed_git_lookup_is_harmless_when_build_supplies_the_tag() {
+        // `up --build`: `web` has a `build:` block and gets a
+        // content-digest tag after the build, so nothing is missing.
+        up_with_failed_git(&["web"], GitFallbackFailure::Dirty, true).unwrap();
+        // Without `--build` the same service does need the fallback.
+        let err = up_with_failed_git(&["web"], GitFallbackFailure::Dirty, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service \"web\""), "got: {err}");
+        // `--build` does not help a service without a `build:` block.
+        let err = up_with_failed_git(&["web", "api"], GitFallbackFailure::Dirty, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service \"api\""), "got: {err}");
+    }
+
+    #[test]
+    fn build_command_message_does_not_suggest_here() {
+        let services = tag_test_services();
+        let filter = ["web".to_string()];
+        let (out, failure) =
+            parse_tag_overrides_with(&[], &filter, &services, || Err(GitFallbackFailure::Dirty))
+                .unwrap();
+        let web = services.iter().find(|s| s.name == "web").unwrap();
+        let err = check_git_fallback([web], &out, failure.as_ref(), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("commit or stash your changes."), "got: {err}");
+        assert!(!err.contains("--here"), "got: {err}");
+    }
+
+    #[test]
+    fn no_service_filter_keeps_the_plain_no_tag_error() {
+        let services = tag_test_services();
+        let (out, failure) = parse_tag_overrides_with(&[], &[], &services, || {
+            panic!("git must not be consulted without --service")
+        })
+        .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(failure, None);
+        check_git_fallback(&services, &out, failure.as_ref(), false, true).unwrap();
+        let api = services.iter().find(|s| s.name == "api").unwrap();
+        let err = yoink::build::resolve_service_tag(api, &out)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "service \"api\" has no `tag:` set and no `--tag api=…` override"
+        );
+    }
+
     #[test]
     fn service_filter_git_fallback_does_not_shadow_config_tag() {
         let services = tag_test_services();
         let filter = ["redis".to_string(), "api".to_string()];
-        let out =
-            parse_tag_overrides_with(&[], &filter, &services, || Some("abc1234".into())).unwrap();
+        let (out, failure) =
+            parse_tag_overrides_with(&[], &filter, &services, || Ok("abc1234".into())).unwrap();
+        assert_eq!(failure, None);
         // `redis` pins `tag: "7"` in the config; the implicit git SHA
         // must not override it.
         assert_eq!(out.get("redis"), None);
@@ -5698,18 +5920,19 @@ services:
     fn git_is_not_consulted_when_every_selected_service_is_pinned() {
         let services = tag_test_services();
         let filter = ["redis".to_string()];
-        let out = parse_tag_overrides_with(&[], &filter, &services, || {
+        let (out, failure) = parse_tag_overrides_with(&[], &filter, &services, || {
             panic!("git must not be consulted when nothing needs the fallback")
         })
         .unwrap();
         assert!(out.is_empty());
+        assert_eq!(failure, None);
     }
 
     #[test]
     fn explicit_bare_tag_still_overrides_config_tag() {
         let services = tag_test_services();
         let filter = ["redis".to_string()];
-        let out = parse_tag_overrides_with(&["8".to_string()], &filter, &services, || {
+        let (out, _) = parse_tag_overrides_with(&["8".to_string()], &filter, &services, || {
             panic!("git must not be consulted when --tag is given")
         })
         .unwrap();
