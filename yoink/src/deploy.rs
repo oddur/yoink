@@ -904,7 +904,7 @@ async fn prepare_one_host(
     // file binds + env + options are identical across replicas, so the
     // spec hash is identical too — only the container name differs.
     let resolved_files = resolve_files(config, service)?;
-    let file_binds: Vec<String> = resolved_files
+    let hash_binds: Vec<String> = resolved_files
         .iter()
         .map(|(m, _bytes, hash)| m.as_bind_string(hash))
         .collect();
@@ -915,14 +915,17 @@ async fn prepare_one_host(
         secrets,
         String::new(),
         "",
-        &file_binds,
+        &hash_binds,
     );
     let spec_hash = docker::compute_spec_hash(&probe_spec);
 
     // Files only need to land on the host once per service, regardless
     // of replica count. Idempotent (content-addressed) so re-uploads
     // are no-ops anyway.
-    upload_files(ops, &host, &resolved_files, &service.name).await?;
+    // The container binds the files where they were staged. That
+    // directory is under the home of the SSH user and is known only
+    // after the upload, so it is not part of the spec hash above.
+    let file_binds = upload_files(ops, &host, &resolved_files, &service.name).await?;
 
     let replicas_count = service.run.replicas;
     let mut replicas: Vec<ReplicaPrep> = Vec::with_capacity(replicas_count as usize);
@@ -1476,22 +1479,26 @@ pub fn resolve_files(
     Ok(out)
 }
 
+/// Upload every file and return the bind string of each one, with
+/// the host path it was staged at.
 async fn upload_files(
     ops: &dyn DockerOps,
     host: &Host,
     files: &[(FileMount, Vec<u8>, String)],
     service_name: &str,
-) -> Result<(), DeployError> {
+) -> Result<Vec<String>, DeployError> {
     let keyfile = ops.ssh_keyfile(host);
+    let mut binds = Vec::with_capacity(files.len());
     for (mount, bytes, hash) in files {
-        files::upload(host, keyfile.as_deref(), mount, hash, bytes)
+        let staging_dir = files::upload(host, keyfile.as_deref(), mount, hash, bytes)
             .await
             .map_err(|source| DeployError::Files {
                 service: service_name.to_string(),
                 source,
             })?;
+        binds.push(mount.bind_string_at(&staging_dir, hash));
     }
-    Ok(())
+    Ok(binds)
 }
 
 /// Resolve `[registry]`-configured username/password secret keys

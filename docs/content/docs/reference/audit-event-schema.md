@@ -149,7 +149,7 @@ A new replica did not pass its healthcheck. yoink removed every container that t
 | field | type | notes |
 |---|---|---|
 | `service` | string | The service that owns the mount. |
-| `sha256` | string | Content hash. It is a part of the file name under `/var/lib/yoink/files/`. |
+| `sha256` | string | Content hash. It is a part of the name of the staged file. |
 | `remote_path` | string | Absolute path on the host. |
 
 ### `WebhookFired`
