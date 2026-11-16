@@ -1798,11 +1798,23 @@ async fn run_hook(
     Ok(())
 }
 
+/// Docker allows only `[a-zA-Z0-9_.-]` in a container name. A digest
+/// tag (`sha256:<hex>`) carries a `:`, and hook names are free-form,
+/// so every other character becomes `-`.
 fn hook_container_name(service: Option<&str>, hook: &str, tag: &str) -> String {
-    match service {
+    let name = match service {
         Some(service) => format!("yoink-hook-{service}-{hook}-{tag}"),
         None => format!("yoink-hook-{hook}-{tag}"),
-    }
+    };
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn hook_env(hook: &HookSpec, secrets: Option<&SecretsBundle>) -> BTreeMap<String, String> {
@@ -2460,6 +2472,20 @@ hooks:
         assert_ne!(
             hook_container_name(Some("api"), "migrate", "v42"),
             hook_container_name(Some("web"), "migrate", "v42")
+        );
+    }
+
+    /// A digest tag carries a `:`, which Docker rejects in a container
+    /// name ("Invalid container name"). The name must stay creatable.
+    #[test]
+    fn hook_container_name_replaces_characters_docker_rejects() {
+        assert_eq!(
+            hook_container_name(Some("api"), "migrate", "sha256:abc123"),
+            "yoink-hook-api-migrate-sha256-abc123"
+        );
+        assert_eq!(
+            hook_container_name(None, "run migrations", "v42"),
+            "yoink-hook-run-migrations-v42"
         );
     }
 
