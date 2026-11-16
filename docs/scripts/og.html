@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- Source of public/og.png (1200 x 630). Render with:  pnpm og  (scripts/render-og.mjs) -->
+<html><head><meta charset="utf-8"><style>
+@font-face { font-family: PackType; font-weight: 100 900; font-stretch: 62% 125%;
+  src: url(../node_modules/@fontsource-variable/archivo/files/archivo-latin-wdth-normal.woff2) format('woff2-variations'); }
+* { box-sizing: border-box; margin: 0; }
+body { width: 1200px; height: 630px; overflow: hidden; background: #ffd400; color: #111; font-family: PackType, sans-serif; position: relative; }
+.hole { position: absolute; left: 50%; top: 30px; width: 170px; height: 52px; margin-left: -85px; border-radius: 26px; background: #2b2a26; }
+.peg { position: absolute; left: 50%; top: 0; width: 16px; height: 62px; margin-left: -8px; border-radius: 0 0 8px 8px; background: #c9ced4; }
+.name { position: absolute; left: 64px; top: 104px; font-weight: 900; font-stretch: 62%; font-variation-settings: 'wdth' 62; font-size: 350px; line-height: .78; letter-spacing: -.02em; }
+.band { position: absolute; left: 0; top: 356px; background: #111; color: #ffd400; padding: 26px 48px 22px 70px;
+  font-weight: 900; font-stretch: 62%; font-variation-settings: 'wdth' 62; font-size: 84px; line-height: .95; text-transform: uppercase; }
+.sub { position: absolute; left: 70px; bottom: 34px; font-size: 27px; font-weight: 600; }
+.burst { position: absolute; right: 70px; top: 96px; width: 300px; height: 300px; transform: rotate(-11deg); }
+.burst svg { position: absolute; inset: 0; }
+.burst span { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; color: #fff;
+  font-weight: 900; font-stretch: 62%; font-variation-settings: 'wdth' 62; font-size: 58px; line-height: .92; text-transform: uppercase; }
+.url { position: absolute; right: 70px; bottom: 34px; font-size: 27px; font-weight: 800; letter-spacing: .06em; }
+</style></head><body>
+<div class="hole"></div><div class="peg"></div>
+<div class="name">yoink</div>
+<div class="burst"><svg viewBox="0 0 100 100"><polygon id="star" fill="#d9231a"/></svg><span>Batteries<br>included</span></div>
+<div class="band">Container deploys<br>without the headaches.</div>
+<div class="sub">One binary over SSH. No control plane.</div>
+<div class="url">yoink.is</div>
+<script>
+  document.getElementById('star').setAttribute('points', Array.from({ length: 44 }, (_, i) => {
+    const r = i % 2 ? 43.5 : 50, a = (i / 44) * Math.PI * 2;
+    return (50 + r * Math.cos(a)).toFixed(2) + ',' + (50 + r * Math.sin(a)).toFixed(2);
+  }).join(' '));
+</script>
+</body></html>

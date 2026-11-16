@@ -1,0 +1,280 @@
+---
+title: TanStack Start + postgres from scratch
+description: Scaffold a TanStack Start app, add postgres with yoink add, deploy, and open the app with yoink pf.
+weight: 2
+---
+
+You deploy a TanStack Start app next to a managed postgres in approximately ten minutes. You build the app locally and send it to the host without a registry.
+
+The result is two containers on a private docker network, with a sealed Postgres password and drift detection on each container.
+
+This is the "indie one-shot" pattern: one laptop, one host, no CI, no Docker Hub account, no Vault. Public HTTPS and domains are out of scope. You reach the deployed stack from your laptop through a port-forward.
+
+## What you need
+
+- A host with Docker installed and key-based SSH login. A new host from Hetzner, DigitalOcean, or Linode is sufficient.
+- yoink, node, and docker on your laptop.
+
+The commands on this page use the host address `your-host`. Replace it with the address of your host.
+
+## Walkthrough
+
+### Scaffold the app [step]
+
+```sh
+npm create @tanstack/start@latest my-app
+cd my-app
+npm install pg
+```
+
+The scaffolder makes a Nitro SSR app that uses Vite, in the new directory `my-app`. The database demo uses the `pg` package.
+
+### Add the database client [step]
+
+Save this server-only module as `src/lib/db.server.ts`. The secrets then never reach the browser bundle.
+
+```ts
+// src/lib/db.server.ts — the .server.ts suffix keeps this off the client
+import { Client } from 'pg'
+
+export type DbStatus =
+  | { ok: true; version: string }
+  | { ok: false; error: string }
+
+export async function checkStack(): Promise<DbStatus> {
+  const pgUrl = `postgres://${process.env.POSTGRES_USER}:${
+    process.env.POSTGRES_PASSWORD
+  }@${process.env.POSTGRES_HOST}:5432/${process.env.POSTGRES_DB}`
+
+  const pg = new Client({ connectionString: pgUrl })
+  try {
+    await pg.connect()
+    const r = await pg.query('SELECT version()')
+    return { ok: true, version: r.rows[0].version }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message }
+  } finally {
+    await pg.end().catch(() => {})
+  }
+}
+```
+
+### Connect the client to the index route [step]
+
+Replace the contents of `src/routes/index.tsx` with this code. The loader then gets the database status at request time.
+
+```tsx
+// src/routes/index.tsx
+import { createFileRoute } from '@tanstack/react-router'
+import { createServerFn } from '@tanstack/react-start'
+import { checkStack, type DbStatus } from '../lib/db.server'
+
+const getStackStatus = createServerFn({ method: 'GET' }).handler(checkStack)
+
+export const Route = createFileRoute('/')({
+  component: App,
+  loader: () => getStackStatus(),
+})
+
+function App() {
+  const status = Route.useLoaderData() as DbStatus
+  return (
+    <main>
+      <h1>yoink stack demo</h1>
+      <pre>{JSON.stringify(status, null, 2)}</pre>
+    </main>
+  )
+}
+```
+
+### Dockerfile [step]
+
+Save this multi-stage build as `Dockerfile`. Nitro bundles all server-side dependencies into `.output/server/_libs/`, thus the runtime image needs no `node_modules`.
+
+```dockerfile
+# Dockerfile
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --no-audit --no-fund
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine
+WORKDIR /app
+COPY --from=builder /app/.output ./.output
+ENV PORT=3000 HOST=0.0.0.0 NODE_ENV=production
+EXPOSE 3000
+CMD ["node", ".output/server/index.mjs"]
+```
+
+`yoink init` reads `EXPOSE 3000` in a later step.
+
+Then add a `.dockerignore`:
+
+```text
+node_modules
+.output
+.git
+secrets.age
+yoink.yaml
+services/
+```
+
+The project directory now contains `Dockerfile` and `.dockerignore`.
+
+### Run `yoink init` [step]
+
+```sh
+yoink init root@your-host
+```
+
+`yoink init` infers the service name, the port, and the image. It writes a starter `yoink.yaml` and makes an age identity for sealed secrets. The output looks like this:
+
+```text
+✓ wrote yoink.yaml (18 lines, validates clean)
+
+inferred:
+  service   my-app                          (cwd)
+  image     my-app                          (Dockerfile (bare name))
+  host      root@your-host                  (positional arg)
+  port      3000 with /health healthcheck   (Dockerfile EXPOSE)
+
+⚠  BACK UP THIS KEY  …
+  identity: ~/.config/yoink/keys/age1….key
+```
+
+Paste the key into a password manager now. If you lose the key, you cannot decrypt the sealed values in this repo. [Sealed secrets](/docs/explanation/secrets) lists the backup options.
+
+### Drop in postgres [step]
+
+```sh
+yoink add postgres
+```
+
+This command does three things:
+
+- It writes a fragment in `services/postgres.yaml` (postgres:18-alpine with a sealed `POSTGRES_PASSWORD`).
+- It seals the password into `secrets.age`.
+- It adds the fragment to the `include:` list of `yoink.yaml`.
+
+Then yoink prints a connection block that is ready to paste. The block uses only fields that are already in the schema (`depends_on:`, `env:`, `env_from_secrets:`):
+
+```text
+connect another service to postgres:
+  # paste under the consuming service in yoink.yaml,
+  # rename keys to whatever your app expects.
+  depends_on: [postgres]
+  env:
+    POSTGRES_DB: app
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_USER: app
+  env_from_secrets:
+    POSTGRES_PASSWORD: POSTGRES_PASSWORD
+```
+
+yoink does not require specific env names in the consuming service. The demo app reads these names, thus you do not rename them.
+
+### Wire the app to the accessory [step]
+
+Open `yoink.yaml`. Paste the `connect another service to …` block into the `services[]` entry of your app. Omit `POSTGRES_PORT`, because the demo `db.server.ts` has the port hard-coded.
+
+Then make three more changes to the app:
+
+1. Add the `build:` block.
+2. Remove the `tag:` line. Then `yoink up --build` uses the content digest of the built image as the tag, and each changed build deploys.
+3. Change `healthcheck_path:` to `/`.
+
+The complete file looks like this:
+
+```yaml
+hosts:
+  - { address: your-host, user: root }
+
+secrets:
+  provider: age
+  recipients:
+    - age1…                       # generated by `yoink init`
+
+services:
+  - name: my-app
+    image: my-app
+    build:
+      context: .
+      # Cross-build to amd64 when developing on Apple Silicon.
+      # Drop this if your laptop matches the host's arch.
+      extra_args: ["--platform", "linux/amd64"]
+    depends_on: [postgres]
+    env:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+    env_from_secrets:
+      POSTGRES_PASSWORD: POSTGRES_PASSWORD
+    run:
+      port: 3000
+      healthcheck_path: /
+
+include:
+  - "services/*.yaml"
+```
+
+Make sure that the config is correct:
+
+```sh
+yoink validate
+yoink doctor
+```
+
+`yoink validate` reports if the config does not parse. `yoink doctor` reports if the deploy is not ready, for example an unreachable host or a missing identity.
+
+### Deploy [step]
+
+```sh
+yoink up --build
+```
+
+The command deploys both services:
+
+- The host pulls postgres from Docker Hub.
+- yoink builds the app locally, because the app has a `build:` block. Then yoink sends the image to the host over SSH through [unregistry](https://github.com/psviderski/unregistry).
+
+Both containers start on the `yoink` network. The healthcheck of the app gates the swap.
+
+The first deploy is the slowest, because it pulls `node:22-alpine` from Docker Hub and runs the npm install.
+
+### Open the app [step]
+
+The app is reachable on the docker network of the host at `my-app:3000`. By default, it is not bound to a host port.
+
+Open the app on your laptop:
+
+```sh
+yoink pf my-app -o
+```
+
+`yoink pf` opens a tunnel to the container. `-o` opens the printed URL in your browser.
+
+The page shows JSON with `ok: true` and a postgres version string.
+
+### Deploy a change [step]
+
+Edit the app code. Then deploy only the app:
+
+```sh
+yoink up --build --service my-app
+```
+
+A typical code change takes approximately 15 seconds. unregistry removes duplicate layers, thus only the rebuilt application layer goes over SSH.
+
+Run `yoink pf my-app -o` again. The page shows your change.
+
+## See also
+
+- [Drop-in templates with `yoink add`](/docs/explanation/templates): `yoink add redis` and `yoink add meilisearch` print their own connection block. Paste it next to the postgres block and merge the `depends_on:` lists.
+- [Port-forward to any service](/docs/explanation/networking#port-forward): how `yoink pf` reaches a container that has no published port.
+- [Sealed secrets (age)](/docs/explanation/secrets): what `yoink init` made, how yoink decrypts `POSTGRES_PASSWORD` at deploy, and how to back up the key.
+- [CLI reference](/docs/reference/cli): each `yoink up` flag. For example, `yoink up --build --here --service my-app` uses `git rev-parse --short HEAD` as the tag, thus `yoink history` shows commits and not content digests.
+- [Add HTTPS to a service](/docs/how-to/add-https): make the app public with a domain and a Let's Encrypt cert.
+- [Edit-save-deploy with `--watch`](/docs/how-to/watch-mode): make the deploy command start on each save.

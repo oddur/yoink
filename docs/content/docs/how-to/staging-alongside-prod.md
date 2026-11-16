@@ -1,19 +1,21 @@
 ---
 title: Run staging alongside prod
-description: Run a staging environment on the same hosts as production using separate configs with namespaced services and networks.
+description: Run a staging environment on the same hosts as production with separate configs that have namespaced services and networks.
 weight: 10
 ---
 
-Common scenario: you want a `staging` environment that mirrors `prod` for pre-merge verification, ideally on the same hardware to avoid paying for a second machine. yoink doesn't have a built-in `environment` concept; instead you use **two config files** that don't collide.
+yoink has no built-in `environment` concept. To run staging on the same hosts as prod, use two config files that do not collide. Two things must differ between the environments:
 
-The two things that have to differ between envs:
+1. **Service names**: Docker container names are unique per host. `api` and `api-staging` can both run. Two `api` services cannot.
+2. **Network names**: `api` (prod) and `api-staging` (staging) keep the traffic apart on the same Docker daemon.
 
-1. **Service names**: Docker container names are unique per host. `api` and `api-staging` can both run; `api` and `api` cannot.
-2. **Network names**: `api` (prod tier) and `api-staging` (staging tier) keep traffic separated even though both stacks live on the same docker daemon.
+The volumes, hostnames, secrets, and ports follow from those two namespaces.
 
-Everything else (volumes, hostnames, secrets, ports) follows from those two namespaces.
+## Create the two configs
 
-## Layout
+### Create one entry config for each environment [step]
+
+Use this layout:
 
 ```
 yoink.prod.yaml             # prod entry; includes services/prod/*.yaml
@@ -24,7 +26,7 @@ services/staging/api.yaml   # name: api-staging, networks: [api-staging, redis-s
 services/staging/web.yaml   # name: web-staging
 ```
 
-Each config is operated independently:
+### Deploy each config independently [step]
 
 ```bash
 yoink up --config yoink.prod.yaml          # prod deploy
@@ -33,11 +35,13 @@ yoink dump --config yoink.staging.yaml     # staging snapshot
 yoink tui --config yoink.staging.yaml      # TUI scoped to staging containers
 ```
 
-The TUI's drift detection, `prune`, and reconcile are all scoped to whatever `--config` references; `yoink prune --config staging.yaml` won't touch prod containers because their `yoink.service` labels don't match anything declared in the staging config.
+`yoink up` reconciles only the services that the loaded config declares. It does not touch the containers of the other environment. `yoink up --dry-run` lists those containers as orphans.
+
+Do not run `yoink prune` while two configs share a host. `yoink prune` removes every yoink-managed container whose service is not in the loaded config. With the staging config, that includes the prod containers.
 
 ## Public surface (bundled Caddy)
 
-The reverse proxy is the one shared piece of infra: yoink's bundled Caddy fronts both envs from the same `:443` listener. Routing is by hostname; set `domain:` on each service:
+The reverse proxy is the one shared part. The bundled Caddy serves the two environments from the same `:443` listener and routes by hostname. Set a different `domain:` on each service:
 
 ```yaml
 # services/prod/api.yaml
@@ -57,29 +61,27 @@ The reverse proxy is the one shared piece of infra: yoink's bundled Caddy fronts
     network_aliases: [api-staging]     # different alias from prod's `api`
 ```
 
-Each `yoink up` re-pushes the routing config via Caddy's admin API; both hostnames coexist on the same listener with no collision.
+## Stateful accessories (redis, postgres)
 
-## Stateful accessories (redis, postgres, etc.)
+Select one of two methods for each service:
 
-Two options, pick per service:
+| Method | Config | Trade-off |
+|---|---|---|
+| One instance for each environment | `redis` and `redis-staging` services, each on its own network. | Full data isolation. |
+| One shared instance | One `redis`. The app in staging uses the key prefix `staging:`. | Half the memory, and no data isolation. |
 
-- **Separate instances per env**: `redis` and `redis-staging` containers, both yoink-managed, on their own networks. Cheap; full isolation.
-- **Shared instance, namespaced data**: one `redis`, but staging uses key prefix `staging:` (app-side responsibility). Half the memory; no data isolation.
-
-For SQL, typically a managed Postgres with separate databases (`myapp` and `myapp_staging`) under the same cluster. Yoink doesn't deploy the database; the connection strings live in env vars / secrets per env.
+For a managed Postgres, use separate databases (`myapp` and `myapp_staging`) in the same cluster. yoink does not deploy that database. Put the connection strings in the env vars or secrets of each environment.
 
 ## Tag overrides between envs
 
-Staging usually wants to deploy whatever's on `main`, while prod tracks `live`. Either:
+The two environments use the same image with different tags. Use one of these two methods:
 
-- Keep `tag:` empty in the service yaml; supply via `--tag api-staging=$MAIN_SHA` from CI when deploying staging
-- Or commit a digest pointer in `yoink.staging.yaml` (build-once-promote-many): same image, different deploy targets
-
-The image identity is the same across envs; only the runtime configuration differs.
+- Leave `tag:` unset in the service YAML. When CI deploys staging, pass `--tag api-staging=$MAIN_SHA`.
+- Commit a digest in `tag:` in the staging config (build once, promote many).
 
 ## Per-environment sealed secrets
 
-Each config carries its **own** sealed file. Set `secrets.file:` so the two environments don't collide:
+Give each config its own sealed file with `secrets.file:`:
 
 ```yaml
 # yoink.prod.yaml
@@ -95,23 +97,26 @@ secrets:
   recipients: [age1...laptop, age1...staging-ci]
 ```
 
-The path is resolved the same way locally, in CI, and from the TUI, based on whatever the loaded config's `secrets.file:` says (relative to the config's directory). The TUI's secrets pane (`e` key) surfaces the active filename in the title bar so you can tell at a glance which environment you're editing:
+yoink resolves `secrets.file:` relative to the directory of the loaded config. The CLI, CI, and the TUI all use this path.
+
+The secrets pane of the TUI (`e` key) shows the active filename in the title bar. Before you edit, make sure that the filename is the one for the correct environment:
 
 ```
 yoink secrets · age — secrets.prod.age (2 recipients) · 7 keys · writable
 ```
 
-Switch environments by switching configs:
+To change the environment, change the config:
 
 ```sh
 yoink -c yoink.prod.yaml tui          # editing prod's secrets
 yoink -c yoink.staging.yaml tui       # editing staging's secrets
 ```
 
-Rotation, recipients, and the `YOINK_AGE_KEY` env var are independent per environment; staging can have a different CI key than prod, scoped via `recipients:`.
+Rotation, recipients, and the `YOINK_AGE_KEY` env var are independent for each environment. With different `recipients:`, staging CI and prod CI have different keys.
 
 ## See also
 
-- [Sealed secrets (age)](/docs/guide/secrets) — per-environment recipients and rotation.
-- [Multi-host distribution](/docs/guide/networking#multi-host-distribution) — when staging-vs-prod isn't enough and you need fine-grained host pinning.
-- [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run) — catch staging/prod diffs at review time.
+- [Sealed secrets (age)](/docs/explanation/secrets): recipients and rotation per environment.
+- [Multi-host distribution](/docs/explanation/networking#multi-host-distribution): host pinning for when the staging and prod split is not sufficient.
+- [Pre-merge dry-run on every PR](/docs/how-to/pr-comment-dry-run): find staging and prod diffs at review time.
+- [Config reference](/docs/reference/config#includes): `include:` globs and the other config keys.

@@ -1,0 +1,32 @@
+---
+import HookMark from './HookMark.astro';
+import { REPO } from '@/lib/site';
+interface Props { card?: boolean; current?: string }
+const { card = false, current } = Astro.props;
+const links = [
+  { href: '/docs', label: 'Docs', key: 'docs' },
+  { href: '/blog', label: 'Blog', key: 'blog' },
+  { href: '/about', label: 'About', key: 'about' },
+];
+---
+<header class:list={['site-header', card && 'site-header--card']}>
+  {card && <div class="hang" aria-hidden="true"></div>}
+  <div class="wrap site-header__in">
+    <a class="brand" href="/" aria-label="yoink home"><HookMark />yoink</a>
+    <nav class="site-nav" aria-label="Site">
+      {links.map((l) => (
+        <a href={l.href} aria-current={current === l.key ? 'true' : undefined}>{l.label}</a>
+      ))}
+      <a class="hide-s" href={REPO}>GitHub</a>
+      <button class="chip" type="button" data-search-open aria-label="Search the docs">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><circle cx="6.8" cy="6.8" r="4.6" /><path d="m10.4 10.4 3.8 3.8" /></svg>
+        <span>Search</span><kbd>/</kbd>
+      </button>
+      {!card && (
+        <button class="chip" type="button" data-theme-toggle aria-label="Switch between light and dark">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2" /><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor" /></svg>
+        </button>
+      )}
+    </nav>
+  </div>
+</header>

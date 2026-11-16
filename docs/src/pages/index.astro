@@ -1,0 +1,300 @@
+---
+import Base from '@/layouts/Base.astro';
+import Terminal from '@/components/Terminal.astro';
+import Deploy from '@/components/Deploy.astro';
+import HowItWorks from '@/components/HowItWorks.astro';
+import { AGENT_PROMPT, BREW, REPO, TAGLINE } from '@/lib/site';
+import '@/styles/pack.css';
+
+// The starburst: a 22-point seal, drawn once.
+const burst = Array.from({ length: 44 }, (_, i) => {
+  const r = i % 2 ? 43.5 : 50;
+  const a = (i / 44) * Math.PI * 2;
+  return `${(50 + r * Math.cos(a)).toFixed(2)},${(50 + r * Math.sin(a)).toFixed(2)}`;
+}).join(' ');
+
+const steps = [
+  { cmd: 'edit yoink.yaml', text: 'Add a service, change a tag, or change a replica count. The config is a file in your repo, so every change shows up as a diff.' },
+  { cmd: 'yoink up --dry-run --format=markdown', text: 'Prints the planned changes as a Markdown table. CI can post the table on the pull request.' },
+  { cmd: 'yoink up', text: 'Reconciles every service in dependency order. A new container only takes traffic after its healthcheck passes.' },
+  { cmd: 'yoink status', text: 'Shows what runs where in one table, and whether anything has drifted from the file.' },
+  { cmd: 'yoink rollback api', text: 'Returns the service to its previous version. A failed swap exits non-zero, so a script knows when to run this.' },
+];
+
+const contents = [
+  { name: 'Secrets', text: 'I seal secrets with <code>age</code> and commit them as <code>secrets.age</code>, so there is no vault to run. If you already have one, <code>provider: command</code> shells out to its CLI.' },
+  { name: 'Hardening', text: 'Containers run as a non-root uid with <code>cap_drop=ALL</code>, <code>no-new-privileges</code>, a read-only rootfs and <code>init=tini</code>. You opt out per service, in the file.' },
+  { name: 'Drift detection', text: 'Every effective spec hashes to a <code>spec_hash</code> label, so yoink can check what is running against the file.' },
+  { name: 'Deploy order', text: 'yoink sorts <code>depends_on</code> into waves, so the database comes up before the API and the API before web.' },
+  { name: 'Network tiers', text: 'Each service joins only the networks it names, so a compromised web container cannot reach a database it never needed.' },
+  { name: 'Templates', text: '<code>yoink add postgres</code> adds a vetted service and seals its secrets.' },
+  { name: 'History', text: '<code>yoink history api</code> shows who deployed what and when, and <code>yoink rollback api</code> undoes it.' },
+  { name: 'Terminal dashboard', text: '<code>yoink tui</code> shows drift, logs and deploy history in the terminal, and lets you shell into a container.' },
+];
+
+const shelf = [
+  { when: '1 host, 1 app', tool: 'docker compose', note: 'Plain compose is fine.' },
+  { when: '1 to 3 hosts, a Rails, Django or Phoenix-shaped app', tool: 'Kamal', href: 'https://kamal-deploy.org' },
+  { when: '1 host, and you want Heroku-style git push to deploy', tool: 'Dokku', href: 'https://dokku.com' },
+  { when: '1 or more hosts, a full self-hosted PaaS with a web UI and build pipelines', tool: 'Coolify', href: 'https://coolify.io' },
+  { when: '1 to 10 hosts, multi-service, a web UI and an agent on each host', tool: 'Komodo', href: 'https://komo.do' },
+  { when: '1 to 10 hosts, multi-service, a built-in WireGuard mesh and a per-host daemon', tool: 'Uncloud', href: 'https://uncloud.run' },
+  { when: '1 to 10 hosts and several services, and you want one binary with no control plane that you, CI and an AI agent all drive the same way', tool: 'yoink', yoink: true },
+  { when: 'Many hosts, autoscaling, multi-tenant, a real infrastructure team', tool: 'Kubernetes' },
+];
+---
+<Base card>
+  <main id="main" class="pack">
+    <div class="front">
+      <div class="front__copy">
+        <div class="front__mark">
+          <p class="front__name" aria-hidden="true">yoink</p>
+          <div class="burst" aria-hidden="true">
+            <svg viewBox="0 0 100 100"><polygon points={burst} fill="#d9231a" /></svg>
+            <span class="pack-type">Batteries<br />included</span>
+          </div>
+        </div>
+        <h1 class="front__band pack-type">Container deploys without the headaches.</h1>
+        <p class="front__sub">One binary deploys over SSH. There is no control plane, and your hosts need nothing but Docker.</p>
+      </div>
+
+      <div class="front__demo"><Deploy /></div>
+
+      <section class="tear" data-tear aria-labelledby="tear-label" tabindex="-1">
+        <div class="tear__stub" aria-hidden="true">
+          <strong class="pack-type">Yoinked.</strong>
+          <span>The install command is on your clipboard. Paste it into your terminal.</span>
+        </div>
+        <div class="tear__strip">
+          <div class="tear__in">
+            <h2 class="tear__label pack-type" id="tear-label">Install it</h2>
+            <p class="tear__prompt"><code>{BREW}</code></p>
+            <button class="btn tear__btn" type="button" data-tear-btn data-copy={BREW}>Tear off &amp; copy</button>
+          </div>
+        </div>
+        <p class="sr-only" role="status" data-tear-status></p>
+      </section>
+
+      <div class="front__alt">
+        <a href="/docs/tutorials/first-deploy">First deploy in five minutes</a>
+        <a href="/docs/how-to/install">Other ways to install</a>
+        <a href="#agents">Works with AI agents</a>
+      </div>
+    </div>
+
+    <section class="panel loop on-dark" aria-labelledby="loop-h">
+      <div class="wrap">
+        <div class="panel__head">
+          <h2 class="pack-type" id="loop-h">The deploy loop</h2>
+          <p class="lead">Each step is one shell command with a clear exit code. I run the loop by hand, CI runs it on merge, and an AI agent can run it the same way.</p>
+        </div>
+        <div class="loop__grid">
+          <ol class="steps">
+            {steps.map((s) => (
+              <li><code>{s.cmd.split(' ').map((arg, i) => <>{i > 0 && ' '}<span>{arg}</span></>)}</code><p>{s.text}</p></li>
+            ))}
+          </ol>
+          <figure class="demo">
+            <Terminal src="/demo.cast" />
+            <figcaption>
+              This recording shows <code>yoink up --build</code> as it deploys this site. It swaps four replicas one at a time, each behind its healthcheck. <a href="/docs/explanation/architecture">How a deploy works</a>
+            </figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel shelf" aria-labelledby="shelf-h">
+      <div class="wrap">
+        <div class="panel__head">
+          <h2 class="pack-type" id="shelf-h">Is this the right tool?</h2>
+          <p class="lead">There are good tools on this shelf, and I want you to pick the one that fits. Choose by your scale and by how much always-on infrastructure you want to run.</p>
+        </div>
+        <table>
+          <thead><tr><th scope="col">Take</th><th scope="col">If you have</th></tr></thead>
+          <tbody>
+            {shelf.map((r) => (
+              <tr class={r.yoink ? 'is-yoink' : undefined}>
+                <th scope="row">{r.href ? <a href={r.href}>{r.tool}</a> : r.tool}</th>
+                <td>{r.when}{r.note && `. ${r.note}`}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <p class="shelf__more"><a href="/docs/explanation/compared">See the full comparison, feature by feature</a></p>
+      </div>
+    </section>
+
+    <section class="panel excluded on-dark" aria-labelledby="excluded-h">
+      <div class="wrap">
+        <div class="panel__head">
+          <h2 class="pack-type" id="excluded-h">Not included</h2>
+        </div>
+        <div class="excluded__grid">
+          <ul class="pack-type">
+            <li>Auto-scaling</li>
+            <li>Multi-tenancy or RBAC</li>
+            <li>A web UI</li>
+            <li>Build pipelines</li>
+          </ul>
+          <div class="excluded__notes">
+            <p>I left these out on purpose. yoink borrows the few Kubernetes ideas that pay off at a handful of hosts and skips the rest.</p>
+            <p>yoink is also new: I started it in 2026 and it is still one person's tool. Kamal has run at 37signals scale since 2023.</p>
+            <p id="agents">An AI agent can drive all of this, with three limits today: <code>yoink tui</code> is for humans, <code>yoink secrets edit</code> opens <code>$EDITOR</code>, and <code>yoink up</code> prints progress text, not structured output. <a href="/docs/explanation/ai-agents#what-does-not-work-yet">What doesn't work yet</a></p>
+            <p class="agent-prompt"><code>{AGENT_PROMPT}</code><button type="button" data-copy={AGENT_PROMPT} data-done="Yoinked">Copy agent prompt</button></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <HowItWorks />
+
+    <section class="panel" aria-labelledby="facts-h">
+      <div class="wrap">
+        <div class="panel__head">
+          <h2 class="pack-type" id="facts-h">Batteries included</h2>
+          <p class="lead">Everything below is on by default, with no plugins to install.</p>
+        </div>
+        <div class="facts-grid">
+          <div class="facts">
+            <h3 class="pack-type">Deploy facts</h3>
+            <p class="serving">Serving size: a handful of services on a handful of hosts.</p>
+            <dl>
+              <div><dt>Binaries</dt><dd>1</dd></div>
+              <div><dt>Control planes</dt><dd>0</dd></div>
+              <div><dt>Agents on your hosts</dt><dd>0</dd></div>
+              <div><dt>Web dashboards</dt><dd>0</dd></div>
+              <div><dt>Registries required</dt><dd>0*</dd></div>
+            </dl>
+            <p class="foot">* When you deploy with <code>yoink up --build</code>. Your hosts only need Docker and key-based SSH.</p>
+          </div>
+          <dl class="contents">
+            {contents.map((c) => (
+              <div><dt>{c.name}</dt><dd set:html={c.text} /></div>
+            ))}
+          </dl>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel proof" aria-labelledby="proof-h">
+      <div class="wrap">
+        <div class="panel__head">
+          <h2 class="pack-type" id="proof-h">Proof of purchase</h2>
+          <p class="lead">I deploy this site with yoink. It runs as an nginx container on one small VPS, from the file below.</p>
+        </div>
+        <div class="proof__grid">
+          <figure class="receipt">
+            <figcaption><span class="spec-type">docs/yoink.yaml, excerpt</span><a href={`${REPO}/blob/main/docs/yoink.yaml`}>Whole file</a></figcaption>
+            <pre><code><span class="k">services:</span>
+  - <span class="k">name:</span> docs
+    <span class="k">image:</span> yoink-docs
+    <span class="k">build:</span>
+      <span class="k">context:</span> .
+    <span class="k">domain:</span> yoink.is
+    <span class="k">run:</span>
+      <span class="k">port:</span> 80
+      <span class="k">replicas:</span> 4
+      <span class="k">healthcheck_path:</span> /
+      <span class="k">drain_timeout:</span> 10s</code></pre>
+          </figure>
+          <div>
+            <blockquote>
+              <p>I didn't want a control plane, a Helm chart, an operator, an admission webhook, and a stack of YAML to deploy a Postgres next to a Rust binary on a €4/month box.</p>
+              <footer><a href="/about">Read why I built yoink</a></footer>
+            </blockquote>
+            <p class="proof__more">yoink is MIT licensed, and I welcome issues, pull requests and templates on <a href={REPO}>GitHub</a>.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel takeaway on-dark" aria-labelledby="take-h" data-dock-stop>
+      <div class="wrap">
+        <h2 class="pack-type" id="take-h">Go on, yoink it</h2>
+        <p>The first deploy takes a fresh VPS to a running container in about five minutes.</p>
+        <div class="takeaway__actions">
+          <a class="btn btn--light" href="/docs/tutorials/first-deploy">First deploy</a>
+          <button class="btn" type="button" data-copy={BREW} data-done="Yoinked">Copy install command</button>
+        </div>
+        <p class="takeaway__status" role="status" data-take-status></p>
+      </div>
+    </section>
+  </main>
+
+  <div class="dock" data-dock inert>
+    <div class="wrap dock__in">
+      <span class="spec-type">Install yoink</span>
+      <span class="dock__prompt">$ {BREW}</span>
+      <button class="btn" type="button" data-copy={BREW} data-done="Yoinked">Copy install command</button>
+      <a class="btn dock__go" href="/docs/tutorials/first-deploy">First deploy in five minutes</a>
+    </div>
+  </div>
+
+  <script>
+    // Tearing the strip off is the copy action.
+    const stopEl = () => document.querySelector<HTMLElement>('[data-dock-stop]')!;
+    let takeTimer: number | undefined;
+    const tear = document.querySelector<HTMLElement>('[data-tear]')!;
+    const btn = tear.querySelector<HTMLButtonElement>('[data-tear-btn]')!;
+    const status = tear.querySelector<HTMLElement>('[data-tear-status]')!;
+    let busy = false;
+    btn.addEventListener('click', async () => {
+      if (busy) return;
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copy!);
+      } catch {
+        status.textContent = 'Copying is blocked here. Select the command and copy it by hand.';
+        btn.textContent = 'Select & copy';
+        return;
+      }
+      busy = true;
+      status.textContent = 'Install command copied. Paste it into your terminal.';
+      // The button leaves with the strip. Keep focus on the section, which stays.
+      const hadFocus = document.activeElement === btn;
+      if (hadFocus) tear.focus({ preventScroll: true });
+      tear.classList.add('is-torn');
+      setTimeout(() => {
+        // A fresh strip feeds in from the roll.
+        tear.classList.add('is-feeding');
+        tear.classList.remove('is-torn');
+        void tear.offsetWidth;
+        tear.classList.remove('is-feeding');
+        status.textContent = '';
+        busy = false;
+        if (hadFocus && document.activeElement === tear) btn.focus({ preventScroll: true });
+      }, 2600);
+    });
+
+    // The close confirms the copy the way the strip does, and says what to do next.
+    const takeStatus = document.querySelector<HTMLElement>('[data-take-status]')!;
+    stopEl().addEventListener('copy-result', (e) => {
+      const ok = (e as CustomEvent<{ ok: boolean }>).detail.ok;
+      takeStatus.textContent = ok
+        ? 'The install command is on your clipboard. Paste it into your terminal.'
+        : 'Copying is blocked here. The command is in the strip at the top of the page.';
+      clearTimeout(takeTimer);
+      takeTimer = window.setTimeout(() => (takeStatus.textContent = ''), 6000);
+    });
+
+    // Dock a compact strip once the card front is out of view, and put it
+    // away again at the close, which carries the same action.
+    const dock = document.querySelector<HTMLElement>('[data-dock]')!;
+    const stop = document.querySelector<HTMLElement>('[data-dock-stop]')!;
+    let past = false;
+    let atEnd = false;
+    const sync = () => {
+      const show = past && !atEnd;
+      dock.classList.toggle('is-shown', show);
+      dock.inert = !show;
+    };
+    new IntersectionObserver(([e]) => {
+      past = !e.isIntersecting && e.boundingClientRect.top < 0;
+      sync();
+    }).observe(tear);
+    new IntersectionObserver(([e]) => {
+      atEnd = e.isIntersecting;
+      sync();
+    }, { rootMargin: '0px 0px -20% 0px' }).observe(stop);
+  </script>
+</Base>

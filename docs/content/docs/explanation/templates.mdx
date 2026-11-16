@@ -1,0 +1,79 @@
+---
+title: Templates (`yoink add`)
+description: "What a yoink add template is, how it handles secrets and hardening, and how template versions resolve."
+weight: 7
+---
+
+`yoink add <name>` is the "poor man's helm" for accessories and full apps. It fetches a template from GitHub and asks for a few variables. The result is a sealed secret and a working service fragment, with an optional deploy. The same code path serves the bundled templates and third-party repos.
+
+## Anatomy of a template
+
+A template is a directory with a manifest and one or more template files. The manifest (`template.yaml`) declares variables and outputs. yoink renders the files through [minijinja](https://github.com/mitsuhiko/minijinja).
+
+Each rendered file must parse as a yoink [`ConfigFragment`](/docs/reference/config), the same shape that you write by hand in `yoink.yaml`. yoink parses the file before it writes it. Thus a bad template fails closed and does not write a broken config.
+
+A complete `clickhouse` example is in [Write a template for `yoink add`](/docs/how-to/write-a-template). The fields are in the [Template manifest](/docs/reference/template-manifest) reference.
+
+## Secrets stay local
+
+For each `secrets:` entry of a manifest, yoink generates a random base32 string locally. yoink seals the string into `secrets.age` before the value leaves the process. The bytes are random and are not derived from anything.
+
+yoink renders the secret name through minijinja, so each instance can have its own secrets. Two postgres instances do not collide on a shared `POSTGRES_PASSWORD`. The convention is `{{ service_name | upper }}_<KIND>`, so that the reference on the env-var side reads naturally.
+
+If `yoink.yaml` has no `secrets:` config, `yoink add` offers to bootstrap age. A template does not have to handle that case.
+
+## Hardening overrides
+
+The container defaults of yoink are deliberately strict:
+
+```yaml
+options:
+  user: "65534:65534"          # nobody
+  cap_drop: [ALL]
+  read_only: true              # rootfs only; volumes are still writable
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 1024
+```
+
+For most templates these defaults are correct. Some popular images need overrides, because their entrypoint starts as root, writes to the rootfs, or runs `chown` on a fresh volume. The pattern is "fail closed, then add back what is strictly necessary".
+
+Most bundled templates have a few lines of overrides for these reasons. They are models for a similar template:
+
+- [`templates/postgres/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/postgres/service.yaml.tmpl): root entrypoint, gosu to lower privileges, initdb chown.
+- [`templates/meilisearch/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/meilisearch/service.yaml.tmpl): root and a writable rootfs for ingest payload buffers.
+- [`templates/redis/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/redis/service.yaml.tmpl): the secure defaults work unchanged, with a tmpfs for `/data`.
+- [`templates/rustfs/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/rustfs/service.yaml.tmpl): uid 10001 is in the image. A `/logs` tmpfs is necessary because the daemon writes operational logs there with `read_only: true`.
+- [`templates/restic-backups/service.yaml.tmpl`](https://github.com/oddur/yoink/blob/main/templates/restic-backups/service.yaml.tmpl): go-cron writes a lockfile to `/run/lock`. The tmpfs is at the leaf path, because a mount of `/run` alone leaves `/lock` nonexistent.
+
+A permission failure on the first deploy does not show in the manifest validator or in the rendered-YAML linter. It occurs only when the container starts. For that reason a template needs a test on a real host. The symptoms and their overrides are in [Correct a permission failure on the first deploy](/docs/how-to/write-a-template#correct-a-permission-failure-on-the-first-deploy).
+
+## Versioning and pinning
+
+yoink fetches a template from a GitHub commit. As a result, each iteration on a template means a commit and a push.
+
+A ref can be a branch, a tag, or a SHA. yoink resolves a branch or a tag to a SHA one time and caches the mapping. `--refresh` makes yoink resolve the ref again. A SHA ref is content-addressed, so yoink never resolves it again. The table is in [Template refs](/docs/reference/template-manifest#template-refs).
+
+A published template has two common pins. `main` moves fast and accepts upstream changes. A specific tag gives stability.
+
+`yoink_min_version:` in the manifest protects a template that needs a newer yoink feature. An older yoink then stops with an "upgrade yoink or pin the template to an older version" message. Without it, the older binary can silently render a wrong config.
+
+## Publishing patterns
+
+Any GitHub repo works, because yoink fetches a template as a gzipped tarball from `https://codeload.github.com/...`. A template can live in its own repo, in a templates monorepo, or in a directory of an existing project. yoink caps the size of the download. Thus a template in a large monorepo works, but a template in a multi-GB repo does not.
+
+The layouts and the caps are in [Publish a template](/docs/how-to/publish-a-template).
+
+## The bundled set
+
+Six templates are bundled: `postgres`, `redis`, `meilisearch`, `rustfs`, `restic-backups`, and `openclaw`. They live in the yoink repo at [`/templates/`](https://github.com/oddur/yoink/tree/main/templates). `yoink add postgres`, with no `gh:` prefix, resolves to them.
+
+PRs that add new bundled templates are welcome. The bar: the template is common enough that it saves many people the work to find the hardening overrides. The acceptance criteria are in [Submit a template to the bundled set](/docs/how-to/publish-a-template#submit-a-template-to-the-bundled-set).
+
+## See also
+
+- [Adding a service via `yoink add`](/docs/how-to/using-templates): how to use the bundled set or a third-party template.
+- [Write a template for `yoink add`](/docs/how-to/write-a-template): a complete example, the development loop, and the permission failures.
+- [Publish a template](/docs/how-to/publish-a-template): repo layouts, pins, and a PR to the bundled set.
+- [Template manifest](/docs/reference/template-manifest): every manifest field and the schema.
+- [Configuration reference](/docs/reference/config): the schema for the rendered service fragment.
+- [Secrets](/docs/explanation/secrets): how yoink decrypts at deploy time the secrets that a template seals.

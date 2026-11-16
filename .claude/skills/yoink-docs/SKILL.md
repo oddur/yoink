@@ -1,143 +1,64 @@
 ---
 name: yoink-docs
-description: Writing and editing the yoink documentation in `docs/content/`. Use when the user asks to write, rewrite, tighten, de-AI, audit, or add a page under `docs/content/docs/{intro,start,guide,how-to,reference,examples,troubleshooting}`, or when modifying the Fumadocs + TanStack Start docs site. Enforces the de-AI prose playbook (information density, no hedges, no trope phrases), the Diátaxis structure the docs follow, the See-also convention, and the per-page word-count-delta verification protocol.
+description: Writing and editing the yoink documentation in `docs/content/`. Use when the user asks to write, rewrite, tighten, de-AI, audit, or add a page under `docs/content/docs/{tutorials,how-to,reference,explanation}`, or when modifying the Astro docs site in `docs/`. Enforces Simplified Technical English (pragmatic mode), the Diátaxis structure, the fixed vocabulary, the See-also convention, and the build-and-link verification.
 ---
 
 # yoink-docs
 
-The yoink docs site lives in `docs/` (Fumadocs + TanStack Start SPA). Pages live under `docs/content/docs/` split by Diátaxis: `intro/`, `start/`, `guide/`, `how-to/`, `reference/`, `examples/`, plus `troubleshooting.md`. Every page ends with a `## See also` section. Most pages open with a one- or two-paragraph problem→solution framing.
+The yoink docs site lives in `docs/` (Astro, hand-built, no docs theme). Pages live under `docs/content/docs/` in four Diátaxis sections: `tutorials/`, `how-to/`, `reference/`, `explanation/`. Every page ends with a `## See also` section, except the four section landing pages.
 
-The bar for prose is **information per sentence**. If a sentence can be deleted without losing technical content, delete it. Every retained sentence must carry a fact, a condition, or a reference. The voice is engineer-to-engineer: concrete, terse, opinionated where the design has an opinion.
+The bar for prose is **information per sentence**, written in Simplified Technical English. Load the `simple-english` skill and apply it in pragmatic mode.
 
 ## Site architecture
 
-- **Framework**: Fumadocs on TanStack Start, statically prerendered via Vite → `.output/public/`
-- **Content**: MDX + Markdown under `docs/content/docs/`. Section index pages use `index.mdx` (not `_index.md`).
-- **Sidebar ordering**: `meta.json` in each directory (replaces Hugo `weight:` frontmatter). Every section has a `meta.json` with `title`, `icon`, and `pages` array.
-- **Frontmatter required fields**: `title:` and `description:` on every page. `weight:` is ignored by Fumadocs — do not use it.
-- **Blog**: `docs/content/blog/` — MDX posts with `title`, `date`, `description` frontmatter.
-- **About**: `docs/content/about.mdx` — single page at `/about/`.
-- **Deploy**: `cd docs && yoink up --build` — yoink derives the image tag from the Docker build digest automatically (no `tag:` in `yoink.yaml`).
+- **Framework**: Astro, static build to `docs/dist/`, then Pagefind indexes it. Config: `docs/astro.config.mjs`. Collections: `docs/src/content.config.ts`.
+- **Docs template**: `docs/src/pages/docs/[...slug].astro`. Styles: `docs/src/styles/leaflet.css` (docs, blog, about) and `pack.css` (home page).
+- **Content**: MDX and Markdown under `docs/content/docs/`. A section landing page is `<section>/index.mdx` and holds only intro text: the template lists the section's pages from the sidebar.
+- **Sidebar**: `meta.json` in each section directory, with `title` and `pages`. `"---Label---"` makes a group label. A new page does not appear until it is in `meta.json`. Root order is in `docs/content/docs/meta.json`.
+- **Frontmatter**: `title:` and `description:` on every page. The description is one plain sentence with no backticks.
+- **Blog**: `docs/content/blog/`. **About**: `docs/content/about.mdx`.
+- **Agent endpoints**: `/llms.txt`, `/llms-full.txt`, `/llms.mdx/docs/<page>/content.md` (`docs/src/pages/llms*.ts`).
+- **Old URLs**: `docs/nginx.conf` redirects the pre-Diátaxis addresses. If you move a page, add a redirect there.
+- **Deploy**: `cd docs && yoink up --build`. Nothing deploys from CI.
 
-## When to use
+## Fixed vocabulary
 
-Trigger when the user asks to:
+| Concept | Use | Not |
+|---|---|---|
+| check / verify / confirm | "make sure that" | check, verify, confirm, ensure |
+| the YAML settings | "config" | configuration, settings, options |
+| run a command | "run" | execute, invoke, launch |
+| take away a container, file or key | "remove" | delete, drop, destroy |
+| put on screen | "show" | display, render, present |
+| something went wrong | "error" (message), "failure" (failed operation) | issue, problem |
+| the machine yoink deploys to | "host" | server, box, node, machine |
+| the reader | "you" | user, developer |
 
-- Write or rewrite any page under `docs/content/docs/`.
-- "De-AI", "tighten", "rewrite", or "audit" docs prose.
-- Add a new how-to, recipe, example, glossary entry, reference page, or guide.
-- Edit `docs/MEDIA_ROADMAP.md`.
-- Touch Fumadocs config (`source.config.ts`, `src/lib/layout.shared.tsx`, `meta.json` files).
-- Add or modify MDX components in `docs/src/components/mdx.tsx`.
+"yoink" is lowercase, also at the start of a sentence. No em dashes, no semicolons, no contractions, no should/would/could/may/might.
 
-Do **not** trigger for unrelated docs (CLAUDE.md files, code comments, in-repo READMEs).
+## MDX components (global, no import)
 
-## Available MDX components (global — no import needed)
+Registered in `docs/src/components/mdx/index.ts`. Only these exist:
 
-All registered in `docs/src/components/mdx.tsx`:
+- `<Callout type="info|warn|error">`: use sparingly, `warn` for footguns.
+- `<Cards>` with `<Card href title description />`.
+- `<Tabs items={["A", "B"]}>` with `<Tab>` children.
+- A heading that ends in ` [step]` becomes a numbered step. The count restarts at each `##` heading that is not a step, so each procedure starts under its own `##`.
+- A `mermaid` code fence renders to SVG at build time. A diagram that fails to render fails the build.
 
-### Callout
-```mdx
-<Callout type="info">Adjacent context that is optional reading.</Callout>
-<Callout type="warn">A footgun that bites without warning.</Callout>
-<Callout type="error">Something that will break.</Callout>
-```
-Use sparingly. `warn` for footguns only. If the callout is emphasis on a paragraph that should be emphasized inline, delete it and rewrite the paragraph.
+There is no `<Files>`, no code-tab syntax, and no `!!include`.
 
-### Cards
-```mdx
-<Cards>
-  <Card href="/docs/guide/architecture" title="How it works" description="Drift detection, deploy lock, spec_hash." />
-  <Card href="/docs/guide/secrets" title="Secrets" description="AGE-sealed in repo, plus provider:command." />
-</Cards>
-```
-Used in section index pages to surface subsections.
-
-### Tabs (explicit JSX)
-```mdx
-<Tabs items={["Option A", "Option B"]}>
-  <Tab>Content for A</Tab>
-  <Tab>Content for B</Tab>
-</Tabs>
-```
-
-### Code tabs (markdown syntax — prefer over JSX Tabs for code groups)
-````mdx
-```bash tab="Homebrew"
-brew install oddur/yoink/yoink
-```
-```bash tab="Cargo"
-cargo install --git https://github.com/oddur/yoink yoink
-```
-````
-
-### Steps (via remarkSteps — no JSX wrapper needed)
-```md
-### Generate the keypair [step]
+## Verify
 
 ```sh
-yoink secrets key generate
+cd docs && pnpm build      # must pass; prints the page count
 ```
 
-### Add the recipient to yoink.yaml [step]
-
-...
-```
-The `[step]` tag on a heading auto-wraps it in a numbered step. No `<Steps>` JSX needed. All existing how-to files use this pattern.
-
-### File tree
-```mdx
-<Files>
-  <Folder name="docs" defaultOpen>
-    <File name="yoink.yaml" />
-    <File name="secrets.age" />
-  </Folder>
-</Files>
-```
-
-### Mermaid diagrams (fenced code block — no component)
-````md
-```mermaid
-flowchart TB
-  A --> B
-```
-````
-Rendered at build time via `beautiful-mermaid` + `remarkMdxMermaid`. Images are click-to-zoom automatically.
-
-## remarkInclude
-
-Include content from other files:
-```md
-!!include ./snippets/prereqs.md
-```
-Put shared snippets in `docs/content/docs/_snippets/` (underscore prefix keeps them out of the page tree).
-
-## meta.json format
-
-```json
-{
-  "title": "How-to",
-  "icon": "Wrench",
-  "pages": [
-    "---Quickstarts---",
-    "hetzner-quickstart",
-    "tanstack-stack",
-    "---Secrets & Security---",
-    "sealed-secrets-workflow"
-  ]
-}
-```
-
-- `"---Label---"` — sidebar separator with label
-- `"[Text](url)"` — external link entry in sidebar
-- `"..."` — remaining pages alphabetically
-- `"!page"` — exclude from rest
-
-Section icons (Lucide names): intro→BookOpen, start→Rocket, guide→Map, how-to→Wrench, reference→BookMarked, examples→LayoutTemplate, troubleshooting→CircleAlert.
+Then make sure that no internal link or heading anchor is broken. Heading text makes the anchor, so a renamed heading breaks inbound links: grep for the old anchor before you rename.
 
 ## Hard rules
 
-- **Every rewrite must be shorter than the original** unless adding a `[NEEDS-SPEC]` placeholder.
+- **Do not add facts.** A rewrite can be longer than the original when short sentences with complete grammar need more words, but every added word must restate a fact that is already on the page.
 - **Do not change technical content.** Anything where the meaning shifts gets flagged `[CHANGED-MEANING?]` in the commit message.
 - **Do not write closing summaries.** "## What we covered" sections are deletable. Exception: `examples/*.md` "What this exercises" lists when items are concrete callouts the reader could not infer.
 - **Do not write opening restatements.** A page titled "Reverse proxy" must not open with "This page is about the reverse proxy."
@@ -191,12 +112,12 @@ Catch: enthusiasm, reader-coaching ("Don't be afraid to…"), performative balan
 
 ## Page structure (Diátaxis)
 
-- `intro/` — pitch, comparison. What yoink is and why.
-- `start/` — getting started. Tutorials. Linear, one-shot.
-- `guide/` — explanation. Mental model. "How it works", "why this exists".
-- `how-to/` — task-oriented. "How to do X". Each is self-contained.
-- `reference/` — lookup. `cli.md`, `config.md`, `tui.md`, `glossary.md`. Mostly tables; minimal prose.
-- `examples/` — annotated end-to-end configs. `hobby-tool.md`, `polyglot-stack.md`, `production.md`.
+Each page is exactly one type. Content of another type moves to the right section and is linked.
+
+- `tutorials/`: learning. One fixed path for a beginner, a visible result after each step, no alternatives.
+- `how-to/`: one task for a competent user. Goal in the title, prerequisites, numbered steps, a way to see that it worked. No background theory.
+- `reference/`: lookup. Flags, fields, schemas, example configs (`reference/examples/`). Tables and lists, no instructions, no opinions.
+- `explanation/`: understanding. Why yoink works the way it does, trade-offs, comparisons. Descriptive prose, no steps, no field tables.
 
 ## Narrative openers
 
@@ -226,7 +147,7 @@ Every page ends with `## See also` listing 2–4 cross-links:
 
 ## Terminal recordings (asciinema)
 
-The home page (`docs/src/routes/index.tsx`) embeds a terminal demo via `<TerminalPlayer src="/demo.cast" />`. The cast file lives at `docs/public/demo.cast` and is served statically. The player component (`docs/src/components/terminal-player.tsx`) lazy-loads `asciinema-player` after mount to avoid SSR issues.
+The home page (`docs/src/pages/index.astro`) embeds a terminal demo via `<Terminal src="/demo.cast" />` (`docs/src/components/Terminal.astro`). The cast file lives at `docs/public/demo.cast` and is served statically. The component loads `asciinema-player` when the recording scrolls into view.
 
 ### Recording
 
@@ -298,18 +219,10 @@ grep -c "WARN\|your.real.ip" docs/public/demo.cast || echo "clean"
 
 ## Verification protocol
 
-1. **Per-page word-count delta is negative**:
-   ```sh
-   for f in <changed files>; do
-     before=$(git show HEAD:"$f" | wc -w | tr -d ' ')
-     after=$(wc -w < "$f" | tr -d ' ')
-     printf "%-50s before=%s after=%s delta=%s\n" "$f" "$before" "$after" "$((after - before))"
-   done
-   ```
-2. **Build clean**: `cd docs && pnpm build` — must show `Prerendered 143 pages:` with no errors.
-3. **No broken cross-links**: `grep -roE '\(/docs/[^)]+\)' docs/content/` then resolve each path.
-4. **Run the banned-phrase grep** (Pass 3).
-5. **Self-check**: Could a reader skip any sentence and lose nothing? Did I replace vagueness with specificity? Is the rewrite shorter?
+1. **No facts added or lost.** Compare each changed page with `git show HEAD:<file>`. A rewrite can be longer; it cannot say more or less.
+2. **Build clean**: `cd docs && pnpm build` must pass.
+3. **No broken links or anchors** in `docs/dist/`.
+4. **Run the banned-phrase grep** (Pass 3) and the self-check from the `simple-english` skill.
 
 ## Commit protocol
 

@@ -1,4 +1,4 @@
-# Multi-stage build: Node + pnpm + vite → static html → nginx:alpine.
+# Multi-stage build: Node + pnpm + Astro → static html → nginx:alpine.
 # Yoink ships this image to the docs box via unregistry on every deploy.
 # syntax=docker/dockerfile:1.7
 
@@ -11,17 +11,16 @@ COPY . .
 RUN pnpm build
 
 FROM nginx:alpine
-# Clear the default nginx welcome page before copying our build output,
-# otherwise Docker's merge-copy leaves index.html from the base image in
-# place (our SPA build has no root index.html — it uses _shell.html).
+# Clear the default nginx welcome page and 50x page before copying our
+# build output, so nothing from the base image is served.
 RUN rm -rf /usr/share/nginx/html/*
 # curl: needed for the HEALTHCHECK below. Recent nginx:alpine builds
 # don't ship busybox wget reliably (the wget applet is gated on the
 # busybox config), and the equivalent /dev/tcp shell trick isn't in
 # busybox sh either. ~5 MiB to add curl, tiny next to the rest.
 RUN apk add --no-cache curl
-COPY --from=builder /src/.output/public /usr/share/nginx/html
-# SPA routing + Cloudflare cache headers.
+COPY --from=builder /src/dist /usr/share/nginx/html
+# Static routing + Cloudflare cache headers.
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY nginx-cache.conf /etc/nginx/conf.d/cache.conf
 EXPOSE 80

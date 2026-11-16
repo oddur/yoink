@@ -1,6 +1,6 @@
 ---
 title: TUI
-description: Keybind table for every TUI pane, log piping, and how drift is shown in the cell view.
+description: The keybind tables for every TUI pane, the log piping, and the drift detail view.
 weight: 3
 ---
 
@@ -8,7 +8,7 @@ weight: 3
 yoink tui
 ```
 
-Heavily inspired by [k9s](https://k9scli.io/) and [lazydocker](https://github.com/jesseduffield/lazydocker), but pointed at remote hosts you deploy to instead of just the local docker daemon. Keyboard-driven, real-time, and aware of yoink-specific concepts (services, drift, sealed secrets, deploy history) on top of the everyday docker introspection an operator wants when something is on fire.
+The TUI is a keyboard-driven dashboard for the remote hosts that you deploy to. It shows yoink concepts (services, drift, sealed secrets, deploy history) together with docker introspection, and it updates in real time. It takes ideas from [k9s](https://k9scli.io/) and [lazydocker](https://github.com/jesseduffield/lazydocker).
 
 ![yoink TUI dashboard](https://github.com/user-attachments/assets/bcf956b1-937a-43d7-92f6-0f24a1d0cd98)
 
@@ -16,89 +16,96 @@ Heavily inspired by [k9s](https://k9scli.io/) and [lazydocker](https://github.co
 
 ## What it shows
 
-| pane | what it's for |
+| pane | purpose |
 |---|---|
-| **Dashboard** | one row per yoink-managed container across every host, with drift, CPU/mem, and exit-code colour. The "is anything broken right now" view. |
-| **Hosts** | per-host preflight (ssh, daemon version, kernel/OS) + aggregate CPU/mem across the host. Drill in for a per-host table. |
-| **HostDetail** | every running container on a host (yoink-managed *or not*) with live stats, plus a rolling per-host docker-events panel at the bottom. |
-| **Services** | one row per configured service with replica count + image. Drill in for `ServiceDetail` (every replica across every host) → `ServiceHistory` (every past deploy → roll back from here). |
-| **ContainerDetail** | k9s-style "describe": image, command, env (secrets redacted), ports, mounts, networks, security profile (cap_drop / read_only / pids_limit), restart count, three **5-minute history charts** (CPU%, Mem, mirrored net tx/rx), and a `NET ↓rx ↑tx` cumulative line in the card. `p` opens a `docker top` modal listing in-container processes. |
-| **Logs** | a multiplexed live tail of every yoink-managed container (auto-piped through [`hl`](https://github.com/pamburus/hl) when present). `/` filters substring, `g`/`G` jump to top/bottom, `y` yanks the visible buffer to the system clipboard via OSC-52. |
-| **ContainerLogs** | same shape, scoped to one container. |
-| **Resources** | three sub-tabs (`Images`, `Volumes`, `Networks`) covering everything lazydocker exposes. Per-row remove with `d`; per-tab `P` prune (`A` for the aggressive image prune that goes beyond `<none>:<none>`). |
-| **Secrets** | view / add / edit / remove individual sealed secrets without leaving the TUI; reuses the same on-disk format as `yoink secrets edit`. |
+| **Dashboard** | One row for each yoink-managed container on every host, with state, health, drift, CPU, and memory. |
+| **Hosts** | The connection status, docker version, and aggregate CPU and memory of each host. |
+| **HostDetail** | Every running container on one host (yoink-managed or not) with live stats, and a docker-events panel. |
+| **Services** | One row for each configured service, with image and running count. |
+| **ServiceDetail** | Every replica of one service, on every host. |
+| **ServiceHistory** | Every past deploy of one service, with rollback. |
+| **ContainerDetail** | Image, command, env, ports, mounts, networks, security profile, restart count, and three 5-minute history charts. |
+| **Logs** | A live tail of every yoink-managed container in one buffer. |
+| **ContainerLogs** | The same view for one container. |
+| **Resources** | The images, volumes, and networks of every host. |
+| **Secrets** | The individual sealed secrets. |
+| **Audit** | The merged operator and host audit log. |
 
 ## Top-level navigation
 
-| key | mode |
+These keys work in every view except the embedded shell and the text inputs.
+
+| key | action |
 |---|---|
-| `d` | Dashboard |
-| `h` | Hosts |
-| `s` | Services |
-| `l` | Logs |
-| `R` | Resources (Images / Volumes / Networks) |
-| `e` | Encrypted-secrets |
-| `a` | Audit log (merged operator + on-host JSONL) |
-| `Tab` / `Shift-Tab` | cycle modes forward / backward |
-| `?` | toggle help overlay (per-view keybinds) |
+| `1` / `d` | Dashboard |
+| `2` / `h` | Hosts |
+| `3` / `s` | Services |
+| `4` / `l` | Logs |
+| `5` / `R` | Resources (Images / Volumes / Networks) |
+| `6` / `e` | Secrets |
+| `7` / `a` | Audit log |
+| `Tab` / `Shift-Tab` | cycle panes forward / backward |
+| `D` | doctor modal: runs the checks of `yoink doctor`. `r` runs them again, `Esc` closes. |
+| `E` | open the config in `$EDITOR`, at the line of the focused service or host |
+| `~` | show the drift detail for the focused service |
+| `f` | port-forward the focused service |
+| `o` / `O` | open the URL of the active port-forward in the system browser. When the focused row has no forward, the key uses the first active tunnel. |
+| `F` | close every active port-forward (the TUI force-removes sidecars and stops ssh children) |
+| `v` | open VS Code in the browser, on the container filesystem of the focused service (not in Resources) |
+| `V` | close every active vscode session |
+| `?` | show or hide the help overlay |
 | `q` / `Ctrl-C` | quit |
 
-## Operator gestures from the dashboard
+`~`, `f`, and `v` need a focused service: a row in Dashboard, HostDetail, or ServiceDetail, or an open ContainerDetail.
 
-| key | action |
-|---|---|
-| `↑` `↓` / `j` `k` | navigate |
-| `enter` | drill into selected row (container detail) |
-| `i` | container inspect (security & limits, env, mounts, networks); also from HostDetail / ServiceDetail |
-| `K` | SIGKILL container (with confirmation) |
-| `S` / `X` / `R` | start / stop / restart container; from HostDetail or ContainerDetail |
-| `U` | reconcile this service (with confirmation); drift-only services no-op |
-| `A` | reconcile **all** services (with confirmation) |
-| `P` | prune stale + orphan containers (with confirmation) |
-| `!` | shell into container (`bash` then fallback to `sh`) |
-| `B` | debug sidecar (alpine in target's pid+net ns, for distroless / shell-less images) |
-| `H` | service deploy history; on a stopped row press `r` to roll back |
-| `~` | show drift detail for the focused service (image / tag / spec_hash / env keys / label keys) |
-| `f` | port-forward the focused service. Auto-mode: published path when the service has a matching `publish:` entry, else spawns an ephemeral `alpine/socat` sidecar that joins the service's docker network. Footer band stays visible across panes until closed. |
-| `o` / `O` | open the active port-forward URL in the system browser. Works in any view; falls back to the most-recently-opened tunnel when the focused row has no forward of its own. |
-| `F` | close every active port-forward (sidecars are force-removed; ssh children killed) |
-| `x` | toggle eXited containers visible in the table |
-| `r` | refresh |
-| `/` | filter substring (Esc clears) |
+`f` uses the published path when the service has a matching `publish:` entry. If there is no match, it starts an `alpine/socat` sidecar on the docker network of the service. A footer band stays visible in all panes until you close the forward. See [Port-forward reference](/docs/reference/port-forward).
 
-## Container detail (`i` from any list view)
+## Container and service keys
 
-The detail pane renders four kinds of information for a single container:
+| key | action | views |
+|---|---|---|
+| `↑` `↓` / `j` `k` | select a row | all list views |
+| `enter` | open the container detail | Dashboard |
+| `enter` | open the live logs of the container | HostDetail, ServiceDetail, ContainerDetail |
+| `i` | open the container detail | HostDetail, ServiceDetail |
+| `!` | open a shell in the container (`bash`, then `sh`) | HostDetail, ServiceDetail, ContainerDetail, ContainerLogs |
+| `B` | open a debug sidecar | HostDetail, ServiceDetail, ContainerDetail, ContainerLogs |
+| `S` / `X` / `T` | start / stop / restart the container | HostDetail, ContainerDetail |
+| `K` | SIGKILL the container | Dashboard, HostDetail, ServiceDetail, ContainerDetail |
+| `U` | reconcile the service of the row | Dashboard, HostDetail, ServiceDetail, ContainerDetail |
+| `A` | reconcile all services | Dashboard |
+| `P` | prune stale and orphan containers | Dashboard |
+| `x` | show or hide exited containers | Dashboard |
+| `H` | open the deploy history of the service | ServiceDetail |
+| `p` | show the processes of the container (`docker top`) in a modal | ContainerDetail |
+| `r` | refresh | Dashboard, Hosts, HostDetail, ContainerDetail, Services, ServiceDetail, Resources, Audit |
+| `esc` | clear the filter, close a modal, or go back | all views |
 
-1. **Header card**: image, state (colored), command, restart count, started/finished/exit-code timestamps. The right column has live `CPU` / `MEM` gauges and a `NET ↓rx ↑tx` cumulative-bytes line ("how much has this thing transferred since start").
-2. **5-minute history charts**: three side-by-side panels, each with the latest sampled value baked into its title so it's readable without squinting at the rightmost edge:
-   - **CPU %** (cyan): own y-axis scaled to peak CPU
-   - **Mem** (magenta): own y-axis. % when memory is capped, MB when uncapped
-   - **net tx / rx** (yellow / green): btop-style mirrored: `tx` (outgoing) plots above the zero line, `rx` (incoming) mirrored below. The two series can never overlap. Title shows current rates: `↑1.2MB/s ↓340KB/s`. Y-axis labels carry the direction arrow on each side.
-3. **Runtime + security blocks**: published ports, mounts, attached networks, then `cap_drop` / `cap_add` / `security_opt` / `read_only` / `pids_limit` / effective `user` so you can see at a glance whether this container is hardened.
-4. **Env + labels**: sorted KEY=value with secret-ish keys (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*API_KEY*`, `*PRIVATE_KEY*`, `*DSN*`) auto-redacted; full label table including the `yoink.*` set.
+Letters are case-sensitive. `K`, `U`, `A`, `P`, and the remove key of Resources and Secrets ask for a confirmation: `y` or `Enter` confirms, and any other key cancels. `S`, `X`, and `T` run immediately.
 
-Plus, at the bottom of the pane, a rolling tail of the container's logs.
+For a service without `tag:` in the config, `U` uses the tag of the running replica.
 
-**History is collected for every container, all the time.** A background poller samples `docker stats` for every running container across every configured host every 2 seconds, regardless of which view you're currently on. When you drill into a container's detail pane, the chart is already populated with up to 5 minutes of context instead of starting from zero. Stale entries (containers that stopped and aged out) are GC'd automatically.
+## Container detail
 
-| key | action |
-|---|---|
-| `enter` / `l` | open dedicated logs view |
-| `!` | exec a shell inside (`bash` → `sh`) |
-| `B` | debug sidecar (alpine sharing pid+net ns) |
-| `S` / `X` / `R` | start / stop / restart |
-| `K` | SIGKILL (with confirmation) |
-| `U` | reconcile this service |
-| `p` | docker top, shows in-container processes in a modal (Esc to close) |
-| `r` | refresh |
-| `esc` | back to host detail |
+The detail pane shows four kinds of information for one container:
 
-If your image is distroless or otherwise has no shell, `!` will fail. **Fall back to `B`**: the debug sidecar attaches an alpine container sharing the target's PID and network namespaces, so you can run `ps`, `ss`, `cat /proc/<pid>/...` against the target without modifying the production image. The sidecar auto-removes when you `exit` / Ctrl-D.
+1. **Header card**: image, state, command, restart count, and the started, finished, and exit-code values. The right column has live `CPU` / `MEM` gauges and a `NET ↓rx ↑tx` line with the bytes transferred since the container started.
+2. **5-minute history charts**: three panels. The title of each panel contains the latest value.
+   - **CPU %** (cyan): scaled to peak CPU.
+   - **Mem** (magenta): in % when memory has a cap, in MB when it has no cap.
+   - **net tx / rx** (yellow / green): `tx` is above the zero line and `rx` is below it. The title shows the current rates, for example `↑1.2MB/s ↓340KB/s`.
+3. **Runtime and security blocks**: published ports, mounts, networks, then `cap_drop` / `cap_add` / `security_opt` / `read_only` / `pids_limit` / effective `user`.
+4. **Env and labels**: sorted `KEY=value`. The TUI redacts the values of keys that contain `TOKEN`, `SECRET`, `PASSWORD`, `PASS`, `API_KEY`, `PRIVATE_KEY`, or `DSN`.
+
+A rolling tail of the container logs is at the bottom of the pane.
+
+A background poller samples `docker stats` every 2 seconds for every running container on every host, in all views. Thus a chart already contains up to 5 minutes of history when you open the pane.
+
+`esc` returns to HostDetail.
 
 ## Drift detail (`~`)
 
-When the dashboard / host detail / service detail / container detail view shows ⚠ on a row, press **`~`** to open a modal that explains *what* drifted, the same per-field diff `yoink up --plan` produces on the CLI side:
+When a row shows ⚠, `~` opens a modal with the per-field diff. The content is the same as `yoink up --plan --service <name>` against the same host:
 
 ```
  drift: api on host-a (esc to close)
@@ -112,145 +119,148 @@ labels:
   - yoink.caddy.tls
 ```
 
-Color-coded so the markers read at a glance: `+` green (added in desired), `-` red (removed from running), `~` yellow (changed). The hash and image columns highlight the running → desired transition in cyan when they differ; the line dims to `(unchanged)` when they match.
+| marker | color | meaning |
+|---|---|---|
+| `+` | green | added in the desired spec |
+| `-` | red | removed from the running container |
+| `~` | yellow | changed |
 
-The fetch reuses `diff::compute` under the hood, so the modal's content is identical to `yoink up --plan --service <name>` against the same host. For services without a `tag:` pinned in config (typical for `image: ghcr.io/you/api` where CI provides the tag), the modal falls back to the running replica's tag so the diff isolates the env/label change instead of erroring on a missing tag, useful for "what changed since deploy?" without leaving the TUI.
+A hash or image line shows the running → desired transition in cyan when it differs, and a dim `(unchanged)` when it matches.
 
-`Esc` closes the modal. The underlying view stays put.
+For a service without `tag:` in the config, the modal uses the tag of the running replica. The diff then shows only the env and label changes.
+
+`Esc` closes the modal.
 
 ## Hosts pane (`h`)
 
-Per-host summary table:
+The table has one row for each host:
 
 | col | meaning |
 |---|---|
-| `host` | `user@address` from `yoink.yaml` |
-| `status` | ssh probe + Docker API handshake — `ok` / `unreachable` (with classified hint for Tailscale auth, `ssh-add` reminders, etc.) |
-| `daemon` | docker server version, OS / kernel |
-| `cpu`, `mem` | aggregate across all running containers (sum of `docker stats`) — gauge-coloured |
+| `ssh target` | `user@address` from `yoink.yaml` |
+| `status` | `connected` or `error` |
+| `server` | docker server version |
+| `cpu (cores)`, `memory` | usage of the host, with a gauge |
+| `ctr run/all` | running containers / all containers |
+| `images` | number of images |
+| `platform / error` | OS and architecture, or the error with a hint (for example for Tailscale auth or `ssh-add`) |
 
-`Enter` drills into **HostDetail**, which shows every running container on the host (whether yoink manages it or not), with the same live CPU/mem cells, drift indicator, and per-container actions:
+`Enter` opens **HostDetail**: every running container on the host, with live CPU and memory, a drift indicator, and the [container keys](#container-and-service-keys). `esc` returns to Hosts.
 
-| key | action |
-|---|---|
-| `↑↓` / `j` `k` | select container |
-| `enter` | live logs |
-| `i` | container detail (env, mounts, security, history charts, …) |
-| `!` | shell · `B` debug sidecar |
-| `S` / `X` / `R` | start · stop · restart |
-| `K` | SIGKILL (with confirmation) |
-| `U` | reconcile this service |
-| `/` | filter substring · `esc` clears |
-| `r` | refresh |
-| `esc` | back to Hosts (when no active filter) |
-
-The **events panel** at the bottom of HostDetail collects live `docker events` for that host (start / stop / die / health-status / kill / oom / restart). Each row is a one-line summary timestamped with relative time. The ring keeps the last 200 events per host, long enough that an operator returning to the pane after a reconcile sees the full sequence of swaps, not just the final state.
+The **events panel** at the bottom of HostDetail collects live `docker events` for the host (start / stop / die / health-status / kill / oom / restart). Each row is a one-line summary with a relative timestamp. The panel keeps the last 200 events for each host.
 
 ## Services pane (`s`)
 
-`Services` lists every service in `yoink.yaml` with its current replica count and configured image. `Enter` opens **ServiceDetail**: one row per running replica across every host, with the same per-row container actions. `H` opens **ServiceHistory**: every yoink-managed container with `yoink.service=<name>` (running and exited), sorted newest-first by `yoink.deployed-at`. Pressing `r` on a row triggers a rollback confirmation pinned to that row's tag (same flow as `yoink rollback --tag <value>`).
+`Services` lists every service in `yoink.yaml` with its image, running count, health, and hosts. `Enter` opens **ServiceDetail**: one row for each replica on every host, with the [container keys](#container-and-service-keys).
+
+In ServiceDetail, `H` opens **ServiceHistory**: every yoink-managed container with `yoink.service=<name>` (running and exited), newest first. On a row that is not running, `r` opens a reconcile confirmation that is pinned to the tag of that row.
 
 ## Resources pane (`R`)
 
-Three sub-tabs covering the introspection lazydocker users expect, fanned out across every configured host:
+Three sub-tabs show the images, volumes, and networks of every configured host.
 
-| tab | columns | actions |
-|---|---|---|
-| **Images** (`i` inside Resources) | host · 12-char id · size · age · dangling · tags | `d` remove · `P` prune dangling · `A` prune all unused |
-| **Volumes** (`v`) | host · name · driver · mountpoint | `d` remove · `P` prune unused |
-| **Networks** (`n`) | host · name · driver · scope · internal | `d` remove · `P` prune unused |
+| tab | key | columns | actions |
+|---|---|---|---|
+| **Images** | `i` | host · id · size · age · dangling · tags | `x` remove · `P` prune dangling · `A` prune all unused |
+| **Volumes** | `v` | host · name · driver · mountpoint | `x` remove · `P` prune unused |
+| **Networks** | `n` | host · name · driver · scope · internal | `x` remove · `P` prune unused |
 
-`Tab` / `Shift-Tab` cycles between the three sub-tabs (only inside Resources, not the top-level modes). `/` filters across host/name/tag substrings; partial fetch errors per host appear as a red footer ribbon rather than blanking the whole table. Dangling images sort to the top so they're trivial to prune.
+Inside Resources, `Tab` / `Shift-Tab` cycles between the three sub-tabs. Dangling images sort to the top. If the fetch fails for some hosts, a red footer shows the errors and the table stays visible.
 
-There's intentionally no volume file browsing. Drop into the container with `!` (or, for distroless containers, `B` for the debug sidecar) and use the shell. That's strictly more capable than the half-baked file UI lazydocker has, and it's what most operators reach for anyway.
+The TUI has no file browser for volumes. A shell in the container (`!` or `B`) gives access to the files.
 
 ## Secrets pane (`e`)
 
-View / add / edit / remove individual sealed secrets without leaving the TUI. Reuses the same on-disk format as `yoink secrets edit` and respects per-environment `secrets.file:` paths; the title bar shows which file is active.
+The pane shows the individual sealed secrets. It uses the same on-disk format as `yoink secrets edit` and the `secrets.file:` path of the config. The header shows the active file.
 
 | key | action |
 |---|---|
-| `↑↓` / `j` `k` | select key |
-| `r` | reveal/mask values |
-| `/` | filter substring |
-| `a` | add a new secret (age provider only) |
-| `e` / `enter` | edit selected value |
-| `d` | delete selected (with confirmation) |
-| `Esc` / `q` | back |
+| `↑↓` / `j` `k` | select a key |
+| `r` | reveal or mask the values |
+| `/` | filter on a substring |
+| `enter` | edit the selected value (age provider only) |
+| `x` | remove the selected secret, with confirmation (age provider only) |
 
-When `provider: command` is configured the pane is read-only; rotation happens in whichever external tool the configured CLI talks to. When no age identity is available, the pane shows the failed-load reason + a remediation pointer. For bulk multi-line edits, drop to the CLI: `yoink secrets edit`.
+With `provider: command`, the pane is read-only. When no age identity is available, the pane shows why the load failed. For bulk edits and multi-line values, use `yoink secrets edit`.
 
 ## Logs pane (`l`)
 
-The multiplexed Logs view aggregates a live tail from **every yoink-managed container** across every host into one scrollable buffer. Each line is prefixed with the container name; lines from different hosts and services interleave in real time. Useful for "something just happened on prod, what was it?" when you don't yet know which service.
+The Logs view collects a live tail from every yoink-managed container on every host into one buffer. Each line has the container name as a prefix.
 
 | key | action |
 |---|---|
-| `↑↓` / `PgUp` `PgDn` | scroll line / page (auto-follow disengages while scrolling away from bottom) |
-| `g` / `G` / `End` | jump to top / bottom (resumes auto-follow) |
-| `/` | begin filter input — Enter applies, Esc cancels (live-typed, case-insensitive substring) |
-| `c` | clear the buffer (next ticks repopulate) |
-| `r` | restart streams (re-opens log pipes if any died) |
-| `y` | yank the visible buffer to the system clipboard via OSC-52 |
+| `↑↓` / `PgUp` `PgDn` | scroll 1 line / 10 lines (auto-follow stops while the view is away from the bottom) |
+| `g` / `G` / `End` | go to the top / bottom (the bottom starts auto-follow again) |
+| `/` | start filter input: a case-insensitive substring. `Enter` applies, `Esc` cancels. |
+| `w` | wrap or truncate long lines |
+| `L` | cycle the minimum level that `hl` shows: all → trace → debug → info → warning → error |
+| `c` | clear the buffer |
+| `r` | restart the streams |
+| `y` | copy the visible buffer to the system clipboard through OSC-52 |
 
-The buffer is bounded at 5,000 lines; older lines fall off as new ones arrive. Filter doesn't shrink the buffer, only the rendered view.
+The buffer has a limit of 5,000 lines. Older lines leave the buffer as new lines arrive. A filter changes the view, not the buffer.
 
 ### `ContainerLogs` (single container)
 
-Reached via `Enter` from any list view. Same shape as the multiplexed Logs pane, scoped to one container. Same keybindings; `Esc` returns to the parent. `!` and `B` are also bound here for quick "tail logs → drop into shell" pivots.
+`Enter` on a row in HostDetail or ServiceDetail, or in ContainerDetail, opens this view. It has the keys of the Logs pane except `r` and `L`. `!` and `B` open a shell from the logs. `Esc` returns to HostDetail.
 
 ## Audit pane (`a`)
 
-Merged operator + per-host JSONL audit log: every state-changing run yoink performed (deploy, rollback, prune, secrets rotate). Same data path as `yoink audit log`, with stable selection on `event_id` so a refresh keeps you on the row you were looking at.
+The pane shows the merged operator and host audit log: every state-changing run of yoink (deploy, rollback, prune, secrets rotate). It uses the same data path as `yoink audit log`. The selection is stable on `event_id`, so a refresh keeps the selected row.
 
 | key | action |
 |---|---|
 | `↑↓` / `j` `k` | select row |
-| `Enter` | toggle detail panel (full `event_id`, `deploy_id`, actor, git SHA, log tail for `DeployFailed`) |
-| `/` | begin substring filter — matches host, event name, summary, `deploy_id`, actor |
-| `r` | refresh (parallel SSH per host + local operator log read) |
-| `Esc` | clears active filter on first press, returns to Dashboard on second |
+| `Enter` | show or hide the detail panel (full `event_id`, `deploy_id`, actor, git SHA, log tail for `DeployFailed`) |
+| `/` | start a substring filter: matches host, event name, summary, `deploy_id`, actor |
+| `r` | refresh |
+| `Esc` | the first press clears the active filter, the second press returns to Dashboard |
 
-The first column tags each row with `operator` (purple) or `host` (cyan) so you can tell at a glance which side of the merge a line came from.
+The `origin` column labels each row `operator` (magenta) or `host` (cyan).
 
 ## Shell / debug sidecar (`!`, `B`)
 
-Both gestures put you on a PTY inside the host's docker daemon with no SSH on top; yoink uses the Docker exec API and the TUI streams bytes both ways through a terminal-emulator parser.
+Both keys open a PTY through the Docker exec API of the host, with no SSH session on top.
 
-`!` runs `bash` (falls back to `sh`) inside the existing container, equivalent to `yoink shell <service>` but staying in the TUI. Useful when the image has a shell and you want quick access to the running process's filesystem, env, etc.
+`!` runs `bash` in the container, with `sh` as the fallback. It is equivalent to `yoink shell <service>`. If the image is distroless or has no shell, `!` fails.
 
-`B` spins up an ephemeral **alpine debug sidecar** sharing the target container's PID and network namespaces. The fallback for distroless / scratch / shell-less images: you get `ps`, `ss`, `cat /proc/<pid>/...`, `tcpdump`, `apk add` whatever you need, without modifying the production image. The sidecar is `--rm` and force-removed when you `exit` / Ctrl-D, even if the TUI crashes.
+`B` starts an alpine debug sidecar that shares the PID and network namespaces of the target. You can run `ps`, `ss`, `cat /proc/<pid>/...`, and `apk add` for other tools, and the production image does not change. yoink removes the sidecar when the shell ends.
 
 | key inside the shell view | action |
 |---|---|
-| anything | forwarded into the in-shell process (Ctrl-C, Ctrl-D, arrow keys, …) |
-| `Ctrl-Q` | exit shell, back to the parent pane (yoink-side gesture) |
-| `?` | toggle help overlay (one yoink-side gesture even inside the shell) |
-| `exit` / `Ctrl-D` | end the in-container shell normally |
+| any other key | forwarded to the process in the shell (also `Ctrl-C` and `Ctrl-D`) |
+| `Ctrl-Q` | leave the shell and go to HostDetail |
+| `?` | show or hide the help overlay |
+| `exit` / `Ctrl-D` | end the shell normally |
 
-Window resizing flows through automatically; the panel size is sent to the daemon on every render so `top` / `vim` / etc. re-flow.
+The TUI sends window resizes to the daemon, so `top`, `vim`, and similar programs reflow.
 
 ## Progress modals
 
-Long-running operations (reconcile-one, reconcile-all, prune) render a centred modal that streams the deploy event log live. The border colour reflects state: cyan while running, green on success, red on failure. The modal eats every key while the operation is in flight (so a stray `j` can't drive the underlying view); `y` yanks the modal's text to the clipboard at any time. Once finished, `Esc` / `Enter` dismisses.
+Reconcile-one, reconcile-all, and prune show a centered modal that streams the deploy event log. The modal takes every key while the operation runs. `y` copies the text of the modal to the clipboard at any time. After the operation finishes, `Esc` or `Enter` closes the modal.
 
-`reconcile-all` (`A` from Dashboard) gets a richer status table at the top of the modal: one row per service, colour-coded by current state (waiting → pulling → healthcheck → swapping → done / failed), so when the wave-parallel deploy is mid-flight you can see all six services' progress at a glance instead of hunting through interleaved log lines.
+`reconcile-all` (`A` from Dashboard) adds a status table at the top of the modal, with one row for each service. The states are waiting, pulling, pulled, healthcheck, swapping, then synced (no-op), done, or failed.
 
 ## Filter conventions
 
-Every list/table pane has a consistent filter:
+Dashboard, Hosts, HostDetail, Services, ServiceDetail, and Secrets have the same filter:
 
-- `/` enters input mode; type freeform, `Backspace` deletes, `Enter` applies, `Esc` cancels (drops back to whatever filter was already active)
-- Active filter is shown in cyan in the footer (`filter: foo`); editable filter buffer is yellow
-- `Esc` with no input mode and an active filter clears it
+- `/` starts input mode. `Backspace` removes a character, `Enter` applies, and `Esc` cancels.
+- Outside input mode, `Esc` clears an active filter.
+- The filter is a case-insensitive substring match. An empty filter shows everything.
 
-Filter is case-insensitive substring across multiple fields per pane (host + service + container name + state + version + networks for the dashboard; analogous sets elsewhere). Empty filter shows everything.
+| pane | fields |
+|---|---|
+| Dashboard | host, service, container name, state, version, networks |
+| Hosts | `user@address` |
+| HostDetail | container name, service, state, status text |
+| Services | service name |
+| ServiceDetail | host, container name, state |
+| Secrets | key |
 
 ## Help overlay (`?`)
 
-Toggles a centred per-view modal listing every key binding active in the current view. Press `?` again or `Esc` to close. The contents are scoped; Dashboard's overlay shows only Dashboard keys, Resources' shows only Resources keys, etc., so you don't have to scan irrelevant bindings.
-
-The overlay is available in every view including inside the embedded shell (which otherwise forwards every key to the PTY).
+`?` shows or hides a modal that lists the global keys and the keys of the current view. `?` or `Esc` closes it. The overlay is available in every view, also in the embedded shell.
 
 ## CLI launch flags
 
@@ -260,45 +270,22 @@ yoink tui --mode hosts          # start on a specific top-level pane
 yoink tui --mouse               # enable mouse capture (scroll wheel + selection)
 ```
 
-`--mode` accepts `dashboard` / `hosts` / `services` / `logs` / `resources` / `secrets` / `audit`. `--mouse` is opt-in because mouse capture disables your terminal's native text-selection; if you don't actively use mouse scroll inside the TUI, leave it off.
+| Flag or variable | Effect |
+|---|---|
+| `--mode` | `dashboard` / `hosts` / `services` / `logs` / `resources` / `secrets` / `audit`. |
+| `--mouse` | The scroll wheel moves the selection in Hosts, HostDetail, Services, and ServiceDetail, and scrolls the logs views. Off by default, because mouse capture disables the native text selection of your terminal. |
+| `YOINK_NO_HL` | When set, the TUI does not look for `hl` and the logs views use raw output. |
 
-`YOINK_NO_HL=1` in the environment skips the `hl` auto-detection (the logs pane will use raw output even if `hl` is on PATH). Useful when troubleshooting `hl` itself.
+The TUI writes its own log to `$XDG_STATE_HOME/yoink/tui.log` (default `~/.local/state/yoink/tui.log`).
 
 ## Pretty logs
 
-Structured log lines (JSON, logfmt, etc.) are hard to scan as raw text. The TUI's logs pane auto-detects [`hl`](https://github.com/pamburus/hl) (`brew install pamburus/tap/hl`) on the operator's `PATH` and transparently pipes every container's log stream through it before rendering; JSON keys are colored, timestamps are dim, levels are highlighted, and stack traces stay readable. Falls back to raw output when `hl` isn't installed; no config knob to toggle.
+When [`hl`](https://github.com/pamburus/hl) (`brew install pamburus/tap/hl`) is on your `PATH`, the logs views pipe the stream of every container through it. `hl` colors JSON keys, dims timestamps, highlights levels, and keeps stack traces readable. When `hl` is not installed, the views use raw output. No config key controls this behavior.
 
-The `yoink logs <svc> -f` CLI doesn't auto-pipe (the operator decides their own shell pipeline), but `yoink logs api -f | hl` works the same way.
-
-## Keybinding cheat sheet
-
-A consistent set of letters has the same meaning everywhere they appear:
-
-| key | meaning |
-|---|---|
-| `j` `k` / `↑` `↓` | navigate up / down |
-| `enter` | drill in (logs from a list, modal-confirm from a dialog) |
-| `esc` | back / dismiss / clear filter |
-| `/` | begin filter input |
-| `r` | refresh the current pane |
-| `!` | shell into selection |
-| `B` | debug sidecar |
-| `i` | inspect (container detail) |
-| `K` | kill (SIGKILL with confirmation) |
-| `S` / `X` / `R` | start · stop · restart container |
-| `U` | reconcile current service |
-| `A` | reconcile all services |
-| `P` | prune (containers from Dashboard; resources from Resources) |
-| `H` | history (only on ServiceDetail) |
-| `p` | docker top (only on ContainerDetail) |
-| `y` | yank visible buffer to clipboard (logs / progress modals) |
-| `?` | help overlay scoped to the current view |
-| `q` / `Ctrl-C` | quit |
-
-Letters are case-sensitive; capital letters generally mean "destructive or expensive" (kill, restart, reconcile-all, prune-all-images, …) and require a `y`/Enter confirmation when state-changing, while lowercase letters are read-only navigation / refreshes.
+`yoink logs <svc> -f` on the CLI does not pipe automatically. `yoink logs api -f | hl` gives the same result.
 
 ## See also
 
-- [CLI reference](/docs/reference/cli) — the same commands the TUI binds to keys, in scriptable form.
-- [Driving yoink from an AI agent](/docs/guide/ai-agents) — the CLI surface the TUI mirrors, suitable for non-interactive driving.
-- [Troubleshooting](/docs/troubleshooting) — when the TUI shows something surprising.
+- [CLI reference](/docs/reference/cli): the same commands that the TUI binds to keys, in a form for scripts.
+- [Driving yoink from an AI agent](/docs/explanation/ai-agents): the CLI surface that the TUI mirrors, for non-interactive use.
+- [Troubleshooting](/docs/how-to/troubleshooting): help for when the TUI shows something that you do not expect.

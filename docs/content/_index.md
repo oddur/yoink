@@ -27,11 +27,11 @@ yoink rollback api        # roll back to the previous version
 ![yoink TUI](https://github.com/user-attachments/assets/bcf956b1-937a-43d7-92f6-0f24a1d0cd98)
 
 {{< cards >}}
-  {{< card link="/docs/start/first-deploy" title="Five-minute first deploy" subtitle="Drop a yoink.yaml next to your Dockerfile, run one command." icon="lightning-bolt" >}}
-  {{< card link="/docs/intro/compared" title="Is this for me?" subtitle="Side-by-side matrix vs Kamal, Coolify, Dokku, Komodo, Kubernetes, plain compose. When yoink is the right answer, when it isn't." icon="adjustments" >}}
-  {{< card link="/docs/guide/deploy-modes" title="Three deploy modes" subtitle="CI-built, local-build push-then-deploy, registry-less standalone." icon="server" >}}
-  {{< card link="/docs/guide/security" title="Secure by default" subtitle="non-root uid, cap_drop=ALL, read-only rootfs, no-new-privileges, init=tini, …" icon="shield-check" >}}
-  {{< card link="/docs/guide/ai-agents" title="Driving yoink from an AI agent" subtitle="CLI + YAML, no GUI. Patterns for Claude Code, Cursor, GitHub Actions." icon="terminal" >}}
+  {{< card link="/docs/tutorials/first-deploy" title="Five-minute first deploy" subtitle="Drop a yoink.yaml next to your Dockerfile, run one command." icon="lightning-bolt" >}}
+  {{< card link="/docs/explanation/compared" title="Is this for me?" subtitle="Side-by-side matrix vs Kamal, Coolify, Dokku, Komodo, Kubernetes, plain compose. When yoink is the right answer, when it isn't." icon="adjustments" >}}
+  {{< card link="/docs/explanation/deploy-modes" title="Three deploy modes" subtitle="CI-built, local-build push-then-deploy, registry-less standalone." icon="server" >}}
+  {{< card link="/docs/explanation/security" title="Secure by default" subtitle="non-root uid, cap_drop=ALL, read-only rootfs, no-new-privileges, init=tini, …" icon="shield-check" >}}
+  {{< card link="/docs/explanation/ai-agents" title="Driving yoink from an AI agent" subtitle="CLI + YAML, no GUI. Patterns for Claude Code, Cursor, GitHub Actions." icon="terminal" >}}
   {{< card link="/docs/how-to" title="How-to walkthroughs" subtitle="Hetzner cx23 quickstart, sealed-secrets workflow, Cloudflare origin certs, staging alongside prod." icon="clipboard-list" >}}
   {{< card link="/docs/reference" title="Reference" subtitle="Every CLI flag, every config field, every TUI keybind." icon="document-text" >}}
 {{< /cards >}}
@@ -61,4 +61,4 @@ Single-host PaaS tools (Kamal, Dokku) are wonderful for "one app, one host" but 
 - **CLI + YAML, no GUI**. Everything is a `yoink` subcommand or a `yoink.yaml` field, no web dashboard, no clicking. Identical experience on your laptop, in CI, and inside an AI coding agent like Claude Code or Cursor.
 - **k9s-style TUI** with deploy history, one-press rollback, drift cells, logs auto-piped through `hl`
 
-Read more in the [intro](/docs/intro), or skip ahead to [first deploy](/docs/start/first-deploy).
+Read more in the [intro](/docs/explanation), or skip ahead to [first deploy](/docs/tutorials/first-deploy).

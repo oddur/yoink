@@ -1,0 +1,96 @@
+---
+title: Install
+description: Install yoink with Homebrew, Cargo, curl, or a pre-built binary. Each method puts the same single binary on your PATH.
+weight: 1
+---
+
+yoink is a single self-contained binary. It has no daemon, no config bootstrap, and no runtime.
+
+## Install yoink
+
+### Install the binary [step]
+
+Use one of the four methods.
+
+<Tabs items={["Homebrew", "Cargo", "curl", "Pre-built binary"]}>
+
+  <Tab>
+
+```sh
+brew install oddur/yoink/yoink
+```
+
+Each release updates the Homebrew tap (`oddur/homebrew-yoink`) automatically.
+
+  </Tab>
+
+  <Tab>
+
+```sh
+cargo install --git https://github.com/oddur/yoink yoink
+```
+
+This command builds the latest `main` from source, not a tagged release. The MSRV is 1.95.
+
+  </Tab>
+
+  <Tab>
+
+```sh
+curl -LsSf https://github.com/oddur/yoink/releases/latest/download/yoink-installer.sh | sh
+```
+
+The cargo-dist installer gets the correct `tar.xz` for your platform and puts the binary in `~/.cargo/bin/`.
+
+  </Tab>
+
+  <Tab>
+
+Download the `tar.xz` for your platform from the [latest release](https://github.com/oddur/yoink/releases/latest):
+
+- `yoink-aarch64-apple-darwin.tar.xz` for macOS Apple Silicon
+- `yoink-x86_64-apple-darwin.tar.xz` for macOS Intel
+- `yoink-x86_64-unknown-linux-gnu.tar.xz` for Linux x86_64
+
+Extract the archive. Then put the binary on `$PATH`.
+
+  </Tab>
+
+</Tabs>
+
+### Make sure that yoink runs [step]
+
+```sh
+yoink --version
+```
+
+The command prints the installed version.
+
+## Prerequisites for actual deploys
+
+yoink does not install Docker. A deploy needs these items:
+
+- **Docker on each host**: Docker runs, and the deploy user is in the `docker` group.
+- **SSH access from your laptop to each host**: yoink uses `ssh://user@host` to reach the docker daemon. No docker socket is open over TCP.
+- **Docker on your laptop**, for local builds only: `yoink build` calls `docker build`.
+
+[Tailscale](https://tailscale.com) fits the SSH transport. See [Networking](/docs/explanation/networking).
+
+## Upgrading
+
+Run the command for your install method:
+
+```sh
+brew upgrade oddur/yoink/yoink              # Homebrew
+cargo install --git https://github.com/oddur/yoink yoink --force   # cargo
+curl -LsSf https://github.com/oddur/yoink/releases/latest/download/yoink-installer.sh | sh   # installer script
+```
+
+The [GitHub releases page](https://github.com/oddur/yoink/releases) has the release notes for each version. yoink obeys SemVer. A minor version can add new fields, but it does not break existing `yoink.yaml` configs.
+
+## See also
+
+- [First deploy](/docs/tutorials/first-deploy): the tutorial from a new host to a running app with two commands.
+- [Hetzner cx23 quickstart with HTTPS](/docs/tutorials/hetzner-quickstart): a tutorial from an empty cloud account to live HTTPS.
+- [Networking](/docs/explanation/networking): how yoink uses SSH and where Tailscale fits.
+- [CLI reference](/docs/reference/cli): each subcommand and flag.

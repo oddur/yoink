@@ -1,158 +1,117 @@
 ---
 title: Notify chat / paging / observability on deploy
-description: Fire HTTP webhooks on `RunStarted` / `RunFinished` to ntfy, Slack, Grafana, or any other receiver. Templated bodies, `${secret:NAME}` for auth, audited via `WebhookFired`.
+description: Send HTTP webhooks with templated bodies and sealed credentials to ntfy, Slack, Grafana, or a different receiver when a run starts or finishes.
 ---
 
-A deploy that succeeds quietly is fine until the room wants to know it shipped. The `webhooks:` block declares outbound HTTP calls that fire on the run's lifecycle events — `run_started`, `run_succeeded`, `run_failed` — with templated url, headers, and body, and `${secret:NAME}` placeholders resolved against the sealed bundle so bearer tokens never sit in the config plaintext.
+The `webhooks:` block declares outbound HTTP calls. yoink sends them on the lifecycle events of a run: `run_started`, `run_succeeded`, and `run_failed`. The url, the headers, and the body are templates. yoink resolves `${secret:NAME}` placeholders from the sealed bundle, so tokens are never plaintext in the config.
 
-Webhooks are operator-side and best-effort: the call goes out from the box running `yoink up`, a failure is recorded as a `WebhookFired { ok: false }` audit event, and the deploy never aborts on a webhook error.
+The call goes out from the computer that runs `yoink up`. A webhook error never aborts the deploy. yoink records the failure as a `WebhookFired { ok: false }` audit event.
 
-## Triggers
-
-| trigger | fired after | template `event` | `error` populated |
-|---|---|---|---|
-| `run_started` | the `RunStarted` audit line lands | `"run_started"` | no |
-| `run_succeeded` | `RunFinished { ok: true }` | `"run_succeeded"` | no |
-| `run_failed` | `RunFinished { ok: false }` | `"run_failed"` | yes — operator-facing error message |
-
-Subscribe each webhook to a subset; `on:` must list at least one trigger.
-
-## Template context
-
-Every templated field renders through minijinja with strict undefined-variable behavior — a typo in `{{ servicse }}` fails the render and lands as `WebhookFired { ok: false }` instead of silently sending an empty string.
-
-| variable | type | notes |
-|---|---|---|
-| `event` | string | `"run_started"`, `"run_succeeded"`, `"run_failed"`. |
-| `ok` | bool | `true` for `run_started` / `run_succeeded`, `false` for `run_failed`. |
-| `command` | string | `up`, `rollback`, etc. |
-| `services` | array&lt;string&gt; | Selected services. Empty for fleet-wide commands. |
-| `deploy_id` | string | `UUIDv7` matching the `deploy_id` in the audit log. |
-| `actor` | string | `$USER@$HOSTNAME` of the operator. |
-| `host` | string | Operator's hostname. |
-| `git_sha` | string \| null | Short SHA of the operator's working tree. |
-| `yoink_version` | string |  |
-| `error` | string \| null | Operator-visible failure message; only set on `run_failed`. |
-| `ts` | string | RFC 3339 timestamp the webhook rendered at. |
+The [Webhooks reference](/docs/reference/webhooks) lists the triggers, the template variables, and the fields.
 
 ## ntfy.sh
 
-Public push notifications, no auth, GET-or-POST to `https://ntfy.sh/<topic>`. Subscribe to the topic in the ntfy app or `ntfy sub <topic>`.
+ntfy.sh sends public push notifications. It needs no authentication.
 
-```yaml
-webhooks:
-  - name: ntfy
-    url: https://ntfy.sh/my-deploys
-    on: [run_started, run_succeeded, run_failed]
-    headers:
-      Title: "yoink {{ event }}"
-      Tags: "{% if ok %}rocket{% else %}warning{% endif %}"
-    body: >
-      {{ command }} {{ services | join(",") }} on {{ host }}
-      ({{ deploy_id }}){% if error %} — {{ error }}{% endif %}
-```
+1. Add this webhook to `yoink.yaml`:
 
-`Tags` rides on ntfy's emoji aliasing — `rocket` renders as a rocket, `warning` as a warning sign, so success and failure render with different glyphs.
+   ```yaml
+   webhooks:
+     - name: ntfy
+       url: https://ntfy.sh/my-deploys
+       on: [run_started, run_succeeded, run_failed]
+       headers:
+         Title: "yoink {{ event }}"
+         Tags: "{% if ok %}rocket{% else %}warning{% endif %}"
+       body: >
+         {{ command }} {{ services | join(",") }} on {{ host }}
+         ({{ deploy_id }}){% if error %} — {{ error }}{% endif %}
+   ```
+
+2. Subscribe to the topic in the ntfy app or with `ntfy sub <topic>`.
+
+The `Tags` header uses the emoji aliases of ntfy, so success shows a rocket and failure shows a warning sign.
 
 ## Slack incoming webhooks
 
-Slack's [incoming webhooks](https://api.slack.com/messaging/webhooks) take a JSON body with a `text` field. The webhook URL itself is the credential — keep it sealed.
+A Slack [incoming webhook](https://api.slack.com/messaging/webhooks) takes a JSON body with a `text` field. The webhook URL is the credential, so seal it.
 
-```yaml
-secrets:
-  provider: age
-  recipients: [age1…]
-  # SLACK_WEBHOOK_PATH = services/T0…/B0…/abc123  (the path under hooks.slack.com)
+1. Put the path of the webhook URL (the part under `hooks.slack.com`) in the sealed bundle as `SLACK_WEBHOOK_PATH`.
+2. Add this webhook to `yoink.yaml`:
 
-webhooks:
-  - name: slack-deploys
-    url: "https://hooks.slack.com/${secret:SLACK_WEBHOOK_PATH}"
-    on: [run_succeeded, run_failed]
-    headers:
-      Content-Type: application/json
-    body: |
-      {
-        "text": "{% if ok %}:white_check_mark:{% else %}:x:{% endif %} *{{ command }}* {{ services | join(', ') }} ({{ deploy_id }}){% if error %} — `{{ error }}`{% endif %}"
-      }
-```
+   ```yaml
+   secrets:
+     provider: age
+     recipients: [age1…]
+     # SLACK_WEBHOOK_PATH = services/T0…/B0…/abc123  (the path under hooks.slack.com)
 
-The full URL is `https://hooks.slack.com/services/T…/B…/…`, but only the path varies between workspaces — splitting at `/services/` keeps the host literal in the config and only the path sealed.
+   webhooks:
+     - name: slack-deploys
+       url: "https://hooks.slack.com/${secret:SLACK_WEBHOOK_PATH}"
+       on: [run_succeeded, run_failed]
+       headers:
+         Content-Type: application/json
+       body: |
+         {
+           "text": "{% if ok %}:white_check_mark:{% else %}:x:{% endif %} *{{ command }}* {{ services | join(', ') }} ({{ deploy_id }}){% if error %} — `{{ error }}`{% endif %}"
+         }
+   ```
+
+The full URL is `https://hooks.slack.com/services/T…/B…/…`. The config keeps the hostname as a literal and seals only the path.
 
 ## Grafana annotations
 
-[Grafana's annotations API](https://grafana.com/docs/grafana/latest/developers/http_api/annotations/) marks a vertical line on every dashboard at the moment of the call. Pin deploy events on your latency / error-rate dashboards so the cause of an inflection is one glance away.
+The [annotations API of Grafana](https://grafana.com/docs/grafana/latest/developers/http_api/annotations/) marks a vertical line on every dashboard at the moment of the call. Then you can see if a deploy caused a change in a graph.
 
-```yaml
-webhooks:
-  - name: grafana-annotation
-    url: https://grafana.example.com/api/annotations
-    on: [run_succeeded]
-    headers:
-      Authorization: "Bearer ${secret:GRAFANA_API_TOKEN}"
-      Content-Type: application/json
-    body: |
-      {
-        "tags": ["deploy", "yoink", "{{ command }}"],
-        "text": "{{ services | join(', ') }} → {{ git_sha }} ({{ deploy_id }})"
-      }
-```
+1. Make sure that `GRAFANA_API_TOKEN` is in the sealed bundle.
+2. Add this webhook to `yoink.yaml`:
 
-Annotations are dashboard-wide unless `dashboardUID:` / `panelId:` are set; see the Grafana API docs.
+   ```yaml
+   webhooks:
+     - name: grafana-annotation
+       url: https://grafana.example.com/api/annotations
+       on: [run_succeeded]
+       headers:
+         Authorization: "Bearer ${secret:GRAFANA_API_TOKEN}"
+         Content-Type: application/json
+       body: |
+         {
+           "tags": ["deploy", "yoink", "{{ command }}"],
+           "text": "{{ services | join(', ') }} → {{ git_sha }} ({{ deploy_id }})"
+         }
+   ```
 
-## Field reference
+An annotation applies to all dashboards unless you set `dashboardUID:` or `panelId:`. The Grafana API docs describe these fields.
 
-| field | type | default | notes |
-|---|---|---|---|
-| `name` | string | required | Identifier shown in `WebhookFired` audit events. Must be unique across the `webhooks:` list. |
-| `url` | string | required | Templated. Must resolve to `http(s)://…` after `${secret:NAME}` substitution. |
-| `on` | list of trigger | required | One or more of `run_started`, `run_succeeded`, `run_failed`. |
-| `method` | `GET` \| `POST` \| `PUT` | `POST` |  |
-| `timeout` | duration | `10s` | Per-request timeout, parsed by `humantime` (`5s`, `2m`, …). |
-| `headers` | map of string | `{}` | Each value is templated. |
-| `body` | string | unset | Templated. Omit for GET-style receivers (e.g. ntfy URL-only triggers). |
+## Verifying without a real deploy
 
-## Secrets in templates
+1. Point one webhook at a local listener.
+2. Run a deploy that triggers the webhook:
 
-`${secret:NAME}` inside `url`, any header value, or `body` is replaced with the decrypted value from the sealed bundle before minijinja runs. Two passes, in this order:
+   ```sh
+   nc -l 9000 &
+   yoink up    # or any subcommand that emits RunStarted/RunFinished
+   ```
 
-1. Literal `${secret:NAME}` → bundle value. Missing key (or no `secrets:` provider configured at all) is an error — no silent empty substitution.
-2. minijinja render with `UndefinedBehavior::Strict`. A typo in a `{{ var }}` fails the render.
+   The listener prints the body and the headers on stdout.
 
-Both kinds of error land as `WebhookFired { ok: false, error: "<reason>" }` in the audit log; the deploy proceeds.
-
-The two-pass order matters: secrets resolve first, so a secret value that happens to contain `{{` won't be re-templated.
+3. Run `yoink audit log --event WebhookFired`. The output shows one event for each call, with its `ok`, `status`, and `error` values.
+4. Stop the listener and run the deploy again. The new event shows `ok: false, error: "transport: …"`.
 
 ## Audit trail
 
-Every fire — success or failure — records a [`WebhookFired`](/docs/reference/audit-event-schema#webhookfired) audit event:
+Each webhook call, success or failure, records a [`WebhookFired`](/docs/reference/audit-event-schema#webhookfired) audit event. To read these events, run one of these commands:
 
 ```sh
 yoink audit log --event WebhookFired --since 1h
 yoink audit run <deploy-id> | grep WebhookFired
 ```
 
-Failure modes captured in `error`:
-
-- `transport: <reqwest message>` — DNS, TCP, TLS.
-- `non-2xx: <code>` — receiver returned a 4xx/5xx.
-- `timed out after <duration>`.
-- `template parse: …` / `template render: …` — minijinja error.
-- `webhook references secret "X" but it is not in the sealed bundle`.
-
-## Verifying without a real deploy
-
-Point one webhook at a local listener and run any deploy that triggers it:
-
-```sh
-nc -l 9000 &
-yoink up    # or any subcommand that emits RunStarted/RunFinished
-```
-
-The body and rendered headers print on stdout, and `yoink audit log --event WebhookFired` shows the corresponding `ok: true, status: 200` line. Stop the listener and re-run to see `ok: false, error: "transport: …"`.
+If a webhook failed, read the `error` field of its event. The [Webhooks reference](/docs/reference/webhooks#error-values) lists the values.
 
 ## See also
 
-- [Configuration: webhooks](/docs/reference/config#webhooks) — full schema.
-- [Audit event schema: `WebhookFired`](/docs/reference/audit-event-schema#webhookfired) — what's logged for each fire.
-- [Read the audit log](/docs/how-to/audit-log) — `yoink audit run <id>` reconstructs every event for one deploy, webhooks included.
-- [Sealed secrets workflow](/docs/how-to/sealed-secrets-workflow) — how `${secret:NAME}` values get into the bundle.
+- [Webhooks reference](/docs/reference/webhooks): the triggers, the template variables, the fields, the secret substitution, and the error values.
+- [Configuration: webhooks](/docs/reference/config#webhooks): the full schema.
+- [Read the audit log](/docs/how-to/audit-log): `yoink audit run <id>` shows every event for one deploy, webhooks included.
+- [Sealed secrets workflow](/docs/how-to/sealed-secrets-workflow): how `${secret:NAME}` values get into the bundle.

@@ -1,0 +1,8 @@
+{
+  "title": "Tutorials",
+  "pages": [
+    "first-deploy",
+    "hetzner-quickstart",
+    "tanstack-stack"
+  ]
+}

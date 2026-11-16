@@ -1,13 +1,15 @@
 ---
 title: Auto-heal unhealthy containers
-description: Restart containers Docker marks unhealthy with a small drop-in sidecar — no yoink subcommand, no template.
+description: Restart the containers that Docker marks unhealthy with a small sidecar, without a yoink subcommand or a template.
 ---
 
-Docker's `HEALTHCHECK` directive is observability-only. `docker ps` shows `(unhealthy)`; nothing acts on it. yoink's default `restart: unless-stopped` policy reincarnates a container that *exits*, but a process that deadlocks while staying alive sits unhealthy until an operator notices. The fix is a label-driven sidecar that watches the docker socket and restarts unhealthy containers — no yoink-managed code path, just a service fragment you drop in.
+The Docker `HEALTHCHECK` directive only reports: `docker ps` shows `(unhealthy)`, and nothing acts on it. The default yoink policy `restart: unless-stopped` restarts only a container that *exits*. A deadlocked process that stays alive stays unhealthy. A sidecar that monitors the docker socket restarts the unhealthy containers that have a label. The sidecar is a service fragment that you add, not code that yoink manages.
 
-## Drop-in service fragment [step]
+## Deploy the sidecar
 
-Save as `services/autoheal.yaml`:
+### Add the service fragment [step]
+
+Save this fragment as `services/autoheal.yaml`:
 
 ```yaml
 services:
@@ -41,11 +43,11 @@ services:
           /tmp: ""
 ```
 
-`hosts:` is omitted, so the sidecar lands on every yoink-managed host.
+The fragment has no `hosts:`, so yoink deploys the sidecar on every host.
 
-## Opt services in [step]
+### Add the label to the services [step]
 
-Auto-heal only acts on containers labelled `autoheal: "true"`. Add the label to any service you want healed:
+Add the label `autoheal: "true"` to each service that auto-heal must restart:
 
 ```yaml
 services:
@@ -55,13 +57,13 @@ services:
       autoheal: "true"
 ```
 
-Services without the label are ignored, including `autoheal` itself.
+Auto-heal ignores a service without the label. The `autoheal` service is one of them.
 
-## Make targets actually heal-able [step]
+### Add a `HEALTHCHECK` to the images [step]
 
-Auto-heal reads `State.Health.Status`. That field is `null` unless the container declares a `HEALTHCHECK`. Two sources today:
+Auto-heal reads `State.Health.Status`. That field is `null` unless the container has a `HEALTHCHECK`. Auto-heal ignores a container with no `HEALTHCHECK`, and shows no message.
 
-**A. Image-side (Dockerfile).** Bake one in:
+If the image of a service declares no `HEALTHCHECK`, add one to its Dockerfile. yoink has no per-service config key that injects one. yoink sets a healthcheck only on the bundled `yoink-proxy` container.
 
 ```dockerfile
 # `apk add --no-cache curl` first if your base image (e.g. nginx:alpine)
@@ -71,31 +73,28 @@ HEALTHCHECK --interval=10s --timeout=2s --start-period=30s --retries=3 \
   CMD curl -fsS -o /dev/null http://localhost:8080/health || exit 1
 ```
 
-The `--start-period=30s` covers cold-start latency before the first probe counts against `--retries`. Match the autoheal sidecar's `AUTOHEAL_START_PERIOD: "30"` env so the sidecar also waits before acting.
+`--start-period=30s` gives time for a cold start before the first probe counts against `--retries`. Set `AUTOHEAL_START_PERIOD` on the sidecar to the same value. Then the sidecar also waits before it acts.
 
-**B. The bundled `yoink-proxy`** ships a `HEALTHCHECK` already, so the proxy is healed automatically once the sidecar is deployed.
+### Make sure that auto-heal restarts a container [step]
 
-For services whose images don't declare one, add it to the Dockerfile. yoink doesn't yet expose a per-service config knob to inject a `HEALTHCHECK` from the fragment; without one of A or B autoheal sees no signal and the container is silently ignored — the correct fail-quiet behaviour for an indeterminate state.
-
-## Verify [step]
-
-Deploy and confirm the sidecar lands:
+Deploy. Make sure that the sidecar runs on each host:
 
 ```sh
 yoink up
 yoink status        # autoheal running on each host
 ```
 
-Manufacture an unhealthy state on a labelled container — freezing PID 1 is the cleanest because the process stays up but stops responding to its `HEALTHCHECK`:
+Freeze PID 1 of a labelled container. The process stays alive but does not answer its `HEALTHCHECK`.
 
 ```sh
 ssh $HOST -- docker exec api-XXXX kill -SIGSTOP 1
 ```
 
-The container's status flips to `(unhealthy)` after `interval × retries`; autoheal restarts it within `AUTOHEAL_INTERVAL` seconds. `yoink history api` shows the restart.
+The container status changes to `(unhealthy)` after `interval × retries`. Auto-heal restarts the container in `AUTOHEAL_INTERVAL` seconds or less. Then `docker ps` on the host shows a new uptime for the container.
 
 ## See also
 
-- [Defense in depth](./defense-in-depth.md) — yoink's hardened defaults the fragment leans on (cap-drop, read-only rootfs, tmpfs).
-- [Templates](./using-templates.md) — for accessories yoink *does* bundle (postgres, redis, restic, …).
-- [Audit log](./audit-log.mdx) — restart events surface here once the heal fires.
+- [Security](/docs/explanation/security): the hardened yoink defaults that the fragment uses (cap-drop, read-only rootfs, tmpfs).
+- [Templates](/docs/how-to/using-templates): the accessories that yoink bundles (postgres, redis, restic, and more).
+- [Audit log coverage](/docs/reference/audit-log-coverage): the operations that yoink records. A restart by the sidecar is not one of them.
+- [Config reference](/docs/reference/config#service): the fields of a service, which include `labels:`.

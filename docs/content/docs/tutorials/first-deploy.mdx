@@ -1,0 +1,119 @@
+---
+title: First deploy
+description: Go from a new host to a running container in five minutes with yoink init and yoink up.
+weight: 2
+---
+
+You take an app from your laptop to a new host in 5 minutes, with two commands and one YAML file. You do not use CI, a registry, or Tailscale.
+
+## Prerequisites
+
+- yoink is [installed](/docs/how-to/install) on your laptop (`brew install oddur/yoink/yoink`).
+- Docker is on your laptop. `yoink build` calls `docker build`.
+- You have a host with Docker and key-based SSH login. `ssh root@<host>` must open a shell. A new host from Hetzner, Linode, or DigitalOcean with your SSH public key in `~/.ssh/authorized_keys` is sufficient.
+- You have a project directory with a `Dockerfile`.
+
+yoink uses the SSH client of your operating system. Your `~/.ssh/config`, `ssh-agent`, hardware keys, and jump hosts continue to work.
+
+The commands on this page use the host address `1.2.3.4` and the service name `my-tool`. Replace `1.2.3.4` with the address of your host. The example `Dockerfile` has `EXPOSE 3000` and `USER hono`.
+
+## Walkthrough
+
+### Generate `yoink.yaml` [step]
+
+Go to your project directory. Then run `yoink init` with the SSH address of your host:
+
+```sh
+yoink init root@1.2.3.4
+```
+
+`yoink init` reads your `Dockerfile`, your `git remote`, and (optionally) your `~/.ssh/config` to fill each field. The output looks like this:
+
+```text
+✓ wrote yoink.yaml (20 lines, validates clean)
+
+inferred:
+  service   my-tool                         (cwd)
+  image     ghcr.io/you/my-tool             (git remote)
+  host      root@1.2.3.4                    (positional arg)
+  port      3000 with /health healthcheck   (Dockerfile EXPOSE)
+  user      hono                            (Dockerfile USER)
+
+────────────────────────────────────────────────────────────────────────
+  ⚠  BACK UP THIS KEY  —  do this BEFORE you seal any secrets
+────────────────────────────────────────────────────────────────────────
+  identity: /Users/you/.config/yoink/keys/age1abc….key
+  public:   age1abc…
+  …
+```
+
+The summary shows each inferred value and its source. If a value is wrong, edit that line in `yoink.yaml`.
+
+### Back up the age key [step]
+
+`yoink init` also generated an age identity for sealed secrets. The backup notice in the output shows the path of the key file.
+
+Paste the contents of that key file into a password manager now. Only this key can decrypt your sealed values, and yoink does not keep a copy.
+
+### Change the image to a bare name [step]
+
+Open the generated `yoink.yaml`. Make three changes to the service:
+
+1. Change `image:` to a bare name that has no registry prefix.
+2. Remove the `tag:` line.
+3. Add a `build:` block.
+
+```yaml
+services:
+  - name: my-tool
+    image: my-tool                  # bare name = build locally, no registry
+    build:
+      context: .                    # build the Dockerfile next to this yoink.yaml
+    run:
+      port: 3000
+      healthcheck_path: /health     # remove if your app has no healthcheck
+      options:
+        user: "hono"
+```
+
+The `build:` block selects **standalone mode**: yoink builds the image locally and sends it directly to the host. The bare name keeps the registry out of the image reference.
+
+Without a `tag:` line, `yoink up --build` uses the content digest of the built image as the tag. Thus each changed build gets a new tag, and yoink deploys it.
+
+### Run one command [step]
+
+```sh
+yoink up --build
+```
+
+yoink builds the image on your laptop and sends it to the host over SSH. Then yoink starts the container in a rolling deploy. The healthcheck gates the swap.
+
+For each service, yoink selects between local-ship and registry-pull. [Deploy modes](/docs/explanation/deploy-modes) explains this selection.
+
+### Inspect the running service [step]
+
+Run these commands one at a time:
+
+```sh
+yoink status                              # snapshot table
+yoink tui                                 # k9s-style dashboard with logs / shell-into / drift
+yoink logs my-tool -f | hl                # live tail, optional `hl` highlighting
+```
+
+### Iterate [step]
+
+Edit a line of code or the `Dockerfile`. Then run the same command again:
+
+```sh
+yoink up --build
+```
+
+yoink builds the image again and sends only the changed layers. The old container stops only after the new container is healthy. For a small image, this deploy takes approximately 5 to 15 seconds.
+
+## See also
+
+- [Add HTTPS to a service](/docs/how-to/add-https): give this service a domain and a Let's Encrypt cert with two more lines of config.
+- [Connect to a host over SSH](/docs/how-to/ssh-access): a host with only a root password, a non-default key, a deploy key in the repo, or Tailscale.
+- [Hetzner quickstart](/docs/tutorials/hetzner-quickstart): the next tutorial, with host provisioning, HTTPS, and a sealed SSH key.
+- [Deploy modes](/docs/explanation/deploy-modes): the local-build path of this tutorial, and the paths that deploy from CI.
+- [CLI](/docs/reference/cli) and [Configuration](/docs/reference/config): each CLI flag and config field. `--no-secrets` for `yoink init` is for when you bring your own key or use `provider: command`.

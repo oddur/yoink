@@ -1,0 +1,100 @@
+---
+title: Add HTTPS to a service
+description: Give a deployed service a public domain and a Let's Encrypt cert through the bundled Caddy proxy.
+---
+
+Two lines of config make yoink terminate TLS and route a domain to your container. The steps use the service `my-app` on port `3000` and the domain `app.example.com`.
+
+## Prerequisites
+
+- A service that deploys with `yoink up`. See [First deploy](/docs/tutorials/first-deploy).
+- A domain, and access to its DNS records.
+- A real email address that you read. Let's Encrypt sends expiry warnings to this address.
+- Port `:80` on the host, open for ACME.
+
+## Add the domain
+
+### Point DNS at the host [step]
+
+Create an A record for the domain that points at the public IP of the host. Then make sure that the record resolves:
+
+```sh
+dig +short A app.example.com
+```
+
+The output must be the public IP of the host.
+
+<Callout type="warn">
+
+Let's Encrypt validates over HTTP-01. A record that does not point at the host results in self-signed certs and a permanent browser warning.
+
+</Callout>
+
+### Add the two lines [step]
+
+Add `proxy.email:` at the top level of `yoink.yaml`. Add `domain:` to the service:
+
+```yaml
+# yoink.yaml — top-level
+proxy:
+  email: you@example.com           # Let's Encrypt registration / expiry warnings
+
+services:
+  - name: my-app
+    # …everything else stays the same…
+    domain: app.example.com        # ← the new line
+```
+
+A complete config for a locally built service (`my-tool` on port `8080`) looks like this:
+
+```yaml
+hosts:
+  - { address: 1.2.3.4, user: root }
+
+proxy:
+  email: ops@example.com         # for Let's Encrypt registration
+
+services:
+  - name: my-tool
+    image: my-tool
+    tag: dev
+    build: { context: . }
+    domain: my-tool.example.com  # ← that
+    run:
+      port: 8080
+      healthcheck_path: /health
+```
+
+### Make sure that the config is ready [step]
+
+```sh
+yoink doctor
+```
+
+`yoink doctor` reports if the host is not reachable or the domain does not resolve. It also shows a warning if `proxy.email:` is the docs placeholder.
+
+### Deploy again [step]
+
+Run your usual deploy command. For a locally built service, the command is:
+
+```sh
+yoink up --build
+```
+
+### Open the domain [step]
+
+Open `https://app.example.com` in a browser. The app serves with a Let's Encrypt cert.
+
+## What yoink deploys
+
+When a service has `domain:`, `yoink up` adds a `yoink-proxy` service that runs `caddy:2` on the docker network of the app. yoink makes the Caddy config from your `yoink.yaml`.
+
+Caddy requests a Let's Encrypt cert (HTTP-01 against `app.example.com`) and routes incoming traffic to `my-app:3000`. The app has no `publish:`. Only the proxy binds the host ports `:80` and `:443`.
+
+## See also
+
+- [Reverse proxy](/docs/explanation/proxy): how the bundled Caddy proxy works, and its full config.
+- [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs): HTTPS behind Cloudflare, without an open `:80` for ACME.
+- [Multi-host Let's Encrypt with Redis](/docs/how-to/multi-host-redis-storage): shared ACME storage for more than one host.
+- [Hetzner quickstart](/docs/tutorials/hetzner-quickstart): a tutorial that gets a Let's Encrypt cert without a domain.
+- [Configuration](/docs/reference/config): the `proxy:` and `domain:` fields.

@@ -1,0 +1,124 @@
+---
+title: Reverse proxy
+description: "How the bundled Caddy proxy puts a service on HTTPS from one field, and why yoink owns the routing change."
+weight: 4
+---
+
+When a service sets `domain: api.example.com`, yoink starts a managed Caddy in front of it. The proxy routes the hostname, gets a Let's Encrypt cert, and renews the cert. It has the same drift detection, logs, and TUI surface as any yoink service. You do not write the Caddy config.
+
+## The smallest config
+
+```yaml
+# yoink.yaml
+hosts:
+  - { address: 1.2.3.4, user: root }
+
+proxy:
+  email: ops@example.com           # for Let's Encrypt registration
+
+services:
+  - name: api
+    image: ghcr.io/me/api
+    tag: v1
+    domain: api.example.com        # ← the whole proxy opt-in
+    run:
+      port: 8080
+      healthcheck_path: /health
+```
+
+When the DNS record of `api.example.com` points at `1.2.3.4`, `yoink up` puts the service on `https://api.example.com` with a valid cert.
+
+All fields are in the [proxy config reference](/docs/reference/proxy).
+
+## How it works
+
+When any service sets `domain:`, yoink adds a `yoink-proxy` service that runs `caddy:2`. yoink generates the Caddy config from your `yoink.yaml`. yoink pushes the config through the admin API of Caddy at fixed points in the rolling deploy. Thus yoink owns the routing change, and no separate reconciler competes with it for Docker labels.
+
+yoink manages two Docker networks for you:
+
+- **`yoink-ingress`**: the proxy and every service with `domain:` join this network. The proxy reaches your containers by name through it.
+- **`yoink-proxy-admin`**: the admin API of the proxy listens here. yoink publishes the admin port only on the loopback of the host, never on a public interface. yoink reaches it through an SSH tunnel for the duration of one `/load` call.
+
+Upstream entries name containers, not IPs. As a result, a container restart with a new IP does not break routing, because Docker DNS resolves the name. The active health checks of Caddy take dead backends out of rotation.
+
+## Rolling deploys with zero traffic loss
+
+For each service, a deploy has these stages:
+
+1. The new replicas start.
+2. yoink waits for the healthcheck of each new replica.
+3. yoink pushes the updated Caddy config (`/load`). The upstream pool of the service now contains only the new replicas.
+4. Caddy reloads in-process. Open connections to the old replicas continue until they close, and new requests go to the new replicas.
+5. The old replicas stop.
+
+yoink drives every stage, and there is no second reconciler. The config push occurs only when the set of containers changes, and yoink is in the loop at that time.
+
+If a healthcheck or the config push fails, yoink removes the new replicas. The old replicas stay in the pool and keep running.
+
+A service with `publish:` is the exception. Its old container stops before the new one starts, because only one container can bind a host port.
+
+## What yoink does not model
+
+The typed proxy fields cover routing, TLS, compression, and HSTS. yoink models deploy primitives, and Caddy models traffic handling.
+
+Auth, rate limiting, headers, CORS, redirects, mTLS, geo-blocking, WAF, and L4/TCP routing are not in the schema of yoink. They live in `caddy_extra_json:`, in the [JSON config syntax](https://caddyserver.com/docs/json/apps/http/servers/routes/handle/) of the Caddy docs. This escape hatch is the advertised path for these features. The other paths are `caddy_extra_caddyfile:` and a custom proxy image.
+
+## Snippets cookbook
+
+The ready-to-paste snippets for `caddy_extra_json:` and `caddy_extra_caddyfile:` are on their own page: [Caddy snippets cookbook](/docs/how-to/caddy-snippets). Each snippet has the Caddyfile form and the JSON form. The page covers forward auth, basic auth, IP allowlist, custom headers, body-size limit, redirects, maintenance page, and plugins.
+
+## Three layers of handlers
+
+A request passes through three layers in a fixed order:
+
+1. The `proxy.global_handlers:` chain runs for every request, before any service route matches.
+2. The handlers of your `caddy_extra_json:` snippet run on the matched route.
+3. The handlers that yoink manages run: compression, the HSTS header, and `reverse_proxy` to the upstream.
+
+Thus your auth gates, rate limits, and redirects see the request before yoink compresses or forwards it. The exact order is in [Per-route handler order](/docs/reference/proxy#per-route-handler-order).
+
+`proxy.global_handlers:` fits fleet-wide concerns, and `caddy_extra_json:` fits per-app concerns. Examples of fleet-wide concerns:
+
+- **CrowdSec bouncer**: IP-based denial that applies everywhere, not only to the services that opt in. A service that you add tomorrow has protection with no change to its config.
+- **Coraza / OWASP CRS**: signature-based payload inspection on every request.
+- **Global rate limiting**: `caddy-ratelimit` zones that apply across hostnames, for example one `per_ip` budget for the whole proxy.
+
+The entries run as a pipeline, so their order matters. Cheap filters (the CrowdSec hashmap lookup) work best before expensive ones (the Coraza regex evaluation). Then the proxy spends no CPU on traffic that it rejects anyway.
+
+## Global Caddy config
+
+yoink does not model the global config values of Caddy as typed fields. Examples are the server-level `trusted_proxies` and `client_ip_headers`, and the top-level `storage` for shared ACME state across hosts. Top-level app blocks for plugins such as `cache-handler` and `coraza` are also in this group.
+
+`proxy.config_extra:` takes raw JSON for these values, and yoink deep-merges it into the generated config. Your value wins on every leaf conflict. Two paths are the exception: yoink rejects a write to the routes or to the TLS connection policies. A write there removes routes or disables mTLS.
+
+`config_extra:` injects raw config. `global_handlers:` is the typed slot for handlers. The merge rules are in the [`config_extra:` block](/docs/reference/proxy#proxyconfig_extra-block-global-caddy-config-escape-hatch) of the reference.
+
+## Plugins without a registry
+
+For rate limiting, redis-storage, the L4 module, or a non-bundled DNS provider, `proxy.xcaddy:` takes a list of plugins. yoink then builds Caddy on each host that the proxy runs on, and tags the image locally. The proxy service runs from that tag, so no registry is necessary.
+
+The tag is a content hash of the build inputs. Thus later `yoink up` runs skip the build until the build inputs change. The costs are a slow first `up` on each fresh host and a need for egress to `proxy.golang.org`. The [`xcaddy:` block](/docs/reference/proxy#proxyxcaddy-block-caddy-plugins-without-a-registry) of the reference lists the full build behavior.
+
+## One cert for every route
+
+When `proxy.tls:` is set, all routed services use the same TLS config by default. This is the Cloudflare pattern: every route is an origin behind the edge of Cloudflare. mTLS proves that the request came from Cloudflare.
+
+No cert state lives on the host filesystem. All of it lives in `secrets.age` or comes through `provider: command`, encrypted at rest.
+
+## The cert volume
+
+The `yoink_caddy_data` named volume holds your ACME state, issued certs, and OCSP staples. Let's Encrypt has strict rate limits (5 duplicate-cert issuances per week). With a fresh volume, Caddy must get every cert again, so a casual removal of the volume is expensive.
+
+`yoink prune` does not touch the volume. A manual purge is your decision and your responsibility.
+
+## See also
+
+- [Proxy config reference](/docs/reference/proxy): every per-service field and every `proxy:` field, with the merge rules.
+- [Caddy snippets cookbook](/docs/how-to/caddy-snippets): ready-to-paste `caddy_extra_json:` and `caddy_extra_caddyfile:` snippets.
+- [Caddy plugins (xcaddy, no registry)](/docs/how-to/caddy-plugins): the task page for a custom Caddy build on each host.
+- [Cloudflare Origin Certificates](/docs/how-to/cloudflare-origin-certs): a 15-year cert from Cloudflare in place of Let's Encrypt, sealed in the repo. Origin-pull mTLS locks your origin to the edge of Cloudflare.
+- [gRPC hosting](/docs/how-to/grpc-hosting): `upstream_h2c: true` for native gRPC backends (Tonic, grpc-go, grpc-java).
+- [Multi-host Let's Encrypt with Redis storage](/docs/how-to/multi-host-redis-storage): shared ACME state across hosts, so that they do not all hit the Let's Encrypt rate limits.
+- [Networking](/docs/explanation/networking): the Docker networks that yoink manages.
+- [Caddy JSON config reference](https://caddyserver.com/docs/json/): the syntax for `caddy_extra_json:` snippets.
+- [Caddyfile docs](https://caddyserver.com/docs/caddyfile): the syntax for `caddy_extra_caddyfile:`.

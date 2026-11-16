@@ -1,38 +1,23 @@
 ---
 title: Pre-merge dry-run on every PR
-description: Post a sticky GitHub PR comment showing exactly what yoink up would change before the merge.
+description: Post a sticky GitHub PR comment that shows what yoink up changes before the merge.
 weight: 7
 ---
 
-`yoink up --dry-run --format=markdown` connects to each host, computes the diff between the running spec and what would deploy, and emits a markdown summary. Pipe that into a sticky GitHub PR comment and reviewers see exactly what the deploy will change before merging.
+`yoink up --dry-run --format=markdown` connects to each host and compares the running containers with the spec that a deploy applies. It changes nothing and prints a Markdown summary. In a sticky GitHub PR comment, the summary shows reviewers what the deploy changes before the merge.
 
-## What the comment looks like
+## Prerequisites
 
-> ### yoink dry-run
->
-> **Plan:** 0 to create · 2 to update · 4 unchanged · 1 orphan
->
-> #### `prod-host-1`
->
-> | | service | spec | image |
-> |---|---|---|---|
-> | ⚪ | `otel` | `d3eb14f` (unchanged) | _(unchanged)_ |
-> | ⚪ | `redis` | `dcef8ac` (unchanged) | _(unchanged)_ |
-> | 🟡 | `api` | `0ba920d` → `4d8e123` | `ghcr.io/you/api:abc1234` → `ghcr.io/you/api:def5678` |
-> | 🟡 | `web` | `67a2fa0` → `a8b3c91` | `ghcr.io/you/web:abc1234` → `ghcr.io/you/web:def5678` |
-> | ⚪ | `caddy` | `8edf75f` (unchanged) | _(unchanged)_ |
->
-> <details><summary>1 orphan container</summary>
->
-> - `prod-host-1@api-old-version` (service: `api`)
->
-> </details>
+The PR runner has the same auth path as your deploy runner, because the dry-run reads from the hosts:
 
-Reviewers can see at a glance: which services this PR rolls, which stay untouched, and whether the `image:` change matches their expectation.
+- Tailnet membership.
+- The secret resolution that your `provider:` config needs. For `age`, that is `YOINK_AGE_KEY`. For `command`, that is the CLI and the token of the configured manager.
 
-## The workflow
+## Add the workflow
 
-`.github/workflows/yoink-pr-diff.yml`:
+### Create the workflow file [step]
+
+Create `.github/workflows/yoink-pr-diff.yml`:
 
 ```yaml
 name: "Yoink: PR dry-run"
@@ -92,18 +77,47 @@ jobs:
           path: diff.md
 ```
 
-## Why this is good
+### Match the `--tag` overrides [step]
 
-- **Fast feedback.** Reviewers see the deploy plan in the PR thread itself, no need to mentally simulate.
-- **Catches the silent-redeploy class of bugs.** A v0.5.0-style change that flips a default and reroles every service is impossible to miss when the dry-run says "6 to update."
-- **Composes with the deploy.** The same `yoink up --dry-run` powers the local `yoink diff <service>` command; operators can rerun the same check at their terminal before merging.
+Set the `--tag` overrides to the same overrides that your deploy workflow passes.
 
-## Limitations
+If staging and prod have different configs, run one dry-run for each config.
 
-- Dry-run reads from the host (it computes the diff against running containers), so the PR runner needs the same auth path your deploy runner does: tailnet membership + whatever secret-resolution your `provider:` setup needs (`YOINK_AGE_KEY` for age, the configured manager's CLI + token for `command`).
-- The `--tag` overrides have to match what your deploy workflow will pass. If staging/prod diverge, run two dry-runs against the right host set.
+## Read the comment
+
+The comment looks like this:
+
+> ### yoink dry-run
+>
+> **Plan:** 0 to create · 2 to update · 4 unchanged · 1 orphan
+>
+> #### `prod-host-1`
+>
+> | | service | spec | image |
+> |---|---|---|---|
+> | ⚪ | `otel` | `d3eb14f` (unchanged) | _(unchanged)_ |
+> | ⚪ | `redis` | `dcef8ac` (unchanged) | _(unchanged)_ |
+> | 🟡 | `api` | `0ba920d` → `4d8e123` | `ghcr.io/you/api:abc1234` → `ghcr.io/you/api:def5678` |
+> | 🟡 | `web` | `67a2fa0` → `a8b3c91` | `ghcr.io/you/web:abc1234` → `ghcr.io/you/web:def5678` |
+> | ⚪ | `caddy` | `8edf75f` (unchanged) | _(unchanged)_ |
+>
+> <details><summary>1 orphan container</summary>
+>
+> - `prod-host-1@api-old-version` (service: `api`)
+>
+> </details>
+
+The comment shows which services this PR rolls and which services stay the same. Make sure that the image change is the change that you expect.
+
+The plan line also shows a silent redeploy. For example, a yoink upgrade that changes a default and rolls every service again shows as "6 to update."
+
+## Run the same dry-run locally
+
+Before you merge, run `yoink up --dry-run` in your terminal with the same `--tag` overrides. For one service, `yoink diff <service>` compares the tag of each running container with the target tag.
 
 ## See also
 
-- [AGE secrets in GitHub Actions](/docs/how-to/age-in-github-actions) — wiring `YOINK_AGE_KEY` into the runner so dry-run can decrypt.
-- [Driving yoink from an AI agent](/docs/guide/ai-agents) — how the dry-run output reads to a reviewer (human or otherwise).
+- [AGE secrets in GitHub Actions](/docs/how-to/age-in-github-actions): how to give `YOINK_AGE_KEY` to the runner so that the dry-run can decrypt.
+- [Run staging alongside prod](/docs/how-to/staging-alongside-prod): two configs on the same hosts, each with its own dry-run.
+- [Driving yoink from an AI agent](/docs/explanation/ai-agents): how a reviewer, human or not, reads the dry-run output.
+- [CLI reference](/docs/reference/cli): the `--dry-run`, `--format` and `--tag` flags.
