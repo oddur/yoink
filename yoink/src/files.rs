@@ -34,7 +34,7 @@ pub struct FileMount {
 
 #[derive(Debug, Error)]
 pub enum FileError {
-    #[error("invalid file mount {0:?}: expected \"local:container[:ro]\"")]
+    #[error("invalid file mount {0:?}: expected \"local:container[:ro|:rw]\"")]
     BadFormat(String),
     #[error("local file {path:?} does not exist or is not readable: {source}")]
     LocalRead {
@@ -53,7 +53,8 @@ pub enum FileError {
 }
 
 impl FileMount {
-    /// Parse `"local:container[:ro]"`. Local paths may be relative —
+    /// Parse `"local:container[:ro|:rw]"`. With no mode the mount ends
+    /// up read-only (see `as_bind_string`). Local paths may be relative —
     /// they're resolved against `base_dir` (typically the config file's
     /// directory).
     pub fn parse(spec: &str, base_dir: Option<&Path>) -> Result<Self, FileError> {
