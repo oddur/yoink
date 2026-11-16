@@ -270,7 +270,7 @@ When set, every routed service uses this cert by default. Per-service `tls_cert_
 | `publish` | list of string | `[]` | Host port mappings (`"80:80"`, `"443:443/udp"`). |
 | `binds` | list of string | `[]` | Host bind mounts (`"src:dst:mode"`). Default mode is `:ro`. |
 | `volumes` | list of string | `[]` | Named docker volumes. |
-| `files` | list of string | `[]` | Same shape as `binds`, but the source content is hashed into `spec_hash` (config files trigger a redeploy on edit). |
+| `files` | list of string | `[]` | Same shape as `binds`, but the source content is hashed into `spec_hash` (config files trigger a redeploy on edit). `files` mounts are always read-only: `:ro` is optional, and `:rw` is rejected at validation. Use `binds` or `volumes` for data the container must write. |
 | `options` | [RunOptions](#runoptions) | hardened defaults | Resource limits + security flags. |
 
 ## RunOptions

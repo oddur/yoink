@@ -275,8 +275,11 @@ Yoink resolves a service's tag in this order:
 1. `--tag name=value` on the CLI overrides everything
 2. A bare `--tag value` (no `name=`) applies to every selected service
 3. The `tag:` field in the service config
+4. With `--service` and no `--tag` at all, the git short SHA of the current commit, for each selected service that has no `tag:`. This needs a clean working tree and does not apply with `--allow-dirty`
 
-Services without an explicit tag (typical for `image: ghcr.io/you/api` where the right answer is "whatever CI just built") error if no `--tag` override is provided. Stable infrastructure (caddy, redis) keeps a literal `tag: 7-alpine` so `yoink up` works without arguments.
+`--here` is the explicit form of rule 4: it applies the SHA to every selected service, also over a config `tag:`, and does not check for uncommitted changes.
+
+Services without an explicit tag (typical for `image: ghcr.io/you/api` where the right answer is "whatever CI just built") error if no rule gives them a tag. Stable infrastructure (caddy, redis) keeps a literal `tag: 7-alpine` so `yoink up` works without arguments.
 
 ## Tag overrides
 

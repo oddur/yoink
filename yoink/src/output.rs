@@ -180,6 +180,11 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
             }
             out
         }
+        DeployEvent::ContainerLogTailUnavailable {
+            host,
+            container,
+            error,
+        } => format!("[{host}] {container} log tail unavailable: {error}"),
         DeployEvent::Done { host, container } => format!("[{host}] done — {container}"),
     }
 }

@@ -4068,7 +4068,8 @@ fn update_service_status(
         DeployEvent::HookStarted { .. }
         | DeployEvent::HookFinished { .. }
         | DeployEvent::NetworkReady { .. }
-        | DeployEvent::ContainerLogTail { .. } => return,
+        | DeployEvent::ContainerLogTail { .. }
+        | DeployEvent::ContainerLogTailUnavailable { .. } => return,
     };
     map.insert(service.to_string(), next);
 }
