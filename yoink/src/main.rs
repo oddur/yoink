@@ -2393,26 +2393,38 @@ async fn cmd_rollback(
 /// leftovers of a deploy that failed after the current generation went
 /// live; anything that was live before it was necessarily created
 /// before it.
+///
+/// "Running" here includes `restarting` and `paused`: a container that
+/// crash-loops under its restart policy, or that an operator paused, is
+/// still the current generation and never a rollback target.
 fn previous_generation(
     containers: &[yoink::docker_ops::ContainerInfo],
 ) -> Option<&yoink::docker_ops::ContainerInfo> {
+    use yoink::docker_ops::ContainerState;
+    let is_current = |c: &&yoink::docker_ops::ContainerInfo| {
+        matches!(
+            c.state,
+            ContainerState::Running | ContainerState::Restarting | ContainerState::Paused
+        )
+    };
+
     // Running spec_hashes (the current generation) and when the oldest
     // running container was created.
     let running_hashes: std::collections::BTreeSet<&str> = containers
         .iter()
-        .filter(|c| c.is_running())
+        .filter(is_current)
         .filter_map(|c| c.yoink_spec_hash.as_deref())
         .collect();
     let running_since = containers
         .iter()
-        .filter(|c| c.is_running())
+        .filter(is_current)
         .filter_map(|c| c.created_unix)
         .min();
 
     // Stopped containers sorted newest-first by creation time.
     let mut stopped: Vec<_> = containers
         .iter()
-        .filter(|c| !c.is_running() && c.state != yoink::docker_ops::ContainerState::Created)
+        .filter(|c| !is_current(c) && c.state != ContainerState::Created)
         .filter(|c| running_since.is_none_or(|t| c.created_unix.unwrap_or(0) < t))
         .collect();
     stopped.sort_by_key(|c| std::cmp::Reverse(c.created_unix.unwrap_or(0)));
@@ -5723,6 +5735,22 @@ mod tests {
         ];
         let prev = previous_generation(&containers).map(|c| c.name.as_str());
         assert_eq!(prev, Some("v2"));
+    }
+
+    /// v2 is the current generation but crash-loops under its restart
+    /// policy, so docker reports it as `restarting` (or an operator
+    /// paused it). It is still the current generation: rollback must go
+    /// to v1, not redeploy v2 onto itself.
+    #[test]
+    fn previous_generation_treats_restarting_and_paused_as_current() {
+        for state in ["restarting", "paused"] {
+            let containers = vec![
+                container("v1", "exited", "h1", 100),
+                container("v2", state, "h2", 200),
+            ];
+            let prev = previous_generation(&containers).map(|c| c.name.as_str());
+            assert_eq!(prev, Some("v1"), "current generation is {state}");
+        }
     }
 
     #[test]
