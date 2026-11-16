@@ -119,6 +119,15 @@ pub enum DeployEvent {
         container: String,
         lines: Vec<String>,
     },
+    /// The log tail of a failed container could not be fetched. Fired
+    /// in place of `ContainerLogTail` so the failure is still recorded
+    /// (the audit log builds `DeployFailed` from either event) even
+    /// though the container is removed right after.
+    ContainerLogTailUnavailable {
+        host: String,
+        container: String,
+        error: String,
+    },
     Done {
         host: String,
         container: String,
@@ -1690,19 +1699,24 @@ async fn wait_until_healthy(
                 .await;
             // Pull the tail of its logs so the operator gets the
             // "why did it die?" answer in the same pane the
-            // reconcile is running in. Best-effort: a fetch error
-            // here just means no log preview, not deploy retry.
-            // The caller removes the container right after this
-            // returns: a stopped container left behind is
-            // indistinguishable from a generation that was once live,
-            // and `yoink rollback` would pick it as the "previous
-            // generation".
-            if let Ok(lines) = ops.fetch_recent_logs(host, new_name, 30).await {
-                on_event(DeployEvent::ContainerLogTail {
+            // reconcile is running in. The caller removes the
+            // container right after this returns (a stopped container
+            // left behind is indistinguishable from a generation that
+            // was once live, and `yoink rollback` would pick it), so
+            // this is the last chance to record anything. When the
+            // fetch fails, say so instead of staying silent: the audit
+            // log builds its `DeployFailed` record from either event.
+            match ops.fetch_recent_logs(host, new_name, 30).await {
+                Ok(lines) => on_event(DeployEvent::ContainerLogTail {
                     host: host.address.clone(),
                     container: new_name.to_string(),
                     lines,
-                });
+                }),
+                Err(e) => on_event(DeployEvent::ContainerLogTailUnavailable {
+                    host: host.address.clone(),
+                    container: new_name.to_string(),
+                    error: e.to_string(),
+                }),
             }
             Err(DeployError::Healthcheck {
                 host: host.address.clone(),
@@ -2388,6 +2402,42 @@ services:
             container: failed,
             lines: vec!["boom".into()],
         }));
+    }
+
+    /// When the log tail cannot be fetched the failure is still
+    /// reported (the audit log turns this event into `DeployFailed`)
+    /// and the container is removed all the same.
+    #[tokio::test(start_paused = true)]
+    async fn log_fetch_failure_is_reported_and_container_still_removed() {
+        let ops = failing_deploy_ops(1, 0);
+        ops.push_fetch_logs(Err(DockerError::Invalid("ssh session closed".into())));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(1);
+        let (failed, events) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        assert_eq!(removed_after_start(&ops), vec![failed.clone()]);
+        let unavailable: Vec<&DeployEvent> = events
+            .iter()
+            .filter(|e| matches!(e, DeployEvent::ContainerLogTailUnavailable { .. }))
+            .collect();
+        let [
+            DeployEvent::ContainerLogTailUnavailable {
+                host,
+                container,
+                error,
+            },
+        ] = unavailable.as_slice()
+        else {
+            panic!("expected one ContainerLogTailUnavailable event, got {events:?}");
+        };
+        assert_eq!(host, "host-a");
+        assert_eq!(*container, failed);
+        assert!(error.contains("ssh session closed"), "got {error:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DeployEvent::ContainerLogTail { .. }))
+        );
     }
 
     /// Failure on the last of three replicas: the two that passed go
