@@ -731,7 +731,7 @@ async fn prepare_one_host(
             continue;
         }
         force_remove_name(ops, &host, &name).await;
-        create_pending_container(
+        if let Err(e) = create_pending_container(
             ops,
             &host,
             config,
@@ -742,7 +742,13 @@ async fn prepare_one_host(
             &spec_hash,
             &file_binds,
         )
-        .await?;
+        .await
+        {
+            // Do not leave the replicas created so far behind in
+            // `created` state.
+            remove_attempt_replicas(ops, &host, &replicas).await;
+            return Err(e);
+        }
         replicas.push(ReplicaPrep {
             name,
             already_running: false,
@@ -776,6 +782,60 @@ async fn attach_extra_networks(
             })?;
     }
     Ok(())
+}
+
+/// Attach networks to, start and healthcheck every replica this attempt
+/// created on `host`, in replica order. Stops at the first failure and
+/// cleans nothing up: [`finalize_one_host`] removes the attempt's
+/// replicas on `Err`. Returns the highest healthcheck attempt count.
+async fn start_new_replicas(
+    ops: &dyn DockerOps,
+    host: &Host,
+    config: &Config,
+    service: &ServiceConfig,
+    replicas: &[ReplicaPrep],
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<u32, DeployError> {
+    let mut total_attempts: u32 = 0;
+    for replica in replicas {
+        if replica.already_running {
+            continue;
+        }
+        // Multi-network attach BEFORE start: docker only honors the first
+        // endpoint at create time, so connect the rest while the container
+        // is still created-but-not-running. Starting with every network
+        // already attached lets a container that eagerly dials its
+        // dependencies (DB, redis) on boot actually reach them. Attaching
+        // *after* start meant such a container exited before the networks
+        // landed, and the post-start connect then 404'd with "network
+        // sandbox not found" on the now-dead container — only services that
+        // connect lazily survived. The alias set is identical on every
+        // network so the container resolves by name everywhere.
+        //
+        // If any attach fails partway, the caller removes the attempt's
+        // replicas so the next reconcile re-creates from scratch —
+        // service_already_at_spec only checks name/hash/running, so a
+        // half-networked container would otherwise short-circuit and
+        // persist forever.
+        let effective = service.effective_networks(&config.deploy);
+        let mut aliases = vec![replica.name.clone()];
+        aliases.extend(service.run.options.network_aliases.iter().cloned());
+        attach_extra_networks(ops, host, &replica.name, &effective, &aliases).await?;
+        ops.start_container(host, &replica.name)
+            .await
+            .map_err(|source| DeployError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
+        on_event(DeployEvent::ContainerStarted {
+            host: host.address.clone(),
+            container: replica.name.clone(),
+        });
+        let attempts =
+            wait_until_healthy(ops, host, config, service, &replica.name, on_event).await?;
+        total_attempts = total_attempts.max(attempts);
+    }
+    Ok(total_attempts)
 }
 
 #[allow(clippy::too_many_lines)] // single linear finalize flow; same rationale as `reconcile`
@@ -837,48 +897,22 @@ async fn finalize_one_host(
         .await?;
     }
 
-    let mut total_attempts: u32 = 0;
-    for replica in &replicas {
-        if replica.already_running {
-            continue;
-        }
-        // Multi-network attach BEFORE start: docker only honors the first
-        // endpoint at create time, so connect the rest while the container
-        // is still created-but-not-running. Starting with every network
-        // already attached lets a container that eagerly dials its
-        // dependencies (DB, redis) on boot actually reach them. Attaching
-        // *after* start meant such a container exited before the networks
-        // landed, and the post-start connect then 404'd with "network
-        // sandbox not found" on the now-dead container — only services that
-        // connect lazily survived. The alias set is identical on every
-        // network so the container resolves by name everywhere.
-        //
-        // If any attach fails partway, force-remove so the next reconcile
-        // re-creates from scratch — service_already_at_spec only checks
-        // name/hash/running, so a half-networked container would otherwise
-        // short-circuit and persist forever.
-        let effective = service.effective_networks(&config.deploy);
-        let mut aliases = vec![replica.name.clone()];
-        aliases.extend(service.run.options.network_aliases.iter().cloned());
-        if let Err(e) = attach_extra_networks(ops, &host, &replica.name, &effective, &aliases).await
-        {
-            force_remove_name(ops, &host, &replica.name).await;
-            return Err(e);
-        }
-        ops.start_container(&host, &replica.name)
-            .await
-            .map_err(|source| DeployError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
-        on_event(DeployEvent::ContainerStarted {
-            host: host.address.clone(),
-            container: replica.name.clone(),
-        });
-        let attempts =
-            wait_until_healthy(ops, &host, config, service, &replica.name, on_event).await?;
-        total_attempts = total_attempts.max(attempts);
-    }
+    // From here until the Caddy push below, a failure unwinds the whole
+    // attempt on this host: every replica this attempt created is
+    // removed, the one that failed and the siblings that already
+    // passed. A sibling left running is unrouted (the Caddy push only
+    // happens once all replicas pass), and after a later successful
+    // deploy stops it, it is indistinguishable from a generation that
+    // was once live, so `yoink rollback` could pick the failed version.
+    // The previous generation in `existing` is never touched here.
+    let total_attempts =
+        match start_new_replicas(ops, &host, config, service, &replicas, on_event).await {
+            Ok(attempts) => attempts,
+            Err(e) => {
+                remove_attempt_replicas(ops, &host, &replicas).await;
+                return Err(e);
+            }
+        };
 
     // Caddy admin-API push: route the new replicas in (and the
     // proxy itself, after first deploy, into a serving state).
@@ -887,18 +921,29 @@ async fn finalize_one_host(
     // expected (post-deploy) replica names — see `push_caddy_config`
     // for why we deliberately do NOT include the about-to-be-stopped
     // old containers in the rendered upstreams.
-    let triggers_caddy_load = crate::proxy::proxy_enabled(config)
-        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
-            || crate::proxy::is_proxied(service));
-    if triggers_caddy_load {
-        push_caddy_config(
+    let is_proxy = matches!(service.kind, Some(crate::config::ServiceKind::Proxy));
+    let triggers_caddy_load =
+        crate::proxy::proxy_enabled(config) && (is_proxy || crate::proxy::is_proxied(service));
+    if triggers_caddy_load
+        && let Err(e) = push_caddy_config(
             ops,
             &host,
             config,
             secrets,
             Some((service.name.as_str(), &expected_names)),
         )
-        .await?;
+        .await
+    {
+        // The new replicas never got routed, so they go too. The
+        // proxy container itself is the exception: its predecessor
+        // is already stopped (it publishes host ports) and Caddy
+        // runs with `--resume`, so the new container is serving
+        // the autosaved config. Removing it would turn a rejected
+        // config push into a full outage.
+        if !is_proxy {
+            remove_attempt_replicas(ops, &host, &replicas).await;
+        }
+        return Err(e);
     }
 
     if !stop_first {
@@ -1521,12 +1566,24 @@ async fn force_remove_name(ops: &dyn DockerOps, host: &Host, name: &str) {
 /// already gone); errors are logged inside `force_remove_name` and
 /// never mask the original hook error.
 async fn cleanup_prepared_replicas(ops: &dyn DockerOps, prepared: &[HostPrep]) {
-    let futs = prepared.iter().flat_map(|prep| {
-        prep.replicas
-            .iter()
-            .filter(|r| !r.already_running)
-            .map(move |r| force_remove_name(ops, &prep.host, &r.name))
-    });
+    let futs = prepared
+        .iter()
+        .map(|prep| remove_attempt_replicas(ops, &prep.host, &prep.replicas));
+    futures_util::future::join_all(futs).await;
+}
+
+/// Force-remove every replica the current deploy attempt created on
+/// `host`: running, exited or still in `created` state. The set is the
+/// attempt's own [`ReplicaPrep`] list, not a label scan, so the
+/// previous generation and replicas that were already at spec before
+/// the attempt (`already_running`) are never touched. Best-effort:
+/// errors are logged inside `force_remove_name` so the caller can
+/// return the original deploy error.
+async fn remove_attempt_replicas(ops: &dyn DockerOps, host: &Host, replicas: &[ReplicaPrep]) {
+    let futs = replicas
+        .iter()
+        .filter(|r| !r.already_running)
+        .map(|r| force_remove_name(ops, host, &r.name));
     futures_util::future::join_all(futs).await;
 }
 
@@ -1635,6 +1692,11 @@ async fn wait_until_healthy(
             // "why did it die?" answer in the same pane the
             // reconcile is running in. Best-effort: a fetch error
             // here just means no log preview, not deploy retry.
+            // The caller removes the container right after this
+            // returns: a stopped container left behind is
+            // indistinguishable from a generation that was once live,
+            // and `yoink rollback` would pick it as the "previous
+            // generation".
             if let Ok(lines) = ops.fetch_recent_logs(host, new_name, 30).await {
                 on_event(DeployEvent::ContainerLogTail {
                     host: host.address.clone(),
@@ -1642,11 +1704,6 @@ async fn wait_until_healthy(
                     lines,
                 });
             }
-            // Remove it once the log tail is captured. A stopped
-            // container left behind is indistinguishable from a
-            // generation that was once live, and `yoink rollback`
-            // would pick it as the "previous generation".
-            force_remove_name(ops, host, new_name).await;
             Err(DeployError::Healthcheck {
                 host: host.address.clone(),
                 container: new_name.to_string(),
@@ -1885,7 +1942,7 @@ async fn run_subprocess_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::docker_ops::FakeDockerOps;
+    use crate::docker_ops::{FakeDockerOps, RecordedCall};
 
     #[test]
     fn summarize_build_outcomes_all_success_is_none() {
@@ -2192,6 +2249,320 @@ services:
                 .any(|c| matches!(c, crate::docker_ops::RecordedCall::ForceRemoveContainer(_, n) if *n == container)),
             "failed container must be removed after it is stopped: {calls:?}"
         );
+    }
+
+    fn config_replicas(replicas: u32) -> Config {
+        let mut cfg = config_one_service();
+        cfg.services[0].run.replicas = replicas;
+        cfg
+    }
+
+    const OLD_GENERATION: &str = "app-a-9f8e7d6";
+
+    /// Scripted ops for a deploy of `replicas` new containers next to a
+    /// running old generation, where the first `healthy` replicas pass
+    /// their healthcheck and the next probe errors out. Cleanup
+    /// removals are left to the caller to script.
+    fn failing_deploy_ops(replicas: u32, healthy: u32) -> FakeDockerOps {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: Some("app-a".into()),
+            yoink_version: Some("9f8e7d6".into()),
+            ..container_with_state(OLD_GENERATION, "running")
+        }]));
+        for _ in 0..replicas {
+            // Prepare: force-remove-by-name, then create.
+            ops.push_force_remove(Ok(()));
+            ops.push_create_container(Ok("abcdef".into()));
+        }
+        for _ in 0..=healthy {
+            ops.push_start_container(Ok(()));
+        }
+        for _ in 0..healthy {
+            ops.push_healthcheck(Ok(200));
+        }
+        // No further healthcheck response: the next probe errors out.
+        ops.push_stop_container(Ok(()));
+        ops
+    }
+
+    async fn deploy_expecting_healthcheck_failure(
+        ops: &FakeDockerOps,
+        cfg: &Config,
+    ) -> (String, Vec<DeployEvent>) {
+        let mut events: Vec<DeployEvent> = Vec::new();
+        let mut sink = |e: DeployEvent| events.push(e);
+        let err = deploy_service(
+            ops,
+            cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        let DeployError::Healthcheck { container, .. } = err else {
+            panic!("expected the original healthcheck error, got {err:?}");
+        };
+        (container, events)
+    }
+
+    fn created_names(ops: &FakeDockerOps) -> Vec<String> {
+        ops.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::CreateContainer(_, n) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Names force-removed after the first `start_container`, i.e. by
+    /// the failure unwind rather than by prepare's remove-by-name.
+    fn removed_after_start(ops: &FakeDockerOps) -> Vec<String> {
+        let calls = ops.calls();
+        let first_start = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::StartContainer(..)))
+            .expect("a container was started");
+        let mut names: Vec<String> = calls[first_start..]
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRemoveContainer(_, n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn assert_old_generation_untouched(ops: &FakeDockerOps) {
+        let calls = ops.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::StopContainer(_, n, _) | RecordedCall::ForceRemoveContainer(_, n)
+                    if n == OLD_GENERATION
+            )),
+            "the serving generation must not be stopped or removed: {calls:?}"
+        );
+    }
+
+    /// Replica 0 passes, replica 1 fails. Replica 0 must not survive:
+    /// it is running but unrouted, and after a later successful deploy
+    /// stops it, `yoink rollback` would take it for a generation that
+    /// was once live.
+    #[tokio::test(start_paused = true)]
+    async fn failed_deploy_removes_healthy_sibling_replicas() {
+        let ops = failing_deploy_ops(2, 1);
+        ops.push_fetch_logs(Ok(vec!["boom".into()]));
+        ops.push_force_remove(Ok(()));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(2);
+        let (failed, events) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(created.len(), 2);
+        assert_eq!(failed, created[1], "replica 1 is the one that failed");
+        assert_eq!(removed_after_start(&ops), created);
+        assert_old_generation_untouched(&ops);
+
+        // The log tail is captured before the failed container goes.
+        let calls = ops.calls();
+        let logs = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::FetchRecentLogs(_, n, _) if *n == failed))
+            .expect("log tail fetched");
+        assert!(
+            calls[logs..]
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ForceRemoveContainer(_, n) if *n == failed)),
+            "failed container must be removed after its logs are fetched: {calls:?}"
+        );
+        assert!(events.contains(&DeployEvent::ContainerLogTail {
+            host: "host-a".into(),
+            container: failed,
+            lines: vec!["boom".into()],
+        }));
+    }
+
+    /// Failure on the last of three replicas: the two that passed go
+    /// with it.
+    #[tokio::test(start_paused = true)]
+    async fn failed_deploy_on_last_replica_removes_all_replicas() {
+        let ops = failing_deploy_ops(3, 2);
+        for _ in 0..3 {
+            ops.push_force_remove(Ok(()));
+        }
+        let cfg = config_replicas(3);
+        let (failed, _) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(created.len(), 3);
+        assert_eq!(failed, created[2]);
+        assert_eq!(removed_after_start(&ops), created);
+        assert_old_generation_untouched(&ops);
+    }
+
+    /// Failure on the first of three replicas: the two still in
+    /// `created` state are removed as well.
+    #[tokio::test(start_paused = true)]
+    async fn failed_deploy_removes_replicas_never_started() {
+        let ops = failing_deploy_ops(3, 0);
+        for _ in 0..3 {
+            ops.push_force_remove(Ok(()));
+        }
+        let cfg = config_replicas(3);
+        let (failed, _) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(failed, created[0]);
+        assert_eq!(removed_after_start(&ops), created);
+        assert_old_generation_untouched(&ops);
+    }
+
+    /// A removal that fails during the unwind is logged, every other
+    /// replica is still attempted, and the caller gets the healthcheck
+    /// error rather than the cleanup error.
+    #[tokio::test(start_paused = true)]
+    async fn failed_cleanup_does_not_mask_the_deploy_error() {
+        let ops = failing_deploy_ops(2, 1);
+        ops.push_force_remove(Err(DockerError::Invalid("daemon went away".into())));
+        ops.push_force_remove(Err(DockerError::Invalid("daemon went away".into())));
+        let cfg = config_replicas(2);
+        // Panics unless the error is the original `Healthcheck` one.
+        let (_, _) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(removed_after_start(&ops), created);
+        assert_old_generation_untouched(&ops);
+    }
+
+    /// A start failure unwinds the same way as a healthcheck failure.
+    #[tokio::test(start_paused = true)]
+    async fn start_failure_removes_all_replicas() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(Vec::new()));
+        for _ in 0..2 {
+            ops.push_force_remove(Ok(()));
+            ops.push_create_container(Ok("abcdef".into()));
+        }
+        ops.push_start_container(Ok(()));
+        ops.push_healthcheck(Ok(200));
+        ops.push_start_container(Err(DockerError::Invalid("no such image".into())));
+        ops.push_force_remove(Ok(()));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(2);
+        let mut sink = |_e: DeployEvent| {};
+        let err = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DeployError::Docker { .. }), "got {err:?}");
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(removed_after_start(&ops), created);
+    }
+
+    /// When creating replica 1 fails, replica 0 is not left behind in
+    /// `created` state.
+    #[tokio::test(start_paused = true)]
+    async fn create_failure_removes_replicas_created_so_far() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Err(DockerError::Invalid("no space left".into())));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(2);
+        let mut sink = |_e: DeployEvent| {};
+        let err = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DeployError::Docker { .. }), "got {err:?}");
+        let calls = ops.calls();
+        let removed: Vec<&String> = calls
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRemoveContainer(_, n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        // Two by prepare (one per replica), then replica 0 again.
+        assert_eq!(removed.len(), 3, "{calls:?}");
+        assert_eq!(removed[2], removed[0]);
+        assert_ne!(removed[2], removed[1]);
+    }
+
+    /// Retrying the same version after a failed attempt starts every
+    /// replica again: nothing of the failed attempt is left to be
+    /// mistaken for a replica that is already at spec.
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_failed_deploy_recreates_every_replica() {
+        let ops = failing_deploy_ops(2, 1);
+        ops.push_force_remove(Ok(()));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(2);
+        deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+        let first_attempt = created_names(&ops);
+
+        // The host now holds only the old generation again.
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: Some("app-a".into()),
+            ..container_with_state(OLD_GENERATION, "running")
+        }]));
+        for _ in 0..2 {
+            ops.push_force_remove(Ok(()));
+            ops.push_create_container(Ok("abcdef".into()));
+            ops.push_start_container(Ok(()));
+            ops.push_healthcheck(Ok(200));
+        }
+        ops.push_stop_container(Ok(()));
+        let mut sink = |_e: DeployEvent| {};
+        let report = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.hosts[0].stopped_old,
+            vec![OLD_GENERATION.to_string()]
+        );
+        let all = created_names(&ops);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[2..], first_attempt[..]);
     }
 
     /// `happy_ops` flavoured for the reconcile entry point: prepends
