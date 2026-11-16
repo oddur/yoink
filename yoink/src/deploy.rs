@@ -2395,6 +2395,22 @@ hooks:
         assert!(message.contains("applying 0001_init"));
     }
 
+    /// Asserts the hook container `name` is force-removed before the
+    /// hook runs under that same name.
+    fn assert_reaped_before_run(ops: &FakeDockerOps, host: &Host, name: &str) {
+        use crate::docker_ops::RecordedCall;
+        let calls = ops.calls();
+        let reap = calls
+            .iter()
+            .position(|c| *c == RecordedCall::ForceRemoveContainer(host.clone(), name.into()))
+            .expect("stale hook container is force-removed");
+        let run = calls
+            .iter()
+            .position(|c| *c == RecordedCall::RunOneShot(host.clone(), name.into()))
+            .expect("hook runs under the expected name");
+        assert!(reap < run, "reap must precede the create: {calls:?}");
+    }
+
     /// A hook container leaked by an interrupted deploy keeps its
     /// deterministic name; without a reap before the create, every
     /// later deploy at that tag fails with a 409 name conflict.
@@ -2436,25 +2452,11 @@ hooks:
             .await
             .unwrap_err();
 
-        let host = Host::from(&cfg.hosts[0]);
-        let name = "yoink-hook-migrate-latest";
-        let calls = ops.calls();
-        let reap = calls
-            .iter()
-            .position(|c| {
-                *c == crate::docker_ops::RecordedCall::ForceRemoveContainer(
-                    host.clone(),
-                    name.into(),
-                )
-            })
-            .expect("stale hook container is force-removed");
-        let run = calls
-            .iter()
-            .position(|c| {
-                *c == crate::docker_ops::RecordedCall::RunOneShot(host.clone(), name.into())
-            })
-            .expect("hook runs");
-        assert!(reap < run, "reap must precede the create: {calls:?}");
+        assert_reaped_before_run(
+            &ops,
+            &Host::from(&cfg.hosts[0]),
+            "yoink-hook-migrate-latest",
+        );
     }
 
     /// Services in one wave deploy concurrently. Two of them with a
@@ -2527,25 +2529,11 @@ services:
             .await
             .unwrap_err();
 
-        let host = Host::from(&cfg.hosts[0]);
-        let name = "yoink-hook-app-a-migrate-v42";
-        let calls = ops.calls();
-        let reap = calls
-            .iter()
-            .position(|c| {
-                *c == crate::docker_ops::RecordedCall::ForceRemoveContainer(
-                    host.clone(),
-                    name.into(),
-                )
-            })
-            .expect("stale service hook container is force-removed");
-        let run = calls
-            .iter()
-            .position(|c| {
-                *c == crate::docker_ops::RecordedCall::RunOneShot(host.clone(), name.into())
-            })
-            .expect("service hook runs under the service-scoped name");
-        assert!(reap < run, "reap must precede the create: {calls:?}");
+        assert_reaped_before_run(
+            &ops,
+            &Host::from(&cfg.hosts[0]),
+            "yoink-hook-app-a-migrate-v42",
+        );
     }
 
     /// Routed-service fixture: api has `domain:` so `is_proxied(api)` is
