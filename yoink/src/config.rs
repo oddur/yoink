@@ -181,14 +181,19 @@ pub fn split_address_port(input: &str) -> Result<(String, Option<u16>), String> 
 /// `Some(reason)` when `address` carries a `:port` suffix. ssh takes
 /// the whole string as a hostname and fails with "Could not resolve
 /// hostname", so config load rejects it and points at `port:`.
-/// `shown` replaces the bare host in the message; pass a placeholder
-/// for a sealed address so its value stays out of the error.
-fn address_port_error(address: &str, shown: Option<&str>) -> Option<String> {
+/// `sealed` is true for a value that came from `address_secret`: the
+/// value stays out of the message, and the hint keeps the address
+/// sealed instead of telling the operator to write `address:`.
+fn address_port_error(address: &str, sealed: bool) -> Option<String> {
     match split_address_port(address) {
+        Ok((_, Some(port))) if sealed => Some(format!(
+            "includes a port, and ssh would read the whole string as a hostname. \
+             Seal the value again without the port and set `port: {port}` \
+             next to `address_secret:`"
+        )),
         Ok((bare, Some(port))) => Some(format!(
             "includes a port, and ssh would read the whole string as a hostname. \
-             Move the port into `port:` (`address: {}`, `port: {port}`)",
-            shown.unwrap_or(&bare)
+             Move the port into `port:` (`address: {bare}`, `port: {port}`)"
         )),
         Ok((_, None)) => None,
         Err(e) => Some(format!(
@@ -1639,7 +1644,7 @@ impl Config {
             // Same rule as the literal `address:` check in `validate`,
             // applied here because a sealed address is only readable
             // now. The value itself stays out of the message.
-            if let Some(reason) = address_port_error(value, Some("<host>")) {
+            if let Some(reason) = address_port_error(value, true) {
                 return Err(ConfigError::Invalid(format!(
                     "hosts[{i}].address_secret = {key:?} resolved to a value that {reason}"
                 )));
@@ -1991,7 +1996,7 @@ impl Config {
                     "hosts[{i}].user must not be empty"
                 )));
             }
-            if has_literal && let Some(reason) = address_port_error(&host.address, None) {
+            if has_literal && let Some(reason) = address_port_error(&host.address, false) {
                 return Err(ConfigError::Invalid(format!(
                     "hosts[{i}].address = {:?} {reason}",
                     host.address
@@ -4275,5 +4280,9 @@ secrets:
         assert!(msg.contains("PROD_HOST_IP"), "got: {msg}");
         assert!(msg.contains("`port: 2200`"), "got: {msg}");
         assert!(!msg.contains("10.0.0.42"), "address leaked: {msg}");
+        // The hint must keep the address sealed, not move it into a
+        // plaintext `address:`.
+        assert!(msg.contains("next to `address_secret:`"), "got: {msg}");
+        assert!(!msg.contains("`address: "), "got: {msg}");
     }
 }
