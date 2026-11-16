@@ -4,9 +4,11 @@
 //! configuration (Caddyfile, otel-collector.yaml, etc.) in git instead
 //! of pre-staging it on the host out-of-band.
 //!
-//! Upload path is content-addressed (`/var/lib/yoink/files/<sha256>-<basename>`)
-//! so concurrent deploys never overwrite each other and a config edit
-//! flows through to a redeploy via the spec hash.
+//! The upload is content-addressed (`<sha256>-<basename>`) so concurrent
+//! deploys never overwrite each other and a config edit flows through
+//! to a redeploy via the spec hash. Files land in
+//! `~/.local/state/yoink/files/` of the SSH user, which that user can
+//! create without root on a server yoink has never seen.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -131,20 +133,51 @@ impl FileMount {
         Ok((bytes, hex(&digest[..])))
     }
 
-    /// `/var/lib/yoink/files/<sha256>-<basename>`. Idempotent: same
-    /// content always lands at the same path, so re-uploads are no-ops
-    /// and concurrent deploys can't collide.
+    /// `<sha256>-<basename>`: the name of the staged file on the host.
+    /// Idempotent: same content always lands at the same name, so
+    /// re-uploads are no-ops and concurrent deploys can't collide.
     #[must_use]
-    pub fn remote_staging_path(&self, content_hash: &str) -> String {
+    pub fn staging_file_name(&self, content_hash: &str) -> String {
         let basename = self
             .local
             .file_name()
             .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
-        format!("/var/lib/yoink/files/{content_hash}-{basename}")
+        format!("{content_hash}-{basename}")
+    }
+
+    /// The path that stands for this file in the spec hash:
+    /// `/var/lib/yoink/files/<sha256>-<basename>`.
+    ///
+    /// This is NOT where the file is staged. yoink staged files there
+    /// before v0.21, and only root can create that directory. The real
+    /// directory is under the home of the SSH user and differs between
+    /// hosts and users, so it cannot feed the hash: `status`, the TUI
+    /// and `--dry-run` compute the hash without a connection to the
+    /// host. The old path stays as the hash input so that no service
+    /// changes its `spec_hash` because of the move.
+    #[must_use]
+    pub fn remote_staging_path(&self, content_hash: &str) -> String {
+        format!(
+            "{LEGACY_FILES_DIR}/{}",
+            self.staging_file_name(content_hash)
+        )
+    }
+
+    /// The bind string for the container: the file as staged in
+    /// `staging_dir` (the directory that [`upload`] returned), mounted
+    /// at the container path. Same shape as [`Self::as_bind_string`].
+    #[must_use]
+    pub fn bind_string_at(&self, staging_dir: &str, content_hash: &str) -> String {
+        let name = self.staging_file_name(content_hash);
+        let container = self.container.display();
+        let mode = if self.read_only { ":ro" } else { "" };
+        format!("{staging_dir}/{name}:{container}{mode}")
     }
 
     /// Render as the docker-cli bind string our container builder
     /// already understands: `<host_path>:<container_path>[:ro]`.
+    /// This form feeds the spec hash only; the container is created
+    /// with [`Self::bind_string_at`]. See [`Self::remote_staging_path`].
     /// A spec with no mode renders bare, and
     /// `docker::default_bind_to_ro` then appends `:ro`. Do not
     /// normalise the two forms: the string feeds the spec hash, so a
@@ -158,11 +191,44 @@ impl FileMount {
     }
 }
 
-/// Upload a single `FileMount` to the target host. Idempotent — the
-/// staging path is content-addressed, so re-uploads of the same bytes
-/// land at the same path. `bytes` is the in-memory content captured
-/// at `read_and_hash` time; piping it to `ssh ... 'cat > file'`
-/// closes the hash-vs-upload TOCTOU window.
+/// Hash-input directory for staged files. See
+/// [`FileMount::remote_staging_path`]. yoink does not write here.
+const LEGACY_FILES_DIR: &str = "/var/lib/yoink/files";
+
+/// Shell expression for the directory that holds staged files on a
+/// host. It is under the home directory of the SSH user, so a deploy
+/// user without root can create it. The host shell expands it.
+const HOST_FILES_DIR_SH: &str = "\"${XDG_STATE_HOME:-$HOME/.local/state}/yoink/files\"";
+
+/// Shell script that writes stdin to the staged file `name` and
+/// prints the absolute staging directory.
+///
+/// Single ssh roundtrip: mkdir, then write the bytes to a tempfile and
+/// atomic-rename into place. Atomic rename means a partial transfer
+/// (network drop) never leaves the staged file half-written for a
+/// concurrent reader. The name goes through a single-quoted shell var
+/// so spaces / metachars in the basename can't break parsing or inject.
+fn upload_script(name: &str) -> String {
+    format!(
+        "set -e; \
+         P={HOST_FILES_DIR_SH}; N={n}; \
+         mkdir -p \"$P\"; \
+         tmp=\"$P/$N.tmp.$$\"; \
+         cat > \"$tmp\"; \
+         chmod 0644 \"$tmp\"; \
+         mv \"$tmp\" \"$P/$N\"; \
+         printf '%s' \"$P\"",
+        n = shell_single_quote(name),
+    )
+}
+
+/// Upload a single `FileMount` to the target host and return the
+/// absolute directory it was staged in, for
+/// [`FileMount::bind_string_at`]. Idempotent: the staged name is
+/// content-addressed, so re-uploads of the same bytes land at the same
+/// path. `bytes` is the in-memory content captured at `read_and_hash`
+/// time; piping it to `ssh ... 'cat > file'` closes the
+/// hash-vs-upload TOCTOU window.
 ///
 /// `keyfile` is `DockerOps::ssh_keyfile(host)`: the decrypted
 /// `ssh_key_secret:` key, so the upload authenticates the same way as
@@ -174,30 +240,12 @@ pub async fn upload(
     mount: &FileMount,
     content_hash: &str,
     bytes: &[u8],
-) -> Result<(), FileError> {
-    let remote = mount.remote_staging_path(content_hash);
-    let parent = Path::new(&remote).parent().map_or_else(
-        || "/var/lib/yoink/files".into(),
-        |p| p.display().to_string(),
-    );
-
-    // Single ssh roundtrip: mkdir parent, then write the bytes to a
-    // tempfile and atomic-rename into place. Atomic rename means a
-    // partial transfer (network drop) never leaves the staging path
-    // half-written for a concurrent reader. Paths are passed through
-    // single-quoted shell vars so any spaces / metachars in the
-    // basename can't break parsing or inject.
-    let script = format!(
-        "set -e; \
-         P={p}; R={r}; \
-         mkdir -p \"$P\"; \
-         tmp=\"$R.tmp.$$\"; \
-         cat > \"$tmp\"; \
-         chmod 0644 \"$tmp\"; \
-         mv \"$tmp\" \"$R\"",
-        p = shell_single_quote(&parent),
-        r = shell_single_quote(&remote),
-    );
+) -> Result<String, FileError> {
+    let name = mount.staging_file_name(content_hash);
+    // For error messages only: the real directory is known after the
+    // script runs.
+    let remote = format!("~/.local/state/yoink/files/{name}");
+    let script = upload_script(&name);
     let mut child = crate::ssh_keys::host_shell_command(host, keyfile, &script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -241,7 +289,20 @@ pub async fn upload(
             message: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    Ok(())
+    // The bind source must be an absolute path. Anything else means
+    // the host shell printed something unexpected (a login banner, an
+    // unset HOME), and a relative bind would name a docker volume.
+    let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !dir.starts_with('/') || dir.contains('\n') {
+        return Err(FileError::Scp {
+            host: host.address.clone(),
+            remote,
+            message: format!(
+                "the host reported the staging directory {dir:?}, not an absolute path"
+            ),
+        });
+    }
+    Ok(dir)
 }
 
 /// POSIX-shell single-quote a string. Wraps in `'…'` and escapes any
@@ -330,6 +391,69 @@ mod tests {
             shell_single_quote("it's"),
             "'it'\\''s'",
             "embedded single quote escapes correctly"
+        );
+    }
+
+    /// Staged files used to go to `/var/lib/yoink/files`, which a
+    /// deploy user without root cannot create. They now go under the
+    /// home directory of that user, and the script reports where.
+    #[test]
+    fn upload_script_stages_the_file_under_the_user_home() {
+        use std::io::Write as _;
+        let home = tempfile::tempdir().unwrap();
+        let name = "abc123-it's a file.yaml";
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(upload_script(name))
+            .env("HOME", home.path())
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"key: value\n")
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let dir = home.path().join(".local/state/yoink/files");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            dir.to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(name)).unwrap(),
+            "key: value\n"
+        );
+        // No tempfile left behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    /// The container binds the real staging directory. The spec hash
+    /// keeps the old fixed path, so the move changes no `spec_hash`.
+    #[test]
+    fn bind_string_at_uses_the_staging_dir_and_hash_form_is_unchanged() {
+        let m = FileMount {
+            local: PathBuf::from("/tmp/foo.yaml"),
+            container: PathBuf::from("/etc/foo.yaml"),
+            read_only: true,
+        };
+        assert_eq!(
+            m.bind_string_at("/home/deploy/.local/state/yoink/files", "abc123"),
+            "/home/deploy/.local/state/yoink/files/abc123-foo.yaml:/etc/foo.yaml:ro"
+        );
+        assert_eq!(
+            m.as_bind_string("abc123"),
+            "/var/lib/yoink/files/abc123-foo.yaml:/etc/foo.yaml:ro"
         );
     }
 

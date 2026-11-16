@@ -278,7 +278,7 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `publish` | list of string | `[]` | Host port mappings (`"80:80"`, `"443:443/udp"`). |
 | `binds` | list of string | `[]` | Host bind mounts (`"src:dst:mode"`). The default mode is `:ro`. |
 | `volumes` | list of string | `[]` | Named docker volumes. |
-| `files` | list of string | `[]` | Files that yoink uploads to the host and mounts read-only (`"local_path:container_path[:ro]"`). `:ro` is optional. Validation rejects `:rw`. yoink hashes the content into `spec_hash`, so an edit triggers a redeploy. For data that the container must write, use `binds` or `volumes`. |
+| `files` | list of string | `[]` | Files that yoink uploads to the host and mounts read-only (`"local_path:container_path[:ro]"`). `:ro` is optional. Validation rejects `:rw`. yoink hashes the content into `spec_hash`, so an edit triggers a redeploy. The files go to `~/.local/state/yoink/files/` of the SSH user on the host, so no root access is necessary. For data that the container must write, use `binds` or `volumes`. |
 | `options` | [RunOptions](#runoptions) | hardened defaults | Resource limits and security flags. |
 
 ## RunOptions
