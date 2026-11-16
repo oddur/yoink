@@ -1921,7 +1921,9 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // change starts double-writing.
     let host_audit = std::sync::Arc::new(yoink::audit::HostAuditSink::new());
     for host_cfg in &config.hosts {
-        host_audit.register(Host::from(host_cfg)).await;
+        let host = Host::from(host_cfg);
+        let keyfile = ops.ssh_keyfile(&host);
+        host_audit.register(host, keyfile).await;
     }
     let audit_sink: std::sync::Arc<dyn yoink::audit::AuditSink> = host_audit.clone();
     let operator_sink: std::sync::Arc<dyn yoink::audit::AuditSink> =

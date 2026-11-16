@@ -702,7 +702,7 @@ async fn prepare_one_host(
     // Files only need to land on the host once per service, regardless
     // of replica count. Idempotent (content-addressed) so re-uploads
     // are no-ops anyway.
-    upload_files(&host, &resolved_files, &service.name).await?;
+    upload_files(ops, &host, &resolved_files, &service.name).await?;
 
     let replicas_count = service.run.replicas;
     let mut replicas: Vec<ReplicaPrep> = Vec::with_capacity(replicas_count as usize);
@@ -1184,12 +1184,14 @@ pub fn resolve_files(
 }
 
 async fn upload_files(
+    ops: &dyn DockerOps,
     host: &Host,
     files: &[(FileMount, Vec<u8>, String)],
     service_name: &str,
 ) -> Result<(), DeployError> {
+    let keyfile = ops.ssh_keyfile(host);
     for (mount, bytes, hash) in files {
-        files::upload(host, mount, hash, bytes)
+        files::upload(host, keyfile.as_deref(), mount, hash, bytes)
             .await
             .map_err(|source| DeployError::Files {
                 service: service_name.to_string(),

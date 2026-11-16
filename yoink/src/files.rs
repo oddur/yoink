@@ -14,7 +14,6 @@ use std::process::Stdio;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use crate::docker_ops::Host;
 
@@ -164,8 +163,14 @@ impl FileMount {
 /// land at the same path. `bytes` is the in-memory content captured
 /// at `read_and_hash` time; piping it to `ssh ... 'cat > file'`
 /// closes the hash-vs-upload TOCTOU window.
+///
+/// `keyfile` is `DockerOps::ssh_keyfile(host)`: the decrypted
+/// `ssh_key_secret:` key, so the upload authenticates the same way as
+/// the docker connection. The `local` sentinel host skips ssh and
+/// stages the file on the operator machine, where its daemon runs.
 pub async fn upload(
     host: &Host,
+    keyfile: Option<&Path>,
     mount: &FileMount,
     content_hash: &str,
     bytes: &[u8],
@@ -193,11 +198,7 @@ pub async fn upload(
         p = shell_single_quote(&parent),
         r = shell_single_quote(&remote),
     );
-    let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(format!("{}@{}", host.user, host.address))
-        .arg(&script)
+    let mut child = crate::ssh_keys::host_shell_command(host, keyfile, &script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
