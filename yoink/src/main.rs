@@ -2264,11 +2264,8 @@ async fn cmd_rollback(
 
     // For each host (optionally filtered), list ALL yoink-managed containers
     // (running + stopped). Group by `yoink.service` label. For each service
-    // group, collect the running containers' spec_hashes (current generation),
-    // then pick the most recently stopped container with a DIFFERENT spec_hash
-    // that predates the running ones — that's the previous generation (see
-    // `previous_generation`). Take its tag from the `yoink.version` label and
-    // record (host, tag) pairs per service.
+    // group, pick the previous generation (see `previous_generation`), take
+    // its tag (see `rollback_tag`) and record (host, tag) pairs per service.
     //
     // Result: service_name -> Vec<(host_address, prev_tag)>
     let mut rollback_plan: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -2302,9 +2299,7 @@ async fn cmd_rollback(
         }
 
         for (svc_name, containers) in by_service {
-            let prev = previous_generation(&containers);
-
-            let Some(prev_container) = prev else {
+            let Some(prev_container) = previous_generation(&containers) else {
                 info_eprintln!(
                     "[{}] {svc_name}: no previous generation found, skipping",
                     host.address
@@ -2421,20 +2416,18 @@ fn previous_generation(
         .filter_map(|c| c.created_unix)
         .min();
 
-    // Stopped containers sorted newest-first by creation time.
-    let mut stopped: Vec<_> = containers
+    // Newest stopped container with a DIFFERENT spec_hash. `min_by_key`
+    // over `Reverse` keeps the first of equally-new candidates.
+    containers
         .iter()
         .filter(|c| !is_current(c) && c.state != ContainerState::Created)
         .filter(|c| running_since.is_none_or(|t| c.created_unix.unwrap_or(0) < t))
-        .collect();
-    stopped.sort_by_key(|c| std::cmp::Reverse(c.created_unix.unwrap_or(0)));
-
-    // Most recently stopped container with a DIFFERENT spec_hash.
-    stopped.into_iter().find(|c| {
-        c.yoink_spec_hash
-            .as_deref()
-            .is_some_and(|h| !running_hashes.contains(h))
-    })
+        .filter(|c| {
+            c.yoink_spec_hash
+                .as_deref()
+                .is_some_and(|h| !running_hashes.contains(h))
+        })
+        .min_by_key(|c| std::cmp::Reverse(c.created_unix.unwrap_or(0)))
 }
 
 /// The tag to redeploy `container` with. The `yoink.version` label is
