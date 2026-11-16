@@ -278,22 +278,22 @@ fn is_likely_hub_library(image: &str) -> bool {
 
 // ---------- config: registry block consistency ----------
 
-/// Flag an orphan `registry:` block — set in config but no service
-/// actually references it. `yoink up` auto-skips the registry phase in
-/// that case, so the block is dead weight; doctor surfaces it so the
-/// operator can either remove it or wire a service to it.
+/// Flag each orphan registry entry (`registry:` or `registries:`) — set
+/// in config but no service actually references it. `yoink up` never
+/// sends that entry's credentials for a service image, so it is dead
+/// weight; doctor surfaces it so the operator can either remove it or
+/// wire a service to it. One finding per configured registry.
 fn check_registry_consistency(config: &Config) -> Vec<Finding> {
-    let Some(reg) = &config.registry else {
-        return Vec::new();
-    };
-    let n = config.services_using_configured_registry().count();
-    if n > 0 {
-        vec![Finding::pass(
-            "config",
-            format!("registry `{}` is referenced by {n} service(s)", reg.server),
-        )]
-    } else {
-        vec![
+    config
+        .configured_registries()
+        .map(|reg| {
+            let n = config.services_using_registry(reg).count();
+            if n > 0 {
+                return Finding::pass(
+                    "config",
+                    format!("registry `{}` is referenced by {n} service(s)", reg.server),
+                );
+            }
             Finding::warn(
                 "config",
                 format!(
@@ -308,12 +308,12 @@ fn check_registry_consistency(config: &Config) -> Vec<Finding> {
                  docker daemon. The configured creds are dead weight.",
             )
             .with_fix(format!(
-                "drop the `registry:` block, or update a service's `image:` to \
-                 use this registry (e.g. `image: {}/your-app`)",
+                "drop this registry from the config, or update a service's `image:` to \
+                 use it (e.g. `image: {}/your-app`)",
                 reg.server
-            )),
-        ]
-    }
+            ))
+        })
+        .collect()
 }
 
 // ---------- config: proxy + domain shape ----------
@@ -1075,5 +1075,26 @@ mod tests {
         .unwrap();
         let f = check_registry_consistency(&cfg);
         assert!(f.is_empty(), "no registry block → no finding (good or bad)");
+    }
+
+    #[test]
+    fn check_registry_consistency_reports_each_registries_entry() {
+        let cfg = Config::parse_str(
+            "deploy:\n  networks: [yoink]\nhosts:\n  - { address: h, user: u }\n\
+             registries:\n\
+             \x20 - { server: ghcr.io, username_secret: U, password_secret: P }\n\
+             \x20 - { server: quay.io, username_secret: U2, password_secret: P2 }\n\
+             secrets: { provider: command, command: [sh, -c, \"echo X=1\"] }\n\
+             services:\n  - name: api\n    image: ghcr.io/me/api\n    tag: v1\n    run: { port: 8080, healthcheck_path: / }\n"
+        )
+        .unwrap();
+        let f = check_registry_consistency(&cfg);
+        assert_eq!(f.len(), 2, "one finding per registry");
+        assert_eq!(f[0].severity, Severity::Pass);
+        assert!(f[0].title.contains("ghcr.io"));
+        assert!(f[0].title.contains("1 service(s)"));
+        assert_eq!(f[1].severity, Severity::Warn);
+        assert!(f[1].title.contains("quay.io"));
+        assert!(f[1].title.contains("no service references it"));
     }
 }

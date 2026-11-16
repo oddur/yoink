@@ -4355,7 +4355,8 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
                     "labels": s.labels,
                 })
             }).collect::<Vec<_>>(),
-            "registry_server": config.registry.as_ref().map(|r| r.server.clone()),
+            "registry_server": config.configured_registries().next().map(|r| r.server.clone()),
+            "registry_servers": config.configured_registries().map(|r| r.server.clone()).collect::<Vec<_>>(),
             "secrets_provider": config.secrets.as_ref().map(|s| match s {
                 yoink::config::SecretsConfig::Age { .. } => "age",
                 yoink::config::SecretsConfig::Command { .. } => "command",
