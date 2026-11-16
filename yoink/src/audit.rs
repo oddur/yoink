@@ -1,5 +1,5 @@
 //! On-host audit log. Each yoink-managed host gets an append-only
-//! JSONL file at `/var/lib/yoink/audit/events.jsonl` recording every
+//! JSONL file at `~/.local/state/yoink/host-audit/events.jsonl` recording every
 //! state-changing operation yoink performs there. Surfaced via
 //! `yoink audit log|run|gc`.
 //!
@@ -36,11 +36,29 @@ use tokio::sync::Mutex;
 
 use crate::docker_ops::Host;
 
-/// Where we keep the audit log on each host. Same parent directory as
-/// `/var/lib/yoink/files/` so all yoink host-side state sits in one
-/// predictable place.
-pub const AUDIT_DIR: &str = "/var/lib/yoink/audit";
-pub const AUDIT_FILE: &str = "/var/lib/yoink/audit/events.jsonl";
+/// Shell expression for the audit directory on a host. It is under
+/// the home directory of the SSH user, so a deploy user without root
+/// can create it on a server that yoink has never seen. The host shell
+/// expands it; quote it as `"$D"` after `D={HOST_AUDIT_DIR_SH}`.
+///
+/// The directory is not the operator log directory (`yoink/audit`):
+/// with the `local` host both live on one machine and must not share
+/// a file.
+pub const HOST_AUDIT_DIR_SH: &str = "\"${XDG_STATE_HOME:-$HOME/.local/state}/yoink/host-audit\"";
+/// Where yoink wrote the host log before the move. Only root can
+/// create it. Readers and `audit gc` still cover it, so the history of
+/// a host that has one stays visible. yoink no longer writes here.
+pub const LEGACY_HOST_AUDIT_DIR: &str = "/var/lib/yoink/audit";
+
+/// The host audit directory on the operator machine, for the `local`
+/// host. Same lookup as [`HOST_AUDIT_DIR_SH`].
+#[must_use]
+pub fn local_host_audit_dir() -> std::path::PathBuf {
+    let mut p = operator_audit_dir();
+    p.set_file_name("host-audit");
+    p
+}
+
 /// Active file size at which a flush triggers a rotation. 5 MiB ≈
 /// thousands of events; a busy host's audit file rotates every few
 /// weeks at most.
@@ -216,7 +234,7 @@ pub struct AuditEvent {
     pub event_id: String,
     /// Where this line was written: `"operator"` for the local file
     /// under `$XDG_STATE_HOME/yoink/audit/`, `"host"` for the on-host
-    /// file under `/var/lib/yoink/audit/`. The merge view in
+    /// file under `~/.local/state/yoink/host-audit/`. The merge view in
     /// `yoink audit log` reads both and tags rows accordingly.
     pub origin: String,
     /// RFC 3339 wall-clock timestamp with millisecond precision.
@@ -387,7 +405,7 @@ impl AuditSink for MemorySink {
     async fn flush(&self) {}
 }
 
-/// Writes audit events to `/var/lib/yoink/audit/events.jsonl` on each
+/// Writes audit events to `~/.local/state/yoink/host-audit/events.jsonl` on each
 /// host via raw SSH (same transport as `files::upload`). Forensic
 /// events flush per-event; progress events buffer per-host and flush
 /// in one SSH call on `flush()` or wave-end.
@@ -632,18 +650,7 @@ async fn append_via_ssh(
     lines: &[String],
 ) -> std::io::Result<()> {
     let payload = lines.join("\n") + "\n";
-    let script = format!(
-        "set -e; \
-         mkdir -p {AUDIT_DIR}; \
-         exec 9>{AUDIT_DIR}/.lock; \
-         flock -x 9 2>/dev/null || true; \
-         cat >> {AUDIT_FILE}; \
-         chmod 0640 {AUDIT_FILE} 2>/dev/null || true; \
-         sz=$(wc -c < {AUDIT_FILE} 2>/dev/null || echo 0); \
-         if [ $sz -gt {ROTATE_BYTES} ]; then \
-           mv {AUDIT_FILE} {AUDIT_DIR}/events-$(date -u +%Y%m%dT%H%M%SZ).jsonl; \
-         fi"
-    );
+    let script = append_script();
     let mut child = crate::ssh_keys::host_shell_command(host, keyfile, &script)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -666,17 +673,37 @@ async fn append_via_ssh(
     }
 }
 
+/// Shell script that appends stdin to the host audit file, then
+/// rotates the file when it is over the size limit.
+fn append_script() -> String {
+    format!(
+        "set -e; \
+         D={HOST_AUDIT_DIR_SH}; \
+         mkdir -p \"$D\"; \
+         exec 9>\"$D/.lock\"; \
+         flock -x 9 2>/dev/null || true; \
+         cat >> \"$D/events.jsonl\"; \
+         chmod 0640 \"$D/events.jsonl\" 2>/dev/null || true; \
+         sz=$(wc -c < \"$D/events.jsonl\" 2>/dev/null || echo 0); \
+         if [ $sz -gt {ROTATE_BYTES} ]; then \
+           mv \"$D/events.jsonl\" \"$D/events-$(date -u +%Y%m%dT%H%M%SZ).jsonl\"; \
+         fi"
+    )
+}
+
 /// Append directly to the local filesystem (the `local` sentinel
 /// host). Writes through the same path layout as remote hosts so a
 /// `yoink audit log --host local` reads back consistently.
 async fn append_local(lines: &[String]) -> std::io::Result<()> {
     use tokio::fs::OpenOptions;
     use tokio::io::AsyncWriteExt;
-    tokio::fs::create_dir_all(AUDIT_DIR).await?;
+    let dir = local_host_audit_dir();
+    let file = dir.join("events.jsonl");
+    tokio::fs::create_dir_all(&dir).await?;
     let mut f = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(AUDIT_FILE)
+        .open(&file)
         .await?;
     let payload = lines.join("\n") + "\n";
     f.write_all(payload.as_bytes()).await?;
@@ -688,8 +715,8 @@ async fn append_local(lines: &[String]) -> std::io::Result<()> {
             .chars()
             .filter(|c| !matches!(c, ':' | '-' | '.'))
             .collect();
-        let rotated = format!("{AUDIT_DIR}/events-{stamp}.jsonl");
-        tokio::fs::rename(AUDIT_FILE, &rotated).await?;
+        let rotated = dir.join(format!("events-{stamp}.jsonl"));
+        tokio::fs::rename(&file, &rotated).await?;
     }
     Ok(())
 }
@@ -1057,6 +1084,25 @@ pub async fn read_operator_audit_files(include_rotated: bool) -> std::io::Result
     Ok(out)
 }
 
+/// Shell script that prints the host audit files. A missing file
+/// reads as empty.
+fn fetch_script(include_rotated: bool) -> String {
+    // The legacy directory comes first so its older events precede
+    // the current ones. A missing file reads as empty.
+    if include_rotated {
+        format!(
+            "D={HOST_AUDIT_DIR_SH}; L={LEGACY_HOST_AUDIT_DIR}; \
+             cat \"$L\"/events.jsonl \"$L\"/events-*.jsonl \
+                 \"$D\"/events.jsonl \"$D\"/events-*.jsonl 2>/dev/null || true"
+        )
+    } else {
+        format!(
+            "D={HOST_AUDIT_DIR_SH}; L={LEGACY_HOST_AUDIT_DIR}; \
+             cat \"$L\"/events.jsonl \"$D\"/events.jsonl 2>/dev/null || true"
+        )
+    }
+}
+
 /// Cat the active host audit file plus rotated files (when requested)
 /// over SSH (or locally for the `local` sentinel host). Returns the
 /// concatenated JSONL bytes; missing files read as empty. `key_path`
@@ -1068,11 +1114,7 @@ pub async fn fetch_audit_files(
     key_path: Option<&std::path::Path>,
     include_rotated: bool,
 ) -> anyhow::Result<String> {
-    let script = if include_rotated {
-        format!("cat {AUDIT_FILE} {AUDIT_DIR}/events-*.jsonl 2>/dev/null || true")
-    } else {
-        format!("cat {AUDIT_FILE} 2>/dev/null || true")
-    };
+    let script = fetch_script(include_rotated);
     run_audit_shell(host, key_path, &script).await
 }
 
@@ -1290,6 +1332,74 @@ pub fn event_summary(kind: &AuditEventKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run a host audit script the way the host shell does, with
+    /// `home` as the home directory of the deploy user.
+    fn run_host_script(script: &str, home: &std::path::Path, stdin: &str) -> String {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("HOME", home)
+            .env_remove("XDG_STATE_HOME")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// The host log used to live in `/var/lib/yoink/audit`, which a
+    /// deploy user without root cannot create, so every flush failed
+    /// with `Permission denied`. The log now lives under the home
+    /// directory of that user and needs no host setup.
+    #[test]
+    fn host_audit_log_is_written_and_read_under_the_user_home() {
+        let home = tempfile::tempdir().unwrap();
+        run_host_script(&append_script(), home.path(), "{\"a\":1}\n");
+        run_host_script(&append_script(), home.path(), "{\"a\":2}\n");
+
+        let file = home
+            .path()
+            .join(".local/state/yoink/host-audit/events.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "{\"a\":1}\n{\"a\":2}\n"
+        );
+        for rotated in [false, true] {
+            assert_eq!(
+                run_host_script(&fetch_script(rotated), home.path(), ""),
+                "{\"a\":1}\n{\"a\":2}\n",
+                "include_rotated={rotated}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_audit_read_on_a_host_without_a_log_is_empty() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(run_host_script(&fetch_script(true), home.path(), ""), "");
+    }
+
+    #[test]
+    fn local_host_audit_dir_is_not_the_operator_log_dir() {
+        let dir = local_host_audit_dir();
+        assert_ne!(dir, operator_audit_dir());
+        assert!(dir.ends_with("yoink/host-audit"), "{}", dir.display());
+    }
 
     fn fixture_ctx() -> RunContext {
         RunContext {

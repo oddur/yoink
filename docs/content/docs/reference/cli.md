@@ -164,7 +164,7 @@ yoink reads these environment variables:
 
 | Command or flag | Effect |
 |---|---|
-| `yoink audit log` | Merges the operator-side log (`$XDG_STATE_HOME/yoink/audit/events.jsonl`) with `/var/lib/yoink/audit/events.jsonl` of each host. Removes duplicates by `event_id` and sorts newest first. |
+| `yoink audit log` | Merges the operator-side log (`$XDG_STATE_HOME/yoink/audit/events.jsonl`) with `~/.local/state/yoink/host-audit/events.jsonl` of each host. Removes duplicates by `event_id` and sorts newest first. |
 | `--host <ADDRESS>` | Reads the log of one host only. |
 | `--service <NAME>` | Shows the events of one service. |
 | `--deploy-id <ID>` | Shows the events of one run. Matches a prefix. |
