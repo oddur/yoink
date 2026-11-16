@@ -22,10 +22,13 @@ pub enum HealthcheckError {
     TimedOut {
         budget: Duration,
         attempts: u32,
+        /// Most recent HTTP status a probe returned, if any. A later
+        /// probe error does not clear it.
         last_http_status: Option<u16>,
-        /// Most recent probe error seen during the budget, if any.
-        /// A probe error is retried like a non-200, so this is the
-        /// only place it surfaces.
+        /// Most recent probe error seen during the budget, if any,
+        /// with the number of the attempt that hit it. A probe error
+        /// is retried like a non-200, so this is the only place it
+        /// surfaces.
         last_error: Option<String>,
     },
 }
@@ -58,10 +61,6 @@ where
 {
     let deadline = Instant::now() + budget;
     let mut attempt: u32 = 0;
-    // `last_http_status` is overwritten by the first `NotYet` arm
-    // before any read; the initial `None` is just to satisfy the
-    // borrow checker on the timeout branch.
-    #[allow(unused_assignments)]
     let mut last_http_status: Option<u16> = None;
     let mut last_error: Option<String> = None;
     loop {
@@ -72,9 +71,14 @@ where
                 last_http_status: s,
                 error,
             } => {
-                last_http_status = s;
-                if error.is_some() {
-                    last_error = error;
+                // Keep the latest of each. An attempt that errors has
+                // no status and must not hide the last real one; the
+                // attempt number shows how old the error is.
+                if s.is_some() {
+                    last_http_status = s;
+                }
+                if let Some(e) = error {
+                    last_error = Some(format!("attempt {attempt}: {e}"));
                 }
             }
         }
@@ -278,16 +282,25 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn tcp_times_out_when_never_reachable() {
+        let refused = || DockerError::Invalid("refused".into());
         let ops = FakeDockerOps::new();
         for _ in 0..50 {
-            ops.push_healthcheck_tcp(Err(crate::docker_ops::DockerError::Invalid(
-                "refused".into(),
-            )));
+            ops.push_healthcheck_tcp(Err(refused()));
         }
         let err = poll_tcp(&ops, &host(), "yoink", "c", 6379, Duration::from_secs(3))
             .await
             .unwrap_err();
-        assert!(matches!(err, HealthcheckError::TimedOut { .. }));
+        match err {
+            HealthcheckError::TimedOut {
+                attempts,
+                last_error,
+                ..
+            } => {
+                let last_error = last_error.expect("probe error kept");
+                assert_eq!(last_error, format!("attempt {attempts}: {}", refused()));
+            }
+            HealthcheckError::Docker(e) => panic!("expected timeout, got {e:?}"),
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -307,6 +320,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_message_dates_an_early_probe_error() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Err(DockerError::Invalid("ssh blip".into())));
+        for _ in 0..50 {
+            ops.push_healthcheck(Ok(503));
+        }
+        let err = poll(
+            &ops,
+            &host(),
+            "yoink",
+            "c",
+            3000,
+            "/h",
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("last status: Some(503)"), "got {message}");
+        assert!(
+            message.contains("last probe error: attempt 1: "),
+            "got {message}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -372,6 +411,8 @@ mod tests {
         for _ in 0..50 {
             ops.push_healthcheck(Err(DockerError::Invalid("ssh blip".into())));
         }
+        // The 503 from attempt 1 stays the last status: the attempts
+        // that errored returned no status.
         let err = poll(
             &ops,
             &host(),
@@ -392,8 +433,12 @@ mod tests {
                 ..
             } => {
                 assert!(attempts >= 2, "got {attempts}");
-                assert_eq!(last_http_status, None);
+                assert_eq!(last_http_status, Some(503));
                 let last_error = last_error.expect("probe error kept");
+                assert!(
+                    last_error.starts_with(&format!("attempt {attempts}: ")),
+                    "got {last_error}"
+                );
                 assert!(last_error.contains("ssh blip"), "got {last_error}");
                 assert!(message.contains("last probe error"), "got {message}");
                 assert!(message.contains("ssh blip"), "got {message}");
