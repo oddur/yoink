@@ -32,6 +32,15 @@ hosts:
   - { address: my-server, user: root }
 ```
 
+## SSH on a port other than 22
+
+Set `port:` on the host. Do not put the port in `address:`, because config load rejects `address: host:2200`.
+
+```yaml
+hosts:
+  - { address: 1.2.3.4, user: deploy, port: 2200 }
+```
+
 ## Ship the deploy key with the repo
 
 If a team must not keep the host key in each personal `ssh-agent`, use this config. The key lives in [sealed secrets](/docs/explanation/secrets).

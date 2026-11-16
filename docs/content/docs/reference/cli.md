@@ -59,7 +59,7 @@ yoink reads these environment variables:
 | `--var <KEY=VALUE>` | Sets a manifest variable. Repeatable. |
 | `--up` | Runs `yoink up` after the fragment is in place. |
 | `--yes` | Skips every confirmation prompt. Required in CI. |
-| `yoink hosts add` | Writes a host fragment to `<dest-dir>/<name>.yaml`. If the new address collides with an existing host, yoink removes the fragment and stops with an error. |
+| `yoink hosts add` | Writes a host fragment to `<dest-dir>/<name>.yaml`. `--port` sets the SSH port; a port in `--address host:2200` is moved to `port:`. If the new address collides with an existing host, yoink removes the fragment and stops with an error. |
 | `--address <ADDR>` | Hostname or IP of the host. Conflicts with `--address-secret`. |
 | `--address-secret <NAME>` | Name of the sealed secret that holds the address. |
 | `--user <USER>` | SSH user. Default: `root`. |

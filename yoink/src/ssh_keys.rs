@@ -41,6 +41,40 @@ impl KeyManager {
     }
 }
 
+/// Build the subprocess that runs `script` on `host`'s shell, for the
+/// call sites that shell out to `ssh` instead of going through bollard
+/// (`files::upload`, the host audit sink). The `local` sentinel host
+/// has nothing to ssh to, so it runs `sh -c <script>` on the operator
+/// machine. Every other host runs `ssh -o BatchMode=yes [-i keyfile]
+/// [-p port] user@address <script>`; `keyfile` is the path from
+/// `DockerOps::ssh_keyfile` (`KeyManager::key_for`), so the shell-out
+/// authenticates with the same `ssh_key_secret:` key as the bollard
+/// connection and `ssh_probe`. Stdio is left for the caller to set.
+#[must_use]
+pub fn host_shell_command(
+    host: &Host,
+    keyfile: Option<&Path>,
+    script: &str,
+) -> tokio::process::Command {
+    if host.is_local() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(script);
+        return cmd;
+    }
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    if let Some(key) = keyfile {
+        // `IdentitiesOnly=yes` stops ssh from trying every agent key
+        // first (which can exhaust the server's auth attempts before
+        // it reaches `-i`).
+        cmd.arg("-o").arg("IdentitiesOnly=yes").arg("-i").arg(key);
+    }
+    // `[-p <port>] user@address`, so a host with `port:` is reached
+    // the same way as by every other ssh shell-out.
+    cmd.args(host.ssh_args()).arg(script);
+    cmd
+}
+
 /// Walk `config.hosts`, decrypt every named `ssh_key_secret` from the
 /// bundle into a 0600 tempfile, and return a manager. The manager
 /// holds the tempfiles alive for the duration of the deploy.
@@ -149,10 +183,97 @@ services:
         cfg
     }
 
+    fn argv(cmd: &tokio::process::Command) -> Vec<String> {
+        let std_cmd = cmd.as_std();
+        std::iter::once(std_cmd.get_program())
+            .chain(std_cmd.get_args())
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn remote_host() -> Host {
+        Host {
+            user: "deploy".into(),
+            address: "h1".into(),
+            port: None,
+        }
+    }
+
+    #[test]
+    fn host_shell_command_passes_both_the_keyfile_and_the_port() {
+        // `files::upload` and the host audit sink on a host with both
+        // `ssh_key_secret:` and `port:`.
+        let host = Host {
+            port: Some(2200),
+            ..remote_host()
+        };
+        let cmd = host_shell_command(&host, Some(Path::new("/tmp/yoink-key-h1.pem")), "true");
+        assert_eq!(
+            argv(&cmd),
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-i",
+                "/tmp/yoink-key-h1.pem",
+                "-p",
+                "2200",
+                "deploy@h1",
+                "true",
+            ],
+        );
+    }
+
+    #[test]
+    fn host_shell_command_passes_the_host_keyfile_to_ssh() {
+        // Regression: `files::upload` and the host audit sink ran a
+        // bare `ssh user@addr`, so a host whose only credential is
+        // `ssh_key_secret:` got "Permission denied (publickey)".
+        let cmd = host_shell_command(
+            &remote_host(),
+            Some(Path::new("/tmp/yoink-key-h1.pem")),
+            "true",
+        );
+        assert_eq!(
+            argv(&cmd),
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-i",
+                "/tmp/yoink-key-h1.pem",
+                "deploy@h1",
+                "true",
+            ],
+        );
+    }
+
+    #[test]
+    fn host_shell_command_without_keyfile_uses_operator_ssh_auth() {
+        let cmd = host_shell_command(&remote_host(), None, "true");
+        assert_eq!(
+            argv(&cmd),
+            ["ssh", "-o", "BatchMode=yes", "deploy@h1", "true"]
+        );
+    }
+
+    #[test]
+    fn host_shell_command_runs_local_host_without_ssh() {
+        // Regression: `address: local` used to run `ssh @local ...`,
+        // which fails with "Could not resolve hostname local".
+        let cmd = host_shell_command(&Host::local(), None, "true");
+        assert_eq!(argv(&cmd), ["sh", "-c", "true"]);
+    }
+
     #[test]
     fn prepare_returns_none_when_no_host_declares_secret() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            port: None,
             address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: None,
@@ -165,6 +286,7 @@ services:
     fn prepare_errors_when_secret_missing_from_bundle() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            port: None,
             address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: Some("h1_key".into()),
@@ -182,6 +304,7 @@ services:
     fn prepare_errors_when_no_secrets_block() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            port: None,
             address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: Some("h1_key".into()),
@@ -196,12 +319,14 @@ services:
         let cfg = config_with_hosts(vec![
             HostConfig {
                 address: "h1".into(),
+                port: None,
                 address_secret: None,
                 user: "deploy".into(),
                 ssh_key_secret: Some("h1_key".into()),
             },
             HostConfig {
                 address: "h2".into(),
+                port: None,
                 address_secret: None,
                 user: "deploy".into(),
                 ssh_key_secret: None,
@@ -221,10 +346,12 @@ services:
             .expect("some");
         let h1 = Host {
             address: "h1".into(),
+            port: None,
             user: "deploy".into(),
         };
         let h2 = Host {
             address: "h2".into(),
+            port: None,
             user: "deploy".into(),
         };
         assert!(mgr.key_for(&h1).is_some());

@@ -25,7 +25,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{Config, HookSpec, HookTag, ServiceConfig};
 use crate::docker::{self, BuildError, RunSpec, SHORT_HASH_LEN};
-use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, Host};
+use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, Host, StoppedRemoval};
 use crate::files::{self, FileError, FileMount};
 use crate::healthcheck::{self, HealthcheckError};
 use crate::network;
@@ -118,6 +118,15 @@ pub enum DeployEvent {
         host: String,
         container: String,
         lines: Vec<String>,
+    },
+    /// The log tail of a failed container could not be fetched. Fired
+    /// in place of `ContainerLogTail` so the failure is still recorded
+    /// (the audit log builds `DeployFailed` from either event) even
+    /// though the container is removed right after.
+    ContainerLogTailUnavailable {
+        host: String,
+        container: String,
+        error: String,
     },
     Done {
         host: String,
@@ -337,7 +346,7 @@ pub async fn reconcile_with_options(
                 name: hook.name.clone(),
             },
         );
-        run_hook(ops, config, hook, &tag, secrets).await?;
+        run_hook(ops, config, None, hook, &tag, secrets).await?;
         on_event(
             None,
             DeployEvent::HookFinished {
@@ -437,33 +446,34 @@ pub async fn reconcile_with_options(
                     // admin state even when nothing has drifted.
                     let desired = build_desired_spec(config_ref, service, &tag, secrets_ref)?;
                     let desired_hash = docker::compute_spec_hash(&desired);
-                    if !options.force
-                        && let Some(host_results) = service_already_at_spec(
-                            snapshot_ref,
-                            config_ref,
-                            service,
-                            &desired_hash,
-                        )
-                    {
+                    let status = if options.force {
+                        SpecStatus::NotAtSpec
+                    } else {
+                        service_already_at_spec(snapshot_ref, config_ref, service, &desired_hash)
+                    };
+                    drop(desired);
+
+                    if let SpecStatus::AtSpec(hosts) = &status {
                         let mut g = sink_ref
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        for r in &host_results {
-                            for index in 0..service.run.replicas {
-                                let name = container_name(
-                                    &service.name,
-                                    &desired_hash,
-                                    index,
-                                    service.run.replicas,
-                                );
+                        let mut host_results = Vec::with_capacity(hosts.len());
+                        for h in hosts {
+                            for name in &h.expected {
                                 g(
                                     Some(&svc_name),
                                     DeployEvent::AlreadyAtSpec {
-                                        host: r.host.clone(),
-                                        container: name,
+                                        host: h.host.address.clone(),
+                                        container: name.clone(),
                                     },
                                 );
                             }
+                            host_results.push(HostDeployResult {
+                                host: h.host.address.clone(),
+                                container: h.expected.first().cloned().unwrap_or_default(),
+                                healthcheck_attempts: 0,
+                                stopped_old: vec![],
+                            });
                         }
                         return Ok(ServiceDeployReport {
                             service: service.name.clone(),
@@ -471,7 +481,6 @@ pub async fn reconcile_with_options(
                             hosts: host_results,
                         });
                     }
-                    drop(desired);
 
                     // Lock-per-event sink that injects the service tag.
                     let mut local_sink = |e: DeployEvent| {
@@ -480,11 +489,30 @@ pub async fn reconcile_with_options(
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         g(Some(&svc_name), e);
                     };
+
+                    // The expected replicas run at spec, but an old
+                    // generation or a surplus replica is still up.
+                    // Stop it without a deploy: no image pull and no
+                    // `pre_deploy` hooks.
+                    if let SpecStatus::AtSpecWithExtras(hosts) = status {
+                        return cleanup_extra_containers(
+                            ops_ref,
+                            config_ref,
+                            service,
+                            &tag,
+                            secrets_ref,
+                            hosts,
+                            &mut local_sink,
+                        )
+                        .await;
+                    }
+
                     deploy_service(
                         ops_ref,
                         config_ref,
                         service,
                         &tag,
+                        overrides_ref,
                         secrets_ref,
                         options.force,
                         &mut local_sink,
@@ -522,50 +550,235 @@ pub async fn reconcile_with_options(
     Ok(reports)
 }
 
-/// Pre-flight equality check: returns `Some(host_results)` when every
-/// applicable host already runs the expected replicas with matching
-/// `yoink.spec_hash`. `None` means "needs deploy" — at least one host
-/// has missing/extra/mismatched replicas.
+/// What one host runs for a service, measured against the desired
+/// spec. Shared by the reconcile skip decision, the cleanup-only
+/// route and the dry-run diff, so the three cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostSpecState {
+    /// Replica names the desired spec calls for, in index order.
+    pub expected: Vec<String>,
+    /// The subset of `expected` that is running with the desired
+    /// `yoink.spec_hash`.
+    pub present: Vec<String>,
+    /// Running containers labelled with the service that are not in
+    /// `expected`: an old generation left by a deploy that died
+    /// before the swap, or a surplus index after scaling `replicas`
+    /// down. Stopped containers do not count.
+    pub extras: Vec<String>,
+}
+
+impl HostSpecState {
+    /// Every expected replica runs at the desired spec.
+    pub(crate) fn all_present(&self) -> bool {
+        self.present.len() == self.expected.len()
+    }
+}
+
+/// Classify `containers` (one host's yoink-managed containers) for
+/// `service` at `desired_hash`.
+pub(crate) fn host_spec_state(
+    containers: &[ContainerInfo],
+    service: &ServiceConfig,
+    desired_hash: &str,
+) -> HostSpecState {
+    let replicas = service.run.replicas;
+    let expected: Vec<String> = (0..replicas)
+        .map(|index| container_name(&service.name, desired_hash, index, replicas))
+        .collect();
+    let present = expected
+        .iter()
+        .filter(|name| {
+            containers.iter().any(|c| {
+                c.name == **name
+                    && c.is_running()
+                    && c.yoink_spec_hash.as_deref() == Some(desired_hash)
+            })
+        })
+        .cloned()
+        .collect();
+    let extras = containers
+        .iter()
+        .filter(|c| {
+            c.yoink_service.as_deref() == Some(service.name.as_str())
+                && c.is_running()
+                && !expected.contains(&c.name)
+        })
+        .map(|c| c.name.clone())
+        .collect();
+    HostSpecState {
+        expected,
+        present,
+        extras,
+    }
+}
+
+/// One host of a service whose expected replicas all run at spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostAtSpec {
+    host: Host,
+    /// Expected replica names, in index order.
+    expected: Vec<String>,
+    /// Running containers of the service to stop. See
+    /// [`HostSpecState::extras`].
+    extras: Vec<String>,
+}
+
+/// Result of the pre-flight check in [`service_already_at_spec`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpecStatus {
+    /// At least one host has a missing or mismatched replica (or was
+    /// not in the snapshot): the service needs a deploy.
+    NotAtSpec,
+    /// Every applicable host runs exactly the expected replicas.
+    /// Nothing to do.
+    AtSpec(Vec<HostAtSpec>),
+    /// Every applicable host runs the expected replicas, and at least
+    /// one host also runs extras. The service needs a cleanup, not a
+    /// deploy.
+    AtSpecWithExtras(Vec<HostAtSpec>),
+}
+
+/// Pre-flight equality check against the reconcile snapshot.
 fn service_already_at_spec(
     snapshot: &std::collections::HashMap<String, Vec<ContainerInfo>>,
     config: &Config,
     service: &ServiceConfig,
     desired_hash: &str,
-) -> Option<Vec<HostDeployResult>> {
-    let mut results = Vec::new();
+) -> SpecStatus {
+    let mut hosts = Vec::new();
     for host_cfg in service.applicable_hosts(&config.hosts) {
-        let containers = snapshot.get(&host_cfg.address)?;
-        let mut primary: Option<String> = None;
-        for index in 0..service.run.replicas {
-            let name = container_name(&service.name, desired_hash, index, service.run.replicas);
-            let found = containers.iter().any(|c| {
-                c.name == name
-                    && c.is_running()
-                    && c.yoink_spec_hash.as_deref() == Some(desired_hash)
-            });
-            if !found {
-                return None;
-            }
-            if primary.is_none() {
-                primary = Some(name);
-            }
+        let Some(containers) = snapshot.get(&host_cfg.address) else {
+            return SpecStatus::NotAtSpec;
+        };
+        let state = host_spec_state(containers, service, desired_hash);
+        if !state.all_present() {
+            return SpecStatus::NotAtSpec;
         }
-        results.push(HostDeployResult {
-            host: host_cfg.address.clone(),
-            container: primary.unwrap_or_default(),
-            healthcheck_attempts: 0,
-            stopped_old: vec![],
+        hosts.push(HostAtSpec {
+            host: Host::from(host_cfg),
+            expected: state.expected,
+            extras: state.extras,
         });
     }
-    Some(results)
+    if hosts.iter().any(|h| !h.extras.is_empty()) {
+        SpecStatus::AtSpecWithExtras(hosts)
+    } else {
+        SpecStatus::AtSpec(hosts)
+    }
+}
+
+/// Cleanup-only route for a service that is at spec but has extra
+/// containers running. Per host: route Caddy to the expected replicas,
+/// then stop the extras. No image pull, no `pre_deploy` hooks, no
+/// container is created or started.
+///
+/// The Caddy push comes first for the same reason as in
+/// `finalize_one_host`: the extras may be what Caddy routes to today
+/// (the earlier deploy may have died at its own Caddy push). If the
+/// push fails, nothing is stopped and the error is returned.
+///
+/// A stop failure is an error here, unlike in the deploy path. The
+/// stop is the whole job of this route, and an extra that stays up
+/// would be picked up again by the final Caddy push in `reconcile`.
+async fn cleanup_extra_containers(
+    ops: &dyn DockerOps,
+    config: &Config,
+    service: &ServiceConfig,
+    tag: &str,
+    secrets: Option<&SecretsBundle>,
+    hosts: Vec<HostAtSpec>,
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<ServiceDeployReport, DeployError> {
+    let push_caddy = triggers_caddy_load(config, service);
+    let mut host_results = Vec::with_capacity(hosts.len());
+    for HostAtSpec {
+        host,
+        expected,
+        extras,
+    } in hosts
+    {
+        let primary = expected.first().cloned().unwrap_or_default();
+        // Same event sequence a deploy emits for this host, minus the
+        // pull: `Started` ... `Done`. Consumers that track per-service
+        // progress (the TUI reconcile table) need the closing `Done`.
+        // A host with no extras ends on `AlreadyAtSpec`, as in the
+        // plain skip.
+        if !extras.is_empty() {
+            on_event(DeployEvent::Started {
+                service: service.name.clone(),
+                tag: tag.to_string(),
+                host: host.address.clone(),
+            });
+        }
+        for name in &expected {
+            on_event(DeployEvent::AlreadyAtSpec {
+                host: host.address.clone(),
+                container: name.clone(),
+            });
+        }
+        let mut stopped_old = Vec::with_capacity(extras.len());
+        if !extras.is_empty() {
+            if push_caddy {
+                let keep: std::collections::BTreeSet<String> = expected.iter().cloned().collect();
+                push_caddy_config(
+                    ops,
+                    &host,
+                    config,
+                    secrets,
+                    Some((service.name.as_str(), &keep)),
+                )
+                .await?;
+            }
+            for name in extras {
+                stop_old_container(ops, &host, service.run.drain_timeout, &name, on_event)
+                    .await
+                    .map_err(|source| DeployError::Custom {
+                        host: host.address.clone(),
+                        detail: format!(
+                            "service {:?}: failed to stop extra container {name}: {source}",
+                            service.name
+                        ),
+                    })?;
+                stopped_old.push(name);
+            }
+            on_event(DeployEvent::Done {
+                host: host.address.clone(),
+                container: primary.clone(),
+            });
+        }
+        host_results.push(HostDeployResult {
+            host: host.address,
+            container: primary,
+            healthcheck_attempts: 0,
+            stopped_old,
+        });
+    }
+    Ok(ServiceDeployReport {
+        service: service.name.clone(),
+        tag: tag.to_string(),
+        hosts: host_results,
+    })
+}
+
+/// True when a change to `service`'s containers must be followed by a
+/// Caddy config push: the proxy is on, and the service is the proxy
+/// itself or is routed by it.
+fn triggers_caddy_load(config: &Config, service: &ServiceConfig) -> bool {
+    crate::proxy::proxy_enabled(config)
+        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
+            || crate::proxy::is_proxied(service))
 }
 
 /// Reconcile a single service across its applicable hosts.
+/// `tag_overrides` is the CLI `--tag` map; service-scoped hooks with
+/// `tag: { service: X }` resolve X's tag through it.
+#[allow(clippy::too_many_arguments)] // every arg is genuine context for the per-service deploy flow
 pub async fn deploy_service(
     ops: &dyn DockerOps,
     config: &Config,
     service: &ServiceConfig,
     tag: &str,
+    tag_overrides: &BTreeMap<String, String>,
     secrets: Option<&SecretsBundle>,
     force: bool,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
@@ -596,19 +809,26 @@ pub async fn deploy_service(
     // not run web's migrations). On hook failure we clean up the
     // pre-created replicas so a failed deploy doesn't leave
     // `created`-state containers hanging around until the next prune.
+    // `tag: { service: X }` mirrors X's deploy-time tag: the `--tag`
+    // override for X, else X's configured tag. This service's own
+    // deploy tag is authoritative for a self-reference.
+    let mut hook_overrides = tag_overrides.clone();
+    hook_overrides.insert(service.name.clone(), tag.to_string());
     for hook in &service.pre_deploy {
-        let hook_tag = resolve_hook_tag(hook, &BTreeMap::new(), &config.services);
-        let resolved_tag = if matches!(hook.tag, Some(HookTag::Ref { .. })) {
-            // For `tag: { service: <self> }`, use the deploy-time tag
-            // we were called with rather than the static fallback.
-            tag.to_string()
-        } else {
-            hook_tag
-        };
+        let resolved_tag = resolve_hook_tag(hook, &hook_overrides, &config.services);
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
         });
-        if let Err(e) = run_hook(ops, config, hook, &resolved_tag, secrets).await {
+        if let Err(e) = run_hook(
+            ops,
+            config,
+            Some(&service.name),
+            hook,
+            &resolved_tag,
+            secrets,
+        )
+        .await
+        {
             cleanup_prepared_replicas(ops, &prepared).await;
             return Err(e);
         }
@@ -676,7 +896,7 @@ async fn prepare_one_host(
     // the same host needs the same set, so 6 services × 6 networks
     // would emit 36 redundant "ready" lines otherwise.
 
-    let credentials = registry_credentials(config, secrets);
+    let credentials = registry_credentials(config, secrets, &service.image);
     pull_image(ops, &host, &service.image, tag, credentials, on_event).await?;
     let existing = list_existing_containers(ops, &host, &service.name).await?;
 
@@ -702,7 +922,7 @@ async fn prepare_one_host(
     // Files only need to land on the host once per service, regardless
     // of replica count. Idempotent (content-addressed) so re-uploads
     // are no-ops anyway.
-    upload_files(&host, &resolved_files, &service.name).await?;
+    upload_files(ops, &host, &resolved_files, &service.name).await?;
 
     let replicas_count = service.run.replicas;
     let mut replicas: Vec<ReplicaPrep> = Vec::with_capacity(replicas_count as usize);
@@ -731,7 +951,7 @@ async fn prepare_one_host(
             continue;
         }
         force_remove_name(ops, &host, &name).await;
-        create_pending_container(
+        if let Err(e) = create_pending_container(
             ops,
             &host,
             config,
@@ -742,7 +962,13 @@ async fn prepare_one_host(
             &spec_hash,
             &file_binds,
         )
-        .await?;
+        .await
+        {
+            // Do not leave the replicas created so far behind in
+            // `created` state.
+            remove_attempt_replicas(ops, &host, &replicas).await;
+            return Err(e);
+        }
         replicas.push(ReplicaPrep {
             name,
             already_running: false,
@@ -778,6 +1004,60 @@ async fn attach_extra_networks(
     Ok(())
 }
 
+/// Attach networks to, start and healthcheck every replica this attempt
+/// created on `host`, in replica order. Stops at the first failure and
+/// cleans nothing up: [`finalize_one_host`] removes the attempt's
+/// replicas on `Err`. Returns the highest healthcheck attempt count.
+async fn start_new_replicas(
+    ops: &dyn DockerOps,
+    host: &Host,
+    config: &Config,
+    service: &ServiceConfig,
+    replicas: &[ReplicaPrep],
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<u32, DeployError> {
+    let mut total_attempts: u32 = 0;
+    for replica in replicas {
+        if replica.already_running {
+            continue;
+        }
+        // Multi-network attach BEFORE start: docker only honors the first
+        // endpoint at create time, so connect the rest while the container
+        // is still created-but-not-running. Starting with every network
+        // already attached lets a container that eagerly dials its
+        // dependencies (DB, redis) on boot actually reach them. Attaching
+        // *after* start meant such a container exited before the networks
+        // landed, and the post-start connect then 404'd with "network
+        // sandbox not found" on the now-dead container — only services that
+        // connect lazily survived. The alias set is identical on every
+        // network so the container resolves by name everywhere.
+        //
+        // If any attach fails partway, the caller removes the attempt's
+        // replicas so the next reconcile re-creates from scratch —
+        // service_already_at_spec only checks name/hash/running, so a
+        // half-networked container would otherwise short-circuit and
+        // persist forever.
+        let effective = service.effective_networks(&config.deploy);
+        let mut aliases = vec![replica.name.clone()];
+        aliases.extend(service.run.options.network_aliases.iter().cloned());
+        attach_extra_networks(ops, host, &replica.name, &effective, &aliases).await?;
+        ops.start_container(host, &replica.name)
+            .await
+            .map_err(|source| DeployError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
+        on_event(DeployEvent::ContainerStarted {
+            host: host.address.clone(),
+            container: replica.name.clone(),
+        });
+        let attempts =
+            wait_until_healthy(ops, host, config, service, &replica.name, on_event).await?;
+        total_attempts = total_attempts.max(attempts);
+    }
+    Ok(total_attempts)
+}
+
 #[allow(clippy::too_many_lines)] // single linear finalize flow; same rationale as `reconcile`
 async fn finalize_one_host(
     ops: &dyn DockerOps,
@@ -797,10 +1077,31 @@ async fn finalize_one_host(
     let expected_names: std::collections::BTreeSet<String> =
         replicas.iter().map(|r| r.name.clone()).collect();
 
+    let triggers_caddy_load = triggers_caddy_load(config, service);
+
     // No fresh container to start, but a prior partial failure may
     // have left an old generation running alongside the new — run
     // orphan cleanup unconditionally so the second reconcile self-heals.
     if replicas.iter().all(|r| r.already_running) {
+        // That prior failure may have been the Caddy push itself, in
+        // which case Caddy still routes only to the old generation.
+        // Route to the expected replicas before stopping anything, as
+        // the normal path below does; otherwise the service is down
+        // until the final push at the end of `reconcile`, which never
+        // runs if a later service fails.
+        let has_old = existing
+            .iter()
+            .any(|c| c.is_running() && !expected_names.contains(&c.name));
+        if has_old && triggers_caddy_load {
+            push_caddy_config(
+                ops,
+                &host,
+                config,
+                secrets,
+                Some((service.name.as_str(), &expected_names)),
+            )
+            .await?;
+        }
         let stopped_old = swap_out_old_containers_by_set(
             ops,
             &host,
@@ -811,6 +1112,15 @@ async fn finalize_one_host(
         )
         .await?;
         let primary = replicas.first().map(|r| r.name.clone()).unwrap_or_default();
+        // `prepare_one_host` emitted `Started` for this host. When the
+        // cleanup did work, close the sequence so consumers that track
+        // per-service progress do not stay on the swap step.
+        if !stopped_old.is_empty() {
+            on_event(DeployEvent::Done {
+                host: host.address.clone(),
+                container: primary.clone(),
+            });
+        }
         return Ok(HostDeployResult {
             host: host.address,
             container: primary,
@@ -837,48 +1147,22 @@ async fn finalize_one_host(
         .await?;
     }
 
-    let mut total_attempts: u32 = 0;
-    for replica in &replicas {
-        if replica.already_running {
-            continue;
-        }
-        // Multi-network attach BEFORE start: docker only honors the first
-        // endpoint at create time, so connect the rest while the container
-        // is still created-but-not-running. Starting with every network
-        // already attached lets a container that eagerly dials its
-        // dependencies (DB, redis) on boot actually reach them. Attaching
-        // *after* start meant such a container exited before the networks
-        // landed, and the post-start connect then 404'd with "network
-        // sandbox not found" on the now-dead container — only services that
-        // connect lazily survived. The alias set is identical on every
-        // network so the container resolves by name everywhere.
-        //
-        // If any attach fails partway, force-remove so the next reconcile
-        // re-creates from scratch — service_already_at_spec only checks
-        // name/hash/running, so a half-networked container would otherwise
-        // short-circuit and persist forever.
-        let effective = service.effective_networks(&config.deploy);
-        let mut aliases = vec![replica.name.clone()];
-        aliases.extend(service.run.options.network_aliases.iter().cloned());
-        if let Err(e) = attach_extra_networks(ops, &host, &replica.name, &effective, &aliases).await
-        {
-            force_remove_name(ops, &host, &replica.name).await;
-            return Err(e);
-        }
-        ops.start_container(&host, &replica.name)
-            .await
-            .map_err(|source| DeployError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
-        on_event(DeployEvent::ContainerStarted {
-            host: host.address.clone(),
-            container: replica.name.clone(),
-        });
-        let attempts =
-            wait_until_healthy(ops, &host, config, service, &replica.name, on_event).await?;
-        total_attempts = total_attempts.max(attempts);
-    }
+    // From here until the Caddy push below, a failure unwinds the whole
+    // attempt on this host: every replica this attempt created is
+    // removed, the one that failed and the siblings that already
+    // passed. A sibling left running is unrouted (the Caddy push only
+    // happens once all replicas pass), and after a later successful
+    // deploy stops it, it is indistinguishable from a generation that
+    // was once live, so `yoink rollback` could pick the failed version.
+    // The previous generation in `existing` is never touched here.
+    let total_attempts =
+        match start_new_replicas(ops, &host, config, service, &replicas, on_event).await {
+            Ok(attempts) => attempts,
+            Err(e) => {
+                remove_attempt_replicas(ops, &host, &replicas).await;
+                return Err(e);
+            }
+        };
 
     // Caddy admin-API push: route the new replicas in (and the
     // proxy itself, after first deploy, into a serving state).
@@ -887,18 +1171,27 @@ async fn finalize_one_host(
     // expected (post-deploy) replica names — see `push_caddy_config`
     // for why we deliberately do NOT include the about-to-be-stopped
     // old containers in the rendered upstreams.
-    let triggers_caddy_load = crate::proxy::proxy_enabled(config)
-        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
-            || crate::proxy::is_proxied(service));
-    if triggers_caddy_load {
-        push_caddy_config(
+    let is_proxy = matches!(service.kind, Some(crate::config::ServiceKind::Proxy));
+    if triggers_caddy_load
+        && let Err(e) = push_caddy_config(
             ops,
             &host,
             config,
             secrets,
             Some((service.name.as_str(), &expected_names)),
         )
-        .await?;
+        .await
+    {
+        // The new replicas never got routed, so they go too. The
+        // proxy container itself is the exception: its predecessor
+        // is already stopped (it publishes host ports) and Caddy
+        // runs with `--resume`, so the new container is serving
+        // the autosaved config. Removing it would turn a rejected
+        // config push into a full outage.
+        if !is_proxy {
+            remove_attempt_replicas(ops, &host, &replicas).await;
+        }
+        return Err(e);
     }
 
     if !stop_first {
@@ -1184,12 +1477,14 @@ pub fn resolve_files(
 }
 
 async fn upload_files(
+    ops: &dyn DockerOps,
     host: &Host,
     files: &[(FileMount, Vec<u8>, String)],
     service_name: &str,
 ) -> Result<(), DeployError> {
+    let keyfile = ops.ssh_keyfile(host);
     for (mount, bytes, hash) in files {
-        files::upload(host, mount, hash, bytes)
+        files::upload(host, keyfile.as_deref(), mount, hash, bytes)
             .await
             .map_err(|source| DeployError::Files {
                 service: service_name.to_string(),
@@ -1201,14 +1496,23 @@ async fn upload_files(
 
 /// Resolve `[registry]`-configured username/password secret keys
 /// against the operator's `SecretsBundle` and return them as bollard
-/// `DockerCredentials`. Returns `None` when no registry block is set
-/// (typical for public-image-only deploys).
+/// `DockerCredentials` for a pull of `image`.
+///
+/// Returns `None` when no registry block is set (typical for
+/// public-image-only deploys), and when `image` is on a registry other
+/// than `registry.server`. That pull is anonymous: the credentials of
+/// one registry make another registry answer 401, also for a public
+/// image such as the default proxy image `caddy:2`.
 #[must_use]
 pub fn registry_credentials(
     config: &Config,
     secrets: Option<&SecretsBundle>,
+    image: &str,
 ) -> Option<bollard::auth::DockerCredentials> {
     let reg = config.registry.as_ref()?;
+    if !crate::docker::image_on_registry(image, &reg.server) {
+        return None;
+    }
     let bundle = secrets?;
     let username = bundle.get(&reg.username_secret)?.to_string();
     let password = Zeroizing::new(bundle.get(&reg.password_secret)?.to_string());
@@ -1323,8 +1627,6 @@ pub async fn prefetch_images(
     rebuild_proxy: bool,
     on_event: Arc<dyn Fn(DeployEvent) + Send + Sync>,
 ) -> Result<(), DeployError> {
-    let credentials = registry_credentials(config, secrets);
-
     // xcaddy builds run in their own collection so per-host failures
     // can be bundled into a "X/N succeeded; failed on host Y" message
     // — first-error-wins on a fleet hides which hosts have a fresh
@@ -1397,6 +1699,7 @@ pub async fn prefetch_images(
                 None => continue,
             },
         };
+        let credentials = registry_credentials(config, secrets, &service.image);
         for host_cfg in service.applicable_hosts(&config.hosts) {
             let host = Host::from(host_cfg);
             let ops = ops.clone();
@@ -1521,12 +1824,24 @@ async fn force_remove_name(ops: &dyn DockerOps, host: &Host, name: &str) {
 /// already gone); errors are logged inside `force_remove_name` and
 /// never mask the original hook error.
 async fn cleanup_prepared_replicas(ops: &dyn DockerOps, prepared: &[HostPrep]) {
-    let futs = prepared.iter().flat_map(|prep| {
-        prep.replicas
-            .iter()
-            .filter(|r| !r.already_running)
-            .map(move |r| force_remove_name(ops, &prep.host, &r.name))
-    });
+    let futs = prepared
+        .iter()
+        .map(|prep| remove_attempt_replicas(ops, &prep.host, &prep.replicas));
+    futures_util::future::join_all(futs).await;
+}
+
+/// Force-remove every replica the current deploy attempt created on
+/// `host`: running, exited or still in `created` state. The set is the
+/// attempt's own [`ReplicaPrep`] list, not a label scan, so the
+/// previous generation and replicas that were already at spec before
+/// the attempt (`already_running`) are never touched. Best-effort:
+/// errors are logged inside `force_remove_name` so the caller can
+/// return the original deploy error.
+async fn remove_attempt_replicas(ops: &dyn DockerOps, host: &Host, replicas: &[ReplicaPrep]) {
+    let futs = replicas
+        .iter()
+        .filter(|r| !r.already_running)
+        .map(|r| force_remove_name(ops, host, &r.name));
     futures_util::future::join_all(futs).await;
 }
 
@@ -1633,14 +1948,24 @@ async fn wait_until_healthy(
                 .await;
             // Pull the tail of its logs so the operator gets the
             // "why did it die?" answer in the same pane the
-            // reconcile is running in. Best-effort: a fetch error
-            // here just means no log preview, not deploy retry.
-            if let Ok(lines) = ops.fetch_recent_logs(host, new_name, 30).await {
-                on_event(DeployEvent::ContainerLogTail {
+            // reconcile is running in. The caller removes the
+            // container right after this returns (a stopped container
+            // left behind is indistinguishable from a generation that
+            // was once live, and `yoink rollback` would pick it), so
+            // this is the last chance to record anything. When the
+            // fetch fails, say so instead of staying silent: the audit
+            // log builds its `DeployFailed` record from either event.
+            match ops.fetch_recent_logs(host, new_name, 30).await {
+                Ok(lines) => on_event(DeployEvent::ContainerLogTail {
                     host: host.address.clone(),
                     container: new_name.to_string(),
                     lines,
-                });
+                }),
+                Err(e) => on_event(DeployEvent::ContainerLogTailUnavailable {
+                    host: host.address.clone(),
+                    container: new_name.to_string(),
+                    error: e.to_string(),
+                }),
             }
             Err(DeployError::Healthcheck {
                 host: host.address.clone(),
@@ -1668,17 +1993,31 @@ async fn swap_out_old_containers_by_set(
         .iter()
         .filter(|c| !keep.contains(&c.name) && c.is_running())
     {
-        if let Err(e) = ops.stop_container(host, &old.name, drain).await {
+        if let Err(e) = stop_old_container(ops, host, drain, &old.name, on_event).await {
             warn!(host = %host.address, old = %old.name, error = %e, "failed to stop old container");
             continue;
         }
-        on_event(DeployEvent::OldContainerStopped {
-            host: host.address.clone(),
-            container: old.name.clone(),
-        });
         stopped.push(old.name.clone());
     }
     Ok(stopped)
+}
+
+/// Stop one container and emit `OldContainerStopped`. The caller
+/// decides what a failure means: the deploy path warns and moves on,
+/// the cleanup-only route fails the service.
+async fn stop_old_container(
+    ops: &dyn DockerOps,
+    host: &Host,
+    drain: Duration,
+    name: &str,
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<(), DockerError> {
+    ops.stop_container(host, name, drain).await?;
+    on_event(DeployEvent::OldContainerStopped {
+        host: host.address.clone(),
+        container: name.to_string(),
+    });
+    Ok(())
 }
 
 /// Resolve a container hook's tag. Subprocess hooks have no tag —
@@ -1711,9 +2050,15 @@ fn resolve_hook_tag(
 /// merged in). Validation guarantees `image`/`tag` are both Some for
 /// container hooks and both None for subprocess hooks; the dispatch
 /// here only has to honor that invariant.
+///
+/// `service` is the owning service for a service-scoped hook, `None`
+/// for a top-level one. It goes into the container name so two
+/// services deployed in the same wave with a same-named hook at the
+/// same tag don't fight over one name.
 async fn run_hook(
     ops: &dyn DockerOps,
     config: &Config,
+    service: Option<&str>,
     hook: &HookSpec,
     tag: &str,
     secrets: Option<&SecretsBundle>,
@@ -1731,7 +2076,7 @@ async fn run_hook(
         .image
         .as_deref()
         .expect("validated: container hook has image");
-    let credentials = registry_credentials(config, secrets);
+    let credentials = registry_credentials(config, secrets, image);
     ops.pull_image(&host, image, tag, credentials)
         .await
         .map_err(|source| DeployError::Docker {
@@ -1756,7 +2101,34 @@ async fn run_hook(
         &hook.cmd,
         &hook_env(hook, secrets),
     );
-    let container_name = format!("yoink-hook-{}-{tag}", hook.name);
+    let container_name = hook_container_name(service, &hook.name, tag);
+    // The name is deterministic, so a hook container left behind by an
+    // interrupted deploy (Ctrl-C, dropped ssh link) would fail the
+    // create with a 409 name conflict on every later deploy. Reap it
+    // first, but only if it has stopped. A leftover that still runs
+    // can be a migration that survived a dropped link, and the deploy
+    // lock does not prove that nobody owns it (the lock sentinel
+    // expires after 30s of missed heartbeats). Killing it could leave
+    // a half-applied migration, so the operator decides.
+    match ops.remove_stopped_container(&host, &container_name).await {
+        Ok(StoppedRemoval::Removed | StoppedRemoval::Absent) => {}
+        Ok(StoppedRemoval::Running) => {
+            return Err(DeployError::Hook {
+                name: hook.name.clone(),
+                message: format!(
+                    "a previous run of this hook is still running on host {} in container \
+                     {container_name}. Wait for it to finish, or remove it with \
+                     `docker rm -f {container_name}`, then rerun.",
+                    host.address
+                ),
+            });
+        }
+        // Best effort, as before: if the name is still taken, the
+        // create reports the conflict.
+        Err(e) => {
+            warn!(host = %host.address, container = %container_name, error = %e, "remove of stale hook container failed; continuing");
+        }
+    }
     let result = ops
         .run_one_shot(&host, &container_name, body)
         .await
@@ -1776,6 +2148,25 @@ async fn run_hook(
         });
     }
     Ok(())
+}
+
+/// Docker allows only `[a-zA-Z0-9_.-]` in a container name. A digest
+/// tag (`sha256:<hex>`) carries a `:`, and hook names are free-form,
+/// so every other character becomes `-`.
+fn hook_container_name(service: Option<&str>, hook: &str, tag: &str) -> String {
+    let name = match service {
+        Some(service) => format!("yoink-hook-{service}-{hook}-{tag}"),
+        None => format!("yoink-hook-{hook}-{tag}"),
+    };
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn hook_env(hook: &HookSpec, secrets: Option<&SecretsBundle>) -> BTreeMap<String, String> {
@@ -1880,7 +2271,7 @@ async fn run_subprocess_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::docker_ops::FakeDockerOps;
+    use crate::docker_ops::{FakeDockerOps, RecordedCall};
 
     #[test]
     fn summarize_build_outcomes_all_success_is_none() {
@@ -2083,6 +2474,34 @@ services:
         assert!(!env.contains_key("MISSING"));
     }
 
+    /// Regression for #108: with `registry.server: ghcr.io`, the pull of
+    /// the default proxy image `caddy:2` carried the ghcr.io credentials
+    /// and Docker Hub answered 401.
+    #[test]
+    fn registry_credentials_go_only_to_the_configured_registry() {
+        let mut cfg = config_one_service();
+        cfg.registry = Some(crate::config::RegistryConfig {
+            server: "ghcr.io".into(),
+            username_secret: "GHCR_USERNAME".into(),
+            password_secret: "GHCR_TOKEN".into(),
+        });
+        let mut values = BTreeMap::new();
+        values.insert("GHCR_USERNAME".into(), Zeroizing::new("me".to_string()));
+        values.insert(
+            "GHCR_TOKEN".into(),
+            Zeroizing::new("fake-test-fixture".to_string()),
+        );
+        let bundle = SecretsBundle::new(values);
+
+        let creds = registry_credentials(&cfg, Some(&bundle), "ghcr.io/owner/app")
+            .expect("credentials for an image on the configured registry");
+        assert_eq!(creds.username.as_deref(), Some("me"));
+        assert_eq!(creds.serveraddress.as_deref(), Some("ghcr.io"));
+
+        assert!(registry_credentials(&cfg, Some(&bundle), "caddy").is_none());
+        assert!(registry_credentials(&cfg, Some(&bundle), "quay.io/owner/app").is_none());
+    }
+
     fn happy_ops(existing_running: &[(&str, &str)]) -> FakeDockerOps {
         let ops = FakeDockerOps::new();
         ops.push_ensure_network(Ok(false));
@@ -2126,6 +2545,7 @@ services:
             &cfg,
             &cfg.services[0],
             "a1b2c3d",
+            &BTreeMap::new(),
             None,
             false,
             &mut sink,
@@ -2143,6 +2563,405 @@ services:
             report.hosts[0].stopped_old,
             vec!["app-a-9f8e7d6".to_string()]
         );
+    }
+
+    /// A container that never passed its healthcheck must not survive
+    /// the failed deploy: left behind stopped, it looks like a previous
+    /// generation and `yoink rollback` redeploys the broken tag.
+    #[tokio::test(start_paused = true)]
+    async fn deploy_service_removes_container_that_fails_healthcheck() {
+        let ops = FakeDockerOps::new();
+        ops.push_ensure_network(Ok(false));
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+        ops.push_start_container(Ok(()));
+        // No healthcheck response queued: the probe errors out.
+        ops.push_stop_container(Ok(()));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_one_service();
+        let mut sink = |_e: DeployEvent| {};
+        let err = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        let DeployError::Healthcheck { container, .. } = err else {
+            panic!("expected healthcheck error, got {err:?}");
+        };
+        let calls = ops.calls();
+        let stop = calls
+            .iter()
+            .position(|c| matches!(c, crate::docker_ops::RecordedCall::StopContainer(_, n, _) if *n == container))
+            .expect("failed container is stopped");
+        assert!(
+            calls[stop..]
+                .iter()
+                .any(|c| matches!(c, crate::docker_ops::RecordedCall::ForceRemoveContainer(_, n) if *n == container)),
+            "failed container must be removed after it is stopped: {calls:?}"
+        );
+    }
+
+    fn config_replicas(replicas: u32) -> Config {
+        let mut cfg = config_one_service();
+        cfg.services[0].run.replicas = replicas;
+        cfg
+    }
+
+    const OLD_GENERATION: &str = "app-a-9f8e7d6";
+
+    /// Scripted ops for a deploy of `replicas` new containers next to a
+    /// running old generation, where the first `healthy` replicas pass
+    /// their healthcheck and the next probe errors out. Cleanup
+    /// removals are left to the caller to script.
+    fn failing_deploy_ops(replicas: u32, healthy: u32) -> FakeDockerOps {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: Some("app-a".into()),
+            yoink_version: Some("9f8e7d6".into()),
+            ..container_with_state(OLD_GENERATION, "running")
+        }]));
+        for _ in 0..replicas {
+            // Prepare: force-remove-by-name, then create.
+            ops.push_force_remove(Ok(()));
+            ops.push_create_container(Ok("abcdef".into()));
+        }
+        for _ in 0..=healthy {
+            ops.push_start_container(Ok(()));
+        }
+        for _ in 0..healthy {
+            ops.push_healthcheck(Ok(200));
+        }
+        // No further healthcheck response: the next probe errors out.
+        ops.push_stop_container(Ok(()));
+        ops
+    }
+
+    async fn deploy_expecting_healthcheck_failure(
+        ops: &FakeDockerOps,
+        cfg: &Config,
+    ) -> (String, Vec<DeployEvent>) {
+        let mut events: Vec<DeployEvent> = Vec::new();
+        let mut sink = |e: DeployEvent| events.push(e);
+        let err = deploy_service(
+            ops,
+            cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        let DeployError::Healthcheck { container, .. } = err else {
+            panic!("expected the original healthcheck error, got {err:?}");
+        };
+        (container, events)
+    }
+
+    fn created_names(ops: &FakeDockerOps) -> Vec<String> {
+        ops.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::CreateContainer(_, n) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Names force-removed after the first `start_container`, i.e. by
+    /// the failure unwind rather than by prepare's remove-by-name.
+    fn removed_after_start(ops: &FakeDockerOps) -> Vec<String> {
+        let calls = ops.calls();
+        let first_start = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::StartContainer(..)))
+            .expect("a container was started");
+        let mut names: Vec<String> = calls[first_start..]
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRemoveContainer(_, n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn assert_old_generation_untouched(ops: &FakeDockerOps) {
+        let calls = ops.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::StopContainer(_, n, _) | RecordedCall::ForceRemoveContainer(_, n)
+                    if n == OLD_GENERATION
+            )),
+            "the serving generation must not be stopped or removed: {calls:?}"
+        );
+    }
+
+    /// Replica 0 passes, replica 1 fails. Replica 0 must not survive:
+    /// it is running but unrouted, and after a later successful deploy
+    /// stops it, `yoink rollback` would take it for a generation that
+    /// was once live.
+    #[tokio::test(start_paused = true)]
+    async fn failed_deploy_removes_healthy_sibling_replicas() {
+        let ops = failing_deploy_ops(2, 1);
+        ops.push_fetch_logs(Ok(vec!["boom".into()]));
+        ops.push_force_remove(Ok(()));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(2);
+        let (failed, events) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(created.len(), 2);
+        assert_eq!(failed, created[1], "replica 1 is the one that failed");
+        assert_eq!(removed_after_start(&ops), created);
+        assert_old_generation_untouched(&ops);
+
+        // The log tail is captured before the failed container goes.
+        let calls = ops.calls();
+        let logs = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::FetchRecentLogs(_, n, _) if *n == failed))
+            .expect("log tail fetched");
+        assert!(
+            calls[logs..]
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ForceRemoveContainer(_, n) if *n == failed)),
+            "failed container must be removed after its logs are fetched: {calls:?}"
+        );
+        assert!(events.contains(&DeployEvent::ContainerLogTail {
+            host: "host-a".into(),
+            container: failed,
+            lines: vec!["boom".into()],
+        }));
+    }
+
+    /// When the log tail cannot be fetched the failure is still
+    /// reported (the audit log turns this event into `DeployFailed`)
+    /// and the container is removed all the same.
+    #[tokio::test(start_paused = true)]
+    async fn log_fetch_failure_is_reported_and_container_still_removed() {
+        let ops = failing_deploy_ops(1, 0);
+        ops.push_fetch_logs(Err(DockerError::Invalid("ssh session closed".into())));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(1);
+        let (failed, events) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        assert_eq!(removed_after_start(&ops), vec![failed.clone()]);
+        let unavailable: Vec<&DeployEvent> = events
+            .iter()
+            .filter(|e| matches!(e, DeployEvent::ContainerLogTailUnavailable { .. }))
+            .collect();
+        let [
+            DeployEvent::ContainerLogTailUnavailable {
+                host,
+                container,
+                error,
+            },
+        ] = unavailable.as_slice()
+        else {
+            panic!("expected one ContainerLogTailUnavailable event, got {events:?}");
+        };
+        assert_eq!(host, "host-a");
+        assert_eq!(*container, failed);
+        assert!(error.contains("ssh session closed"), "got {error:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DeployEvent::ContainerLogTail { .. }))
+        );
+    }
+
+    /// Failure on the last of three replicas: the two that passed go
+    /// with it.
+    #[tokio::test(start_paused = true)]
+    async fn failed_deploy_on_last_replica_removes_all_replicas() {
+        let ops = failing_deploy_ops(3, 2);
+        for _ in 0..3 {
+            ops.push_force_remove(Ok(()));
+        }
+        let cfg = config_replicas(3);
+        let (failed, _) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(created.len(), 3);
+        assert_eq!(failed, created[2]);
+        assert_eq!(removed_after_start(&ops), created);
+        assert_old_generation_untouched(&ops);
+    }
+
+    /// Failure on the first of three replicas: the two still in
+    /// `created` state are removed as well.
+    #[tokio::test(start_paused = true)]
+    async fn failed_deploy_removes_replicas_never_started() {
+        let ops = failing_deploy_ops(3, 0);
+        for _ in 0..3 {
+            ops.push_force_remove(Ok(()));
+        }
+        let cfg = config_replicas(3);
+        let (failed, _) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(failed, created[0]);
+        assert_eq!(removed_after_start(&ops), created);
+        assert_old_generation_untouched(&ops);
+    }
+
+    /// A removal that fails during the unwind is logged, every other
+    /// replica is still attempted, and the caller gets the healthcheck
+    /// error rather than the cleanup error.
+    #[tokio::test(start_paused = true)]
+    async fn failed_cleanup_does_not_mask_the_deploy_error() {
+        let ops = failing_deploy_ops(2, 1);
+        ops.push_force_remove(Err(DockerError::Invalid("daemon went away".into())));
+        ops.push_force_remove(Err(DockerError::Invalid("daemon went away".into())));
+        let cfg = config_replicas(2);
+        // Panics unless the error is the original `Healthcheck` one.
+        let (_, _) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(removed_after_start(&ops), created);
+        assert_old_generation_untouched(&ops);
+    }
+
+    /// A start failure unwinds the same way as a healthcheck failure.
+    #[tokio::test(start_paused = true)]
+    async fn start_failure_removes_all_replicas() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(Vec::new()));
+        for _ in 0..2 {
+            ops.push_force_remove(Ok(()));
+            ops.push_create_container(Ok("abcdef".into()));
+        }
+        ops.push_start_container(Ok(()));
+        ops.push_healthcheck(Ok(200));
+        ops.push_start_container(Err(DockerError::Invalid("no such image".into())));
+        ops.push_force_remove(Ok(()));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(2);
+        let mut sink = |_e: DeployEvent| {};
+        let err = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DeployError::Docker { .. }), "got {err:?}");
+        let mut created = created_names(&ops);
+        created.sort();
+        assert_eq!(removed_after_start(&ops), created);
+    }
+
+    /// When creating replica 1 fails, replica 0 is not left behind in
+    /// `created` state.
+    #[tokio::test(start_paused = true)]
+    async fn create_failure_removes_replicas_created_so_far() {
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Err(DockerError::Invalid("no space left".into())));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(2);
+        let mut sink = |_e: DeployEvent| {};
+        let err = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DeployError::Docker { .. }), "got {err:?}");
+        let calls = ops.calls();
+        let removed: Vec<&String> = calls
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRemoveContainer(_, n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        // Two by prepare (one per replica), then replica 0 again.
+        assert_eq!(removed.len(), 3, "{calls:?}");
+        assert_eq!(removed[2], removed[0]);
+        assert_ne!(removed[2], removed[1]);
+    }
+
+    /// Retrying the same version after a failed attempt starts every
+    /// replica again: nothing of the failed attempt is left to be
+    /// mistaken for a replica that is already at spec.
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_failed_deploy_recreates_every_replica() {
+        let ops = failing_deploy_ops(2, 1);
+        ops.push_force_remove(Ok(()));
+        ops.push_force_remove(Ok(()));
+        let cfg = config_replicas(2);
+        deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+        let first_attempt = created_names(&ops);
+
+        // The host now holds only the old generation again.
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: Some("app-a".into()),
+            ..container_with_state(OLD_GENERATION, "running")
+        }]));
+        for _ in 0..2 {
+            ops.push_force_remove(Ok(()));
+            ops.push_create_container(Ok("abcdef".into()));
+            ops.push_start_container(Ok(()));
+            ops.push_healthcheck(Ok(200));
+        }
+        ops.push_stop_container(Ok(()));
+        let mut sink = |_e: DeployEvent| {};
+        let report = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "a1b2c3d",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.hosts[0].stopped_old,
+            vec![OLD_GENERATION.to_string()]
+        );
+        let all = created_names(&ops);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[2..], first_attempt[..]);
     }
 
     /// `happy_ops` flavoured for the reconcile entry point: prepends
@@ -2252,6 +3071,7 @@ services:
             &cfg,
             &cfg.services[0],
             "a1b2c3d",
+            &BTreeMap::new(),
             None,
             false,
             &mut sink,
@@ -2264,6 +3084,441 @@ services:
             e,
             DeployEvent::AlreadyAtSpec { container, .. } if container == &expected_name
         )));
+    }
+
+    fn snapshot_container(service: &str, name: &str, hash: &str, state: &str) -> ContainerInfo {
+        ContainerInfo {
+            yoink_service: Some(service.into()),
+            yoink_spec_hash: Some(hash.into()),
+            ..container_with_state(name, state)
+        }
+    }
+
+    fn snapshot_of(
+        containers: Vec<ContainerInfo>,
+    ) -> std::collections::HashMap<String, Vec<ContainerInfo>> {
+        std::collections::HashMap::from([("host-a".to_string(), containers)])
+    }
+
+    fn extras_of(status: &SpecStatus) -> Vec<String> {
+        match status {
+            SpecStatus::AtSpecWithExtras(hosts) => {
+                hosts.iter().flat_map(|h| h.extras.clone()).collect()
+            }
+            other => panic!("expected AtSpecWithExtras, got {other:?}"),
+        }
+    }
+
+    /// The pre-flight check must report a running old generation as an
+    /// extra instead of a plain "at spec". A deploy that died between
+    /// "new healthy" and "old stopped" left the old generation up; the
+    /// next reconcile skipped the service and the final Caddy push
+    /// load-balanced across both generations.
+    #[test]
+    fn already_at_spec_reports_running_old_generation_as_extra() {
+        let cfg = config_one_service();
+        let service = &cfg.services[0];
+        let desired = "a".repeat(64);
+        let stale = "b".repeat(64);
+        let new_name = container_name("app-a", &desired, 0, 1);
+        let old_name = container_name("app-a", &stale, 0, 1);
+
+        // Only the expected replica: at spec, nothing to clean up.
+        let snap = snapshot_of(vec![snapshot_container(
+            "app-a", &new_name, &desired, "running",
+        )]);
+        assert!(matches!(
+            service_already_at_spec(&snap, &cfg, service, &desired),
+            SpecStatus::AtSpec(_)
+        ));
+
+        // Old generation still running next to it: cleanup.
+        let snap = snapshot_of(vec![
+            snapshot_container("app-a", &new_name, &desired, "running"),
+            snapshot_container("app-a", &old_name, &stale, "running"),
+        ]);
+        let status = service_already_at_spec(&snap, &cfg, service, &desired);
+        assert_eq!(extras_of(&status), vec![old_name.clone()]);
+
+        // Old generation already stopped: not an extra.
+        let snap = snapshot_of(vec![
+            snapshot_container("app-a", &new_name, &desired, "running"),
+            snapshot_container("app-a", &old_name, &stale, "exited"),
+        ]);
+        assert!(matches!(
+            service_already_at_spec(&snap, &cfg, service, &desired),
+            SpecStatus::AtSpec(_)
+        ));
+
+        // A running container of another service is not an extra.
+        let snap = snapshot_of(vec![
+            snapshot_container("app-a", &new_name, &desired, "running"),
+            snapshot_container("app-b", "app-b-1234567", &stale, "running"),
+        ]);
+        assert!(matches!(
+            service_already_at_spec(&snap, &cfg, service, &desired),
+            SpecStatus::AtSpec(_)
+        ));
+
+        // Expected replica missing: a deploy, even with the old
+        // generation running.
+        let snap = snapshot_of(vec![snapshot_container(
+            "app-a", &old_name, &stale, "running",
+        )]);
+        assert_eq!(
+            service_already_at_spec(&snap, &cfg, service, &desired),
+            SpecStatus::NotAtSpec
+        );
+
+        // Host absent from the snapshot: a deploy.
+        assert_eq!(
+            service_already_at_spec(&std::collections::HashMap::new(), &cfg, service, &desired),
+            SpecStatus::NotAtSpec
+        );
+    }
+
+    /// `replicas` is not part of the spec hash, so after scaling
+    /// 3 -> 2 the `-0` / `-1` names still match. The surplus `-2` must
+    /// be reported as an extra.
+    #[test]
+    fn already_at_spec_reports_surplus_replica_as_extra() {
+        let mut cfg = config_one_service();
+        cfg.services[0].run.replicas = 2;
+        let service = &cfg.services[0];
+        let desired = "a".repeat(64);
+        let mut containers: Vec<ContainerInfo> = (0..2)
+            .map(|i| {
+                snapshot_container(
+                    "app-a",
+                    &container_name("app-a", &desired, i, 2),
+                    &desired,
+                    "running",
+                )
+            })
+            .collect();
+        assert!(matches!(
+            service_already_at_spec(&snapshot_of(containers.clone()), &cfg, service, &desired),
+            SpecStatus::AtSpec(_)
+        ));
+
+        let surplus = container_name("app-a", &desired, 2, 3);
+        containers.push(snapshot_container("app-a", &surplus, &desired, "running"));
+        let status = service_already_at_spec(&snapshot_of(containers), &cfg, service, &desired);
+        assert_eq!(extras_of(&status), vec![surplus]);
+    }
+
+    /// `app-a` with a service-scoped `pre_deploy` hook, so the
+    /// cleanup-only tests can prove the hook does not run.
+    fn config_service_with_hook(replicas: u32) -> Config {
+        Config::parse_str(&format!(
+            r#"
+hosts:
+  - {{ address: host-a, user: deploy }}
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/app-a
+        tag: {{ service: app-a }}
+        cmd: ["bin/migrate"]
+    run:
+      replicas: {replicas}
+      port: 3000
+      healthcheck_path: /health
+      healthcheck_timeout: 60s
+      drain_timeout: 10s
+"#
+        ))
+        .unwrap()
+    }
+
+    fn desired_hash_of(cfg: &Config, service: &str) -> String {
+        let svc = cfg.services.iter().find(|s| s.name == service).unwrap();
+        docker::compute_spec_hash(&build_desired_spec(cfg, svc, "latest", None).unwrap())
+    }
+
+    /// Fake primed for a reconcile whose pre-flight snapshot returns
+    /// `snapshot`. Nothing else is queued except what the caller adds,
+    /// so an unexpected pull, hook run or stop fails the reconcile
+    /// with `FakeExhausted`.
+    fn ops_with_snapshot(cfg: &Config, snapshot: Vec<ContainerInfo>) -> FakeDockerOps {
+        let ops = FakeDockerOps::new();
+        for _ in &cfg.deploy.networks {
+            ops.push_ensure_network(Ok(false));
+        }
+        ops.push_list_containers(Ok(snapshot));
+        ops
+    }
+
+    type TaggedEvents = Vec<(Option<String>, DeployEvent)>;
+
+    async fn reconcile_collect(
+        ops: &FakeDockerOps,
+        cfg: &Config,
+        filter: Option<&[String]>,
+    ) -> (Result<Vec<ServiceDeployReport>, DeployError>, TaggedEvents) {
+        let mut events: TaggedEvents = Vec::new();
+        let mut sink =
+            |svc: Option<&str>, e: DeployEvent| events.push((svc.map(str::to_string), e));
+        let result = reconcile(ops, cfg, &BTreeMap::new(), filter, None, &mut sink).await;
+        (result, events)
+    }
+
+    fn stopped_names(calls: &[crate::docker_ops::RecordedCall]) -> Vec<String> {
+        calls
+            .iter()
+            .filter_map(|c| match c {
+                crate::docker_ops::RecordedCall::StopContainer(_, name, _) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The cleanup-only route must not do any deploy work.
+    fn assert_no_deploy_calls(calls: &[crate::docker_ops::RecordedCall]) {
+        use crate::docker_ops::RecordedCall;
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::PullImage(..)
+                    | RecordedCall::RunOneShot(..)
+                    | RecordedCall::CreateContainer(..)
+                    | RecordedCall::StartContainer(..)
+                    | RecordedCall::ForceRemoveContainer(..)
+            )),
+            "cleanup-only route did deploy work: {calls:?}"
+        );
+    }
+
+    /// Service events of a successful cleanup: `Started`, one
+    /// `AlreadyAtSpec` per expected replica, one `OldContainerStopped`
+    /// per extra, then `Done`.
+    fn assert_cleanup_events(events: &TaggedEvents, expected: &[String], extras: &[String]) {
+        let got: Vec<&DeployEvent> = events
+            .iter()
+            .filter(|(svc, _)| svc.as_deref() == Some("app-a"))
+            .map(|(_, e)| e)
+            .collect();
+        let mut want = vec![DeployEvent::Started {
+            service: "app-a".into(),
+            tag: "latest".into(),
+            host: "host-a".into(),
+        }];
+        want.extend(expected.iter().map(|c| DeployEvent::AlreadyAtSpec {
+            host: "host-a".into(),
+            container: c.clone(),
+        }));
+        want.extend(extras.iter().map(|c| DeployEvent::OldContainerStopped {
+            host: "host-a".into(),
+            container: c.clone(),
+        }));
+        want.push(DeployEvent::Done {
+            host: "host-a".into(),
+            container: expected[0].clone(),
+        });
+        assert_eq!(got, want.iter().collect::<Vec<_>>());
+    }
+
+    /// At spec with an old generation still running: reconcile stops
+    /// the old container and nothing else. No image pull and no
+    /// service-scoped `pre_deploy` hook (a migration must not rerun
+    /// just to stop a leftover container).
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_stops_old_generation_without_redeploying() {
+        let cfg = config_service_with_hook(1);
+        let hash = desired_hash_of(&cfg, "app-a");
+        let new_name = container_name("app-a", &hash, 0, 1);
+        let old_name = container_name("app-a", &"b".repeat(64), 0, 1);
+        let ops = ops_with_snapshot(
+            &cfg,
+            vec![
+                snapshot_container("app-a", &new_name, &hash, "running"),
+                snapshot_container("app-a", &old_name, &"b".repeat(64), "running"),
+            ],
+        );
+        ops.push_stop_container(Ok(()));
+
+        let (result, events) = reconcile_collect(&ops, &cfg, None).await;
+        let reports = result.unwrap();
+
+        let calls = ops.calls();
+        assert_no_deploy_calls(&calls);
+        assert_eq!(stopped_names(&calls), vec![old_name.clone()]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].hosts[0].container, new_name);
+        assert_eq!(reports[0].hosts[0].stopped_old, vec![old_name.clone()]);
+        assert!(
+            crate::output::format_deploy_summary(&reports).contains("stopped 1 old"),
+            "summary must report the stopped container"
+        );
+        assert_cleanup_events(&events, &[new_name], &[old_name]);
+    }
+
+    /// At spec with a surplus replica after scaling 3 -> 2: reconcile
+    /// stops `-2` and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_stops_surplus_replica_without_redeploying() {
+        let cfg = config_service_with_hook(2);
+        let hash = desired_hash_of(&cfg, "app-a");
+        let expected: Vec<String> = (0..2)
+            .map(|i| container_name("app-a", &hash, i, 2))
+            .collect();
+        let surplus = container_name("app-a", &hash, 2, 3);
+        let ops = ops_with_snapshot(
+            &cfg,
+            expected
+                .iter()
+                .chain(std::iter::once(&surplus))
+                .map(|n| snapshot_container("app-a", n, &hash, "running"))
+                .collect(),
+        );
+        ops.push_stop_container(Ok(()));
+
+        let (result, events) = reconcile_collect(&ops, &cfg, None).await;
+        let reports = result.unwrap();
+
+        let calls = ops.calls();
+        assert_no_deploy_calls(&calls);
+        assert_eq!(stopped_names(&calls), vec![surplus.clone()]);
+        assert_eq!(reports[0].hosts[0].container, expected[0]);
+        assert_eq!(reports[0].hosts[0].stopped_old, vec![surplus.clone()]);
+        assert_cleanup_events(&events, &expected, &[surplus]);
+    }
+
+    /// The cleanup-only route pushes Caddy before it stops anything.
+    /// The old generation may be the only thing Caddy routes to (the
+    /// earlier deploy may have died at its own Caddy push). Here the
+    /// push fails because no proxy container is running, so nothing
+    /// may be stopped and the error must reach the caller.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_cleanup_stops_nothing_when_caddy_push_fails() {
+        use crate::docker_ops::RecordedCall;
+        let cfg = config_proxied_service();
+        let hash = desired_hash_of(&cfg, "api");
+        let new_name = container_name("api", &hash, 0, 1);
+        let old_name = container_name("api", &"b".repeat(64), 0, 1);
+        let ops = ops_with_snapshot(
+            &cfg,
+            vec![
+                snapshot_container("api", &new_name, &hash, "running"),
+                snapshot_container("api", &old_name, &"b".repeat(64), "running"),
+            ],
+        );
+        // Proxy container lookup at the start of the push: none running.
+        ops.push_list_containers(Ok(Vec::new()));
+        // Would let the stop succeed if the route got that far.
+        ops.push_stop_container(Ok(()));
+
+        let (result, _events) = reconcile_collect(&ops, &cfg, Some(&["api".to_string()])).await;
+
+        let err = result.expect_err("the failed Caddy push must fail the reconcile");
+        assert!(
+            err.to_string().contains("push Caddy config"),
+            "unexpected error: {err}"
+        );
+        let calls = ops.calls();
+        let proxy_label = format!("yoink.service={}", crate::proxy::PROXY_SERVICE_NAME);
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, RecordedCall::ListContainersByLabel(_, l) if *l == proxy_label)
+            ),
+            "the Caddy push was never attempted: {calls:?}"
+        );
+        assert_eq!(stopped_names(&calls), Vec::<String>::new());
+        assert_no_deploy_calls(&calls);
+    }
+
+    /// On the cleanup-only route a failed stop is an error, not a
+    /// warning: the stop is the whole job, and the error must name the
+    /// host and the container.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_cleanup_fails_when_extra_cannot_be_stopped() {
+        let cfg = config_service_with_hook(1);
+        let hash = desired_hash_of(&cfg, "app-a");
+        let new_name = container_name("app-a", &hash, 0, 1);
+        let old_name = container_name("app-a", &"b".repeat(64), 0, 1);
+        let ops = ops_with_snapshot(
+            &cfg,
+            vec![
+                snapshot_container("app-a", &new_name, &hash, "running"),
+                snapshot_container("app-a", &old_name, &"b".repeat(64), "running"),
+            ],
+        );
+        ops.push_stop_container(Err(DockerError::Invalid("daemon said no".into())));
+
+        let (result, events) = reconcile_collect(&ops, &cfg, None).await;
+
+        let msg = result
+            .expect_err("a failed stop must fail the reconcile")
+            .to_string();
+        assert!(msg.contains(&old_name), "container not named: {msg}");
+        assert!(msg.contains("host-a"), "host not named: {msg}");
+        assert!(msg.contains("daemon said no"), "cause not shown: {msg}");
+        assert!(
+            !events.iter().any(|(_, e)| matches!(
+                e,
+                DeployEvent::OldContainerStopped { .. } | DeployEvent::Done { .. }
+            )),
+            "no stop succeeded, got {events:?}"
+        );
+        assert_no_deploy_calls(&ops.calls());
+    }
+
+    /// At spec with no extras: the skip is unchanged. Reconcile makes
+    /// no call beyond the network check and the snapshot, and emits
+    /// only `AlreadyAtSpec`.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_skips_service_at_spec_without_extras() {
+        use crate::docker_ops::RecordedCall;
+        let cfg = config_service_with_hook(1);
+        let hash = desired_hash_of(&cfg, "app-a");
+        let new_name = container_name("app-a", &hash, 0, 1);
+        let ops = ops_with_snapshot(
+            &cfg,
+            vec![
+                snapshot_container("app-a", &new_name, &hash, "running"),
+                // Stopped old generation and another service's
+                // container: neither is an extra.
+                snapshot_container("app-a", "app-a-0ld0ld0", &"b".repeat(64), "exited"),
+                snapshot_container("app-b", "app-b-1234567", &"c".repeat(64), "running"),
+            ],
+        );
+
+        let (result, events) = reconcile_collect(&ops, &cfg, None).await;
+        let reports = result.unwrap();
+
+        let calls = ops.calls();
+        assert!(
+            calls.iter().all(|c| matches!(
+                c,
+                RecordedCall::EnsureNetwork(..) | RecordedCall::ListContainersByLabel(..)
+            )),
+            "unexpected calls: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::ListContainersByLabel(..)))
+                .count(),
+            1,
+            "only the snapshot may list containers: {calls:?}"
+        );
+        assert_eq!(reports[0].hosts[0].container, new_name);
+        assert!(reports[0].hosts[0].stopped_old.is_empty());
+        let service_events: Vec<&DeployEvent> = events
+            .iter()
+            .filter(|(svc, _)| svc.is_some())
+            .map(|(_, e)| e)
+            .collect();
+        assert_eq!(
+            service_events,
+            vec![&DeployEvent::AlreadyAtSpec {
+                host: "host-a".into(),
+                container: new_name,
+            }]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2310,6 +3565,104 @@ hooks:
         )));
     }
 
+    /// Config for the service-scoped hook tag regressions: `api` runs
+    /// a pre-deploy hook whose tag mirrors a *different* service.
+    fn config_service_hook_refs_other_service() -> Config {
+        Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: migrations
+    image: registry.example.com/migrations
+    tag: m-1
+    run: { port: 3000, healthcheck_path: /health }
+  - name: api
+    image: registry.example.com/api
+    tag: api-1
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/migrations
+        tag: { service: migrations }
+        cmd: ["bin/migrate"]
+      - name: self-check
+        image: registry.example.com/api
+        tag: { service: api }
+        cmd: ["bin/check"]
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Tags pulled for `image` during a `deploy_service` run of `api`
+    /// from [`config_service_hook_refs_other_service`].
+    async fn hook_pull_tags(
+        tag: &str,
+        overrides: &BTreeMap<String, String>,
+        image: &str,
+    ) -> Vec<String> {
+        let cfg = config_service_hook_refs_other_service();
+        let ops = happy_ops(&[]);
+        for _ in 0..2 {
+            ops.push_pull_image(Ok(()));
+            ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }));
+        }
+        let mut sink = |_e: DeployEvent| {};
+        deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[1],
+            tag,
+            overrides,
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        ops.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::docker_ops::RecordedCall::PullImage(_, i, t) if i == image => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression: a service-scoped hook with `tag: { service: X }`
+    /// received the tag of the service being deployed instead of X's,
+    /// so `api`'s migrate hook pulled `migrations:<api-tag>`.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_tag_ref_resolves_referenced_service_tag() {
+        let tags =
+            hook_pull_tags("api-2", &BTreeMap::new(), "registry.example.com/migrations").await;
+        assert_eq!(tags, vec!["m-1".to_string()]);
+    }
+
+    /// Regression: `--tag migrations=...` was ignored for the
+    /// referenced service because hooks resolved against an empty
+    /// overrides map.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_tag_ref_honours_override_for_referenced_service() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("migrations".to_string(), "m-2".to_string());
+        let tags = hook_pull_tags("api-2", &overrides, "registry.example.com/migrations").await;
+        assert_eq!(tags, vec!["m-2".to_string()]);
+    }
+
+    /// A self-reference still mirrors the tag this deploy was called
+    /// with (service pull + hook pull), not the configured `tag:`.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_tag_self_ref_uses_deploy_tag() {
+        let tags = hook_pull_tags("api-2", &BTreeMap::new(), "registry.example.com/api").await;
+        assert_eq!(tags, vec!["api-2".to_string(), "api-2".to_string()]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn pre_deploy_hook_failure_aborts_reconcile_with_logs() {
         let cfg = Config::parse_str(
@@ -2354,6 +3707,284 @@ hooks:
         assert_eq!(name, "migrate");
         assert!(message.contains("ERROR: connection refused"));
         assert!(message.contains("applying 0001_init"));
+    }
+
+    /// Asserts the stopped-only remove of the hook container `name`
+    /// comes before the hook runs under that same name, and that the
+    /// name is never force-removed.
+    fn assert_reaped_before_run(ops: &FakeDockerOps, host: &Host, name: &str) {
+        use crate::docker_ops::RecordedCall;
+        let calls = ops.calls();
+        let reap = calls
+            .iter()
+            .position(|c| *c == RecordedCall::RemoveStoppedContainer(host.clone(), name.into()))
+            .expect("stale hook container is removed if stopped");
+        let run = calls
+            .iter()
+            .position(|c| *c == RecordedCall::RunOneShot(host.clone(), name.into()))
+            .expect("hook runs under the expected name");
+        assert!(reap < run, "reap must precede the create: {calls:?}");
+        assert!(
+            !calls.contains(&RecordedCall::ForceRemoveContainer(
+                host.clone(),
+                name.into()
+            )),
+            "hook container must not be force-removed: {calls:?}"
+        );
+    }
+
+    const TOP_LEVEL_HOOK_CONFIG: &str = r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+hooks:
+  pre_deploy:
+    - name: migrate
+      image: registry.example.com/app-a
+      tag: { service: app-a }
+      cmd: ["bin/migrate"]
+"#;
+
+    /// Runs a reconcile whose pre-deploy hook finds `leftover` under
+    /// its container name. The hook exits non-zero so the reconcile
+    /// stops right after it.
+    async fn reconcile_with_hook_leftover(
+        leftover: StoppedRemoval,
+    ) -> (FakeDockerOps, Host, DeployError) {
+        let cfg = Config::parse_str(TOP_LEVEL_HOOK_CONFIG).unwrap();
+        let ops = FakeDockerOps::new();
+        ops.push_ensure_network(Ok(false));
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_pull_image(Ok(()));
+        ops.push_remove_stopped(Ok(leftover));
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "hook ran".into(),
+        }));
+
+        let mut sink = |_svc: Option<&str>, _e: DeployEvent| {};
+        let err = reconcile(&ops, &cfg, &BTreeMap::new(), None, None, &mut sink)
+            .await
+            .unwrap_err();
+        let host = Host::from(&cfg.hosts[0]);
+        (ops, host, err)
+    }
+
+    /// A hook container leaked by an interrupted deploy keeps its
+    /// deterministic name; without a reap before the create, every
+    /// later deploy at that tag fails with a 409 name conflict.
+    #[tokio::test(start_paused = true)]
+    async fn hook_reaps_stale_container_before_run() {
+        let (ops, host, err) = reconcile_with_hook_leftover(StoppedRemoval::Removed).await;
+        assert_reaped_before_run(&ops, &host, "yoink-hook-migrate-latest");
+        assert!(err.to_string().contains("hook ran"), "{err}");
+    }
+
+    /// With no leftover the hook runs as usual.
+    #[tokio::test(start_paused = true)]
+    async fn hook_runs_when_no_leftover_container_exists() {
+        let (ops, host, err) = reconcile_with_hook_leftover(StoppedRemoval::Absent).await;
+        assert_reaped_before_run(&ops, &host, "yoink-hook-migrate-latest");
+        assert!(err.to_string().contains("hook ran"), "{err}");
+    }
+
+    /// A leftover that still runs can be a migration that survived a
+    /// dropped ssh link. The deploy must not kill it and must not start
+    /// a second run; it fails and tells the operator what to do.
+    #[tokio::test(start_paused = true)]
+    async fn hook_fails_without_touching_a_leftover_that_still_runs() {
+        use crate::docker_ops::RecordedCall;
+        let (ops, host, err) = reconcile_with_hook_leftover(StoppedRemoval::Running).await;
+
+        let name = "yoink-hook-migrate-latest";
+        let calls = ops.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::ForceRemoveContainer(_, n) | RecordedCall::RunOneShot(_, n)
+                    if n == name
+            )),
+            "running hook container must be left alone and the hook must not run: {calls:?}"
+        );
+        assert!(calls.contains(&RecordedCall::RemoveStoppedContainer(
+            host.clone(),
+            name.into()
+        )));
+
+        let DeployError::Hook {
+            name: hook,
+            message,
+        } = err
+        else {
+            panic!("expected Hook error, got {err:?}");
+        };
+        assert_eq!(hook, "migrate");
+        assert!(message.contains("still running"), "{message}");
+        assert!(message.contains("host-a"), "{message}");
+        assert!(
+            message.contains("docker rm -f yoink-hook-migrate-latest"),
+            "{message}"
+        );
+    }
+
+    /// Services in one wave deploy concurrently. Two of them with a
+    /// same-named hook at the same tag must not share a container name.
+    #[test]
+    fn hook_container_name_is_scoped_by_service() {
+        assert_eq!(
+            hook_container_name(None, "migrate", "v42"),
+            "yoink-hook-migrate-v42"
+        );
+        assert_eq!(
+            hook_container_name(Some("api"), "migrate", "v42"),
+            "yoink-hook-api-migrate-v42"
+        );
+        assert_ne!(
+            hook_container_name(Some("api"), "migrate", "v42"),
+            hook_container_name(Some("web"), "migrate", "v42")
+        );
+    }
+
+    /// A digest tag carries a `:`, which Docker rejects in a container
+    /// name ("Invalid container name"). The name must stay creatable.
+    #[test]
+    fn hook_container_name_replaces_characters_docker_rejects() {
+        assert_eq!(
+            hook_container_name(Some("api"), "migrate", "sha256:abc123"),
+            "yoink-hook-api-migrate-sha256-abc123"
+        );
+        assert_eq!(
+            hook_container_name(None, "run migrations", "v42"),
+            "yoink-hook-run-migrations-v42"
+        );
+    }
+
+    /// The service-scoped path end to end: `deploy_service` must hand
+    /// its own service name to the hook, so the reap and the run both
+    /// use `yoink-hook-{service}-{hook}-{tag}`.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_reaps_and_runs_under_service_scoped_name() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/app-a
+        tag: { service: app-a }
+        cmd: ["bin/migrate"]
+"#,
+        )
+        .unwrap();
+
+        let ops = happy_ops(&[]);
+        ops.push_pull_image(Ok(()));
+        ops.push_remove_stopped(Ok(StoppedRemoval::Removed));
+        // Exit non-zero so the deploy stops right after the hook.
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+
+        let mut sink = |_e: DeployEvent| {};
+        let _ = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "v42",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+
+        assert_reaped_before_run(
+            &ops,
+            &Host::from(&cfg.hosts[0]),
+            "yoink-hook-app-a-migrate-v42",
+        );
+    }
+
+    /// #108 end to end: a service on the configured registry pulls with
+    /// credentials, and its hook image on Docker Hub pulls anonymously.
+    #[tokio::test(start_paused = true)]
+    async fn pulls_send_credentials_only_for_images_on_the_registry() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+registry:
+  server: registry.example.com
+  username_secret: REG_USER
+  password_secret: REG_TOKEN
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: busybox
+        tag: "1"
+        cmd: ["true"]
+"#,
+        )
+        .unwrap();
+        let mut values = BTreeMap::new();
+        values.insert("REG_USER".into(), Zeroizing::new("me".to_string()));
+        values.insert(
+            "REG_TOKEN".into(),
+            Zeroizing::new("fake-test-fixture".to_string()),
+        );
+        let bundle = SecretsBundle::new(values);
+
+        let ops = happy_ops(&[]);
+        ops.push_pull_image(Ok(()));
+        ops.push_remove_stopped(Ok(StoppedRemoval::Removed));
+        // Exit non-zero so the deploy stops right after the hook.
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+
+        let mut sink = |_e: DeployEvent| {};
+        let _ = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "v42",
+            &BTreeMap::new(),
+            Some(&bundle),
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            ops.pull_auth(),
+            vec![
+                (
+                    "registry.example.com/app-a".to_string(),
+                    Some("registry.example.com".to_string()),
+                ),
+                ("busybox".to_string(), None),
+            ],
+        );
     }
 
     /// Routed-service fixture: api has `domain:` so `is_proxied(api)` is
@@ -2431,6 +4062,7 @@ services:
         let host = Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
         };
         let names = build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
             .await
@@ -2502,6 +4134,7 @@ services:
         let host = Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
         };
         let names = build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
             .await
@@ -2512,6 +4145,89 @@ services:
             names.get("web"),
             Some(&vec!["web-OLDHASH-0".to_string()]),
             "exited containers must be filtered out for non-in-flight services"
+        );
+    }
+
+    /// Regression: the cleanup-only branch of `finalize_one_host`
+    /// (every replica already running, an old generation still up)
+    /// must push Caddy before it stops the old container. The old
+    /// generation is there because an earlier deploy died after the
+    /// new one became healthy, possibly at the Caddy push, so Caddy
+    /// may still route only to the old container. Here the push
+    /// fails (no proxy container), so nothing may be stopped.
+    #[tokio::test]
+    async fn cleanup_only_finalize_pushes_caddy_before_stopping_old() {
+        let cfg = config_proxied_service();
+        let service = &cfg.services[0];
+        let ops = FakeDockerOps::new();
+        // `discover_admin_target` lookup: no proxy container running.
+        ops.push_list_containers(Ok(Vec::new()));
+
+        let prep = HostPrep {
+            host: Host {
+                user: "deploy".into(),
+                address: "host-a".into(),
+                port: None,
+            },
+            replicas: vec![ReplicaPrep {
+                name: "api-NEWHASH".into(),
+                already_running: true,
+            }],
+            existing: vec![
+                container_with_state("api-NEWHASH", "running"),
+                container_with_state("api-OLDHASH", "running"),
+            ],
+            stop_first: false,
+        };
+        let mut sink = |_e: DeployEvent| {};
+        let result = finalize_one_host(&ops, &cfg, service, prep, None, &mut sink).await;
+
+        assert!(result.is_err(), "the failed Caddy push must abort");
+        let calls = ops.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, crate::docker_ops::RecordedCall::StopContainer(..))),
+            "old container stopped before Caddy was pushed: {calls:?}"
+        );
+    }
+
+    /// The cleanup-only branch must end with `Done` once it stopped
+    /// an old container. Without it the last event for the service is
+    /// `OldContainerStopped` and the TUI leaves it on "swapping".
+    #[tokio::test]
+    async fn cleanup_only_finalize_emits_done_after_stopping_old() {
+        let cfg = config_one_service();
+        let service = &cfg.services[0];
+        let ops = FakeDockerOps::new();
+        ops.push_stop_container(Ok(()));
+
+        let prep = HostPrep {
+            host: Host {
+                user: "deploy".into(),
+                address: "host-a".into(),
+                port: None,
+            },
+            replicas: vec![ReplicaPrep {
+                name: "app-a-NEWHASH".into(),
+                already_running: true,
+            }],
+            existing: vec![
+                container_with_state("app-a-NEWHASH", "running"),
+                container_with_state("app-a-OLDHASH", "running"),
+            ],
+            stop_first: false,
+        };
+        let mut events: Vec<DeployEvent> = Vec::new();
+        let mut sink = |e: DeployEvent| events.push(e);
+        let result = finalize_one_host(&ops, &cfg, service, prep, None, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(result.stopped_old, vec!["app-a-OLDHASH".to_string()]);
+        assert!(
+            matches!(events.last(), Some(DeployEvent::Done { container, .. }) if container == "app-a-NEWHASH"),
+            "expected Done as the last event, got {events:?}"
         );
     }
 

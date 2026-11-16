@@ -30,6 +30,7 @@ Each host has exactly one of `address:` and `address_secret:`. Config load rejec
 | `address` | string | Hostname or IP. Any value that your local SSH client accepts: a raw IP, a DNS name, a `~/.ssh/config` alias, or a tailnet hostname. |
 | `address_secret` | string (optional) | Name of the sealed-secret entry that holds the address (IP or hostname). yoink resolves it at config-load time, after the bundle decrypts. It is for a sensitive address in a public repo, for example a public IP behind Cloudflare. |
 | `user` | string | SSH user. Must be in the `docker` group on the host (or be `root`). |
+| `port` | integer (optional) | SSH port, 1 to 65535. If unset, yoink passes no port and your SSH client selects it (22, or a `Port` line in `~/.ssh/config`). The port applies to every SSH connection that yoink makes to this host. Config load rejects a port in `address` (`address: host:2200`). yoink ignores `port` for `address: local`. |
 | `ssh_key_secret` | string (optional) | Name of the sealed-secret entry that holds a PEM SSH private key. yoink decrypts the key into a per-process tempfile (mode `0o600`). yoink uses it for the docker daemon connection and the pre-flight ssh probe of this host. The deploy key can thus ship in the repo, encrypted in `secrets.age`, and your `ssh-agent` does not need it. |
 
 ```yaml

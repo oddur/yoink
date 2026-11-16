@@ -52,12 +52,45 @@ pub enum DockerError {
     Invalid(String),
 }
 
+impl DockerError {
+    /// True when the daemon answered the request and rejected it
+    /// with a 4xx (no such network, no such image, bad request). The
+    /// request reached the daemon, so this is not a transport blip.
+    /// Transport errors, ssh failures and 5xx are not included.
+    #[must_use]
+    pub fn is_daemon_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::Bollard {
+                source: bollard::errors::Error::DockerResponseServerError { status_code, .. },
+                ..
+            } if (400..500).contains(status_code)
+        )
+    }
+}
+
+/// Outcome of [`DockerOps::remove_stopped_container`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoppedRemoval {
+    /// The container existed, was not running, and is now removed.
+    Removed,
+    /// No container has that name.
+    Absent,
+    /// The container is running, restarting or paused. It was not
+    /// touched.
+    Running,
+}
+
 /// Minimal host identity used by the trait; converts cheaply from
 /// [`crate::config::HostConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Host {
     pub user: String,
     pub address: String,
+    /// SSH port from `hosts[].port`. `None` emits no port flag, so
+    /// ssh picks (22, or `~/.ssh/config`). Never part of `address`,
+    /// which stays the host's identity and display label.
+    pub port: Option<u16>,
 }
 
 impl Host {
@@ -68,9 +101,38 @@ impl Host {
     /// `yoink.yaml` to deploy at their own laptop.
     pub const LOCAL_ADDRESS: &'static str = "local";
 
+    /// `ssh://user@address[:port]`. An IPv6 address is bracketed when
+    /// a port follows it, as the URL form requires.
     #[must_use]
     pub fn ssh_url(&self) -> String {
-        format!("ssh://{}@{}", self.user, self.address)
+        format!(
+            "ssh://{}@{}",
+            self.user,
+            crate::config::join_address_port(&self.address, self.ssh_port())
+        )
+    }
+
+    /// The port every ssh connection to this host must use. `None`
+    /// when `port:` is unset, and always for the `local` sentinel.
+    #[must_use]
+    pub fn ssh_port(&self) -> Option<u16> {
+        if self.is_local() { None } else { self.port }
+    }
+
+    /// The `ssh` argv tail that selects this host: `[-p <port>]
+    /// user@address`. Every `ssh` shell-out ends its options with
+    /// this instead of formatting `user@address` itself, so a host
+    /// with `port:` is reached the same way everywhere. `ssh` takes
+    /// `-p`; `scp` would need `-P` (yoink has no `scp` call today).
+    #[must_use]
+    pub fn ssh_args(&self) -> Vec<String> {
+        let mut args = Vec::with_capacity(3);
+        if let Some(port) = self.ssh_port() {
+            args.push("-p".to_string());
+            args.push(port.to_string());
+        }
+        args.push(format!("{}@{}", self.user, self.address));
+        args
     }
 
     /// True for the local-docker sentinel host — bypasses ssh and
@@ -88,6 +150,7 @@ impl Host {
         Self {
             user: String::new(),
             address: Self::LOCAL_ADDRESS.to_string(),
+            port: None,
         }
     }
 }
@@ -104,6 +167,7 @@ impl From<&YoinkHost> for Host {
         Self {
             user: h.user.clone(),
             address: h.address.clone(),
+            port: h.port,
         }
     }
 }
@@ -748,6 +812,17 @@ pub trait DockerOps: Send + Sync {
 
     async fn force_remove_container(&self, host: &Host, name: &str) -> Result<(), DockerError>;
 
+    /// Remove a container only if it is not running. The daemon makes
+    /// the decision in one step (a remove without `force` is refused
+    /// for a running, restarting or paused container), so there is no
+    /// window between a state check and the remove in which the
+    /// container could be killed.
+    async fn remove_stopped_container(
+        &self,
+        host: &Host,
+        name: &str,
+    ) -> Result<StoppedRemoval, DockerError>;
+
     /// Send SIGKILL to a container without removing it. The exited
     /// container stays around for `docker logs` / `inspect` and can
     /// be reaped later. Used by `yoink kill` for the "stop responding
@@ -1001,12 +1076,18 @@ impl RealDockerOps {
                     host: host.address.clone(),
                     detail,
                 })?;
-            Docker::connect_with_ssh(
-                &key,
-                self.timeout_secs,
-                bollard::API_DEFAULT_VERSION,
-                keyfile,
-            )
+            // bollard's own ssh connector cannot dial a non-default
+            // port (see `crate::bollard_ssh`), so a host with `port:`
+            // goes through yoink's copy of it.
+            match host.ssh_port() {
+                Some(port) => crate::bollard_ssh::connect(host, port, keyfile, self.timeout_secs),
+                None => Docker::connect_with_ssh(
+                    &key,
+                    self.timeout_secs,
+                    bollard::API_DEFAULT_VERSION,
+                    keyfile,
+                ),
+            }
             .map_err(|source| DockerError::Connect {
                 host: host.address.clone(),
                 source,
@@ -1063,6 +1144,41 @@ impl RealDockerOps {
             }
             Err(e) => Err(Self::err(host, e)),
         }
+    }
+
+    /// `docker rm`, with or without `-f`. A missing container (404) is
+    /// idempotent success.
+    async fn remove_container(
+        &self,
+        host: &Host,
+        name: &str,
+        force: bool,
+    ) -> Result<(), DockerError> {
+        self.with_retry(host, |docker| async move {
+            let opts = RemoveContainerOptionsBuilder::new().force(force).build();
+            match docker.remove_container(name, Some(opts)).await {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
+    /// Make sure a healthcheck probe image (`repo:tag`) is in the
+    /// daemon's store. Best-effort: a failure here surfaces on the
+    /// probe's `create_container` instead. The `image_present` check
+    /// is a local daemon stat; without it every probe attempt asks
+    /// the registry for the manifest, which is slow and counts
+    /// against Docker Hub's pull rate limit.
+    async fn ensure_probe_image(&self, host: &Host, reference: &str) {
+        let (image, tag) = reference.split_once(':').unwrap_or((reference, "latest"));
+        if self.image_present(host, image, tag).await.unwrap_or(false) {
+            return;
+        }
+        let _ = self.pull_image(host, image, tag, None).await;
     }
 
     /// Create + start a container, then wait for it to exit. Returns
@@ -1678,15 +1794,47 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn force_remove_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
+        self.remove_container(host, name, true).await
+    }
+
+    async fn remove_stopped_container(
+        &self,
+        host: &Host,
+        name: &str,
+    ) -> Result<StoppedRemoval, DockerError> {
         self.with_retry(host, |docker| async move {
-            let opts = RemoveContainerOptionsBuilder::new().force(true).build();
-            // 404 = container didn't exist, treat as idempotent success.
-            match docker.remove_container(name, Some(opts)).await {
-                Ok(())
-                | Err(bollard::errors::Error::DockerResponseServerError {
+            let conflict = match docker.remove_container(name, None).await {
+                Ok(()) => return Ok(StoppedRemoval::Removed),
+                Err(bollard::errors::Error::DockerResponseServerError {
                     status_code: 404, ..
-                }) => Ok(()),
-                Err(other) => Err(other),
+                }) => return Ok(StoppedRemoval::Absent),
+                Err(
+                    e @ bollard::errors::Error::DockerResponseServerError {
+                        status_code: 409, ..
+                    },
+                ) => e,
+                Err(other) => return Err(other),
+            };
+            // The daemon answers 409 for a running container, but also
+            // for a removal that is already in progress. Inspect to
+            // tell them apart instead of matching on the message text.
+            match docker.inspect_container(name, None).await {
+                Ok(resp) => {
+                    // `running` stays true while a container is paused
+                    // or waits for a restart.
+                    let state = resp.state.unwrap_or_default();
+                    let live =
+                        [state.running, state.paused, state.restarting].contains(&Some(true));
+                    if live {
+                        Ok(StoppedRemoval::Running)
+                    } else {
+                        Err(conflict)
+                    }
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(StoppedRemoval::Absent),
+                Err(_) => Err(conflict),
             }
         })
         .await
@@ -1717,14 +1865,9 @@ impl DockerOps for RealDockerOps {
     ) -> Result<u16, DockerError> {
         let url = format!("http://{target}:{port}{path}");
         let probe_name = format!("yoink-probe-{}-{}", target, rand_hex());
-        // Pull the probe image up front (best-effort; fast no-op when cached),
-        // mirroring healthcheck_tcp's busybox pull. Without this the first HTTP
-        // probe on a fresh daemon (a just-provisioned host) 404s on
-        // create_container because curlimages/curl was never pulled.
-        let (probe_img, probe_tag) = HEALTHCHECK_CURL_IMAGE
-            .split_once(':')
-            .unwrap_or((HEALTHCHECK_CURL_IMAGE, "latest"));
-        let _ = self.pull_image(host, probe_img, probe_tag, None).await;
+        // Without this the first probe on a fresh daemon (a
+        // just-provisioned host) 404s on create_container.
+        self.ensure_probe_image(host, HEALTHCHECK_CURL_IMAGE).await;
         let body = probe_body(
             network,
             vec![
@@ -1739,8 +1882,10 @@ impl DockerOps for RealDockerOps {
             ],
         );
         let exit_status = self.create_start_wait(host, &probe_name, body).await?;
-        let logs = self.fetch_recent_logs(host, &probe_name, 32).await?;
+        // Reap the probe before `?` so a failed log fetch can't leak it.
+        let logs = self.fetch_recent_logs(host, &probe_name, 32).await;
         let _ = self.force_remove_container(host, &probe_name).await;
+        let logs = logs?;
 
         // curl with `-w "%{http_code}"` writes the 3-digit code (no newline)
         // before any `-S` error text. Take the leading digits we see.
@@ -2062,10 +2207,9 @@ impl DockerOps for RealDockerOps {
         // protocol). curl's `--connect-only` is HTTP-scheme-bound
         // and `telnet://` reads after connect — both fall over on
         // those.
-        // Pull the busybox image best-effort. Idempotent — no-op
-        // when already cached. Without this the first probe on a
-        // fresh daemon 404s on create_container.
-        let _ = self.pull_image(host, "busybox", "1.37", None).await;
+        // Without this the first probe on a fresh daemon (a
+        // just-provisioned host) 404s on create_container.
+        self.ensure_probe_image(host, HEALTHCHECK_TCP_IMAGE).await;
         let probe_name = format!("yoink-tcp-probe-{}-{}", target, rand_hex());
         let body = probe_body_with_image(
             HEALTHCHECK_TCP_IMAGE,
@@ -2128,9 +2272,15 @@ impl DockerOps for RealDockerOps {
         body: ContainerCreateBody,
     ) -> Result<OneShotResult, DockerError> {
         let exit_code = self.create_start_wait(host, name, body).await?;
-        let docker = self.client_for(host).await?;
-        let (stdout, stderr) = collect_stdout_stderr(&docker, name).await?;
+        // Remove on every path, including a failed log collection, as
+        // the trait contract promises.
+        let collected = async {
+            let docker = self.client_for(host).await?;
+            collect_stdout_stderr(&docker, name).await
+        }
+        .await;
         let _ = self.force_remove_container(host, name).await;
+        let (stdout, stderr) = collected?;
         Ok(OneShotResult {
             exit_code,
             stdout,
@@ -2604,6 +2754,9 @@ struct FakeState {
     container_stats: VecDeque<Result<ContainerStats, DockerError>>,
     ensure_network: VecDeque<Result<bool, DockerError>>,
     pull_image: VecDeque<Result<(), DockerError>>,
+    /// `(image, serveraddress of the credentials)` for each pull, in
+    /// call order. `None` is an anonymous pull.
+    pull_auth: Vec<(String, Option<String>)>,
     load_image: VecDeque<Result<(), DockerError>>,
     build_image: VecDeque<Result<(), DockerError>>,
     /// `image:tag` → presence flag. Defaults `false` so existing tests
@@ -2615,6 +2768,7 @@ struct FakeState {
     start_container: VecDeque<Result<(), DockerError>>,
     stop_container: VecDeque<Result<(), DockerError>>,
     force_remove_container: VecDeque<Result<(), DockerError>>,
+    remove_stopped_container: VecDeque<Result<StoppedRemoval, DockerError>>,
     healthcheck: VecDeque<Result<u16, DockerError>>,
     healthcheck_tcp: VecDeque<Result<(), DockerError>>,
     exec_oneshot: VecDeque<Result<OneShotResult, DockerError>>,
@@ -2640,6 +2794,7 @@ pub enum RecordedCall {
     StartContainer(Host, String),
     StopContainer(Host, String, Duration),
     ForceRemoveContainer(Host, String),
+    RemoveStoppedContainer(Host, String),
     Healthcheck(Host, String, String, u16, String),
     HealthcheckTcp(Host, String, String, u16),
     ExecOneshot(Host, String, Vec<String>),
@@ -2698,6 +2853,9 @@ impl FakeDockerOps {
     pub fn push_force_remove(&self, v: Result<(), DockerError>) {
         self.lock().force_remove_container.push_back(v);
     }
+    pub fn push_remove_stopped(&self, v: Result<StoppedRemoval, DockerError>) {
+        self.lock().remove_stopped_container.push_back(v);
+    }
     pub fn push_healthcheck(&self, v: Result<u16, DockerError>) {
         self.lock().healthcheck.push_back(v);
     }
@@ -2721,6 +2879,11 @@ impl FakeDockerOps {
     }
 
     #[must_use]
+    /// `(image, registry the credentials were for)` for each pull.
+    pub fn pull_auth(&self) -> Vec<(String, Option<String>)> {
+        self.lock().pull_auth.clone()
+    }
+
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.lock().calls.clone()
     }
@@ -2789,9 +2952,11 @@ impl DockerOps for FakeDockerOps {
         host: &Host,
         image: &str,
         tag: &str,
-        _credentials: Option<bollard::auth::DockerCredentials>,
+        credentials: Option<bollard::auth::DockerCredentials>,
     ) -> Result<(), DockerError> {
         let mut s = self.lock();
+        s.pull_auth
+            .push((image.into(), credentials.and_then(|c| c.serveraddress)));
         s.calls.push(RecordedCall::PullImage(
             host.clone(),
             image.into(),
@@ -2892,6 +3057,18 @@ impl DockerOps for FakeDockerOps {
             name.into(),
         ));
         pop(&mut s.force_remove_container, "force_remove_container")
+    }
+    async fn remove_stopped_container(
+        &self,
+        host: &Host,
+        name: &str,
+    ) -> Result<StoppedRemoval, DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::RemoveStoppedContainer(
+            host.clone(),
+            name.into(),
+        ));
+        pop(&mut s.remove_stopped_container, "remove_stopped_container")
     }
     async fn kill_container(&self, _host: &Host, _name: &str) -> Result<(), DockerError> {
         Ok(())
@@ -3052,6 +3229,7 @@ mod tests {
         Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
         }
     }
 
@@ -3107,5 +3285,57 @@ mod tests {
             info.other_labels.get("caddy"),
             Some(&"app-a.example.com".to_string())
         );
+    }
+
+    fn host_on(address: &str, port: Option<u16>) -> Host {
+        Host {
+            user: "deploy".into(),
+            address: address.into(),
+            port,
+        }
+    }
+
+    #[test]
+    fn ssh_args_without_port_is_just_the_destination() {
+        assert_eq!(host().ssh_args(), vec!["deploy@host-a"]);
+        assert_eq!(host().ssh_port(), None);
+    }
+
+    #[test]
+    fn ssh_args_with_port_puts_dash_p_before_the_destination() {
+        let h = host_on("100.122.184.6", Some(2200));
+        assert_eq!(h.ssh_args(), vec!["-p", "2200", "deploy@100.122.184.6"]);
+        assert_eq!(h.ssh_port(), Some(2200));
+    }
+
+    #[test]
+    fn ssh_url_with_port() {
+        assert_eq!(
+            host_on("100.122.184.6", Some(2200)).ssh_url(),
+            "ssh://deploy@100.122.184.6:2200"
+        );
+        // IPv6 needs brackets once a port follows.
+        assert_eq!(
+            host_on("2001:db8::1", Some(2200)).ssh_url(),
+            "ssh://deploy@[2001:db8::1]:2200"
+        );
+    }
+
+    #[test]
+    fn local_host_ignores_port() {
+        let h = host_on(Host::LOCAL_ADDRESS, Some(2200));
+        assert_eq!(h.ssh_port(), None);
+        assert_eq!(h.ssh_args(), vec!["deploy@local"]);
+        assert_eq!(h.ssh_url(), "ssh://deploy@local");
+    }
+
+    #[test]
+    fn host_from_config_carries_port_and_keeps_address() {
+        let cfg = crate::config::Config::parse_str(
+            "hosts:\n  - { address: h1, port: 2200, user: deploy }\nservices: []\n",
+        )
+        .expect("parse");
+        let h = Host::from(&cfg.hosts[0]);
+        assert_eq!(h, host_on("h1", Some(2200)));
     }
 }

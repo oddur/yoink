@@ -1076,9 +1076,14 @@ enum HostsAction {
     /// if it does, the fragment is removed and the command errors.
     Add {
         /// Hostname or IP yoink will SSH into. Mutually exclusive with
-        /// `--address-secret`.
+        /// `--address-secret`. `host:port` and `[ipv6]:port` are split:
+        /// the port is written to `port:`, not into `address:`.
         #[arg(long, value_name = "ADDR", conflicts_with = "address_secret")]
         address: Option<String>,
+        /// SSH port, when the host's sshd does not listen on 22.
+        /// Omit it to let ssh decide (22, or `~/.ssh/config`).
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        port: Option<u16>,
         /// Name of a sealed-secret entry holding the host address (IP
         /// or hostname). Resolved at deploy time. Use this when the
         /// deploy config sits in a public repo and the host's address
@@ -1785,9 +1790,21 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         .chain(here_overrides.iter())
         .cloned()
         .collect();
-    let mut tag_overrides = parse_tag_overrides(&tag_args, services, allow_dirty)?;
+    let (mut tag_overrides, git_fallback_failure) =
+        parse_tag_overrides(&tag_args, services, allow_dirty, &config.services)?;
 
     let services_filter = services_filter(services);
+
+    // A real `--build` run gives an untagged `build:` service a
+    // content-digest tag further down, so that service does not need the
+    // git fallback. A dry run returns before the build and does need it.
+    check_git_fallback(
+        config.selected_services(services_filter),
+        &tag_overrides,
+        git_fallback_failure.as_ref(),
+        build && !dry_run,
+        true,
+    )?;
 
     if dry_run {
         return run_dry_run(
@@ -1887,7 +1904,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             let lock = HostLock::acquire(&*ops, host.clone())
                 .await
                 .with_context(|| format!(
-                    "another `yoink up` appears to be in progress on {} (lock container running). \
+                    "could not acquire the deploy lock on {}: another `yoink up` may be in progress, or the lock step itself failed (cause below). \
                      If you're sure no operator is deploying, the sentinel will self-exit within ~30s; \
                      retry then. To force-clear: `docker rm -f yoink-deploy-lock` on the host.",
                     host.address,
@@ -1909,7 +1926,9 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // change starts double-writing.
     let host_audit = std::sync::Arc::new(yoink::audit::HostAuditSink::new());
     for host_cfg in &config.hosts {
-        host_audit.register(Host::from(host_cfg)).await;
+        let host = Host::from(host_cfg);
+        let keyfile = ops.ssh_keyfile(&host);
+        host_audit.register(host, keyfile).await;
     }
     let audit_sink: std::sync::Arc<dyn yoink::audit::AuditSink> = host_audit.clone();
     let operator_sink: std::sync::Arc<dyn yoink::audit::AuditSink> =
@@ -2119,13 +2138,113 @@ fn services_filter(services: &[String]) -> Option<&[String]> {
 /// is either `name=tag` (override that named service's tag) or a bare
 /// `tag` (applies to every `--service`-selected service). A bare tag
 /// without `--service` is rejected as ambiguous in multi-service mode.
+///
+/// Git SHA fallback: with `--service` and no `--tag` at all, each
+/// selected service that has no `tag:` in the config gets the git short
+/// SHA. This is the lowest-priority rule and never replaces a config
+/// `tag:`. It needs a clean working tree and is off under
+/// `--allow-dirty`. When the fallback was wanted but git gave no SHA,
+/// the reason comes back next to the map (the map then has no entry for
+/// those services) so [`check_git_fallback`] can explain it. `--here` is
+/// the explicit form of the same thing.
 fn parse_tag_overrides(
     tag_args: &[String],
     services_filter: &[String],
     allow_dirty: bool,
-) -> Result<std::collections::BTreeMap<String, String>> {
+    config_services: &[yoink::config::ServiceConfig],
+) -> Result<(
+    std::collections::BTreeMap<String, String>,
+    Option<GitFallbackFailure>,
+)> {
+    parse_tag_overrides_with(tag_args, services_filter, config_services, || {
+        if allow_dirty {
+            return Err(GitFallbackFailure::AllowDirty);
+        }
+        git::version(std::path::Path::new("."), false).map_err(|e| match e {
+            git::GitError::Dirty => GitFallbackFailure::Dirty,
+            other => GitFallbackFailure::Git(other.to_string().trim().to_string()),
+        })
+    })
+}
+
+/// Why the git SHA fallback of [`parse_tag_overrides`] gave no tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitFallbackFailure {
+    /// `--allow-dirty` was passed, which turns the fallback off.
+    AllowDirty,
+    /// The working tree has uncommitted changes.
+    Dirty,
+    /// git gave no SHA: not a repository, no commits, or git is missing.
+    Git(String),
+}
+
+/// Fail with an explanation when a selected service needed the git SHA
+/// fallback and did not get it. Without this the user only sees the
+/// generic "no tag" error later, with no word about the fallback.
+///
+/// `build_tags_untagged`: the caller gives an untagged `build:` service
+/// a content-digest tag later (`up --build`), so such a service is fine.
+/// `here_available`: the command has a `--here` flag to suggest.
+fn check_git_fallback<'a>(
+    selected: impl IntoIterator<Item = &'a yoink::config::ServiceConfig>,
+    tag_overrides: &std::collections::BTreeMap<String, String>,
+    failure: Option<&GitFallbackFailure>,
+    build_tags_untagged: bool,
+    here_available: bool,
+) -> Result<()> {
+    let Some(failure) = failure else {
+        return Ok(());
+    };
+    let Some(svc) = selected.into_iter().find(|svc| {
+        let tagged_by_build = build_tags_untagged && svc.build.is_some();
+        !yoink::build::has_tag(svc, tag_overrides) && !tagged_by_build
+    }) else {
+        return Ok(());
+    };
+    let name = &svc.name;
+    let intro = format!(
+        "service {name:?} has no `tag:` in config and no `--tag` was given. \
+         With `--service`, yoink falls back to the git commit SHA"
+    );
+    let here_hint = if here_available {
+        ", or pass `--here` to use the SHA of the current commit \
+         (`--here` does not look at uncommitted changes)"
+    } else {
+        ""
+    };
+    match failure {
+        GitFallbackFailure::Dirty => anyhow::bail!(
+            "{intro}, but only from a clean working tree, and this tree has \
+             uncommitted changes. Pass `--tag {name}=<tag>`, commit or stash \
+             your changes{here_hint}."
+        ),
+        GitFallbackFailure::AllowDirty => anyhow::bail!(
+            "{intro}, but `--allow-dirty` turns that fallback off. \
+             Pass `--tag {name}=<tag>`{here_hint}."
+        ),
+        // `--here` asks the same git for the same SHA, so it would fail too.
+        GitFallbackFailure::Git(err) => anyhow::bail!(
+            "{intro}, but git gave no SHA in this directory \
+             (is it a git repository with a commit?): {err}. \
+             Pass `--tag {name}=<tag>`."
+        ),
+    }
+}
+
+/// [`parse_tag_overrides`] with the git lookup injected, so tests don't
+/// depend on the state of the working tree they run in.
+fn parse_tag_overrides_with(
+    tag_args: &[String],
+    services_filter: &[String],
+    config_services: &[yoink::config::ServiceConfig],
+    git_version: impl FnOnce() -> Result<String, GitFallbackFailure>,
+) -> Result<(
+    std::collections::BTreeMap<String, String>,
+    Option<GitFallbackFailure>,
+)> {
     use std::collections::BTreeMap;
     let mut out = BTreeMap::new();
+    let mut git_failure = None;
     let mut bare: Option<String> = None;
     for arg in tag_args {
         if let Some((name, tag)) = arg.split_once('=') {
@@ -2152,17 +2271,37 @@ fn parse_tag_overrides(
         }
     } else if !out.is_empty() {
         // user provided per-service tags only; nothing else to do.
-    } else if !services_filter.is_empty() && !allow_dirty {
+    } else if !services_filter.is_empty() {
         // fall back to git version for selected services. Helpful in CI
         // where you'd otherwise just `--tag $GIT_SHA`. Operator can
-        // always opt out by passing tags explicitly.
-        if let Ok(version) = git::version(std::path::Path::new("."), allow_dirty) {
-            for service in services_filter {
-                out.insert(service.clone(), version.clone());
+        // always opt out by passing tags explicitly. Only services
+        // without a config `tag:` get it: an implicit fallback must not
+        // shadow an explicit pin (`redis` with `tag: "7"` would otherwise
+        // be pulled as `redis:<sha>`, and only from a clean tree).
+        let unpinned: Vec<&String> = services_filter
+            .iter()
+            .filter(|service| {
+                !config_services
+                    .iter()
+                    .any(|s| &s.name == *service && s.tag.is_some())
+            })
+            .collect();
+        // Only ask git when some service needs the answer: the lookup
+        // spawns `git status`, and `--watch` repeats it every pass.
+        if !unpinned.is_empty() {
+            match git_version() {
+                Ok(version) => {
+                    for service in unpinned {
+                        out.insert(service.clone(), version.clone());
+                    }
+                }
+                // Not an error yet: `up --build` can still tag an
+                // untagged `build:` service. `check_git_fallback` decides.
+                Err(why) => git_failure = Some(why),
             }
         }
     }
-    Ok(out)
+    Ok((out, git_failure))
 }
 
 struct BuildOptions<'a> {
@@ -2184,7 +2323,8 @@ async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
         no_cache,
         push,
     } = build;
-    let tag_overrides = parse_tag_overrides(tag_args, services, allow_dirty)?;
+    let (tag_overrides, git_fallback_failure) =
+        parse_tag_overrides(tag_args, services, allow_dirty, &config.services)?;
     let services_filter = services_filter(services);
     let explicit_services = services_filter.is_some();
 
@@ -2203,6 +2343,14 @@ async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
             }
             continue;
         }
+        // `yoink build` has no `--here` and no content-digest tag.
+        check_git_fallback(
+            [svc],
+            &tag_overrides,
+            git_fallback_failure.as_ref(),
+            false,
+            false,
+        )?;
         let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
         yoink::build::build_service(config, svc, &tag, no_cache, push)
             .await
@@ -2264,10 +2412,8 @@ async fn cmd_rollback(
 
     // For each host (optionally filtered), list ALL yoink-managed containers
     // (running + stopped). Group by `yoink.service` label. For each service
-    // group, collect the running containers' spec_hashes (current generation),
-    // then pick the most recently stopped container with a DIFFERENT spec_hash
-    // — that's the previous generation. Extract the image tag from its image
-    // reference and record (host, tag) pairs per service.
+    // group, pick the previous generation (see `previous_generation`), take
+    // its tag (see `rollback_tag`) and record (host, tag) pairs per service.
     //
     // Result: service_name -> Vec<(host_address, prev_tag)>
     let mut rollback_plan: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -2301,25 +2447,7 @@ async fn cmd_rollback(
         }
 
         for (svc_name, containers) in by_service {
-            // Collect running spec_hashes (the current generation).
-            let running_hashes: std::collections::BTreeSet<&str> = containers
-                .iter()
-                .filter(|c| c.is_running())
-                .filter_map(|c| c.yoink_spec_hash.as_deref())
-                .collect();
-
-            // Stopped containers sorted newest-first by creation time.
-            let mut stopped: Vec<_> = containers.iter().filter(|c| !c.is_running()).collect();
-            stopped.sort_by_key(|c| std::cmp::Reverse(c.created_unix.unwrap_or(0)));
-
-            // Most recently stopped container with a DIFFERENT spec_hash.
-            let prev = stopped.into_iter().find(|c| {
-                c.yoink_spec_hash
-                    .as_deref()
-                    .is_some_and(|h| !running_hashes.contains(h))
-            });
-
-            let Some(prev_container) = prev else {
+            let Some(prev_container) = previous_generation(&containers) else {
                 info_eprintln!(
                     "[{}] {svc_name}: no previous generation found, skipping",
                     host.address
@@ -2327,7 +2455,7 @@ async fn cmd_rollback(
                 continue;
             };
 
-            let prev_tag = extract_image_tag(&prev_container.image).to_string();
+            let prev_tag = rollback_tag(prev_container);
             rollback_plan
                 .entry(svc_name)
                 .or_default()
@@ -2398,10 +2526,74 @@ async fn cmd_rollback(
     Ok(())
 }
 
+/// Pick the container `yoink rollback` redeploys from one service's
+/// containers on one host: the newest stopped container whose
+/// `spec_hash` differs from every running one.
+///
+/// A container that never served is not a previous generation, so two
+/// kinds are skipped: ones still in `created` state (never started),
+/// and ones created after the running generation. The latter are the
+/// leftovers of a deploy that failed after the current generation went
+/// live; anything that was live before it was necessarily created
+/// before it.
+///
+/// "Running" here includes `restarting` and `paused`: a container that
+/// crash-loops under its restart policy, or that an operator paused, is
+/// still the current generation and never a rollback target.
+fn previous_generation(
+    containers: &[yoink::docker_ops::ContainerInfo],
+) -> Option<&yoink::docker_ops::ContainerInfo> {
+    use yoink::docker_ops::ContainerState;
+    let is_current = |c: &&yoink::docker_ops::ContainerInfo| {
+        matches!(
+            c.state,
+            ContainerState::Running | ContainerState::Restarting | ContainerState::Paused
+        )
+    };
+
+    // Running spec_hashes (the current generation) and when the oldest
+    // running container was created.
+    let running_hashes: std::collections::BTreeSet<&str> = containers
+        .iter()
+        .filter(is_current)
+        .filter_map(|c| c.yoink_spec_hash.as_deref())
+        .collect();
+    let running_since = containers
+        .iter()
+        .filter(is_current)
+        .filter_map(|c| c.created_unix)
+        .min();
+
+    // Newest stopped container with a DIFFERENT spec_hash. `min_by_key`
+    // over `Reverse` keeps the first of equally-new candidates.
+    containers
+        .iter()
+        .filter(|c| !is_current(c) && c.state != ContainerState::Created)
+        .filter(|c| running_since.is_none_or(|t| c.created_unix.unwrap_or(0) < t))
+        .filter(|c| {
+            c.yoink_spec_hash
+                .as_deref()
+                .is_some_and(|h| !running_hashes.contains(h))
+        })
+        .min_by_key(|c| std::cmp::Reverse(c.created_unix.unwrap_or(0)))
+}
+
+/// The tag to redeploy `container` with. The `yoink.version` label is
+/// the tag it was deployed with (a `sha256:` digest for pinned
+/// services); the image reference is only a fallback for containers
+/// that lack the label.
+fn rollback_tag(container: &yoink::docker_ops::ContainerInfo) -> String {
+    container
+        .yoink_version
+        .clone()
+        .unwrap_or_else(|| extract_image_tag(&container.image).to_string())
+}
+
 /// Extract the tag portion from a docker image reference.
 ///
 /// Examples:
 ///   `ghcr.io/user/app:abc123`  => `abc123`
+///   `repo@sha256:abc123`       => `sha256:abc123` (digest-pinned)
 ///   `myapp:def456`             => `def456`
 ///   `nginx`                    => `nginx`   (bare, no tag)
 ///   `registry:5000/img:tag`    => `tag`     (port in registry host)
@@ -2411,6 +2603,9 @@ async fn cmd_rollback(
 /// host). If the final colon belongs to a host:port segment, the whole
 /// string is returned unchanged.
 fn extract_image_tag(image: &str) -> &str {
+    if let Some((_, digest)) = image.split_once('@') {
+        return digest;
+    }
     let Some(colon_pos) = image.rfind(':') else {
         return image;
     };
@@ -2920,8 +3115,7 @@ async fn cmd_pf(
     };
 
     let tunnel = SshTunnel::open_with_local_port(
-        &host.user,
-        &host.address,
+        &host,
         &remote_dial_host,
         remote_port,
         local_port_request,
@@ -3309,7 +3503,7 @@ async fn cmd_pull(
             git::version(std::path::Path::new("."), true).unwrap_or_else(|_| "latest".into())
         });
     let bundle = load_secrets_bundle(config).await?;
-    let credentials = deploy::registry_credentials(config, bundle.as_ref());
+    let credentials = deploy::registry_credentials(config, bundle.as_ref(), &svc_cfg.image);
     let ops = build_real_ops(config, bundle.as_ref()).await?;
     // Fan out across hosts so a slow daemon doesn't block the others.
     let pulls = config
@@ -4582,12 +4776,14 @@ fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Resu
                 } else {
                     String::new()
                 };
-                println!("{}@{}{}", host.user, display_address, key_note);
+                let port_note = host.port.map(|p| format!("  port={p}")).unwrap_or_default();
+                println!("{}@{}{}{}", host.user, display_address, port_note, key_note);
             }
             Ok(())
         }
         HostsAction::Add {
             address,
+            port,
             address_secret,
             user,
             ssh_key_secret,
@@ -4596,6 +4792,7 @@ fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Resu
         } => cmd_hosts_add(
             config_path,
             address.as_deref(),
+            port,
             address_secret.as_deref(),
             &user,
             ssh_key_secret.as_deref(),
@@ -4606,10 +4803,35 @@ fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Resu
     }
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::items_after_statements)]
+/// `--address host:2200` carries the SSH port. Keep it out of
+/// `address:` (ssh would read the whole string as a hostname) and
+/// return it as the port, merged with `--port`.
+fn split_hosts_add_address(
+    address: Option<&str>,
+    port: Option<u16>,
+) -> Result<(Option<String>, Option<u16>)> {
+    let Some(address) = address else {
+        return Ok((None, port));
+    };
+    let (address, inline) = yoink::config::split_address_port(address)
+        .map_err(|e| anyhow::anyhow!("--address: {e}"))?;
+    match (port, inline) {
+        (Some(flag), Some(inline)) if flag != inline => Err(anyhow::anyhow!(
+            "--port {flag} conflicts with the port {inline} in --address"
+        )),
+        (flag, inline) => Ok((Some(address), flag.or(inline))),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::items_after_statements,
+    clippy::too_many_arguments
+)]
 fn cmd_hosts_add(
     config_path: PathBuf,
     address: Option<&str>,
+    port: Option<u16>,
     address_secret: Option<&str>,
     user: &str,
     ssh_key_secret: Option<&str>,
@@ -4629,6 +4851,8 @@ fn cmd_hosts_add(
         }
         _ => {}
     }
+    let (address, port) = split_hosts_add_address(address, port)?;
+    let address = address.as_deref();
     let derived_name = match (name, address) {
         (Some(n), _) => n.to_string(),
         (None, Some(addr)) => addr.replace([':', '.'], "-"),
@@ -4682,6 +4906,9 @@ fn cmd_hosts_add(
     } else if let Some(secret) = address_secret {
         let _ = writeln!(body, "  - address_secret: {secret}");
     }
+    if let Some(port) = port {
+        let _ = writeln!(body, "    port: {port}");
+    }
     let _ = writeln!(body, "    user: {user}");
     if let Some(secret) = ssh_key_secret {
         let _ = writeln!(body, "    ssh_key_secret: {secret}");
@@ -4702,8 +4929,9 @@ fn cmd_hosts_add(
         .map(str::to_string)
         .or_else(|| address_secret.map(|s| format!("<address_secret:{s}>")))
         .unwrap_or_default();
+    let port_note = port.map(|p| format!(", port {p}")).unwrap_or_default();
     eprintln!(
-        "✓ added host {derived_name} ({user}@{display_address}) to {}",
+        "✓ added host {derived_name} ({user}@{display_address}{port_note}) to {}",
         fragment_path.display()
     );
     Ok(())
@@ -5625,7 +5853,297 @@ fn chrono_like_now() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_as_pairs;
+    use super::{
+        GitFallbackFailure, check_git_fallback, extract_image_tag, parse_as_pairs,
+        parse_tag_overrides_with, previous_generation, rollback_tag,
+    };
+
+    fn tag_test_services() -> Vec<yoink::config::ServiceConfig> {
+        yoink::config::Config::parse_str(
+            r#"
+hosts:
+  - { address: h, user: u }
+services:
+  - name: redis
+    image: redis
+    tag: "7"
+    run: { port: 6379, healthcheck_path: / }
+  - name: api
+    image: ghcr.io/me/api
+    run: { port: 8080, healthcheck_path: / }
+  - name: web
+    image: ghcr.io/me/web
+    build: { context: . }
+    run: { port: 3000, healthcheck_path: / }
+"#,
+        )
+        .unwrap()
+        .services
+    }
+
+    /// Run the parse and the fallback check the way `yoink up` does,
+    /// with the git lookup failing with `why`.
+    fn up_with_failed_git(
+        filter: &[&str],
+        why: GitFallbackFailure,
+        build: bool,
+    ) -> anyhow::Result<()> {
+        let services = tag_test_services();
+        let filter: Vec<String> = filter.iter().map(ToString::to_string).collect();
+        let (out, failure) = parse_tag_overrides_with(&[], &filter, &services, || Err(why))?;
+        assert!(out.is_empty(), "a failed lookup must not add overrides");
+        check_git_fallback(
+            services.iter().filter(|s| filter.contains(&s.name)),
+            &out,
+            failure.as_ref(),
+            build,
+            true,
+        )
+    }
+
+    #[test]
+    fn dirty_tree_explains_the_git_fallback() {
+        let err = up_with_failed_git(&["redis", "api"], GitFallbackFailure::Dirty, false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "service \"api\" has no `tag:` in config and no `--tag` was given. \
+             With `--service`, yoink falls back to the git commit SHA, but only \
+             from a clean working tree, and this tree has uncommitted changes. \
+             Pass `--tag api=<tag>`, commit or stash your changes, or pass \
+             `--here` to use the SHA of the current commit (`--here` does not \
+             look at uncommitted changes)."
+        );
+    }
+
+    #[test]
+    fn git_failure_explains_the_fallback_without_suggesting_here() {
+        let why = GitFallbackFailure::Git("fatal: not a git repository".into());
+        let err = up_with_failed_git(&["api"], why, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service \"api\""), "got: {err}");
+        assert!(err.contains("fatal: not a git repository"), "got: {err}");
+        assert!(err.contains("`--tag api=<tag>`"), "got: {err}");
+        // `--here` needs the same git SHA, so it is not a way out.
+        assert!(!err.contains("--here"), "got: {err}");
+    }
+
+    #[test]
+    fn allow_dirty_explains_the_fallback_is_off() {
+        let err = up_with_failed_git(&["api"], GitFallbackFailure::AllowDirty, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`--allow-dirty` turns that fallback off"));
+        assert!(err.contains("`--tag api=<tag>`"), "got: {err}");
+        assert!(err.contains("`--here`"), "got: {err}");
+    }
+
+    #[test]
+    fn failed_git_lookup_is_harmless_when_build_supplies_the_tag() {
+        // `up --build`: `web` has a `build:` block and gets a
+        // content-digest tag after the build, so nothing is missing.
+        up_with_failed_git(&["web"], GitFallbackFailure::Dirty, true).unwrap();
+        // Without `--build` the same service does need the fallback.
+        let err = up_with_failed_git(&["web"], GitFallbackFailure::Dirty, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service \"web\""), "got: {err}");
+        // `--build` does not help a service without a `build:` block.
+        let err = up_with_failed_git(&["web", "api"], GitFallbackFailure::Dirty, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service \"api\""), "got: {err}");
+    }
+
+    #[test]
+    fn build_command_message_does_not_suggest_here() {
+        let services = tag_test_services();
+        let filter = ["web".to_string()];
+        let (out, failure) =
+            parse_tag_overrides_with(&[], &filter, &services, || Err(GitFallbackFailure::Dirty))
+                .unwrap();
+        let web = services.iter().find(|s| s.name == "web").unwrap();
+        let err = check_git_fallback([web], &out, failure.as_ref(), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("commit or stash your changes."), "got: {err}");
+        assert!(!err.contains("--here"), "got: {err}");
+    }
+
+    #[test]
+    fn no_service_filter_keeps_the_plain_no_tag_error() {
+        let services = tag_test_services();
+        let (out, failure) = parse_tag_overrides_with(&[], &[], &services, || {
+            panic!("git must not be consulted without --service")
+        })
+        .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(failure, None);
+        check_git_fallback(&services, &out, failure.as_ref(), false, true).unwrap();
+        let api = services.iter().find(|s| s.name == "api").unwrap();
+        let err = yoink::build::resolve_service_tag(api, &out)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "service \"api\" has no `tag:` set and no `--tag api=…` override"
+        );
+    }
+
+    #[test]
+    fn service_filter_git_fallback_does_not_shadow_config_tag() {
+        let services = tag_test_services();
+        let filter = ["redis".to_string(), "api".to_string()];
+        let (out, failure) =
+            parse_tag_overrides_with(&[], &filter, &services, || Ok("abc1234".into())).unwrap();
+        assert_eq!(failure, None);
+        // `redis` pins `tag: "7"` in the config; the implicit git SHA
+        // must not override it.
+        assert_eq!(out.get("redis"), None);
+        // `api` has no config tag, so it still gets the fallback.
+        assert_eq!(out.get("api").map(String::as_str), Some("abc1234"));
+    }
+
+    #[test]
+    fn git_is_not_consulted_when_every_selected_service_is_pinned() {
+        let services = tag_test_services();
+        let filter = ["redis".to_string()];
+        let (out, failure) = parse_tag_overrides_with(&[], &filter, &services, || {
+            panic!("git must not be consulted when nothing needs the fallback")
+        })
+        .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(failure, None);
+    }
+
+    #[test]
+    fn explicit_bare_tag_still_overrides_config_tag() {
+        let services = tag_test_services();
+        let filter = ["redis".to_string()];
+        let (out, _) = parse_tag_overrides_with(&["8".to_string()], &filter, &services, || {
+            panic!("git must not be consulted when --tag is given")
+        })
+        .unwrap();
+        assert_eq!(out.get("redis").map(String::as_str), Some("8"));
+    }
+
+    use yoink::docker_ops::ContainerInfo;
+
+    fn container(name: &str, state: &str, spec_hash: &str, created: i64) -> ContainerInfo {
+        ContainerInfo {
+            host: "host-a".into(),
+            name: name.into(),
+            image: format!("registry.example.com/api:{name}"),
+            state: state.into(),
+            status_text: String::new(),
+            created_unix: Some(created),
+            yoink_service: Some("api".into()),
+            yoink_version: Some(name.into()),
+            yoink_spec_hash: Some(spec_hash.into()),
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// v2 is live and a v3 deploy failed its healthcheck, leaving a
+    /// stopped v3 container behind. Rollback must go to v1, not to the
+    /// v3 that never served.
+    #[test]
+    fn previous_generation_skips_failed_deploy_newer_than_running() {
+        let containers = vec![
+            container("v1", "exited", "h1", 100),
+            container("v2", "running", "h2", 200),
+            container("v3", "exited", "h3", 300),
+        ];
+        let prev = previous_generation(&containers).map(|c| c.name.as_str());
+        assert_eq!(prev, Some("v1"));
+    }
+
+    #[test]
+    fn previous_generation_skips_never_started_container() {
+        let containers = vec![
+            container("v1", "exited", "h1", 100),
+            container("v2", "created", "h2", 200),
+            container("v3", "running", "h3", 300),
+        ];
+        let prev = previous_generation(&containers).map(|c| c.name.as_str());
+        assert_eq!(prev, Some("v1"));
+    }
+
+    #[test]
+    fn previous_generation_picks_newest_stopped_before_running() {
+        let containers = vec![
+            container("v1", "exited", "h1", 100),
+            container("v2", "exited", "h2", 200),
+            container("v3", "running", "h3", 300),
+        ];
+        let prev = previous_generation(&containers).map(|c| c.name.as_str());
+        assert_eq!(prev, Some("v2"));
+    }
+
+    /// v2 is the current generation but crash-loops under its restart
+    /// policy, so docker reports it as `restarting` (or an operator
+    /// paused it). It is still the current generation: rollback must go
+    /// to v1, not redeploy v2 onto itself.
+    #[test]
+    fn previous_generation_treats_restarting_and_paused_as_current() {
+        for state in ["restarting", "paused"] {
+            let containers = vec![
+                container("v1", "exited", "h1", 100),
+                container("v2", state, "h2", 200),
+            ];
+            let prev = previous_generation(&containers).map(|c| c.name.as_str());
+            assert_eq!(prev, Some("v1"), "current generation is {state}");
+        }
+    }
+
+    #[test]
+    fn previous_generation_none_when_only_a_failed_deploy_is_stopped() {
+        let containers = vec![
+            container("v2", "running", "h2", 200),
+            container("v3", "exited", "h3", 300),
+        ];
+        assert!(previous_generation(&containers).is_none());
+    }
+
+    /// Digest-pinned services run `repo@sha256:<hex>`. The rollback
+    /// tag must keep the `sha256:` prefix so the redeploy pulls
+    /// `repo@sha256:<hex>` instead of the nonexistent `repo:<hex>`.
+    #[test]
+    fn rollback_tag_keeps_digest_prefix() {
+        let mut c = container("v1", "exited", "h1", 100);
+        c.image = "registry.example.com/api@sha256:abc123".into();
+        c.yoink_version = Some("sha256:abc123".into());
+        assert_eq!(rollback_tag(&c), "sha256:abc123");
+        // Container without the label: fall back to the image reference.
+        c.yoink_version = None;
+        assert_eq!(rollback_tag(&c), "sha256:abc123");
+    }
+
+    /// The label wins over the image reference. Docker reports a bare
+    /// image ID once the tag has moved to a newer image, and the image
+    /// reference then no longer holds the deployed tag.
+    #[test]
+    fn rollback_tag_prefers_version_label_over_image_reference() {
+        let mut c = container("v1", "exited", "h1", 100);
+        c.image = "sha256:0123456789ab".into();
+        assert_eq!(rollback_tag(&c), "v1");
+    }
+
+    #[test]
+    fn extract_image_tag_handles_tags_ports_and_digests() {
+        assert_eq!(extract_image_tag("ghcr.io/user/app:abc123"), "abc123");
+        assert_eq!(extract_image_tag("registry:5000/img:tag"), "tag");
+        assert_eq!(extract_image_tag("registry:5000/img"), "registry:5000/img");
+        assert_eq!(
+            extract_image_tag("registry:5000/img@sha256:abc123"),
+            "sha256:abc123"
+        );
+    }
 
     #[test]
     fn as_pair_literal_value() {
@@ -5678,5 +6196,89 @@ mod tests {
         let arg = format!("KEY=@{}", path.display());
         let err = parse_as_pairs(&[arg], 50).unwrap_err();
         assert!(format!("{err:#}").contains("larger than"));
+    }
+
+    /// A project dir whose `yoink.yaml` includes `hosts/*.yaml`, the
+    /// shape `yoink hosts add` writes fragments for.
+    fn hosts_add_project() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("yoink.yaml");
+        std::fs::write(&config_path, "include: [hosts/*.yaml]\nservices: []\n").unwrap();
+        (dir, config_path)
+    }
+
+    fn hosts_add(
+        config_path: &std::path::Path,
+        address: &str,
+        port: Option<u16>,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        super::cmd_hosts_add(
+            config_path.to_path_buf(),
+            Some(address),
+            port,
+            None,
+            "root",
+            None,
+            Some(name),
+            std::path::Path::new("hosts"),
+        )
+    }
+
+    #[test]
+    fn hosts_add_splits_port_out_of_address() {
+        let (dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "100.122.184.6:2200", None, "sshoddur-1").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("hosts/sshoddur-1.yaml")).unwrap();
+        assert!(body.contains("  - address: 100.122.184.6\n"), "{body}");
+        assert!(body.contains("    port: 2200\n"), "{body}");
+        let cfg = yoink::config::Config::load_from_path(&config_path).unwrap();
+        assert_eq!(cfg.hosts[0].address, "100.122.184.6");
+        assert_eq!(cfg.hosts[0].port, Some(2200));
+    }
+
+    #[test]
+    fn hosts_add_port_flag_writes_port() {
+        let (dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "prod-eu-1", Some(2200), "prod").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("hosts/prod.yaml")).unwrap();
+        assert!(body.contains("  - address: prod-eu-1\n"), "{body}");
+        assert!(body.contains("    port: 2200\n"), "{body}");
+    }
+
+    #[test]
+    fn hosts_add_without_port_writes_no_port_line() {
+        let (dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "prod-eu-1", None, "prod").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("hosts/prod.yaml")).unwrap();
+        assert!(!body.contains("port:"), "{body}");
+    }
+
+    #[test]
+    fn hosts_add_bracketed_ipv6_with_port() {
+        let (_dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "[2001:db8::1]:2200", None, "v6").unwrap();
+        let cfg = yoink::config::Config::load_from_path(&config_path).unwrap();
+        assert_eq!(cfg.hosts[0].address, "2001:db8::1");
+        assert_eq!(cfg.hosts[0].port, Some(2200));
+    }
+
+    #[test]
+    fn hosts_add_bare_ipv6_keeps_whole_address() {
+        let (_dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "2001:db8::22", None, "v6").unwrap();
+        let cfg = yoink::config::Config::load_from_path(&config_path).unwrap();
+        assert_eq!(cfg.hosts[0].address, "2001:db8::22");
+        assert_eq!(cfg.hosts[0].port, None);
+    }
+
+    #[test]
+    fn hosts_add_rejects_conflicting_ports() {
+        let (dir, config_path) = hosts_add_project();
+        let err = hosts_add(&config_path, "prod-eu-1:2200", Some(2222), "prod").unwrap_err();
+        assert!(format!("{err}").contains("conflicts"), "{err}");
+        assert!(!dir.path().join("hosts/prod.yaml").exists());
+        // The same port given twice is fine.
+        hosts_add(&config_path, "prod-eu-1:2200", Some(2200), "prod").unwrap();
     }
 }

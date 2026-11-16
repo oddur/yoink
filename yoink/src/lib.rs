@@ -1,5 +1,6 @@
 pub mod add;
 pub mod audit;
+pub mod bollard_ssh;
 pub mod build;
 pub mod completion;
 pub mod config;

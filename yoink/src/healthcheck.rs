@@ -16,22 +16,35 @@ pub enum HealthcheckError {
     #[error("docker error: {0}")]
     Docker(#[from] DockerError),
     #[error(
-        "healthcheck timed out after {budget:?} ({attempts} attempts; last status: {last_http_status:?})"
+        "healthcheck timed out after {budget:?} ({attempts} attempts; last status: {last_http_status:?}{})",
+        fmt_last_error(.last_error.as_deref())
     )]
     TimedOut {
         budget: Duration,
         attempts: u32,
+        /// Most recent HTTP status a probe returned, if any. A later
+        /// probe error does not clear it.
         last_http_status: Option<u16>,
+        /// Most recent probe error seen during the budget, if any,
+        /// with the number of the attempt that hit it. A probe error
+        /// is retried like a non-200, so this is the only place it
+        /// surfaces.
+        last_error: Option<String>,
     },
 }
 
-/// Outcome of one probe attempt: either healthy (caller stops polling)
-/// or not-yet, with an optional HTTP status to surface in the timeout
-/// error message. The TCP probe always reports `None` since there's no
-/// HTTP code to report.
+fn fmt_last_error(last_error: Option<&str>) -> String {
+    last_error.map_or_else(String::new, |e| format!("; last probe error: {e}"))
+}
+
+/// Outcome of one probe attempt: healthy (caller stops polling), a
+/// non-200 HTTP status, or a failed probe (ssh blip, docker API
+/// error). The timeout message reports the latest of each. The TCP
+/// probe has no HTTP code, so it never reports `Unhealthy`.
 enum AttemptOutcome {
     Healthy,
-    NotYet { last_http_status: Option<u16> },
+    Unhealthy(u16),
+    ProbeFailed(DockerError),
 }
 
 /// Generic backoff loop shared by `poll` (HTTP) and `poll_tcp` (TCP).
@@ -45,18 +58,19 @@ where
 {
     let deadline = Instant::now() + budget;
     let mut attempt: u32 = 0;
-    // `last_http_status` is overwritten by the first `NotYet` arm
-    // before any read; the initial `None` is just to satisfy the
-    // borrow checker on the timeout branch.
-    #[allow(unused_assignments)]
     let mut last_http_status: Option<u16> = None;
+    let mut last_error: Option<String> = None;
     loop {
         attempt += 1;
         match attempt_fn(attempt).await? {
             AttemptOutcome::Healthy => return Ok(attempt),
-            AttemptOutcome::NotYet {
-                last_http_status: s,
-            } => last_http_status = s,
+            AttemptOutcome::Unhealthy(status) => last_http_status = Some(status),
+            // A failed probe has no status and does not clear the
+            // last real one. The attempt number shows how old the
+            // error is.
+            AttemptOutcome::ProbeFailed(e) => {
+                last_error = Some(format!("attempt {attempt}: {e}"));
+            }
         }
         let now = Instant::now();
         if now >= deadline {
@@ -64,6 +78,7 @@ where
                 budget,
                 attempts: attempt,
                 last_http_status,
+                last_error,
             });
         }
         let remaining = deadline - now;
@@ -93,9 +108,7 @@ pub async fn poll_tcp(
             }
             Err(e) => {
                 debug!(host = %host.address, container, attempt, error = %e, "tcp probe failed");
-                Ok(AttemptOutcome::NotYet {
-                    last_http_status: None,
-                })
+                Ok(AttemptOutcome::ProbeFailed(e))
             }
         }
     })
@@ -104,6 +117,16 @@ pub async fn poll_tcp(
 
 /// Poll the new container's HTTP healthcheck endpoint until 200 or
 /// `budget` elapses. Returns the number of attempts on success.
+///
+/// A probe that errors (ssh transport blip, daemon 5xx on the one-shot
+/// curl container) counts as not-yet, same as `poll_tcp`: one bad
+/// probe must not fail a deploy whose app would answer 200 on the
+/// next attempt. The last error is kept for the timeout message.
+///
+/// The exception is a request the daemon rejected with a 4xx (the
+/// probe network does not exist, or the probe image is absent and
+/// the pull just failed). That is not a blip, so the error ends the
+/// poll at once instead of after the whole budget.
 pub async fn poll(
     ops: &dyn DockerOps,
     host: &Host,
@@ -114,17 +137,20 @@ pub async fn poll(
     budget: Duration,
 ) -> Result<u32, HealthcheckError> {
     poll_until(budget, |attempt| async move {
-        let status = ops
-            .healthcheck(host, network, container, port, path)
-            .await?;
-        if status == 200 {
-            debug!(host = %host.address, container, attempt, "healthcheck 200");
-            Ok(AttemptOutcome::Healthy)
-        } else {
-            debug!(host = %host.address, container, attempt, status, "healthcheck non-200");
-            Ok(AttemptOutcome::NotYet {
-                last_http_status: Some(status),
-            })
+        match ops.healthcheck(host, network, container, port, path).await {
+            Ok(200) => {
+                debug!(host = %host.address, container, attempt, "healthcheck 200");
+                Ok(AttemptOutcome::Healthy)
+            }
+            Ok(status) => {
+                debug!(host = %host.address, container, attempt, status, "healthcheck non-200");
+                Ok(AttemptOutcome::Unhealthy(status))
+            }
+            Err(e) if e.is_daemon_rejection() => Err(e),
+            Err(e) => {
+                debug!(host = %host.address, container, attempt, error = %e, "healthcheck probe failed");
+                Ok(AttemptOutcome::ProbeFailed(e))
+            }
         }
     })
     .await
@@ -139,6 +165,17 @@ mod tests {
         Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
+        }
+    }
+
+    fn daemon_error(status_code: u16, message: &str) -> DockerError {
+        DockerError::Bollard {
+            host: "host-a".into(),
+            source: bollard::errors::Error::DockerResponseServerError {
+                status_code,
+                message: message.into(),
+            },
         }
     }
 
@@ -202,10 +239,12 @@ mod tests {
                 budget,
                 attempts,
                 last_http_status,
+                last_error,
             } => {
                 assert_eq!(budget, Duration::from_secs(3));
                 assert!(attempts >= 2, "got {attempts}");
                 assert_eq!(last_http_status, Some(503));
+                assert_eq!(last_error, None);
             }
             HealthcheckError::Docker(e) => panic!("expected timeout, got {e:?}"),
         }
@@ -235,21 +274,53 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn tcp_times_out_when_never_reachable() {
+        let refused = || DockerError::Invalid("refused".into());
         let ops = FakeDockerOps::new();
         for _ in 0..50 {
-            ops.push_healthcheck_tcp(Err(crate::docker_ops::DockerError::Invalid(
-                "refused".into(),
-            )));
+            ops.push_healthcheck_tcp(Err(refused()));
         }
         let err = poll_tcp(&ops, &host(), "yoink", "c", 6379, Duration::from_secs(3))
             .await
             .unwrap_err();
-        assert!(matches!(err, HealthcheckError::TimedOut { .. }));
+        match err {
+            HealthcheckError::TimedOut {
+                attempts,
+                last_error,
+                ..
+            } => {
+                let last_error = last_error.expect("probe error kept");
+                assert_eq!(last_error, format!("attempt {attempts}: {}", refused()));
+            }
+            HealthcheckError::Docker(e) => panic!("expected timeout, got {e:?}"),
+        }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn propagates_docker_error() {
+    async fn retries_after_probe_error_then_succeeds() {
         let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Err(DockerError::Invalid("ssh blip".into())));
+        ops.push_healthcheck(Ok(200));
+        let attempts = poll(
+            &ops,
+            &host(),
+            "yoink",
+            "c",
+            3000,
+            "/h",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_message_dates_an_early_probe_error() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Err(DockerError::Invalid("ssh blip".into())));
+        for _ in 0..50 {
+            ops.push_healthcheck(Ok(503));
+        }
         let err = poll(
             &ops,
             &host(),
@@ -257,10 +328,102 @@ mod tests {
             "c",
             3000,
             "/h",
-            Duration::from_secs(1),
+            Duration::from_secs(3),
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, HealthcheckError::Docker(_)));
+        let message = err.to_string();
+        assert!(message.contains("last status: Some(503)"), "got {message}");
+        assert!(
+            message.contains("last probe error: attempt 1: "),
+            "got {message}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_rejection_fails_at_once() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Err(daemon_error(404, "network yoink not found")));
+        // A second attempt would get this 200. The poll must not make it.
+        ops.push_healthcheck(Ok(200));
+        let err = poll(
+            &ops,
+            &host(),
+            "yoink",
+            "c",
+            3000,
+            "/h",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            HealthcheckError::Docker(e) => {
+                assert!(e.to_string().contains("network yoink not found"), "got {e}");
+            }
+            HealthcheckError::TimedOut { .. } => panic!("expected docker error, got {err:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_server_error_is_retried() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Err(daemon_error(500, "daemon busy")));
+        ops.push_healthcheck(Ok(200));
+        let attempts = poll(
+            &ops,
+            &host(),
+            "yoink",
+            "c",
+            3000,
+            "/h",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn times_out_with_last_probe_error_in_message() {
+        let ops = FakeDockerOps::new();
+        ops.push_healthcheck(Ok(503));
+        for _ in 0..50 {
+            ops.push_healthcheck(Err(DockerError::Invalid("ssh blip".into())));
+        }
+        // The 503 from attempt 1 stays the last status: the attempts
+        // that errored returned no status.
+        let err = poll(
+            &ops,
+            &host(),
+            "yoink",
+            "c",
+            3000,
+            "/h",
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        match err {
+            HealthcheckError::TimedOut {
+                attempts,
+                last_http_status,
+                last_error,
+                ..
+            } => {
+                assert!(attempts >= 2, "got {attempts}");
+                assert_eq!(last_http_status, Some(503));
+                let last_error = last_error.expect("probe error kept");
+                assert!(
+                    last_error.starts_with(&format!("attempt {attempts}: ")),
+                    "got {last_error}"
+                );
+                assert!(last_error.contains("ssh blip"), "got {last_error}");
+                assert!(message.contains("last probe error"), "got {message}");
+                assert!(message.contains("ssh blip"), "got {message}");
+            }
+            HealthcheckError::Docker(e) => panic!("expected timeout, got {e:?}"),
+        }
     }
 }
