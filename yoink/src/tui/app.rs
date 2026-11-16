@@ -2284,11 +2284,7 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.dashboard.select_next(),
                 KeyCode::Enter => {
                     if let Some(row) = self.dashboard.selected() {
-                        let host = config_host(&self.config, &row.host).unwrap_or(Host {
-                            user: String::new(),
-                            address: row.host,
-                            port: None,
-                        });
+                        let host = config_host_or_bare(&self.config, &row.host);
                         self.transition(View::ContainerDetail {
                             host,
                             container: row.container,
@@ -2298,11 +2294,7 @@ impl App {
                 }
                 KeyCode::Char('K') => {
                     if let Some(row) = self.dashboard.selected() {
-                        let host = config_host(&self.config, &row.host).unwrap_or(Host {
-                            user: String::new(),
-                            address: row.host,
-                            port: None,
-                        });
+                        let host = config_host_or_bare(&self.config, &row.host);
                         self.kill_target = Some((host, row.container));
                     }
                 }
@@ -3602,11 +3594,7 @@ impl App {
         };
         for host_status in report.hosts {
             for container in host_status.containers.iter().filter(|c| c.is_running()) {
-                let host = config_host(&self.config, &host_status.host).unwrap_or(Host {
-                    user: String::new(),
-                    address: host_status.host.clone(),
-                    port: None,
-                });
+                let host = config_host_or_bare(&self.config, &host_status.host);
                 self.spawn_log_forwarder(host, container.name.clone()).await;
             }
         }
@@ -4085,15 +4073,24 @@ fn update_service_status(
     map.insert(service.to_string(), next);
 }
 
-/// Look up `(user, address)` from the loaded config by address —
-/// used so Dashboard's host names resolve to a full `Host` for
-/// transitions that need the ssh user (`HostDetail`, kill modal).
-fn config_host(config: &Config, address: &str) -> Option<Host> {
+/// The config's `Host` for `address`, so Dashboard and service rows
+/// (which carry only an address) get the ssh user and port for
+/// transitions that need them (`HostDetail`, kill modal, log
+/// streams). An address the config does not know falls back to a
+/// bare host with no user and no port.
+pub(super) fn config_host_or_bare(config: &Config, address: &str) -> Host {
     config
         .hosts
         .iter()
         .find(|h| h.address == address)
-        .map(Host::from)
+        .map_or_else(
+            || Host {
+                user: String::new(),
+                address: address.to_string(),
+                port: None,
+            },
+            Host::from,
+        )
 }
 
 /// Background reconcile task. Acquires the per-host advisory lock,

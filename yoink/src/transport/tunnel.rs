@@ -152,8 +152,12 @@ fn tunnel_args(host: &Host, forward: &str, keyfile: Option<&std::path::Path>) ->
         // are using for this host (see `RealDockerOps::ssh_keyfile`).
         // `IdentitiesOnly=yes` stops ssh from trying agent keys
         // first.
-        args.extend(["-i".into(), key.into(), "-o".into()]);
-        args.push("IdentitiesOnly=yes".into());
+        args.extend([
+            "-i".into(),
+            key.into(),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+        ]);
     }
     args.extend(
         [

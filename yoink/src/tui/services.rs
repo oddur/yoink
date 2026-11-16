@@ -303,18 +303,7 @@ impl ServiceDetailState {
         if let Some(r) = report {
             let mut rows = Vec::new();
             for host_status in &r.hosts {
-                let host = config
-                    .hosts
-                    .iter()
-                    .find(|h| h.address == host_status.host)
-                    .map_or_else(
-                        || Host {
-                            user: String::new(),
-                            address: host_status.host.clone(),
-                            port: None,
-                        },
-                        Host::from,
-                    );
+                let host = super::app::config_host_or_bare(config, &host_status.host);
                 for c in &host_status.containers {
                     if c.yoink_service.as_deref() == Some(name.as_str()) {
                         rows.push(ServiceContainerRow {

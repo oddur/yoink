@@ -76,13 +76,11 @@ impl Host {
     /// a port follows it, as the URL form requires.
     #[must_use]
     pub fn ssh_url(&self) -> String {
-        match self.ssh_port() {
-            Some(port) if self.address.contains(':') => {
-                format!("ssh://{}@[{}]:{port}", self.user, self.address)
-            }
-            Some(port) => format!("ssh://{}@{}:{port}", self.user, self.address),
-            None => format!("ssh://{}@{}", self.user, self.address),
-        }
+        format!(
+            "ssh://{}@{}",
+            self.user,
+            crate::config::join_address_port(&self.address, self.ssh_port())
+        )
     }
 
     /// The port every ssh connection to this host must use. `None`

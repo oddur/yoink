@@ -178,6 +178,17 @@ pub fn split_address_port(input: &str) -> Result<(String, Option<u16>), String> 
     }
 }
 
+/// Inverse of [`split_address_port`]: `address[:port]`, with brackets
+/// around an IPv6 address when a port follows it.
+#[must_use]
+pub fn join_address_port(address: &str, port: Option<u16>) -> String {
+    match port {
+        Some(port) if address.contains(':') => format!("[{address}]:{port}"),
+        Some(port) => format!("{address}:{port}"),
+        None => address.to_string(),
+    }
+}
+
 /// `Some(reason)` when `address` carries a `:port` suffix. ssh takes
 /// the whole string as a hostname and fails with "Could not resolve
 /// hostname", so config load rejects it and points at `port:`.

@@ -495,11 +495,7 @@ fn prompt_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
         ImageSource::Bare(image)
     };
 
-    let suggested = match plan.host_port {
-        Some(p) if plan.host_address.contains(':') => format!("[{}]:{p}", plan.host_address),
-        Some(p) => format!("{}:{p}", plan.host_address),
-        None => plan.host_address.clone(),
-    };
+    let suggested = crate::config::join_address_port(&plan.host_address, plan.host_port);
     let host = ask("ssh host (address or address:port)", &suggested)?;
     (plan.host_address, plan.host_port) =
         crate::config::split_address_port(&host).map_err(|e| anyhow::anyhow!("ssh host: {e}"))?;
