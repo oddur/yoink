@@ -48,7 +48,7 @@ secrets:
 
 # Registry credentials live in the same secrets bundle. Yoink looks up
 # these named keys and passes them to docker as X-Registry-Auth on
-# every pull. Skip this block when every service is locally-built
+# each pull from `registry.server`. Skip this block when every service is locally-built
 # (yoink ships build artifacts straight from your docker daemon, no
 # auth needed) or when pulling exclusively from public registries.
 registry:

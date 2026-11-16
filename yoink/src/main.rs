@@ -3503,7 +3503,7 @@ async fn cmd_pull(
             git::version(std::path::Path::new("."), true).unwrap_or_else(|_| "latest".into())
         });
     let bundle = load_secrets_bundle(config).await?;
-    let credentials = deploy::registry_credentials(config, bundle.as_ref());
+    let credentials = deploy::registry_credentials(config, bundle.as_ref(), &svc_cfg.image);
     let ops = build_real_ops(config, bundle.as_ref()).await?;
     // Fan out across hosts so a slow daemon doesn't block the others.
     let pulls = config

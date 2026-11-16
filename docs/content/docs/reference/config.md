@@ -167,7 +167,7 @@ See the [secrets guide](/docs/guide/secrets) for per-tool wiring.
 | `username_secret` | string | Name of the secret in your provider holding the username. |
 | `password_secret` | string | Name of the secret holding the token/password. |
 
-Yoink resolves these at deploy time and passes them as `X-Registry-Auth` on every pull.
+Yoink resolves these at deploy time and passes them as `X-Registry-Auth` on each pull of an image from `server`. A pull from another registry is anonymous, so a public image such as the default proxy image `caddy:2` still pulls.
 
 ## Proxy
 
