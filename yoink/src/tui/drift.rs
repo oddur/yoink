@@ -150,6 +150,22 @@ fn body_lines(diff: &ServiceDiff) -> Vec<Line<'static>> {
             ),
             Span::raw(format!(" (spec_hash {})", short(current_hash))),
         ])],
+        ChangeKind::Cleanup { current_hash, stop } => {
+            let mut out = vec![
+                Line::from(vec![
+                    Span::styled(
+                        "- would stop extra containers",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(" (spec_hash {})", short(current_hash))),
+                ]),
+                Line::from(""),
+            ];
+            out.extend(stop.iter().map(|name| Line::from(format!("  {name}"))));
+            out
+        }
         ChangeKind::Create { desired_image } => vec![
             Line::from(vec![
                 Span::styled(

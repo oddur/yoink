@@ -14,7 +14,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::config::Config;
-use crate::deploy::{self, DeployError, build_desired_spec, container_name};
+use crate::deploy::{self, DeployError, build_desired_spec};
 use crate::docker;
 use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, Host};
 use crate::secrets::SecretsBundle;
@@ -73,6 +73,15 @@ pub enum ChangeKind {
         desired_image: String,
         #[serde(default, skip_serializing_if = "FieldDiff::is_empty")]
         fields: FieldDiff,
+    },
+    /// Spec hash matches and every expected replica runs, but extra
+    /// containers of the service are still running (an old generation
+    /// left by an interrupted deploy, or surplus replicas after
+    /// scaling down). `yoink up` stops the containers in `stop` and
+    /// does nothing else: no image pull, no hooks, no new container.
+    Cleanup {
+        current_hash: String,
+        stop: Vec<String>,
     },
     /// Spec hash matches — nothing for `yoink up` to do.
     NoOp { current_hash: String },
@@ -135,12 +144,14 @@ pub struct OrphanContainer {
     pub service: Option<String>,
 }
 
-/// `(create, update, noop, orphans)` rollup, useful for the PR-comment
-/// "Plan: …" line and exit-code logic in CI.
+/// `(create, update, cleanup, noop, orphans)` rollup, useful for the
+/// PR-comment "Plan: …" line and exit-code logic in CI.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Summary {
     pub create: usize,
     pub update: usize,
+    /// Services at spec that have extra containers to stop.
+    pub cleanup: usize,
     pub noop: usize,
     pub orphans: usize,
 }
@@ -151,6 +162,7 @@ impl DiffReport {
         let mut s = Summary {
             create: 0,
             update: 0,
+            cleanup: 0,
             noop: 0,
             orphans: self.orphans.len(),
         };
@@ -158,6 +170,7 @@ impl DiffReport {
             match d.change {
                 ChangeKind::Create { .. } => s.create += 1,
                 ChangeKind::Update { .. } => s.update += 1,
+                ChangeKind::Cleanup { .. } => s.cleanup += 1,
                 ChangeKind::NoOp { .. } => s.noop += 1,
             }
         }
@@ -169,7 +182,25 @@ impl DiffReport {
     #[must_use]
     pub fn has_changes(&self) -> bool {
         let s = self.summary();
-        s.create + s.update > 0
+        s.create + s.update + s.cleanup > 0
+    }
+}
+
+impl Summary {
+    /// The counts of the "Plan:" line, joined with `sep`. The cleanup
+    /// count only shows when there is something to clean up, so the
+    /// line keeps its usual shape otherwise.
+    fn plan_counts(&self, sep: &str) -> String {
+        let mut parts = vec![
+            format!("{} to create", self.create),
+            format!("{} to update", self.update),
+        ];
+        if self.cleanup > 0 {
+            parts.push(format!("{} to clean up", self.cleanup));
+        }
+        parts.push(format!("{} unchanged", self.noop));
+        parts.push(format!("{} orphan", self.orphans));
+        parts.join(sep)
     }
 }
 
@@ -233,26 +264,28 @@ pub async fn compute(
             let host = host_cfg.address.clone();
             let containers = snapshot.get(&host).map_or(&[][..], Vec::as_slice);
 
-            // Claim every desired-spec replica that's already running
-            // with the matching spec_hash — that's the no-op path.
-            let mut all_present = true;
-            for index in 0..svc.run.replicas {
-                let name = container_name(&svc.name, &desired_hash, index, svc.run.replicas);
-                let matched = containers.iter().any(|c| {
-                    c.name == name
-                        && c.is_running()
-                        && c.yoink_spec_hash.as_deref() == Some(desired_hash.as_str())
-                });
-                if matched {
-                    owned.insert((host.clone(), name));
-                } else {
-                    all_present = false;
-                }
+            // Same classification the reconcile skip uses
+            // (`deploy::host_spec_state`), so the dry-run reports what
+            // `yoink up` will do. Claim every desired-spec replica
+            // that's already running with the matching spec_hash.
+            let state = deploy::host_spec_state(containers, svc, &desired_hash);
+            for name in &state.present {
+                owned.insert((host.clone(), name.clone()));
             }
 
-            let change = if all_present {
+            let change = if state.all_present() && state.extras.is_empty() {
                 ChangeKind::NoOp {
                     current_hash: desired_hash.clone(),
+                }
+            } else if state.all_present() {
+                // `yoink up` stops these, so they are part of the
+                // plan and not orphans.
+                for name in &state.extras {
+                    owned.insert((host.clone(), name.clone()));
+                }
+                ChangeKind::Cleanup {
+                    current_hash: desired_hash.clone(),
+                    stop: state.extras,
                 }
             } else {
                 // CREATE vs UPDATE: is there *any* running container
@@ -569,12 +602,7 @@ impl DiffReport {
             let _ = writeln!(out);
         }
 
-        let s = self.summary();
-        let _ = writeln!(
-            out,
-            "Plan: {} to create, {} to update, {} unchanged, {} orphan",
-            s.create, s.update, s.noop, s.orphans
-        );
+        let _ = writeln!(out, "Plan: {}", self.summary().plan_counts(", "));
         out
     }
 
@@ -583,11 +611,7 @@ impl DiffReport {
         let mut out = String::new();
         let s = self.summary();
         let _ = writeln!(out, "### yoink dry-run\n");
-        let _ = writeln!(
-            out,
-            "**Plan:** {} to create · {} to update · {} unchanged · {} orphan\n",
-            s.create, s.update, s.noop, s.orphans
-        );
+        let _ = writeln!(out, "**Plan:** {}\n", s.plan_counts(" · "));
 
         let by_host = group_by_host(&self.services);
         for (host, rows) in &by_host {
@@ -666,6 +690,13 @@ fn text_row(d: &ServiceDiff) -> String {
                 format!("{head}\n{}", detail_lines.join("\n"))
             }
         }
+        ChangeKind::Cleanup { current_hash, stop } => format!(
+            "- {:18} {}              (at spec; stop {} extra)\n  stop:     {}",
+            d.service,
+            short(current_hash),
+            stop.len(),
+            stop.join(", ")
+        ),
         ChangeKind::NoOp { current_hash } => format!(
             "= {:18} {}              (no change)",
             d.service,
@@ -767,6 +798,17 @@ fn markdown_cells(d: &ServiceDiff) -> (&'static str, String, String) {
             format!("`{}` → `{}`", short(current_hash), short(&d.desired_hash)),
             format!("`{current_image}` → `{desired_image}`"),
         ),
+        ChangeKind::Cleanup { current_hash, stop } => (
+            "🟠",
+            format!("`{}` (unchanged)", short(current_hash)),
+            format!(
+                "stop {}",
+                stop.iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
         ChangeKind::NoOp { current_hash } => (
             "⚪",
             format!("`{}` (unchanged)", short(current_hash)),
@@ -821,6 +863,141 @@ mod tests {
                 current_hash: "cafef00ddd".into(),
             },
         }
+    }
+
+    fn cleanup(svc: &str, host: &str, stop: &[&str]) -> ServiceDiff {
+        ServiceDiff {
+            service: svc.into(),
+            host: host.into(),
+            tag: "v3".into(),
+            desired_hash: "cafef00ddd".into(),
+            change: ChangeKind::Cleanup {
+                current_hash: "cafef00ddd".into(),
+                stop: stop.iter().map(|s| (*s).to_string()).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn cleanup_counts_as_a_change_and_renders_the_containers_to_stop() {
+        let r = diff_with(
+            vec![
+                noop("a", "h1"),
+                cleanup("web", "h1", &["web-0ld0ld0", "web-cafef00-2"]),
+            ],
+            vec![],
+        );
+        assert_eq!(r.summary().cleanup, 1);
+        assert_eq!(r.summary().noop, 1);
+        assert!(r.has_changes());
+
+        let t = r.render(Format::Text);
+        assert!(t.contains("- web"), "got: {t}");
+        assert!(t.contains("stop 2 extra"), "got: {t}");
+        assert!(
+            t.contains("stop:     web-0ld0ld0, web-cafef00-2"),
+            "got: {t}"
+        );
+        assert!(
+            t.contains("Plan: 0 to create, 0 to update, 1 to clean up, 1 unchanged, 0 orphan"),
+            "got: {t}"
+        );
+
+        let m = r.render(Format::Markdown);
+        assert!(m.contains("1 to clean up"), "got: {m}");
+        assert!(
+            m.contains("| `web` | `cafef00` (unchanged) | stop `web-0ld0ld0`, `web-cafef00-2` |"),
+            "got: {m}"
+        );
+        assert!(!m.contains("_No changes._"), "got: {m}");
+
+        let j: serde_json::Value = serde_json::from_str(&r.render(Format::Json)).unwrap();
+        assert_eq!(j["services"][1]["change"]["kind"], "cleanup");
+        assert_eq!(j["services"][1]["change"]["stop"][0], "web-0ld0ld0");
+    }
+
+    fn running(service: &str, name: &str, hash: &str, state: &str) -> ContainerInfo {
+        ContainerInfo {
+            host: "host-a".into(),
+            name: name.into(),
+            image: String::new(),
+            state: state.into(),
+            status_text: String::new(),
+            created_unix: None,
+            yoink_service: Some(service.into()),
+            yoink_version: None,
+            yoink_spec_hash: Some(hash.into()),
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: BTreeMap::new(),
+        }
+    }
+
+    /// A service at spec with an old generation still running is not a
+    /// no-op: `yoink up` stops the old container, so the dry-run must
+    /// say so. The container is part of the plan, not an orphan. A
+    /// stopped old container changes nothing and stays an orphan.
+    #[tokio::test]
+    async fn compute_reports_cleanup_for_running_extras() {
+        let cfg = crate::config::Config::parse_str(
+            r"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: latest
+    run: { replicas: 2, port: 8080, healthcheck_path: /health }
+",
+        )
+        .unwrap();
+        let svc = &cfg.services[0];
+        let hash =
+            docker::compute_spec_hash(&build_desired_spec(&cfg, svc, "latest", None).unwrap());
+        let stale = "b".repeat(64);
+        let r0 = deploy::container_name("api", &hash, 0, 2);
+        let r1 = deploy::container_name("api", &hash, 1, 2);
+        let surplus = deploy::container_name("api", &hash, 2, 3);
+        let old = deploy::container_name("api", &stale, 0, 1);
+
+        let at_spec = vec![
+            running("api", &r0, &hash, "running"),
+            running("api", &r1, &hash, "running"),
+        ];
+
+        // Expected replicas plus a surplus replica and an old generation.
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        let mut containers = at_spec.clone();
+        containers.push(running("api", &surplus, &hash, "running"));
+        containers.push(running("api", &old, &stale, "running"));
+        ops.push_list_containers(Ok(containers));
+        let report = compute(&ops, &cfg, &BTreeMap::new(), None, None)
+            .await
+            .unwrap();
+        match &report.services[0].change {
+            ChangeKind::Cleanup { current_hash, stop } => {
+                assert_eq!(current_hash, &hash);
+                assert_eq!(stop, &vec![surplus.clone(), old.clone()]);
+            }
+            other => panic!("expected Cleanup, got {other:?}"),
+        }
+        assert!(report.orphans.is_empty(), "got: {:?}", report.orphans);
+        assert!(report.has_changes());
+
+        // Same host with the old generation already stopped: no-op,
+        // and the stopped container is an orphan as before.
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        let mut containers = at_spec;
+        containers.push(running("api", &old, &stale, "exited"));
+        ops.push_list_containers(Ok(containers));
+        let report = compute(&ops, &cfg, &BTreeMap::new(), None, None)
+            .await
+            .unwrap();
+        assert!(matches!(report.services[0].change, ChangeKind::NoOp { .. }));
+        assert_eq!(report.orphans.len(), 1);
+        assert_eq!(report.orphans[0].name, old);
+        assert!(!report.has_changes());
     }
 
     #[test]
