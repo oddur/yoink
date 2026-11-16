@@ -958,7 +958,8 @@ pub struct ServiceRun {
     pub volumes: Vec<String>,
     /// Files to upload from the operator's machine to the target host
     /// before `docker create`, then bind-mount into the container.
-    /// Format: `"local_path:container_path[:ro]"`.
+    /// Format: `"local_path:container_path[:ro]"`. The mount is always
+    /// read-only; `:rw` is rejected at validation.
     /// Local paths are resolved relative to the config file. The on-host
     /// staging path is content-addressed (a sha256 of the file) so
     /// concurrent deploys never overwrite each other and a config edit
@@ -2083,6 +2084,19 @@ impl Config {
                     )));
                 }
             }
+            // A `files:` mount is always read-only. `:rw` used to load
+            // and then mount read-only without a word; reject it here
+            // so `yoink validate` catches it before a deploy does.
+            for spec in &service.run.files {
+                if crate::files::has_rw_mode(spec) {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.run.files: entry {spec:?} sets `:rw`, but `files:` mounts \
+                         are always read-only; use `binds:` or a volume for data the container \
+                         must write",
+                        service.name
+                    )));
+                }
+            }
             // depends_on validation (refs + duplicates + self). Cycle
             // detection lives in `topo_sort_services` since it needs
             // the full graph anyway.
@@ -3174,6 +3188,53 @@ services:
 "#;
         let err = Config::parse_str(s).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(m) if m.contains("port required")));
+    }
+
+    fn config_with_files_entry(entry: &str) -> String {
+        format!(
+            r#"
+hosts:
+  - {{ address: h, user: u }}
+services:
+  - name: api
+    image: i
+    tag: v1
+    run:
+      files:
+        - "{entry}"
+"#
+        )
+    }
+
+    #[test]
+    fn rejects_rw_on_a_files_entry() {
+        let s = config_with_files_entry("./data.json:/app/data.json:rw");
+        let err = Config::parse_str(&s).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid config: service \"api\".run.files: entry \"./data.json:/app/data.json:rw\" \
+             sets `:rw`, but `files:` mounts are always read-only; use `binds:` or a volume for \
+             data the container must write"
+        );
+    }
+
+    /// Same check through `Config::load_from_path`, the path that
+    /// `yoink validate` and every deploy command load the config with.
+    #[test]
+    fn load_from_path_rejects_rw_on_a_files_entry() {
+        let s = config_with_files_entry("./data.json:/app/data.json:rw");
+        let err = parse_via_temp(&s).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Invalid(m)
+                if m.contains("service \"api\".run.files") && m.contains("always read-only")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn accepts_files_entry_with_no_mode_and_with_ro() {
+        Config::parse_str(&config_with_files_entry("./c.yaml:/etc/c.yaml")).unwrap();
+        Config::parse_str(&config_with_files_entry("./c.yaml:/etc/c.yaml:ro")).unwrap();
     }
 
     #[test]
