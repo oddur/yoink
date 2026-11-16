@@ -2120,6 +2120,8 @@ fn services_filter(services: &[String]) -> Option<&[String]> {
 /// is either `name=tag` (override that named service's tag) or a bare
 /// `tag` (applies to every `--service`-selected service). A bare tag
 /// without `--service` is rejected as ambiguous in multi-service mode.
+/// With `--service` and no `--tag` at all, each selected service that
+/// has no `tag:` in the config gets the git short SHA (clean tree only).
 fn parse_tag_overrides(
     tag_args: &[String],
     services_filter: &[String],
@@ -2130,7 +2132,7 @@ fn parse_tag_overrides(
         if allow_dirty {
             return None;
         }
-        git::version(std::path::Path::new("."), allow_dirty).ok()
+        git::version(std::path::Path::new("."), false).ok()
     })
 }
 
@@ -2177,14 +2179,21 @@ fn parse_tag_overrides_with(
         // without a config `tag:` get it: an implicit fallback must not
         // shadow an explicit pin (`redis` with `tag: "7"` would otherwise
         // be pulled as `redis:<sha>`, and only from a clean tree).
-        if let Some(version) = git_version() {
-            for service in services_filter {
-                let pinned = config_services
+        let unpinned: Vec<&String> = services_filter
+            .iter()
+            .filter(|service| {
+                !config_services
                     .iter()
-                    .any(|s| &s.name == service && s.tag.is_some());
-                if !pinned {
-                    out.insert(service.clone(), version.clone());
-                }
+                    .any(|s| &s.name == *service && s.tag.is_some())
+            })
+            .collect();
+        // Only ask git when some service needs the answer: the lookup
+        // spawns `git status`, and `--watch` repeats it every pass.
+        if !unpinned.is_empty()
+            && let Some(version) = git_version()
+        {
+            for service in unpinned {
+                out.insert(service.clone(), version.clone());
             }
         }
     }
@@ -5683,6 +5692,17 @@ services:
         assert_eq!(out.get("redis"), None);
         // `api` has no config tag, so it still gets the fallback.
         assert_eq!(out.get("api").map(String::as_str), Some("abc1234"));
+    }
+
+    #[test]
+    fn git_is_not_consulted_when_every_selected_service_is_pinned() {
+        let services = tag_test_services();
+        let filter = ["redis".to_string()];
+        let out = parse_tag_overrides_with(&[], &filter, &services, || {
+            panic!("git must not be consulted when nothing needs the fallback")
+        })
+        .unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
