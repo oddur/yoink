@@ -2205,6 +2205,22 @@ impl Config {
             }
         }
 
+        // Service-scoped hooks resolve `tag: { service: X }` the same
+        // way, so an unknown X must fail here too instead of falling
+        // back to `latest` at deploy time.
+        for service in &self.services {
+            for hook in &service.pre_deploy {
+                if let Some(HookTag::Ref { service: target }) = &hook.tag
+                    && !seen_names.contains(target.as_str())
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?} hook {:?}.tag references unknown service {target:?}",
+                        service.name, hook.name
+                    )));
+                }
+            }
+        }
+
         // Templates are deliberately not parsed here — minijinja errors
         // surface at fire time as `WebhookFired { ok: false }` so a typo
         // in one template doesn't gate every deploy.
@@ -3209,6 +3225,43 @@ hooks:
 "#;
         let err = Config::parse_str(s).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(m) if m.contains("references unknown service")));
+    }
+
+    /// Service-scoped hooks get the same check: a typo used to load
+    /// and then resolve to `latest` at deploy time.
+    #[test]
+    fn rejects_service_hook_tag_ref_to_unknown_service() {
+        let config = |target: &str| {
+            format!(
+                r"
+hosts:
+  - {{ address: h, user: u }}
+
+services:
+  - name: migrations
+    image: m
+    tag: v1
+    run: {{ port: 1 }}
+  - name: api
+    image: i
+    tag: v1
+    run: {{ port: 1 }}
+    pre_deploy:
+      - name: x
+        image: m
+        tag: {{ service: {target} }}
+"
+            )
+        };
+        let err = Config::parse_str(&config("migratoins")).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid(m)
+                if m.contains("service \"api\" hook \"x\".tag references unknown service \"migratoins\"")
+        ));
+        // A later-declared or earlier-declared known service is fine.
+        Config::parse_str(&config("migrations")).unwrap();
+        Config::parse_str(&config("api")).unwrap();
     }
 
     #[test]
