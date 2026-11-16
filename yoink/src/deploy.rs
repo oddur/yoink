@@ -25,7 +25,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{Config, HookSpec, HookTag, ServiceConfig};
 use crate::docker::{self, BuildError, RunSpec, SHORT_HASH_LEN};
-use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, Host};
+use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, Host, StoppedRemoval};
 use crate::files::{self, FileError, FileMount};
 use crate::healthcheck::{self, HealthcheckError};
 use crate::network;
@@ -346,7 +346,7 @@ pub async fn reconcile_with_options(
                 name: hook.name.clone(),
             },
         );
-        run_hook(ops, config, hook, &tag, secrets).await?;
+        run_hook(ops, config, None, hook, &tag, secrets).await?;
         on_event(
             None,
             DeployEvent::HookFinished {
@@ -819,7 +819,16 @@ pub async fn deploy_service(
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
         });
-        if let Err(e) = run_hook(ops, config, hook, &resolved_tag, secrets).await {
+        if let Err(e) = run_hook(
+            ops,
+            config,
+            Some(&service.name),
+            hook,
+            &resolved_tag,
+            secrets,
+        )
+        .await
+        {
             cleanup_prepared_replicas(ops, &prepared).await;
             return Err(e);
         }
@@ -2033,9 +2042,15 @@ fn resolve_hook_tag(
 /// merged in). Validation guarantees `image`/`tag` are both Some for
 /// container hooks and both None for subprocess hooks; the dispatch
 /// here only has to honor that invariant.
+///
+/// `service` is the owning service for a service-scoped hook, `None`
+/// for a top-level one. It goes into the container name so two
+/// services deployed in the same wave with a same-named hook at the
+/// same tag don't fight over one name.
 async fn run_hook(
     ops: &dyn DockerOps,
     config: &Config,
+    service: Option<&str>,
     hook: &HookSpec,
     tag: &str,
     secrets: Option<&SecretsBundle>,
@@ -2078,7 +2093,34 @@ async fn run_hook(
         &hook.cmd,
         &hook_env(hook, secrets),
     );
-    let container_name = format!("yoink-hook-{}-{tag}", hook.name);
+    let container_name = hook_container_name(service, &hook.name, tag);
+    // The name is deterministic, so a hook container left behind by an
+    // interrupted deploy (Ctrl-C, dropped ssh link) would fail the
+    // create with a 409 name conflict on every later deploy. Reap it
+    // first, but only if it has stopped. A leftover that still runs
+    // can be a migration that survived a dropped link, and the deploy
+    // lock does not prove that nobody owns it (the lock sentinel
+    // expires after 30s of missed heartbeats). Killing it could leave
+    // a half-applied migration, so the operator decides.
+    match ops.remove_stopped_container(&host, &container_name).await {
+        Ok(StoppedRemoval::Removed | StoppedRemoval::Absent) => {}
+        Ok(StoppedRemoval::Running) => {
+            return Err(DeployError::Hook {
+                name: hook.name.clone(),
+                message: format!(
+                    "a previous run of this hook is still running on host {} in container \
+                     {container_name}. Wait for it to finish, or remove it with \
+                     `docker rm -f {container_name}`, then rerun.",
+                    host.address
+                ),
+            });
+        }
+        // Best effort, as before: if the name is still taken, the
+        // create reports the conflict.
+        Err(e) => {
+            warn!(host = %host.address, container = %container_name, error = %e, "remove of stale hook container failed; continuing");
+        }
+    }
     let result = ops
         .run_one_shot(&host, &container_name, body)
         .await
@@ -2098,6 +2140,25 @@ async fn run_hook(
         });
     }
     Ok(())
+}
+
+/// Docker allows only `[a-zA-Z0-9_.-]` in a container name. A digest
+/// tag (`sha256:<hex>`) carries a `:`, and hook names are free-form,
+/// so every other character becomes `-`.
+fn hook_container_name(service: Option<&str>, hook: &str, tag: &str) -> String {
+    let name = match service {
+        Some(service) => format!("yoink-hook-{service}-{hook}-{tag}"),
+        None => format!("yoink-hook-{hook}-{tag}"),
+    };
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn hook_env(hook: &HookSpec, secrets: Option<&SecretsBundle>) -> BTreeMap<String, String> {
@@ -3610,6 +3671,215 @@ hooks:
         assert_eq!(name, "migrate");
         assert!(message.contains("ERROR: connection refused"));
         assert!(message.contains("applying 0001_init"));
+    }
+
+    /// Asserts the stopped-only remove of the hook container `name`
+    /// comes before the hook runs under that same name, and that the
+    /// name is never force-removed.
+    fn assert_reaped_before_run(ops: &FakeDockerOps, host: &Host, name: &str) {
+        use crate::docker_ops::RecordedCall;
+        let calls = ops.calls();
+        let reap = calls
+            .iter()
+            .position(|c| *c == RecordedCall::RemoveStoppedContainer(host.clone(), name.into()))
+            .expect("stale hook container is removed if stopped");
+        let run = calls
+            .iter()
+            .position(|c| *c == RecordedCall::RunOneShot(host.clone(), name.into()))
+            .expect("hook runs under the expected name");
+        assert!(reap < run, "reap must precede the create: {calls:?}");
+        assert!(
+            !calls.contains(&RecordedCall::ForceRemoveContainer(
+                host.clone(),
+                name.into()
+            )),
+            "hook container must not be force-removed: {calls:?}"
+        );
+    }
+
+    const TOP_LEVEL_HOOK_CONFIG: &str = r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+hooks:
+  pre_deploy:
+    - name: migrate
+      image: registry.example.com/app-a
+      tag: { service: app-a }
+      cmd: ["bin/migrate"]
+"#;
+
+    /// Runs a reconcile whose pre-deploy hook finds `leftover` under
+    /// its container name. The hook exits non-zero so the reconcile
+    /// stops right after it.
+    async fn reconcile_with_hook_leftover(
+        leftover: StoppedRemoval,
+    ) -> (FakeDockerOps, Host, DeployError) {
+        let cfg = Config::parse_str(TOP_LEVEL_HOOK_CONFIG).unwrap();
+        let ops = FakeDockerOps::new();
+        ops.push_ensure_network(Ok(false));
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_pull_image(Ok(()));
+        ops.push_remove_stopped(Ok(leftover));
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "hook ran".into(),
+        }));
+
+        let mut sink = |_svc: Option<&str>, _e: DeployEvent| {};
+        let err = reconcile(&ops, &cfg, &BTreeMap::new(), None, None, &mut sink)
+            .await
+            .unwrap_err();
+        let host = Host::from(&cfg.hosts[0]);
+        (ops, host, err)
+    }
+
+    /// A hook container leaked by an interrupted deploy keeps its
+    /// deterministic name; without a reap before the create, every
+    /// later deploy at that tag fails with a 409 name conflict.
+    #[tokio::test(start_paused = true)]
+    async fn hook_reaps_stale_container_before_run() {
+        let (ops, host, err) = reconcile_with_hook_leftover(StoppedRemoval::Removed).await;
+        assert_reaped_before_run(&ops, &host, "yoink-hook-migrate-latest");
+        assert!(err.to_string().contains("hook ran"), "{err}");
+    }
+
+    /// With no leftover the hook runs as usual.
+    #[tokio::test(start_paused = true)]
+    async fn hook_runs_when_no_leftover_container_exists() {
+        let (ops, host, err) = reconcile_with_hook_leftover(StoppedRemoval::Absent).await;
+        assert_reaped_before_run(&ops, &host, "yoink-hook-migrate-latest");
+        assert!(err.to_string().contains("hook ran"), "{err}");
+    }
+
+    /// A leftover that still runs can be a migration that survived a
+    /// dropped ssh link. The deploy must not kill it and must not start
+    /// a second run; it fails and tells the operator what to do.
+    #[tokio::test(start_paused = true)]
+    async fn hook_fails_without_touching_a_leftover_that_still_runs() {
+        use crate::docker_ops::RecordedCall;
+        let (ops, host, err) = reconcile_with_hook_leftover(StoppedRemoval::Running).await;
+
+        let name = "yoink-hook-migrate-latest";
+        let calls = ops.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::ForceRemoveContainer(_, n) | RecordedCall::RunOneShot(_, n)
+                    if n == name
+            )),
+            "running hook container must be left alone and the hook must not run: {calls:?}"
+        );
+        assert!(calls.contains(&RecordedCall::RemoveStoppedContainer(
+            host.clone(),
+            name.into()
+        )));
+
+        let DeployError::Hook {
+            name: hook,
+            message,
+        } = err
+        else {
+            panic!("expected Hook error, got {err:?}");
+        };
+        assert_eq!(hook, "migrate");
+        assert!(message.contains("still running"), "{message}");
+        assert!(message.contains("host-a"), "{message}");
+        assert!(
+            message.contains("docker rm -f yoink-hook-migrate-latest"),
+            "{message}"
+        );
+    }
+
+    /// Services in one wave deploy concurrently. Two of them with a
+    /// same-named hook at the same tag must not share a container name.
+    #[test]
+    fn hook_container_name_is_scoped_by_service() {
+        assert_eq!(
+            hook_container_name(None, "migrate", "v42"),
+            "yoink-hook-migrate-v42"
+        );
+        assert_eq!(
+            hook_container_name(Some("api"), "migrate", "v42"),
+            "yoink-hook-api-migrate-v42"
+        );
+        assert_ne!(
+            hook_container_name(Some("api"), "migrate", "v42"),
+            hook_container_name(Some("web"), "migrate", "v42")
+        );
+    }
+
+    /// A digest tag carries a `:`, which Docker rejects in a container
+    /// name ("Invalid container name"). The name must stay creatable.
+    #[test]
+    fn hook_container_name_replaces_characters_docker_rejects() {
+        assert_eq!(
+            hook_container_name(Some("api"), "migrate", "sha256:abc123"),
+            "yoink-hook-api-migrate-sha256-abc123"
+        );
+        assert_eq!(
+            hook_container_name(None, "run migrations", "v42"),
+            "yoink-hook-run-migrations-v42"
+        );
+    }
+
+    /// The service-scoped path end to end: `deploy_service` must hand
+    /// its own service name to the hook, so the reap and the run both
+    /// use `yoink-hook-{service}-{hook}-{tag}`.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_reaps_and_runs_under_service_scoped_name() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/app-a
+        tag: { service: app-a }
+        cmd: ["bin/migrate"]
+"#,
+        )
+        .unwrap();
+
+        let ops = happy_ops(&[]);
+        ops.push_pull_image(Ok(()));
+        ops.push_remove_stopped(Ok(StoppedRemoval::Removed));
+        // Exit non-zero so the deploy stops right after the hook.
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+
+        let mut sink = |_e: DeployEvent| {};
+        let _ = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "v42",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+
+        assert_reaped_before_run(
+            &ops,
+            &Host::from(&cfg.hosts[0]),
+            "yoink-hook-app-a-migrate-v42",
+        );
     }
 
     /// Routed-service fixture: api has `domain:` so `is_proxied(api)` is
