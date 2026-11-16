@@ -896,7 +896,7 @@ async fn prepare_one_host(
     // the same host needs the same set, so 6 services × 6 networks
     // would emit 36 redundant "ready" lines otherwise.
 
-    let credentials = registry_credentials(config, secrets);
+    let credentials = registry_credentials(config, secrets, &service.image);
     pull_image(ops, &host, &service.image, tag, credentials, on_event).await?;
     let existing = list_existing_containers(ops, &host, &service.name).await?;
 
@@ -1496,14 +1496,23 @@ async fn upload_files(
 
 /// Resolve `[registry]`-configured username/password secret keys
 /// against the operator's `SecretsBundle` and return them as bollard
-/// `DockerCredentials`. Returns `None` when no registry block is set
-/// (typical for public-image-only deploys).
+/// `DockerCredentials` for a pull of `image`.
+///
+/// Returns `None` when no registry block is set (typical for
+/// public-image-only deploys), and when `image` is on a registry other
+/// than `registry.server`. That pull is anonymous: the credentials of
+/// one registry make another registry answer 401, also for a public
+/// image such as the default proxy image `caddy:2`.
 #[must_use]
 pub fn registry_credentials(
     config: &Config,
     secrets: Option<&SecretsBundle>,
+    image: &str,
 ) -> Option<bollard::auth::DockerCredentials> {
     let reg = config.registry.as_ref()?;
+    if !crate::docker::image_on_registry(image, &reg.server) {
+        return None;
+    }
     let bundle = secrets?;
     let username = bundle.get(&reg.username_secret)?.to_string();
     let password = Zeroizing::new(bundle.get(&reg.password_secret)?.to_string());
@@ -1618,8 +1627,6 @@ pub async fn prefetch_images(
     rebuild_proxy: bool,
     on_event: Arc<dyn Fn(DeployEvent) + Send + Sync>,
 ) -> Result<(), DeployError> {
-    let credentials = registry_credentials(config, secrets);
-
     // xcaddy builds run in their own collection so per-host failures
     // can be bundled into a "X/N succeeded; failed on host Y" message
     // — first-error-wins on a fleet hides which hosts have a fresh
@@ -1692,6 +1699,7 @@ pub async fn prefetch_images(
                 None => continue,
             },
         };
+        let credentials = registry_credentials(config, secrets, &service.image);
         for host_cfg in service.applicable_hosts(&config.hosts) {
             let host = Host::from(host_cfg);
             let ops = ops.clone();
@@ -2068,7 +2076,7 @@ async fn run_hook(
         .image
         .as_deref()
         .expect("validated: container hook has image");
-    let credentials = registry_credentials(config, secrets);
+    let credentials = registry_credentials(config, secrets, image);
     ops.pull_image(&host, image, tag, credentials)
         .await
         .map_err(|source| DeployError::Docker {
@@ -2464,6 +2472,34 @@ services:
         );
         assert!(!env.contains_key("UNRELATED"));
         assert!(!env.contains_key("MISSING"));
+    }
+
+    /// Regression for #108: with `registry.server: ghcr.io`, the pull of
+    /// the default proxy image `caddy:2` carried the ghcr.io credentials
+    /// and Docker Hub answered 401.
+    #[test]
+    fn registry_credentials_go_only_to_the_configured_registry() {
+        let mut cfg = config_one_service();
+        cfg.registry = Some(crate::config::RegistryConfig {
+            server: "ghcr.io".into(),
+            username_secret: "GHCR_USERNAME".into(),
+            password_secret: "GHCR_TOKEN".into(),
+        });
+        let mut values = BTreeMap::new();
+        values.insert("GHCR_USERNAME".into(), Zeroizing::new("me".to_string()));
+        values.insert(
+            "GHCR_TOKEN".into(),
+            Zeroizing::new("fake-test-fixture".to_string()),
+        );
+        let bundle = SecretsBundle::new(values);
+
+        let creds = registry_credentials(&cfg, Some(&bundle), "ghcr.io/owner/app")
+            .expect("credentials for an image on the configured registry");
+        assert_eq!(creds.username.as_deref(), Some("me"));
+        assert_eq!(creds.serveraddress.as_deref(), Some("ghcr.io"));
+
+        assert!(registry_credentials(&cfg, Some(&bundle), "caddy").is_none());
+        assert!(registry_credentials(&cfg, Some(&bundle), "quay.io/owner/app").is_none());
     }
 
     fn happy_ops(existing_running: &[(&str, &str)]) -> FakeDockerOps {
