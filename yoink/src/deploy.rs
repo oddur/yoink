@@ -485,6 +485,7 @@ pub async fn reconcile_with_options(
                         config_ref,
                         service,
                         &tag,
+                        overrides_ref,
                         secrets_ref,
                         options.force,
                         &mut local_sink,
@@ -561,11 +562,15 @@ fn service_already_at_spec(
 }
 
 /// Reconcile a single service across its applicable hosts.
+/// `tag_overrides` is the CLI `--tag` map; service-scoped hooks with
+/// `tag: { service: X }` resolve X's tag through it.
+#[allow(clippy::too_many_arguments)] // every arg is genuine context for the per-service deploy flow
 pub async fn deploy_service(
     ops: &dyn DockerOps,
     config: &Config,
     service: &ServiceConfig,
     tag: &str,
+    tag_overrides: &BTreeMap<String, String>,
     secrets: Option<&SecretsBundle>,
     force: bool,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
@@ -596,15 +601,13 @@ pub async fn deploy_service(
     // not run web's migrations). On hook failure we clean up the
     // pre-created replicas so a failed deploy doesn't leave
     // `created`-state containers hanging around until the next prune.
+    // `tag: { service: X }` mirrors X's deploy-time tag: the `--tag`
+    // override for X, else X's configured tag. This service's own
+    // deploy tag is authoritative for a self-reference.
+    let mut hook_overrides = tag_overrides.clone();
+    hook_overrides.insert(service.name.clone(), tag.to_string());
     for hook in &service.pre_deploy {
-        let hook_tag = resolve_hook_tag(hook, &BTreeMap::new(), &config.services);
-        let resolved_tag = if matches!(hook.tag, Some(HookTag::Ref { .. })) {
-            // For `tag: { service: <self> }`, use the deploy-time tag
-            // we were called with rather than the static fallback.
-            tag.to_string()
-        } else {
-            hook_tag
-        };
+        let resolved_tag = resolve_hook_tag(hook, &hook_overrides, &config.services);
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
         });
@@ -2128,6 +2131,7 @@ services:
             &cfg,
             &cfg.services[0],
             "a1b2c3d",
+            &BTreeMap::new(),
             None,
             false,
             &mut sink,
@@ -2254,6 +2258,7 @@ services:
             &cfg,
             &cfg.services[0],
             "a1b2c3d",
+            &BTreeMap::new(),
             None,
             false,
             &mut sink,
@@ -2310,6 +2315,104 @@ hooks:
             e,
             DeployEvent::HookFinished { name } if name == "migrate"
         )));
+    }
+
+    /// Config for the service-scoped hook tag regressions: `api` runs
+    /// a pre-deploy hook whose tag mirrors a *different* service.
+    fn config_service_hook_refs_other_service() -> Config {
+        Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: migrations
+    image: registry.example.com/migrations
+    tag: m-1
+    run: { port: 3000, healthcheck_path: /health }
+  - name: api
+    image: registry.example.com/api
+    tag: api-1
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/migrations
+        tag: { service: migrations }
+        cmd: ["bin/migrate"]
+      - name: self-check
+        image: registry.example.com/api
+        tag: { service: api }
+        cmd: ["bin/check"]
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Tags pulled for `image` during a `deploy_service` run of `api`
+    /// from [`config_service_hook_refs_other_service`].
+    async fn hook_pull_tags(
+        tag: &str,
+        overrides: &BTreeMap<String, String>,
+        image: &str,
+    ) -> Vec<String> {
+        let cfg = config_service_hook_refs_other_service();
+        let ops = happy_ops(&[]);
+        for _ in 0..2 {
+            ops.push_pull_image(Ok(()));
+            ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }));
+        }
+        let mut sink = |_e: DeployEvent| {};
+        deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[1],
+            tag,
+            overrides,
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        ops.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::docker_ops::RecordedCall::PullImage(_, i, t) if i == image => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression: a service-scoped hook with `tag: { service: X }`
+    /// received the tag of the service being deployed instead of X's,
+    /// so `api`'s migrate hook pulled `migrations:<api-tag>`.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_tag_ref_resolves_referenced_service_tag() {
+        let tags =
+            hook_pull_tags("api-2", &BTreeMap::new(), "registry.example.com/migrations").await;
+        assert_eq!(tags, vec!["m-1".to_string()]);
+    }
+
+    /// Regression: `--tag migrations=...` was ignored for the
+    /// referenced service because hooks resolved against an empty
+    /// overrides map.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_tag_ref_honours_override_for_referenced_service() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("migrations".to_string(), "m-2".to_string());
+        let tags = hook_pull_tags("api-2", &overrides, "registry.example.com/migrations").await;
+        assert_eq!(tags, vec!["m-2".to_string()]);
+    }
+
+    /// A self-reference still mirrors the tag this deploy was called
+    /// with (service pull + hook pull), not the configured `tag:`.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_tag_self_ref_uses_deploy_tag() {
+        let tags = hook_pull_tags("api-2", &BTreeMap::new(), "registry.example.com/api").await;
+        assert_eq!(tags, vec!["api-2".to_string(), "api-2".to_string()]);
     }
 
     #[tokio::test(start_paused = true)]
