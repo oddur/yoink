@@ -392,13 +392,11 @@ impl AuditSink for MemorySink {
 /// events flush per-event; progress events buffer per-host and flush
 /// in one SSH call on `flush()` or wave-end.
 pub struct HostAuditSink {
-    /// Host descriptors keyed by address. Populated by `register()`
-    /// before any event for that host is recorded.
-    hosts: Mutex<std::collections::HashMap<String, Host>>,
-    /// Operator-side SSH private-key path per host address, for hosts
-    /// that declare `ssh_key_secret:`. Absent means the operator's
-    /// normal SSH auth.
-    keyfiles: Mutex<std::collections::HashMap<String, std::path::PathBuf>>,
+    /// Host descriptors keyed by address, each with the operator-side
+    /// SSH private-key path for hosts that declare `ssh_key_secret:`
+    /// (`None` means the operator's normal SSH auth). Populated by
+    /// `register()` before any event for that host is recorded.
+    hosts: Mutex<std::collections::HashMap<String, (Host, Option<std::path::PathBuf>)>>,
     /// One pending-line buffer per host.
     buffers: Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
@@ -408,7 +406,6 @@ impl HostAuditSink {
     pub fn new() -> Self {
         Self {
             hosts: Mutex::new(std::collections::HashMap::new()),
-            keyfiles: Mutex::new(std::collections::HashMap::new()),
             buffers: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -419,13 +416,10 @@ impl HostAuditSink {
     /// `DockerOps::ssh_keyfile(&host)`: without it a host that only
     /// accepts its `ssh_key_secret:` key rejects every flush.
     pub async fn register(&self, host: Host, keyfile: Option<std::path::PathBuf>) {
-        if let Some(keyfile) = keyfile {
-            self.keyfiles
-                .lock()
-                .await
-                .insert(host.address.clone(), keyfile);
-        }
-        self.hosts.lock().await.insert(host.address.clone(), host);
+        self.hosts
+            .lock()
+            .await
+            .insert(host.address.clone(), (host, keyfile));
     }
 
     /// Drain one host's buffer to disk via a single SSH invocation.
@@ -439,7 +433,7 @@ impl HostAuditSink {
                 _ => return,
             }
         };
-        let Some(host) = self.hosts.lock().await.get(host_addr).cloned() else {
+        let Some((host, keyfile)) = self.hosts.lock().await.get(host_addr).cloned() else {
             eprintln!(
                 "yoink audit: no host descriptor registered for {host_addr}; \
                  dropping {} event(s)",
@@ -456,7 +450,6 @@ impl HostAuditSink {
             return;
         }
         let count = lines.len();
-        let keyfile = self.keyfiles.lock().await.get(host_addr).cloned();
         if let Err(e) = append_via_ssh(&host, keyfile.as_deref(), &lines).await {
             eprintln!(
                 "yoink audit: failed to flush {count} event(s) to {}: {e}",
