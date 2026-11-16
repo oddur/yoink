@@ -2713,6 +2713,9 @@ struct FakeState {
     container_stats: VecDeque<Result<ContainerStats, DockerError>>,
     ensure_network: VecDeque<Result<bool, DockerError>>,
     pull_image: VecDeque<Result<(), DockerError>>,
+    /// `(image, serveraddress of the credentials)` for each pull, in
+    /// call order. `None` is an anonymous pull.
+    pull_auth: Vec<(String, Option<String>)>,
     load_image: VecDeque<Result<(), DockerError>>,
     build_image: VecDeque<Result<(), DockerError>>,
     /// `image:tag` → presence flag. Defaults `false` so existing tests
@@ -2835,6 +2838,11 @@ impl FakeDockerOps {
     }
 
     #[must_use]
+    /// `(image, registry the credentials were for)` for each pull.
+    pub fn pull_auth(&self) -> Vec<(String, Option<String>)> {
+        self.lock().pull_auth.clone()
+    }
+
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.lock().calls.clone()
     }
@@ -2903,9 +2911,11 @@ impl DockerOps for FakeDockerOps {
         host: &Host,
         image: &str,
         tag: &str,
-        _credentials: Option<bollard::auth::DockerCredentials>,
+        credentials: Option<bollard::auth::DockerCredentials>,
     ) -> Result<(), DockerError> {
         let mut s = self.lock();
+        s.pull_auth
+            .push((image.into(), credentials.and_then(|c| c.serveraddress)));
         s.calls.push(RecordedCall::PullImage(
             host.clone(),
             image.into(),

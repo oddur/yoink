@@ -63,9 +63,10 @@ pub struct Config {
     pub services: Vec<ServiceConfig>,
     /// Optional registry credentials. When set, yoink resolves the named
     /// secrets from the configured `secrets:` provider and passes them
-    /// to docker as `X-Registry-Auth` on every pull. Without this, only
-    /// public registries (or hosts with cached `docker login` creds)
-    /// will pull successfully.
+    /// to docker as `X-Registry-Auth` on each pull of an image from
+    /// `registry.server`. Pulls from other registries are anonymous.
+    /// Without this, only public registries (or hosts with cached
+    /// `docker login` creds) will pull successfully.
     #[serde(default)]
     pub registry: Option<RegistryConfig>,
     /// Optional reverse-proxy config. The proxy is auto-enabled when
@@ -1612,9 +1613,7 @@ impl Config {
         let server = self.registry.as_ref().map(|r| r.server.as_str());
         self.services.iter().filter(move |svc| {
             let Some(server) = server else { return false };
-            svc.build.is_none()
-                && crate::docker::image_registry_host(&svc.image)
-                    .is_some_and(|h| h.eq_ignore_ascii_case(server))
+            svc.build.is_none() && crate::docker::image_on_registry(&svc.image, server)
         })
     }
 
