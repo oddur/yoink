@@ -611,13 +611,18 @@ fn resolve_host(
         ));
     }
     if let Some(host) = opts.host.as_deref() {
+        // The ssh-config hint is keyed by the bare alias. The caller
+        // splits the port off afterwards, so `prod:2200` must match
+        // the hint for `prod` here.
+        let alias = crate::config::split_address_port(host)
+            .map_or_else(|_| host.to_string(), |(bare, _)| bare);
         let (user, addr) = match host.split_once('@') {
             Some((u, a)) => (u.to_string(), a.to_string()),
             None => {
                 let user = detection
                     .ssh_host
                     .as_ref()
-                    .filter(|h| h.address == host)
+                    .filter(|h| h.address == alias)
                     .and_then(|h| h.user.clone())
                     .unwrap_or_else(|| DEFAULT_SSH_USER.to_string());
                 (user, host.to_string())
@@ -628,7 +633,7 @@ fn resolve_host(
         } else if detection
             .ssh_host
             .as_ref()
-            .is_some_and(|h| h.address == host && h.user.is_some())
+            .is_some_and(|h| h.address == alias && h.user.is_some())
         {
             HostUserOrigin::SshConfig
         } else {
@@ -1307,5 +1312,33 @@ mod tests {
         assert_eq!(plan.host_address, "100.122.184.6");
         assert_eq!(plan.host_port, Some(2200));
         assert_eq!(plan.host_user, "root");
+    }
+
+    #[test]
+    fn infer_plan_takes_ssh_config_user_for_alias_with_port() {
+        let detection = Detection {
+            ssh_host: Some(SshHostHint {
+                address: "prod".into(),
+                user: Some("admin".into()),
+            }),
+            ..Detection::default()
+        };
+        let opts = InitOpts {
+            host: Some("prod:2200".into()),
+            force: false,
+            interactive: false,
+            service: Some("demo".into()),
+            port: None,
+            no_port: false,
+            image: None,
+            no_secrets: true,
+            create_ssh_key: None,
+            proxy_email: None,
+        };
+        let plan = infer_plan(&detection, &opts).expect("plan");
+        assert_eq!(plan.host_address, "prod");
+        assert_eq!(plan.host_port, Some(2200));
+        assert_eq!(plan.host_user, "admin");
+        assert!(matches!(plan.host_user_origin, HostUserOrigin::SshConfig));
     }
 }
