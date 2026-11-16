@@ -44,17 +44,25 @@ pub fn image_reference(image: &str, tag: &str) -> String {
 /// `4db05qgnlk.registry.depot.dev/api → Some("4db05qgnlk.registry.depot.dev")`.
 #[must_use]
 pub fn image_registry_host(image: &str) -> Option<&str> {
-    let head = image.split_once('/').map_or(image, |(h, _)| h);
+    // No `/` means no host: the `:` in `caddy:2` starts a tag, not a port.
+    let (head, _) = image.split_once('/')?;
     (head == "localhost" || head.contains('.') || head.contains(':')).then_some(head)
 }
 
 /// Registry names that all mean Docker Hub. An image with no embedded
 /// host (`caddy:2`, `library/postgres`) also resolves there.
-const DOCKER_HUB_HOSTS: [&str; 3] = ["docker.io", "index.docker.io", "registry-1.docker.io"];
+const DOCKER_HUB_HOSTS: [&str; 5] = [
+    "docker.io",
+    "index.docker.io",
+    "registry-1.docker.io",
+    "registry.hub.docker.com",
+    "hub.docker.com",
+];
 
 /// Reduce a registry name to a comparable host: no scheme, no path,
-/// lowercase, and one spelling for Docker Hub.
+/// no default HTTPS port, lowercase, and one spelling for Docker Hub.
 fn canonical_registry_host(raw: &str) -> String {
+    let raw = raw.trim();
     let no_scheme = raw
         .strip_prefix("https://")
         .or_else(|| raw.strip_prefix("http://"))
@@ -63,10 +71,11 @@ fn canonical_registry_host(raw: &str) -> String {
         .split_once('/')
         .map_or(no_scheme, |(h, _)| h)
         .to_ascii_lowercase();
-    if DOCKER_HUB_HOSTS.contains(&host.as_str()) {
+    let host = host.strip_suffix(":443").unwrap_or(&host);
+    if DOCKER_HUB_HOSTS.contains(&host) {
         "docker.io".to_string()
     } else {
-        host
+        host.to_string()
     }
 }
 
@@ -718,6 +727,9 @@ mod tests {
         assert!(!image_on_registry("library/caddy", "ghcr.io"));
         assert!(!image_on_registry("quay.io/owner/app", "ghcr.io"));
         assert!(!image_on_registry("localhost:5000/x", "localhost:5001"));
+        // The default HTTPS port is the same registry with or without `:443`.
+        assert!(image_on_registry("ghcr.io/owner/app", "ghcr.io:443"));
+        assert!(image_on_registry("ghcr.io:443/owner/app", " ghcr.io "));
     }
 
     #[test]
@@ -727,7 +739,11 @@ mod tests {
             "index.docker.io",
             "registry-1.docker.io",
             "https://index.docker.io/v1/",
+            "registry.hub.docker.com",
+            "hub.docker.com",
         ] {
+            // A tag in the image name is not a registry port.
+            assert!(image_on_registry("caddy:2", server), "{server}");
             assert!(image_on_registry("caddy", server), "{server}");
             assert!(image_on_registry("owner/app", server), "{server}");
             assert!(
@@ -779,6 +795,7 @@ mod tests {
     fn image_registry_host_classification() {
         assert_eq!(image_registry_host("postgres"), None);
         assert_eq!(image_registry_host("redis"), None);
+        assert_eq!(image_registry_host("caddy:2"), None);
         // user/repo on Docker Hub: still no embedded host (no `.`/`:`/localhost).
         assert_eq!(image_registry_host("library/postgres"), None);
         assert_eq!(image_registry_host("ghcr.io/u/a"), Some("ghcr.io"));

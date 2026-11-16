@@ -3918,6 +3918,75 @@ services:
         );
     }
 
+    /// #108 end to end: a service on the configured registry pulls with
+    /// credentials, and its hook image on Docker Hub pulls anonymously.
+    #[tokio::test(start_paused = true)]
+    async fn pulls_send_credentials_only_for_images_on_the_registry() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+registry:
+  server: registry.example.com
+  username_secret: REG_USER
+  password_secret: REG_TOKEN
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: busybox
+        tag: "1"
+        cmd: ["true"]
+"#,
+        )
+        .unwrap();
+        let mut values = BTreeMap::new();
+        values.insert("REG_USER".into(), Zeroizing::new("me".to_string()));
+        values.insert(
+            "REG_TOKEN".into(),
+            Zeroizing::new("fake-test-fixture".to_string()),
+        );
+        let bundle = SecretsBundle::new(values);
+
+        let ops = happy_ops(&[]);
+        ops.push_pull_image(Ok(()));
+        ops.push_remove_stopped(Ok(StoppedRemoval::Removed));
+        // Exit non-zero so the deploy stops right after the hook.
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+
+        let mut sink = |_e: DeployEvent| {};
+        let _ = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "v42",
+            &BTreeMap::new(),
+            Some(&bundle),
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            ops.pull_auth(),
+            vec![
+                (
+                    "registry.example.com/app-a".to_string(),
+                    Some("registry.example.com".to_string()),
+                ),
+                ("busybox".to_string(), None),
+            ],
+        );
+    }
+
     /// Routed-service fixture: api has `domain:` so `is_proxied(api)` is
     /// true. Bare config — no proxy block, but `proxy_enabled` returns
     /// true for any service with a domain.
