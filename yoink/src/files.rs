@@ -131,13 +131,14 @@ impl FileMount {
     pub fn as_bind_string(&self, content_hash: &str) -> String {
         let host = self.remote_staging_path(content_hash);
         let container = self.container.display();
-        if self.read_only {
-            format!("{host}:{container}:ro")
+        let mode = if self.read_only {
+            ":ro"
         } else if self.explicit_rw {
-            format!("{host}:{container}:rw")
+            ":rw"
         } else {
-            format!("{host}:{container}")
-        }
+            ""
+        };
+        format!("{host}:{container}{mode}")
     }
 }
 
