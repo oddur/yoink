@@ -1887,7 +1887,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             let lock = HostLock::acquire(&*ops, host.clone())
                 .await
                 .with_context(|| format!(
-                    "another `yoink up` appears to be in progress on {} (lock container running). \
+                    "could not acquire the deploy lock on {}: another `yoink up` may be in progress, or the lock step itself failed (cause below). \
                      If you're sure no operator is deploying, the sentinel will self-exit within ~30s; \
                      retry then. To force-clear: `docker rm -f yoink-deploy-lock` on the host.",
                     host.address,
