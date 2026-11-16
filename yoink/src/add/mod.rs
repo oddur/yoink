@@ -306,8 +306,8 @@ pub async fn cmd_add(config: &Config, config_path: &Path, opts: AddOpts) -> Resu
 
     if !rendered.secrets.is_empty() {
         eprintln!();
-        eprintln!("to inspect a generated value (e.g. to paste into a 3rd-party UI):");
-        eprintln!("  yoink secrets show {} --reveal", rendered.secrets[0].name);
+        eprintln!("to inspect the generated values (e.g. to paste into a 3rd-party UI):");
+        eprintln!("  yoink secrets show --reveal");
     }
 
     let deploy = if opts.up {

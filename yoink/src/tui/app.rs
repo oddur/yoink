@@ -166,7 +166,8 @@ impl View {
             "global",
             "  q / Ctrl-C    quit yoink",
             "  1 2 3 4 5 6 7  dashboard / hosts / services / logs / resources / secrets / audit",
-            "  d h s l R e a same panes, letter aliases (R = resources, e = secrets, a = audit)",
+            "  d h s l R e a same panes, letter aliases (R = resources, e = secrets, a = audit;",
+            "                in secrets, a adds a secret; use 7 for audit)",
             "  Tab / S-Tab   cycle panes forward / backward",
             "  D             doctor — diagnose deploy-blockers",
             "  E             edit config in $EDITOR (jumps to focused service/host)",
@@ -258,7 +259,6 @@ impl View {
                 "service history",
                 "  ↑↓ / j k     select past deploy",
                 "  r            rollback to selected (with confirmation)",
-                "  R            refresh",
                 "  esc          back to service detail",
             ],
             View::Logs => vec![
@@ -266,7 +266,8 @@ impl View {
                 "  /            filter substring",
                 "  ↑↓ / PgUp PgDn  scroll · g top · G bottom",
                 "  y            yank visible buffer to system clipboard",
-                "  k            clear · r restart streams",
+                "  w            toggle line wrap · L cycle level filter",
+                "  c            clear · r restart streams",
             ],
             View::ContainerLogs { .. } => vec![
                 "container logs",
@@ -274,23 +275,24 @@ impl View {
                 "  ↑↓ / PgUp PgDn  scroll · g top · G bottom",
                 "  !            shell · B debug sidecar",
                 "  y            yank visible buffer to system clipboard",
-                "  k            clear · esc back",
+                "  w            toggle line wrap",
+                "  c            clear · esc back",
             ],
             View::Secrets => vec![
                 "secrets",
                 "  ↑↓ / j k     select key",
-                "  /            filter substring",
+                "  /            filter substring · esc to clear",
                 "  r            reveal/mask values",
                 "  a            add a new secret (age provider only)",
-                "  e            edit selected value",
-                "  d            delete selected (with confirmation)",
-                "  esc          back",
+                "  enter        view/edit selected value",
+                "  x            delete selected (with confirmation)",
             ],
             View::Resources => vec![
                 "resources (images / volumes / networks)",
                 "  Tab / S-Tab  cycle Images → Volumes → Networks",
+                "  i / v / n    jump to Images / Volumes / Networks",
                 "  ↑↓ / j k     select row",
-                "  d            remove selected (with confirmation)",
+                "  x            remove selected (with confirmation)",
                 "  P            prune unused (with confirmation)",
                 "  A            (Images only) prune ALL unused, not just dangling",
                 "  /            filter substring · esc to clear",
@@ -1935,7 +1937,10 @@ impl App {
             }
             // `7` is the canonical tab digit; `a` is the letter alias.
             // Lowercase `a` is unused elsewhere as a global; capital `A`
-            // is taken on Dashboard ("reconcile ALL").
+            // is taken on Dashboard ("reconcile ALL"). Secrets view
+            // binds `a` to "add secret"; we let that win there (same
+            // shape as `v` in Resources below).
+            KeyCode::Char('a') if matches!(self.view, View::Secrets) => {}
             KeyCode::Char('7' | 'a') => {
                 self.transition(View::Audit).await;
                 return false;
@@ -2527,6 +2532,7 @@ impl App {
             View::Services => Some(&mut self.services.filter),
             View::ServiceDetail(_) => Some(&mut self.service_detail.filter),
             View::Secrets => Some(&mut self.secrets_state.filter),
+            View::Resources => Some(&mut self.resources.filter),
             _ => None,
         }
     }
@@ -4544,6 +4550,66 @@ services:
             !app.dashboard_in_flight,
             "exec_create is too chatty to refresh on"
         );
+    }
+
+    fn press(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// `a` is the global Audit alias, but the Secrets pane binds it
+    /// to "add secret" and advertises it in the footer.
+    #[tokio::test]
+    async fn a_in_secrets_pane_does_not_jump_to_audit() {
+        let ops: Arc<dyn DockerOps> = Arc::new(FakeDockerOps::new());
+        let mut app = App::new(
+            config(),
+            std::path::PathBuf::from("yoink.yaml"),
+            ops,
+            View::Secrets,
+            false,
+        );
+        assert!(!app.on_key(press('a')).await);
+        assert_eq!(app.view, View::Secrets);
+        // Outside Secrets the alias still opens Audit.
+        app.view = View::Hosts;
+        assert!(!app.on_key(press('a')).await);
+        assert_eq!(app.view, View::Audit);
+    }
+
+    #[tokio::test]
+    async fn slash_opens_the_filter_in_resources_pane() {
+        let ops: Arc<dyn DockerOps> = Arc::new(FakeDockerOps::new());
+        let mut app = App::new(
+            config(),
+            std::path::PathBuf::from("yoink.yaml"),
+            ops,
+            View::Resources,
+            false,
+        );
+        assert!(!app.on_key(press('/')).await);
+        assert!(app.resources.filter.input_mode());
+        // Typed characters go to the filter, not to pane navigation.
+        assert!(!app.on_key(press('d')).await);
+        assert_eq!(app.view, View::Resources);
+        assert!(
+            !app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await
+        );
+        assert_eq!(app.resources.filter.current(), Some("d"));
+    }
+
+    /// The `?` overlay must name the keys the handler binds.
+    #[test]
+    fn help_overlay_matches_real_bindings() {
+        let has = |view: View, needle: &str| view.help_lines().iter().any(|l| l.contains(needle));
+        assert!(has(View::Logs, "c            clear"));
+        assert!(!has(View::Logs, "k            clear"));
+        assert!(has(View::Resources, "x            remove selected"));
+        assert!(has(View::Secrets, "x            delete selected"));
+        assert!(!has(
+            View::ServiceHistory("api".into()),
+            "R            refresh"
+        ));
     }
 
     #[tokio::test]
