@@ -535,19 +535,17 @@ fn service_already_at_spec(
     let mut results = Vec::new();
     for host_cfg in service.applicable_hosts(&config.hosts) {
         let containers = snapshot.get(&host_cfg.address)?;
-        let mut primary: Option<String> = None;
-        for index in 0..service.run.replicas {
-            let name = container_name(&service.name, desired_hash, index, service.run.replicas);
+        let expected: Vec<String> = (0..service.run.replicas)
+            .map(|index| container_name(&service.name, desired_hash, index, service.run.replicas))
+            .collect();
+        for name in &expected {
             let found = containers.iter().any(|c| {
-                c.name == name
+                c.name == *name
                     && c.is_running()
                     && c.yoink_spec_hash.as_deref() == Some(desired_hash)
             });
             if !found {
                 return None;
-            }
-            if primary.is_none() {
-                primary = Some(name);
             }
         }
         // Extras: a running container of this service that is not one
@@ -559,17 +557,14 @@ fn service_already_at_spec(
         let has_extra = containers.iter().any(|c| {
             c.yoink_service.as_deref() == Some(service.name.as_str())
                 && c.is_running()
-                && !(0..service.run.replicas).any(|index| {
-                    c.name
-                        == container_name(&service.name, desired_hash, index, service.run.replicas)
-                })
+                && !expected.contains(&c.name)
         });
         if has_extra {
             return None;
         }
         results.push(HostDeployResult {
             host: host_cfg.address.clone(),
-            container: primary.unwrap_or_default(),
+            container: expected.into_iter().next().unwrap_or_default(),
             healthcheck_attempts: 0,
             stopped_old: vec![],
         });
@@ -2314,19 +2309,9 @@ services:
 
     fn snapshot_container(name: &str, hash: &str, state: &str) -> ContainerInfo {
         ContainerInfo {
-            host: "host-a".into(),
-            name: name.into(),
-            image: String::new(),
-            state: state.into(),
-            status_text: String::new(),
-            created_unix: None,
             yoink_service: Some("app-a".into()),
-            yoink_version: None,
             yoink_spec_hash: Some(hash.into()),
-            yoink_deployed_by: None,
-            yoink_deployed_at: None,
-            networks: Vec::new(),
-            other_labels: std::collections::BTreeMap::new(),
+            ..container_with_state(name, state)
         }
     }
 
