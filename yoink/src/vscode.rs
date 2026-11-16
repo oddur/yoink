@@ -394,8 +394,7 @@ pub async fn cmd_vscode(
     let host_port = handle.host_port();
 
     let tunnel = SshTunnel::open_with_local_port(
-        &host.user,
-        &host.address,
+        &host,
         pf::SIDECAR_DIAL_HOST,
         host_port,
         options.local_port,

@@ -239,6 +239,7 @@ mod tests {
         let host = Host {
             user: "u".into(),
             address: "h".into(),
+            port: None,
         };
         let c = cfg(&["github.com/a/one"]);
         let tag = c.resolved_local_tag();
@@ -264,6 +265,7 @@ mod tests {
         let host = Host {
             user: "u".into(),
             address: "h".into(),
+            port: None,
         };
         let c = cfg(&["github.com/a/one"]);
         let tag = c.resolved_local_tag();
@@ -291,6 +293,7 @@ mod tests {
         let host = Host {
             user: "u".into(),
             address: "h".into(),
+            port: None,
         };
         let c = cfg(&["github.com/a/one"]);
         ops.push_pull_image(Ok(())); // builder pull

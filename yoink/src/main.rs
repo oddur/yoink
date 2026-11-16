@@ -1076,9 +1076,14 @@ enum HostsAction {
     /// if it does, the fragment is removed and the command errors.
     Add {
         /// Hostname or IP yoink will SSH into. Mutually exclusive with
-        /// `--address-secret`.
+        /// `--address-secret`. `host:port` and `[ipv6]:port` are split:
+        /// the port is written to `port:`, not into `address:`.
         #[arg(long, value_name = "ADDR", conflicts_with = "address_secret")]
         address: Option<String>,
+        /// SSH port, when the host's sshd does not listen on 22.
+        /// Omit it to let ssh decide (22, or `~/.ssh/config`).
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        port: Option<u16>,
         /// Name of a sealed-secret entry holding the host address (IP
         /// or hostname). Resolved at deploy time. Use this when the
         /// deploy config sits in a public repo and the host's address
@@ -3110,8 +3115,7 @@ async fn cmd_pf(
     };
 
     let tunnel = SshTunnel::open_with_local_port(
-        &host.user,
-        &host.address,
+        &host,
         &remote_dial_host,
         remote_port,
         local_port_request,
@@ -4772,12 +4776,14 @@ fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Resu
                 } else {
                     String::new()
                 };
-                println!("{}@{}{}", host.user, display_address, key_note);
+                let port_note = host.port.map(|p| format!("  port={p}")).unwrap_or_default();
+                println!("{}@{}{}{}", host.user, display_address, port_note, key_note);
             }
             Ok(())
         }
         HostsAction::Add {
             address,
+            port,
             address_secret,
             user,
             ssh_key_secret,
@@ -4786,6 +4792,7 @@ fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Resu
         } => cmd_hosts_add(
             config_path,
             address.as_deref(),
+            port,
             address_secret.as_deref(),
             &user,
             ssh_key_secret.as_deref(),
@@ -4796,10 +4803,35 @@ fn cmd_hosts(config: &Config, config_path: PathBuf, action: HostsAction) -> Resu
     }
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::items_after_statements)]
+/// `--address host:2200` carries the SSH port. Keep it out of
+/// `address:` (ssh would read the whole string as a hostname) and
+/// return it as the port, merged with `--port`.
+fn split_hosts_add_address(
+    address: Option<&str>,
+    port: Option<u16>,
+) -> Result<(Option<String>, Option<u16>)> {
+    let Some(address) = address else {
+        return Ok((None, port));
+    };
+    let (address, inline) = yoink::config::split_address_port(address)
+        .map_err(|e| anyhow::anyhow!("--address: {e}"))?;
+    match (port, inline) {
+        (Some(flag), Some(inline)) if flag != inline => Err(anyhow::anyhow!(
+            "--port {flag} conflicts with the port {inline} in --address"
+        )),
+        (flag, inline) => Ok((Some(address), flag.or(inline))),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::items_after_statements,
+    clippy::too_many_arguments
+)]
 fn cmd_hosts_add(
     config_path: PathBuf,
     address: Option<&str>,
+    port: Option<u16>,
     address_secret: Option<&str>,
     user: &str,
     ssh_key_secret: Option<&str>,
@@ -4819,6 +4851,8 @@ fn cmd_hosts_add(
         }
         _ => {}
     }
+    let (address, port) = split_hosts_add_address(address, port)?;
+    let address = address.as_deref();
     let derived_name = match (name, address) {
         (Some(n), _) => n.to_string(),
         (None, Some(addr)) => addr.replace([':', '.'], "-"),
@@ -4872,6 +4906,9 @@ fn cmd_hosts_add(
     } else if let Some(secret) = address_secret {
         let _ = writeln!(body, "  - address_secret: {secret}");
     }
+    if let Some(port) = port {
+        let _ = writeln!(body, "    port: {port}");
+    }
     let _ = writeln!(body, "    user: {user}");
     if let Some(secret) = ssh_key_secret {
         let _ = writeln!(body, "    ssh_key_secret: {secret}");
@@ -4892,8 +4929,9 @@ fn cmd_hosts_add(
         .map(str::to_string)
         .or_else(|| address_secret.map(|s| format!("<address_secret:{s}>")))
         .unwrap_or_default();
+    let port_note = port.map(|p| format!(", port {p}")).unwrap_or_default();
     eprintln!(
-        "✓ added host {derived_name} ({user}@{display_address}) to {}",
+        "✓ added host {derived_name} ({user}@{display_address}{port_note}) to {}",
         fragment_path.display()
     );
     Ok(())
@@ -6158,5 +6196,89 @@ services:
         let arg = format!("KEY=@{}", path.display());
         let err = parse_as_pairs(&[arg], 50).unwrap_err();
         assert!(format!("{err:#}").contains("larger than"));
+    }
+
+    /// A project dir whose `yoink.yaml` includes `hosts/*.yaml`, the
+    /// shape `yoink hosts add` writes fragments for.
+    fn hosts_add_project() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("yoink.yaml");
+        std::fs::write(&config_path, "include: [hosts/*.yaml]\nservices: []\n").unwrap();
+        (dir, config_path)
+    }
+
+    fn hosts_add(
+        config_path: &std::path::Path,
+        address: &str,
+        port: Option<u16>,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        super::cmd_hosts_add(
+            config_path.to_path_buf(),
+            Some(address),
+            port,
+            None,
+            "root",
+            None,
+            Some(name),
+            std::path::Path::new("hosts"),
+        )
+    }
+
+    #[test]
+    fn hosts_add_splits_port_out_of_address() {
+        let (dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "100.122.184.6:2200", None, "sshoddur-1").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("hosts/sshoddur-1.yaml")).unwrap();
+        assert!(body.contains("  - address: 100.122.184.6\n"), "{body}");
+        assert!(body.contains("    port: 2200\n"), "{body}");
+        let cfg = yoink::config::Config::load_from_path(&config_path).unwrap();
+        assert_eq!(cfg.hosts[0].address, "100.122.184.6");
+        assert_eq!(cfg.hosts[0].port, Some(2200));
+    }
+
+    #[test]
+    fn hosts_add_port_flag_writes_port() {
+        let (dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "prod-eu-1", Some(2200), "prod").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("hosts/prod.yaml")).unwrap();
+        assert!(body.contains("  - address: prod-eu-1\n"), "{body}");
+        assert!(body.contains("    port: 2200\n"), "{body}");
+    }
+
+    #[test]
+    fn hosts_add_without_port_writes_no_port_line() {
+        let (dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "prod-eu-1", None, "prod").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("hosts/prod.yaml")).unwrap();
+        assert!(!body.contains("port:"), "{body}");
+    }
+
+    #[test]
+    fn hosts_add_bracketed_ipv6_with_port() {
+        let (_dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "[2001:db8::1]:2200", None, "v6").unwrap();
+        let cfg = yoink::config::Config::load_from_path(&config_path).unwrap();
+        assert_eq!(cfg.hosts[0].address, "2001:db8::1");
+        assert_eq!(cfg.hosts[0].port, Some(2200));
+    }
+
+    #[test]
+    fn hosts_add_bare_ipv6_keeps_whole_address() {
+        let (_dir, config_path) = hosts_add_project();
+        hosts_add(&config_path, "2001:db8::22", None, "v6").unwrap();
+        let cfg = yoink::config::Config::load_from_path(&config_path).unwrap();
+        assert_eq!(cfg.hosts[0].address, "2001:db8::22");
+        assert_eq!(cfg.hosts[0].port, None);
+    }
+
+    #[test]
+    fn hosts_add_rejects_conflicting_ports() {
+        let (dir, config_path) = hosts_add_project();
+        let err = hosts_add(&config_path, "prod-eu-1:2200", Some(2222), "prod").unwrap_err();
+        assert!(format!("{err}").contains("conflicts"), "{err}");
+        assert!(!dir.path().join("hosts/prod.yaml").exists());
+        // The same port given twice is fine.
+        hosts_add(&config_path, "prod-eu-1:2200", Some(2200), "prod").unwrap();
     }
 }

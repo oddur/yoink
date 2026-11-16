@@ -414,8 +414,8 @@ fn check_hosts_from_versions(
                     Finding::error("host", format!("{}: cannot reach docker", host.address))
                         .with_detail(e.to_string())
                         .with_fix(format!(
-                            "verify `ssh {}@{}` works and `docker info` runs on the host",
-                            host.user, host.address
+                            "verify `ssh {}` works and `docker info` runs on the host",
+                            host.ssh_args().join(" ")
                         )),
                 );
             }
