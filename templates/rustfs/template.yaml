@@ -54,7 +54,7 @@ notes: |
 
   To pair with the restic-backups template, run:
     yoink add restic-backups \
-      --vars repository=s3:http://{{ bind_address }}:9000/<bucket-name>
+      --var repository=s3:http://{{ bind_address }}:9000/<bucket-name>
   and reuse `{{ service_name | upper }}_ACCESS_KEY` /
   `{{ service_name | upper }}_SECRET_KEY` as the `S3_ACCESS_KEY_ID` /
   `S3_SECRET_ACCESS_KEY` sealed secrets it expects (copy via

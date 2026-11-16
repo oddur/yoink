@@ -745,6 +745,42 @@ pub async fn emit(sink: &Arc<dyn AuditSink>, ctx: &RunContext, host: &str, kind:
     sink.record(build_event(ctx, host, kind)).await;
 }
 
+/// Build the event for a `(host, kind)` pair from [`map_deploy_event`].
+/// An empty `host` means the event has no single host (pre-deploy
+/// hooks: a subprocess hook runs on the operator machine, and
+/// `HookFinished` carries only the hook name), so it becomes an
+/// operator-origin event. Everything else is a host-origin event.
+#[must_use]
+pub fn build_deploy_event(
+    ctx: &RunContext,
+    host: impl Into<String>,
+    kind: AuditEventKind,
+) -> AuditEvent {
+    let host = host.into();
+    if host.is_empty() {
+        build_operator_event(ctx, host, kind)
+    } else {
+        build_event(ctx, host, kind)
+    }
+}
+
+/// Pick the sink an event belongs in: operator-origin events go to
+/// the operator log, host-origin events to the per-host log. Sending
+/// an operator-origin event (empty `host`) to [`HostAuditSink`] drops
+/// it, because no host descriptor matches the empty address.
+#[must_use]
+pub fn sink_for<'a>(
+    event: &AuditEvent,
+    host_sink: &'a Arc<dyn AuditSink>,
+    operator_sink: &'a Arc<dyn AuditSink>,
+) -> &'a Arc<dyn AuditSink> {
+    if event.origin == "operator" {
+        operator_sink
+    } else {
+        host_sink
+    }
+}
+
 /// Same as [`emit`] but for operator-origin events.
 pub async fn emit_operator(
     sink: &Arc<dyn AuditSink>,
@@ -759,6 +795,10 @@ pub async fn emit_operator(
 /// record. Returns `None` for events we don't audit at this stage
 /// (e.g. `Started`, which is a per-host announcement subsumed by the
 /// later `ContainerStarted` / `ContainerCreated` events).
+///
+/// Hook events return an empty host. Build the event with
+/// [`build_deploy_event`] and record it through [`sink_for`] so they
+/// land in the operator log.
 ///
 /// Some payload fields (`tag`, `spec_hash`) aren't carried in
 /// `DeployEvent` — we derive `spec_hash` from the container name's
@@ -1462,6 +1502,52 @@ mod tests {
             log_tail,
             vec!["(yoink: could not fetch container logs: ssh session closed)".to_string()]
         );
+    }
+
+    /// Hook events carry no host. Before the fix they were built as
+    /// host-origin events with an empty host and `HostAuditSink`
+    /// dropped them ("no host descriptor registered").
+    #[tokio::test]
+    async fn hook_events_route_to_the_operator_sink() {
+        use crate::deploy::DeployEvent;
+        let ctx = fixture_ctx();
+        let host_mem = Arc::new(MemorySink::new());
+        let operator_mem = Arc::new(MemorySink::new());
+        let host_sink: Arc<dyn AuditSink> = host_mem.clone();
+        let operator_sink: Arc<dyn AuditSink> = operator_mem.clone();
+
+        let events = [
+            DeployEvent::HookStarted {
+                name: "migrate".into(),
+            },
+            DeployEvent::HookFinished {
+                name: "migrate".into(),
+            },
+            DeployEvent::ContainerStarted {
+                host: "h1".into(),
+                container: "api-abcdef12".into(),
+            },
+        ];
+        for event in &events {
+            let (host, kind) =
+                map_deploy_event(Some("api"), event, &|_| String::new()).expect("audited");
+            let ev = build_deploy_event(&ctx, host, kind);
+            sink_for(&ev, &host_sink, &operator_sink).record(ev).await;
+        }
+
+        let operator_events = operator_mem.events().await;
+        assert_eq!(
+            operator_events
+                .iter()
+                .map(|e| event_name(&e.kind))
+                .collect::<Vec<_>>(),
+            vec!["HookStarted", "HookFinished"]
+        );
+        assert!(operator_events.iter().all(|e| e.origin == "operator"));
+        let host_events = host_mem.events().await;
+        assert_eq!(host_events.len(), 1);
+        assert_eq!(host_events[0].origin, "host");
+        assert_eq!(host_events[0].host, "h1");
     }
 
     #[test]

@@ -75,9 +75,9 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     quiet: u8,
 
-    /// When to colour output. `auto` (the default) detects whether the
-    /// destination is a terminal; `always` forces colour, `never`
-    /// disables it. Honours `NO_COLOR` regardless.
+    /// Reserved: accepted and validated, but it has no effect yet.
+    /// Colour follows terminal detection. Set `NO_COLOR` to disable
+    /// it.
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
     color: ColorChoice,
 
@@ -471,8 +471,8 @@ enum Command {
         /// Service name as declared in the config.
         service: String,
         /// Either `LOCAL:CONTAINER` or just `CONTAINER` (LOCAL defaults
-        /// to the same number as CONTAINER, or use `0:CONTAINER` /
-        /// `--local 0` to ask the OS for a free port). Optional when
+        /// to the same number as CONTAINER, or use `0:CONTAINER` to
+        /// ask the OS for a free port). Optional when
         /// the service has exactly one `publish:` entry (that entry's
         /// container port is used) or no `publish:` block at all but
         /// declares `run.port:` (the healthcheck port is used).
@@ -901,8 +901,10 @@ enum SecretsAction {
     /// both the existing recipients AND the new public key. Prints
     /// the new secret for pasting into a GitHub Actions secret. After
     /// CI is updated to the new key, edit `yoink.yaml` to remove the
-    /// old recipient and run `yoink secrets edit` (just save without
-    /// changes) to re-seal under the new recipients only.
+    /// old recipient and run `yoink secrets seal < /dev/null` to
+    /// re-seal under the new recipients only. `rotate` does not edit
+    /// `yoink.yaml`: add the printed recipient to `secrets.recipients:`
+    /// yourself.
     Rotate,
     /// Manage SSH keypairs used by yoink itself (e.g. host
     /// `ssh_key_secret:` references). Subcommands operate on
@@ -1013,8 +1015,9 @@ enum AuditAction {
     /// (`$XDG_STATE_HOME/yoink/audit/events.jsonl`) with each host's
     /// on-host log, dedupe on `event_id`, sort newest-first.
     Log {
-        /// Restrict to one host's events. Skips the operator log too;
-        /// pass `--origin operator` to keep just the operator side.
+        /// Restrict the host-side fetch to one host. Operator-log
+        /// events are still included; add `--origin host` to see
+        /// only that host's events.
         #[arg(long)]
         host: Option<String>,
         /// Restrict to one service.
@@ -1988,9 +1991,13 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     let (audit_tx, mut audit_rx) =
         tokio::sync::mpsc::unbounded_channel::<yoink::audit::AuditEvent>();
     let drain_sink = audit_sink.clone();
+    let drain_operator_sink = operator_sink.clone();
     let drain_task = tokio::spawn(async move {
         while let Some(ev) = audit_rx.recv().await {
-            drain_sink.record(ev).await;
+            // Hook events have no host and go to the operator log.
+            yoink::audit::sink_for(&ev, &drain_sink, &drain_operator_sink)
+                .record(ev)
+                .await;
         }
     });
     // For audit events that need a `tag` field: prefer a CLI override
@@ -2011,7 +2018,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         if let Some((host, kind)) = yoink::audit::map_deploy_event(service, &event, &|svc| {
             tag_lookup.get(svc).cloned().unwrap_or_default()
         }) {
-            let ev = yoink::audit::build_event(&run_ctx_for_closure, host, kind);
+            let ev = yoink::audit::build_deploy_event(&run_ctx_for_closure, host, kind);
             let _ = audit_tx.send(ev);
         }
     };
@@ -5653,11 +5660,13 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     eprintln!("  - {new_public}");
     eprintln!();
     eprintln!("Next steps:");
-    eprintln!("  1. Add the new recipient to yoink.yaml so future edits include it.");
+    eprintln!("  1. Add the new recipient to yoink.yaml. This command did not change");
+    eprintln!("     yoink.yaml. Until you add it, the next `yoink secrets edit` or");
+    eprintln!("     `yoink secrets seal` re-seals without the new recipient.");
     eprintln!("  2. Update the YOINK_AGE_KEY GitHub secret to the value above.");
     eprintln!("  3. Once CI is happily decrypting with the new key, remove the OLD");
-    eprintln!("     recipient from yoink.yaml and run `yoink secrets edit` (save");
-    eprintln!("     without changes) to drop it from the sealed file.");
+    eprintln!("     recipient from yoink.yaml and run `yoink secrets seal < /dev/null`");
+    eprintln!("     to drop it from the sealed file.");
     Ok(())
 }
 
