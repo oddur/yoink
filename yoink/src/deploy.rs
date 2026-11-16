@@ -851,6 +851,15 @@ async fn finalize_one_host(
         )
         .await?;
         let primary = replicas.first().map(|r| r.name.clone()).unwrap_or_default();
+        // `prepare_one_host` emitted `Started` for this host. When the
+        // cleanup did work, close the sequence so consumers that track
+        // per-service progress do not stay on the swap step.
+        if !stopped_old.is_empty() {
+            on_event(DeployEvent::Done {
+                host: host.address.clone(),
+                container: primary.clone(),
+            });
+        }
         return Ok(HostDeployResult {
             host: host.address,
             container: primary,
@@ -2687,6 +2696,44 @@ services:
                 .iter()
                 .any(|c| matches!(c, crate::docker_ops::RecordedCall::StopContainer(..))),
             "old container stopped before Caddy was pushed: {calls:?}"
+        );
+    }
+
+    /// The cleanup-only branch must end with `Done` once it stopped
+    /// an old container. Without it the last event for the service is
+    /// `OldContainerStopped` and the TUI leaves it on "swapping".
+    #[tokio::test]
+    async fn cleanup_only_finalize_emits_done_after_stopping_old() {
+        let cfg = config_one_service();
+        let service = &cfg.services[0];
+        let ops = FakeDockerOps::new();
+        ops.push_stop_container(Ok(()));
+
+        let prep = HostPrep {
+            host: Host {
+                user: "deploy".into(),
+                address: "host-a".into(),
+            },
+            replicas: vec![ReplicaPrep {
+                name: "app-a-NEWHASH".into(),
+                already_running: true,
+            }],
+            existing: vec![
+                container_with_state("app-a-NEWHASH", "running"),
+                container_with_state("app-a-OLDHASH", "running"),
+            ],
+            stop_first: false,
+        };
+        let mut events: Vec<DeployEvent> = Vec::new();
+        let mut sink = |e: DeployEvent| events.push(e);
+        let result = finalize_one_host(&ops, &cfg, service, prep, None, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(result.stopped_old, vec!["app-a-OLDHASH".to_string()]);
+        assert!(
+            matches!(events.last(), Some(DeployEvent::Done { container, .. }) if container == "app-a-NEWHASH"),
+            "expected Done as the last event, got {events:?}"
         );
     }
 
