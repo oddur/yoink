@@ -58,6 +58,10 @@ pub enum DockerError {
 pub struct Host {
     pub user: String,
     pub address: String,
+    /// SSH port from `hosts[].port`. `None` emits no port flag, so
+    /// ssh picks (22, or `~/.ssh/config`). Never part of `address`,
+    /// which stays the host's identity and display label.
+    pub port: Option<u16>,
 }
 
 impl Host {
@@ -68,9 +72,40 @@ impl Host {
     /// `yoink.yaml` to deploy at their own laptop.
     pub const LOCAL_ADDRESS: &'static str = "local";
 
+    /// `ssh://user@address[:port]`. An IPv6 address is bracketed when
+    /// a port follows it, as the URL form requires.
     #[must_use]
     pub fn ssh_url(&self) -> String {
-        format!("ssh://{}@{}", self.user, self.address)
+        match self.ssh_port() {
+            Some(port) if self.address.contains(':') => {
+                format!("ssh://{}@[{}]:{port}", self.user, self.address)
+            }
+            Some(port) => format!("ssh://{}@{}:{port}", self.user, self.address),
+            None => format!("ssh://{}@{}", self.user, self.address),
+        }
+    }
+
+    /// The port every ssh connection to this host must use. `None`
+    /// when `port:` is unset, and always for the `local` sentinel.
+    #[must_use]
+    pub fn ssh_port(&self) -> Option<u16> {
+        if self.is_local() { None } else { self.port }
+    }
+
+    /// The `ssh` argv tail that selects this host: `[-p <port>]
+    /// user@address`. Every `ssh` shell-out ends its options with
+    /// this instead of formatting `user@address` itself, so a host
+    /// with `port:` is reached the same way everywhere. `ssh` takes
+    /// `-p`; `scp` would need `-P` (yoink has no `scp` call today).
+    #[must_use]
+    pub fn ssh_args(&self) -> Vec<String> {
+        let mut args = Vec::with_capacity(3);
+        if let Some(port) = self.ssh_port() {
+            args.push("-p".to_string());
+            args.push(port.to_string());
+        }
+        args.push(format!("{}@{}", self.user, self.address));
+        args
     }
 
     /// True for the local-docker sentinel host — bypasses ssh and
@@ -88,6 +123,7 @@ impl Host {
         Self {
             user: String::new(),
             address: Self::LOCAL_ADDRESS.to_string(),
+            port: None,
         }
     }
 }
@@ -104,6 +140,7 @@ impl From<&YoinkHost> for Host {
         Self {
             user: h.user.clone(),
             address: h.address.clone(),
+            port: h.port,
         }
     }
 }
@@ -1001,12 +1038,18 @@ impl RealDockerOps {
                     host: host.address.clone(),
                     detail,
                 })?;
-            Docker::connect_with_ssh(
-                &key,
-                self.timeout_secs,
-                bollard::API_DEFAULT_VERSION,
-                keyfile,
-            )
+            // bollard's own ssh connector cannot dial a non-default
+            // port (see `crate::bollard_ssh`), so a host with `port:`
+            // goes through yoink's copy of it.
+            match host.ssh_port() {
+                Some(port) => crate::bollard_ssh::connect(host, port, keyfile, self.timeout_secs),
+                None => Docker::connect_with_ssh(
+                    &key,
+                    self.timeout_secs,
+                    bollard::API_DEFAULT_VERSION,
+                    keyfile,
+                ),
+            }
             .map_err(|source| DockerError::Connect {
                 host: host.address.clone(),
                 source,
@@ -3052,6 +3095,7 @@ mod tests {
         Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
         }
     }
 
@@ -3107,5 +3151,57 @@ mod tests {
             info.other_labels.get("caddy"),
             Some(&"app-a.example.com".to_string())
         );
+    }
+
+    fn host_on(address: &str, port: Option<u16>) -> Host {
+        Host {
+            user: "deploy".into(),
+            address: address.into(),
+            port,
+        }
+    }
+
+    #[test]
+    fn ssh_args_without_port_is_just_the_destination() {
+        assert_eq!(host().ssh_args(), vec!["deploy@host-a"]);
+        assert_eq!(host().ssh_port(), None);
+    }
+
+    #[test]
+    fn ssh_args_with_port_puts_dash_p_before_the_destination() {
+        let h = host_on("100.122.184.6", Some(2200));
+        assert_eq!(h.ssh_args(), vec!["-p", "2200", "deploy@100.122.184.6"]);
+        assert_eq!(h.ssh_port(), Some(2200));
+    }
+
+    #[test]
+    fn ssh_url_with_port() {
+        assert_eq!(
+            host_on("100.122.184.6", Some(2200)).ssh_url(),
+            "ssh://deploy@100.122.184.6:2200"
+        );
+        // IPv6 needs brackets once a port follows.
+        assert_eq!(
+            host_on("2001:db8::1", Some(2200)).ssh_url(),
+            "ssh://deploy@[2001:db8::1]:2200"
+        );
+    }
+
+    #[test]
+    fn local_host_ignores_port() {
+        let h = host_on(Host::LOCAL_ADDRESS, Some(2200));
+        assert_eq!(h.ssh_port(), None);
+        assert_eq!(h.ssh_args(), vec!["deploy@local"]);
+        assert_eq!(h.ssh_url(), "ssh://deploy@local");
+    }
+
+    #[test]
+    fn host_from_config_carries_port_and_keeps_address() {
+        let cfg = crate::config::Config::parse_str(
+            "hosts:\n  - { address: h1, port: 2200, user: deploy }\nservices: []\n",
+        )
+        .expect("parse");
+        let h = Host::from(&cfg.hosts[0]);
+        assert_eq!(h, host_on("h1", Some(2200)));
     }
 }

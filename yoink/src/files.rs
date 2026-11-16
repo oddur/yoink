@@ -168,7 +168,7 @@ pub async fn upload(
     let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
-        .arg(format!("{}@{}", host.user, host.address))
+        .args(host.ssh_args())
         .arg(&script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

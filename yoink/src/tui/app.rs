@@ -2287,6 +2287,7 @@ impl App {
                         let host = config_host(&self.config, &row.host).unwrap_or(Host {
                             user: String::new(),
                             address: row.host,
+                            port: None,
                         });
                         self.transition(View::ContainerDetail {
                             host,
@@ -2300,6 +2301,7 @@ impl App {
                         let host = config_host(&self.config, &row.host).unwrap_or(Host {
                             user: String::new(),
                             address: row.host,
+                            port: None,
                         });
                         self.kill_target = Some((host, row.container));
                     }
@@ -3383,8 +3385,7 @@ impl App {
                 }
             };
             match crate::transport::tunnel::SshTunnel::open_with_local_port(
-                &host_for_task.user,
-                &host_for_task.address,
+                &host_for_task,
                 &dial_host,
                 dial_port,
                 None, // OS-assigned local port
@@ -3489,8 +3490,7 @@ impl App {
             };
             let host_port = handle.host_port();
             let tunnel = match crate::transport::tunnel::SshTunnel::open_with_local_port(
-                &host_for_task.user,
-                &host_for_task.address,
+                &host_for_task,
                 crate::pf::SIDECAR_DIAL_HOST,
                 host_port,
                 None,
@@ -3602,16 +3602,11 @@ impl App {
         };
         for host_status in report.hosts {
             for container in host_status.containers.iter().filter(|c| c.is_running()) {
-                let host = Host {
-                    user: self
-                        .config
-                        .hosts
-                        .iter()
-                        .find(|h| h.address == host_status.host)
-                        .map(|h| h.user.clone())
-                        .unwrap_or_default(),
+                let host = config_host(&self.config, &host_status.host).unwrap_or(Host {
+                    user: String::new(),
                     address: host_status.host.clone(),
-                };
+                    port: None,
+                });
                 self.spawn_log_forwarder(host, container.name.clone()).await;
             }
         }
@@ -4508,6 +4503,7 @@ services:
             &Host {
                 user: "deploy".into(),
                 address: "host-a".into(),
+                port: None,
             },
             &DockerEvent {
                 kind: DockerEventKind::Container,
@@ -4532,6 +4528,7 @@ services:
             &Host {
                 user: "deploy".into(),
                 address: "host-a".into(),
+                port: None,
             },
             &DockerEvent {
                 kind: DockerEventKind::Container,

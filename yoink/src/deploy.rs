@@ -2431,6 +2431,7 @@ services:
         let host = Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
         };
         let names = build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
             .await
@@ -2502,6 +2503,7 @@ services:
         let host = Host {
             user: "deploy".into(),
             address: "host-a".into(),
+            port: None,
         };
         let names = build_upstream_names(&ops, &host, &routed, Some(("api", &expected)))
             .await

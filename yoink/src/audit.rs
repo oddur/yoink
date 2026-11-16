@@ -636,7 +636,7 @@ async fn append_via_ssh(host: &Host, lines: &[String]) -> std::io::Result<()> {
     let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
-        .arg(format!("{}@{}", host.user, host.address))
+        .args(host.ssh_args())
         .arg(script)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1014,7 +1014,7 @@ pub async fn fetch_audit_files(
 }
 
 /// Run `script` on `host`'s shell. Local synthetic host uses `sh -c`;
-/// remote uses `ssh -o BatchMode=yes [-i key_path] user@addr script`.
+/// remote uses `ssh -o BatchMode=yes [-i key_path] [-p port] user@addr script`.
 /// Returns stdout.
 pub async fn run_audit_shell(
     host: &Host,
@@ -1038,8 +1038,7 @@ pub async fn run_audit_shell(
             // and exhaust auth attempts before reaching `-i`).
             cmd.arg("-o").arg("IdentitiesOnly=yes").arg("-i").arg(key);
         }
-        cmd.arg(format!("{}@{}", host.user, host.address))
-            .arg(script);
+        cmd.args(host.ssh_args()).arg(script);
         cmd.output()
             .await
             .with_context(|| format!("ssh {}@{}", host.user, host.address))?

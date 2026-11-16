@@ -153,6 +153,7 @@ services:
     fn prepare_returns_none_when_no_host_declares_secret() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            port: None,
             address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: None,
@@ -165,6 +166,7 @@ services:
     fn prepare_errors_when_secret_missing_from_bundle() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            port: None,
             address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: Some("h1_key".into()),
@@ -182,6 +184,7 @@ services:
     fn prepare_errors_when_no_secrets_block() {
         let cfg = config_with_hosts(vec![HostConfig {
             address: "h1".into(),
+            port: None,
             address_secret: None,
             user: "deploy".into(),
             ssh_key_secret: Some("h1_key".into()),
@@ -196,12 +199,14 @@ services:
         let cfg = config_with_hosts(vec![
             HostConfig {
                 address: "h1".into(),
+                port: None,
                 address_secret: None,
                 user: "deploy".into(),
                 ssh_key_secret: Some("h1_key".into()),
             },
             HostConfig {
                 address: "h2".into(),
+                port: None,
                 address_secret: None,
                 user: "deploy".into(),
                 ssh_key_secret: None,
@@ -221,10 +226,12 @@ services:
             .expect("some");
         let h1 = Host {
             address: "h1".into(),
+            port: None,
             user: "deploy".into(),
         };
         let h2 = Host {
             address: "h2".into(),
+            port: None,
             user: "deploy".into(),
         };
         assert!(mgr.key_for(&h1).is_some());
