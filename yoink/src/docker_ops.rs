@@ -55,7 +55,7 @@ pub enum DockerError {
 impl DockerError {
     /// True when the daemon answered the request and rejected it
     /// with a 4xx (no such network, no such image, bad request). The
-    /// same request gets the same answer, so a retry cannot help.
+    /// request reached the daemon, so this is not a transport blip.
     /// Transport errors, ssh failures and 5xx are not included.
     #[must_use]
     pub fn is_daemon_rejection(&self) -> bool {
@@ -1748,10 +1748,8 @@ impl DockerOps for RealDockerOps {
     ) -> Result<u16, DockerError> {
         let url = format!("http://{target}:{port}{path}");
         let probe_name = format!("yoink-probe-{}-{}", target, rand_hex());
-        // Pull the probe image up front (best-effort; skipped when cached),
-        // mirroring healthcheck_tcp's busybox pull. Without this the first HTTP
-        // probe on a fresh daemon (a just-provisioned host) 404s on
-        // create_container because curlimages/curl was never pulled.
+        // Without this the first probe on a fresh daemon (a
+        // just-provisioned host) 404s on create_container.
         self.ensure_probe_image(host, HEALTHCHECK_CURL_IMAGE).await;
         let body = probe_body(
             network,
@@ -2092,9 +2090,8 @@ impl DockerOps for RealDockerOps {
         // protocol). curl's `--connect-only` is HTTP-scheme-bound
         // and `telnet://` reads after connect — both fall over on
         // those.
-        // Pull the busybox image best-effort, skipped when already
-        // cached. Without this the first probe on a fresh daemon
-        // 404s on create_container.
+        // Without this the first probe on a fresh daemon (a
+        // just-provisioned host) 404s on create_container.
         self.ensure_probe_image(host, HEALTHCHECK_TCP_IMAGE).await;
         let probe_name = format!("yoink-tcp-probe-{}-{}", target, rand_hex());
         let body = probe_body_with_image(
