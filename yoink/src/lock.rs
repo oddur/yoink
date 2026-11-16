@@ -82,6 +82,14 @@ impl HostLock {
             host: host.address.clone(),
             source,
         };
+        // A 409 from the daemon means another operator has the lock.
+        let held_or_err = |e: DockerError| {
+            if is_conflict(&e) {
+                already_held(&host)
+            } else {
+                docker_err(e)
+            }
+        };
 
         // Daemons without alpine pre-pulled (laptops, fresh hosts)
         // would otherwise 404 on create_container below. Pull only
@@ -117,18 +125,14 @@ impl HostLock {
                 // heartbeat task died. The non-force remove fails
                 // with a 409 if another operator started a sentinel
                 // since the list above, so it cannot reap a live lock.
-                match ops.remove_stopped_container(&host, LOCK_NAME).await {
-                    Ok(()) => {}
-                    Err(e) if is_conflict(&e) => return Err(already_held(&host)),
-                    Err(e) => return Err(docker_err(e)),
-                }
-                match ops.create_container(&host, LOCK_NAME, lock_body()).await {
-                    Ok(id) => id,
-                    // Another operator reaped the orphan too and won
-                    // the create.
-                    Err(e) if is_conflict(&e) => return Err(already_held(&host)),
-                    Err(e) => return Err(docker_err(e)),
-                }
+                ops.remove_stopped_container(&host, LOCK_NAME)
+                    .await
+                    .map_err(held_or_err)?;
+                // A 409 here: another operator reaped the orphan too
+                // and won the create.
+                ops.create_container(&host, LOCK_NAME, lock_body())
+                    .await
+                    .map_err(held_or_err)?
             }
             Err(e) => return Err(docker_err(e)),
         };
@@ -138,11 +142,13 @@ impl HostLock {
         // fails instead of silently sharing their lock: a 404 once
         // their remove finished, a 409 while it is in progress. Either
         // way they hold the lock now.
-        match ops.start_container(&host, &id).await {
-            Ok(()) => {}
-            Err(e) if is_conflict(&e) || is_not_found(&e) => return Err(already_held(&host)),
-            Err(e) => return Err(docker_err(e)),
-        }
+        ops.start_container(&host, &id).await.map_err(|e| {
+            if is_not_found(&e) {
+                already_held(&host)
+            } else {
+                held_or_err(e)
+            }
+        })?;
 
         // No external initial-touch — the script itself touches
         // `HEARTBEAT_FILE` as its first action (see
@@ -170,9 +176,9 @@ impl HostLock {
         let id = self.id.clone();
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
-            tick.tick().await; // first tick fires immediately; we did
-            // an initial touch in acquire(), so
-            // skip and wait for the next one.
+            // The first tick fires immediately. The sentinel script
+            // touched the file itself on start, so skip that tick.
+            tick.tick().await;
             loop {
                 tick.tick().await;
                 if let Err(e) = ops
@@ -394,9 +400,6 @@ mod tests {
         ops.push_list_containers(Ok(vec![]));
         ops.push_create_container(Err(conflict()));
         ops.push_remove_stopped(Err(conflict()));
-        // Scripted so the pre-fix sequence (force-remove, then create)
-        // has a response to pop for its force-remove.
-        ops.push_force_remove(Ok(()));
 
         let res = HostLock::acquire(&ops, host()).await;
 

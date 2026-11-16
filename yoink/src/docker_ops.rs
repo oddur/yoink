@@ -1072,6 +1072,27 @@ impl RealDockerOps {
         }
     }
 
+    /// `docker rm`, with or without `-f`. A missing container (404) is
+    /// idempotent success.
+    async fn remove_container(
+        &self,
+        host: &Host,
+        name: &str,
+        force: bool,
+    ) -> Result<(), DockerError> {
+        self.with_retry(host, |docker| async move {
+            let opts = RemoveContainerOptionsBuilder::new().force(force).build();
+            match docker.remove_container(name, Some(opts)).await {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
     /// Create + start a container, then wait for it to exit. Returns
     /// the exit code. The caller owns inspecting the container (logs)
     /// and the final `force_remove_container` — this helper only
@@ -1685,34 +1706,13 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn force_remove_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
-        self.with_retry(host, |docker| async move {
-            let opts = RemoveContainerOptionsBuilder::new().force(true).build();
-            // 404 = container didn't exist, treat as idempotent success.
-            match docker.remove_container(name, Some(opts)).await {
-                Ok(())
-                | Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404, ..
-                }) => Ok(()),
-                Err(other) => Err(other),
-            }
-        })
-        .await
+        self.remove_container(host, name, true).await
     }
 
     async fn remove_stopped_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
-        self.with_retry(host, |docker| async move {
-            let opts = RemoveContainerOptionsBuilder::new().force(false).build();
-            // 404 = container didn't exist, treat as idempotent success.
-            // 409 (container is running) propagates to the caller.
-            match docker.remove_container(name, Some(opts)).await {
-                Ok(())
-                | Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404, ..
-                }) => Ok(()),
-                Err(other) => Err(other),
-            }
-        })
-        .await
+        // Without force the daemon answers 409 for a running
+        // container, and that propagates to the caller.
+        self.remove_container(host, name, false).await
     }
 
     async fn kill_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
