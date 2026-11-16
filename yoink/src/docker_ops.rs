@@ -1105,6 +1105,27 @@ impl RealDockerOps {
         }
     }
 
+    /// `docker rm`, with or without `-f`. A missing container (404) is
+    /// idempotent success.
+    async fn remove_container(
+        &self,
+        host: &Host,
+        name: &str,
+        force: bool,
+    ) -> Result<(), DockerError> {
+        self.with_retry(host, |docker| async move {
+            let opts = RemoveContainerOptionsBuilder::new().force(force).build();
+            match docker.remove_container(name, Some(opts)).await {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
     /// Make sure a healthcheck probe image (`repo:tag`) is in the
     /// daemon's store. Best-effort: a failure here surfaces on the
     /// probe's `create_container` instead. The `image_present` check
@@ -1732,18 +1753,7 @@ impl DockerOps for RealDockerOps {
     }
 
     async fn force_remove_container(&self, host: &Host, name: &str) -> Result<(), DockerError> {
-        self.with_retry(host, |docker| async move {
-            let opts = RemoveContainerOptionsBuilder::new().force(true).build();
-            // 404 = container didn't exist, treat as idempotent success.
-            match docker.remove_container(name, Some(opts)).await {
-                Ok(())
-                | Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404, ..
-                }) => Ok(()),
-                Err(other) => Err(other),
-            }
-        })
-        .await
+        self.remove_container(host, name, true).await
     }
 
     async fn remove_stopped_container(
