@@ -2489,6 +2489,65 @@ hooks:
         );
     }
 
+    /// The service-scoped path end to end: `deploy_service` must hand
+    /// its own service name to the hook, so the reap and the run both
+    /// use `yoink-hook-{service}-{hook}-{tag}`.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_reaps_and_runs_under_service_scoped_name() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/app-a
+        tag: { service: app-a }
+        cmd: ["bin/migrate"]
+"#,
+        )
+        .unwrap();
+
+        let ops = happy_ops(&[]);
+        ops.push_pull_image(Ok(()));
+        ops.push_force_remove(Ok(()));
+        // Exit non-zero so the deploy stops right after the hook.
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+
+        let mut sink = |_e: DeployEvent| {};
+        let _ = deploy_service(&ops, &cfg, &cfg.services[0], "v42", None, false, &mut sink)
+            .await
+            .unwrap_err();
+
+        let host = Host::from(&cfg.hosts[0]);
+        let name = "yoink-hook-app-a-migrate-v42";
+        let calls = ops.calls();
+        let reap = calls
+            .iter()
+            .position(|c| {
+                *c == crate::docker_ops::RecordedCall::ForceRemoveContainer(
+                    host.clone(),
+                    name.into(),
+                )
+            })
+            .expect("stale service hook container is force-removed");
+        let run = calls
+            .iter()
+            .position(|c| {
+                *c == crate::docker_ops::RecordedCall::RunOneShot(host.clone(), name.into())
+            })
+            .expect("service hook runs under the service-scoped name");
+        assert!(reap < run, "reap must precede the create: {calls:?}");
+    }
+
     /// Routed-service fixture: api has `domain:` so `is_proxied(api)` is
     /// true. Bare config — no proxy block, but `proxy_enabled` returns
     /// true for any service with a domain.
