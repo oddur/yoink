@@ -30,7 +30,7 @@ use std::time::Duration;
 use bollard::models::ContainerCreateBody;
 use tokio::task::JoinHandle;
 
-use crate::docker_ops::{DockerError, DockerOps, Host};
+use crate::docker_ops::{DockerError, DockerOps, Host, StoppedRemoval};
 
 const LOCK_IMAGE_REPO: &str = "alpine";
 const LOCK_IMAGE_TAG: &str = "3.20";
@@ -125,9 +125,14 @@ impl HostLock {
                 // heartbeat task died. The non-force remove fails
                 // with a 409 if another operator started a sentinel
                 // since the list above, so it cannot reap a live lock.
-                ops.remove_stopped_container(&host, LOCK_NAME)
+                if ops
+                    .remove_stopped_container(&host, LOCK_NAME)
                     .await
-                    .map_err(held_or_err)?;
+                    .map_err(held_or_err)?
+                    == StoppedRemoval::Running
+                {
+                    return Err(already_held(&host));
+                }
                 // A 409 here: another operator reaped the orphan too
                 // and won the create.
                 ops.create_container(&host, LOCK_NAME, lock_body())
@@ -399,7 +404,10 @@ mod tests {
         ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
         ops.push_list_containers(Ok(vec![]));
         ops.push_create_container(Err(conflict()));
-        ops.push_remove_stopped(Err(conflict()));
+        // The daemon refuses the non-force remove of a running
+        // container; `remove_stopped_container` reports that as
+        // `Running` and leaves the container alone.
+        ops.push_remove_stopped(Ok(StoppedRemoval::Running));
 
         let res = HostLock::acquire(&ops, host()).await;
 
@@ -420,7 +428,7 @@ mod tests {
         ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
         ops.push_create_container(Err(conflict()));
         ops.push_list_containers(Ok(vec![]));
-        ops.push_remove_stopped(Ok(()));
+        ops.push_remove_stopped(Ok(StoppedRemoval::Removed));
         ops.push_create_container(Ok("abc123".into()));
         ops.push_start_container(Ok(()));
 
@@ -447,7 +455,7 @@ mod tests {
         ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
         ops.push_create_container(Err(conflict()));
         ops.push_list_containers(Ok(vec![]));
-        ops.push_remove_stopped(Ok(()));
+        ops.push_remove_stopped(Ok(StoppedRemoval::Removed));
         ops.push_create_container(Err(conflict()));
 
         let err = HostLock::acquire(&ops, host()).await.err().expect("held");

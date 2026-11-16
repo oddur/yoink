@@ -32,7 +32,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::docker_ops::Host;
@@ -393,9 +392,11 @@ impl AuditSink for MemorySink {
 /// events flush per-event; progress events buffer per-host and flush
 /// in one SSH call on `flush()` or wave-end.
 pub struct HostAuditSink {
-    /// Host descriptors keyed by address. Populated by `register()`
-    /// before any event for that host is recorded.
-    hosts: Mutex<std::collections::HashMap<String, Host>>,
+    /// Host descriptors keyed by address, each with the operator-side
+    /// SSH private-key path for hosts that declare `ssh_key_secret:`
+    /// (`None` means the operator's normal SSH auth). Populated by
+    /// `register()` before any event for that host is recorded.
+    hosts: Mutex<std::collections::HashMap<String, (Host, Option<std::path::PathBuf>)>>,
     /// One pending-line buffer per host.
     buffers: Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
@@ -411,9 +412,14 @@ impl HostAuditSink {
 
     /// Register a host so its buffer slot exists. Required before any
     /// event for that host can flush — without the descriptor we don't
-    /// know which user/address to SSH to.
-    pub async fn register(&self, host: Host) {
-        self.hosts.lock().await.insert(host.address.clone(), host);
+    /// know which user/address to SSH to. `keyfile` is
+    /// `DockerOps::ssh_keyfile(&host)`: without it a host that only
+    /// accepts its `ssh_key_secret:` key rejects every flush.
+    pub async fn register(&self, host: Host, keyfile: Option<std::path::PathBuf>) {
+        self.hosts
+            .lock()
+            .await
+            .insert(host.address.clone(), (host, keyfile));
     }
 
     /// Drain one host's buffer to disk via a single SSH invocation.
@@ -427,7 +433,7 @@ impl HostAuditSink {
                 _ => return,
             }
         };
-        let Some(host) = self.hosts.lock().await.get(host_addr).cloned() else {
+        let Some((host, keyfile)) = self.hosts.lock().await.get(host_addr).cloned() else {
             eprintln!(
                 "yoink audit: no host descriptor registered for {host_addr}; \
                  dropping {} event(s)",
@@ -444,7 +450,7 @@ impl HostAuditSink {
             return;
         }
         let count = lines.len();
-        if let Err(e) = append_via_ssh(&host, &lines).await {
+        if let Err(e) = append_via_ssh(&host, keyfile.as_deref(), &lines).await {
             eprintln!(
                 "yoink audit: failed to flush {count} event(s) to {}: {e}",
                 host.address
@@ -603,7 +609,8 @@ async fn append_to_operator_log(line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Pipe `lines` (newline-joined) through `ssh user@host sh -c "…"`.
+/// Pipe `lines` (newline-joined) through `ssh [-i keyfile] user@host
+/// sh -c "…"`.
 /// Single roundtrip: mkdir + tee + size-based rotate, all in one
 /// shell.
 ///
@@ -619,7 +626,11 @@ async fn append_to_operator_log(line: &str) -> std::io::Result<()> {
 /// the previous (unlocked) behavior on those hosts rather than
 /// aborting the whole script under `set -e` and silently dropping
 /// audit lines.
-async fn append_via_ssh(host: &Host, lines: &[String]) -> std::io::Result<()> {
+async fn append_via_ssh(
+    host: &Host,
+    keyfile: Option<&std::path::Path>,
+    lines: &[String],
+) -> std::io::Result<()> {
     let payload = lines.join("\n") + "\n";
     let script = format!(
         "set -e; \
@@ -633,11 +644,7 @@ async fn append_via_ssh(host: &Host, lines: &[String]) -> std::io::Result<()> {
            mv {AUDIT_FILE} {AUDIT_DIR}/events-$(date -u +%Y%m%dT%H%M%SZ).jsonl; \
          fi"
     );
-    let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(format!("{}@{}", host.user, host.address))
-        .arg(script)
+    let mut child = crate::ssh_keys::host_shell_command(host, keyfile, &script)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -759,6 +766,7 @@ pub async fn emit_operator(
 /// know the tag (e.g. `cmd_up`'s `tag_overrides`) can patch it in via
 /// the `tag_for` parameter, keyed by service name.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one flat match, one arm per `DeployEvent` variant
 pub fn map_deploy_event(
     service: Option<&str>,
     event: &crate::deploy::DeployEvent,
@@ -844,6 +852,21 @@ pub fn map_deploy_event(
                 service: svc(),
                 container: container.clone(),
                 log_tail: lines.clone(),
+            },
+        )),
+        // No log lines to record, but the failure itself still is:
+        // the container is removed right after, so this record is all
+        // that is left of it.
+        DeployEvent::ContainerLogTailUnavailable {
+            host,
+            container,
+            error,
+        } => Some((
+            host.clone(),
+            AuditEventKind::DeployFailed {
+                service: svc(),
+                container: container.clone(),
+                log_tail: vec![format!("(yoink: could not fetch container logs: {error})")],
             },
         )),
         DeployEvent::Done { host, container } => Some((
@@ -1414,6 +1437,32 @@ mod tests {
             }
             other => panic!("unexpected kind: {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_deploy_event_records_deploy_failed_when_logs_are_unavailable() {
+        use crate::deploy::DeployEvent;
+        let ev = DeployEvent::ContainerLogTailUnavailable {
+            host: "h1".into(),
+            container: "api-ab12cd34".into(),
+            error: "ssh session closed".into(),
+        };
+        let (host, kind) = map_deploy_event(Some("api"), &ev, &|_| "v1".into()).unwrap();
+        assert_eq!(host, "h1");
+        let AuditEventKind::DeployFailed {
+            service,
+            container,
+            log_tail,
+        } = kind
+        else {
+            panic!("unexpected kind: {kind:?}");
+        };
+        assert_eq!(service, "api");
+        assert_eq!(container, "api-ab12cd34");
+        assert_eq!(
+            log_tail,
+            vec!["(yoink: could not fetch container logs: ssh session closed)".to_string()]
+        );
     }
 
     #[test]
