@@ -5776,6 +5776,16 @@ mod tests {
         assert_eq!(rollback_tag(&c), "sha256:abc123");
     }
 
+    /// The label wins over the image reference. Docker reports a bare
+    /// image ID once the tag has moved to a newer image, and the image
+    /// reference then no longer holds the deployed tag.
+    #[test]
+    fn rollback_tag_prefers_version_label_over_image_reference() {
+        let mut c = container("v1", "exited", "h1", 100);
+        c.image = "sha256:0123456789ab".into();
+        assert_eq!(rollback_tag(&c), "v1");
+    }
+
     #[test]
     fn extract_image_tag_handles_tags_ports_and_digests() {
         assert_eq!(extract_image_tag("ghcr.io/user/app:abc123"), "abc123");
