@@ -61,7 +61,7 @@ const DOCKER_HUB_HOSTS: [&str; 5] = [
 
 /// Reduce a registry name to a comparable host: no scheme, no path,
 /// no default HTTPS port, lowercase, and one spelling for Docker Hub.
-fn canonical_registry_host(raw: &str) -> String {
+pub(crate) fn canonical_registry_host(raw: &str) -> String {
     let raw = raw.trim();
     let no_scheme = raw
         .strip_prefix("https://")

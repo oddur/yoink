@@ -241,8 +241,9 @@ fn config_references_secrets(config: &Config) -> bool {
     if config.services.iter().any(any_in) {
         return true;
     }
-    if let Some(reg) = &config.registry
-        && (!reg.username_secret.is_empty() || !reg.password_secret.is_empty())
+    if config
+        .configured_registries()
+        .any(|reg| !reg.username_secret.is_empty() || !reg.password_secret.is_empty())
     {
         return true;
     }

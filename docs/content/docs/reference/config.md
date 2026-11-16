@@ -15,6 +15,7 @@ Full schema for `yoink.yaml`. Canonical source: [`yoink/src/config.rs`](https://
 | `deploy` | [Deploy](#deploy) | `{}` | Cross-service defaults (networks, etc.). |
 | `secrets` | [Secrets](#secrets) | unset | Secret provider config. Required if any service uses `secrets:` / `env_from_secrets:`. |
 | `registry` | [Registry](#registry) | unset | Image-pull credentials. Skip when every service is locally-built (yoink ships build artifacts from your docker daemon, no auth needed) or when pulling exclusively from public registries. |
+| `registries` | list of [Registry](#registry) | `[]` | Image-pull credentials for more than one registry. Mutually exclusive with `registry`. |
 | `proxy` | [Proxy](#proxy) | unset | Bundled Caddy reverse proxy. Implicitly enabled when any service has a `domain:` set. |
 | `services` | list of [Service](#service) | `[]` | Services to deploy. Can be defined inline or split via `include:`. |
 | `hooks` | [Hooks](#hooks) | `{}` | Top-level hooks not scoped to a single service. Currently: `pre_deploy:`. |
@@ -168,6 +169,20 @@ See the [secrets guide](/docs/guide/secrets) for per-tool wiring.
 | `password_secret` | string | Name of the secret holding the token/password. |
 
 Yoink resolves these at deploy time and passes them as `X-Registry-Auth` on each pull of an image from `server`. A pull from another registry is anonymous, so a public image such as the default proxy image `caddy:2` still pulls.
+
+To pull from more than one private registry, use `registries:`. It is a list of the same fields:
+
+```yaml
+registries:
+  - server: ghcr.io
+    username_secret: GHCR_USERNAME
+    password_secret: GHCR_TOKEN
+  - server: docker.io
+    username_secret: DOCKERHUB_USERNAME
+    password_secret: DOCKERHUB_TOKEN
+```
+
+Each pull uses the entry whose `server` hosts the image. A pull from a registry that is not in the list is anonymous. `registry:` is the same as a list with one entry. A config that sets both `registry:` and `registries:` is invalid, and each registry can appear only once in the list (`docker.io` and `index.docker.io` are the same registry).
 
 ## Proxy
 
@@ -370,7 +385,7 @@ yoink up --tag api=$(git rev-parse HEAD) --tag web=$(git rev-parse HEAD)
 
 ## Includes
 
-`include:` globs are resolved relative to the config file's directory. Each matched file is parsed as a partial config; only `services:` and `hooks.pre_deploy:` are permitted in fragments and they merge into the entry config's lists. All other top-level fields (`hosts`, `deploy`, `secrets`, `registry`, `proxy`, `slug`) belong only in the entry config.
+`include:` globs are resolved relative to the config file's directory. Each matched file is parsed as a partial config; only `services:` and `hooks.pre_deploy:` are permitted in fragments and they merge into the entry config's lists. All other top-level fields (`hosts`, `deploy`, `secrets`, `registry`, `registries`, `proxy`, `slug`) belong only in the entry config.
 
 ```yaml
 # yoink.prod.yaml

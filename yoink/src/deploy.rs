@@ -1498,9 +1498,10 @@ async fn upload_files(
 /// against the operator's `SecretsBundle` and return them as bollard
 /// `DockerCredentials` for a pull of `image`.
 ///
-/// Returns `None` when no registry block is set (typical for
-/// public-image-only deploys), and when `image` is on a registry other
-/// than `registry.server`. That pull is anonymous: the credentials of
+/// Uses the first configured registry (`registry:` or `registries:`)
+/// whose `server` hosts `image`. Returns `None` when no registry is
+/// configured (typical for public-image-only deploys), and when `image`
+/// is on a registry that is not configured. That pull is anonymous: the credentials of
 /// one registry make another registry answer 401, also for a public
 /// image such as the default proxy image `caddy:2`.
 #[must_use]
@@ -1509,10 +1510,9 @@ pub fn registry_credentials(
     secrets: Option<&SecretsBundle>,
     image: &str,
 ) -> Option<bollard::auth::DockerCredentials> {
-    let reg = config.registry.as_ref()?;
-    if !crate::docker::image_on_registry(image, &reg.server) {
-        return None;
-    }
+    let reg = config
+        .configured_registries()
+        .find(|reg| crate::docker::image_on_registry(image, &reg.server))?;
     let bundle = secrets?;
     let username = bundle.get(&reg.username_secret)?.to_string();
     let password = Zeroizing::new(bundle.get(&reg.password_secret)?.to_string());
@@ -2499,6 +2499,53 @@ services:
         assert_eq!(creds.serveraddress.as_deref(), Some("ghcr.io"));
 
         assert!(registry_credentials(&cfg, Some(&bundle), "caddy").is_none());
+        assert!(registry_credentials(&cfg, Some(&bundle), "quay.io/owner/app").is_none());
+    }
+
+    fn two_registry_bundle() -> SecretsBundle {
+        let mut values = BTreeMap::new();
+        for (key, value) in [
+            ("GHCR_USERNAME", "ghcr-user"),
+            ("GHCR_TOKEN", "fake-ghcr-fixture"),
+            ("HUB_USERNAME", "hub-user"),
+            ("HUB_TOKEN", "fake-hub-fixture"),
+        ] {
+            values.insert(key.into(), Zeroizing::new(value.to_string()));
+        }
+        SecretsBundle::new(values)
+    }
+
+    #[test]
+    fn registry_credentials_pick_the_registry_that_hosts_the_image() {
+        let mut cfg = config_one_service();
+        cfg.registries = vec![
+            crate::config::RegistryConfig {
+                server: "ghcr.io".into(),
+                username_secret: "GHCR_USERNAME".into(),
+                password_secret: "GHCR_TOKEN".into(),
+            },
+            crate::config::RegistryConfig {
+                server: "index.docker.io".into(),
+                username_secret: "HUB_USERNAME".into(),
+                password_secret: "HUB_TOKEN".into(),
+            },
+        ];
+        let bundle = two_registry_bundle();
+
+        let ghcr = registry_credentials(&cfg, Some(&bundle), "ghcr.io/owner/app")
+            .expect("credentials for the ghcr.io image");
+        assert_eq!(ghcr.username.as_deref(), Some("ghcr-user"));
+        assert_eq!(ghcr.password.as_deref(), Some("fake-ghcr-fixture"));
+        assert_eq!(ghcr.serveraddress.as_deref(), Some("ghcr.io"));
+
+        // A bare image name is on Docker Hub, the second entry.
+        let hub = registry_credentials(&cfg, Some(&bundle), "owner/app")
+            .expect("credentials for the Docker Hub image");
+        assert_eq!(hub.username.as_deref(), Some("hub-user"));
+        assert_eq!(hub.password.as_deref(), Some("fake-hub-fixture"));
+        assert_eq!(hub.serveraddress.as_deref(), Some("index.docker.io"));
+
+        // A third registry has no entry: anonymous pull.
         assert!(registry_credentials(&cfg, Some(&bundle), "quay.io/owner/app").is_none());
     }
 
@@ -3983,6 +4030,73 @@ services:
                     Some("registry.example.com".to_string()),
                 ),
                 ("busybox".to_string(), None),
+            ],
+        );
+    }
+
+    /// Two registries end to end: the service image and its hook image
+    /// are on different configured registries, and each pull carries the
+    /// credentials of its own registry.
+    #[tokio::test(start_paused = true)]
+    async fn pulls_send_each_image_the_credentials_of_its_own_registry() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+registries:
+  - server: ghcr.io
+    username_secret: GHCR_USERNAME
+    password_secret: GHCR_TOKEN
+  - server: docker.io
+    username_secret: HUB_USERNAME
+    password_secret: HUB_TOKEN
+services:
+  - name: app-a
+    image: ghcr.io/owner/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: owner/migrate
+        tag: "1"
+        cmd: ["true"]
+"#,
+        )
+        .unwrap();
+        let bundle = two_registry_bundle();
+
+        let ops = happy_ops(&[]);
+        ops.push_pull_image(Ok(()));
+        ops.push_remove_stopped(Ok(StoppedRemoval::Removed));
+        // Exit non-zero so the deploy stops right after the hook.
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+
+        let mut sink = |_e: DeployEvent| {};
+        let _ = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "v42",
+            &BTreeMap::new(),
+            Some(&bundle),
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            ops.pull_auth(),
+            vec![
+                (
+                    "ghcr.io/owner/app-a".to_string(),
+                    Some("ghcr.io".to_string()),
+                ),
+                ("owner/migrate".to_string(), Some("docker.io".to_string())),
             ],
         );
     }
