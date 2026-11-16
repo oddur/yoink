@@ -814,10 +814,33 @@ async fn finalize_one_host(
     let expected_names: std::collections::BTreeSet<String> =
         replicas.iter().map(|r| r.name.clone()).collect();
 
+    let triggers_caddy_load = crate::proxy::proxy_enabled(config)
+        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
+            || crate::proxy::is_proxied(service));
+
     // No fresh container to start, but a prior partial failure may
     // have left an old generation running alongside the new — run
     // orphan cleanup unconditionally so the second reconcile self-heals.
     if replicas.iter().all(|r| r.already_running) {
+        // That prior failure may have been the Caddy push itself, in
+        // which case Caddy still routes only to the old generation.
+        // Route to the expected replicas before stopping anything, as
+        // the normal path below does; otherwise the service is down
+        // until the final push at the end of `reconcile`, which never
+        // runs if a later service fails.
+        let has_old = existing
+            .iter()
+            .any(|c| c.is_running() && !expected_names.contains(&c.name));
+        if has_old && triggers_caddy_load {
+            push_caddy_config(
+                ops,
+                &host,
+                config,
+                secrets,
+                Some((service.name.as_str(), &expected_names)),
+            )
+            .await?;
+        }
         let stopped_old = swap_out_old_containers_by_set(
             ops,
             &host,
@@ -904,9 +927,6 @@ async fn finalize_one_host(
     // expected (post-deploy) replica names — see `push_caddy_config`
     // for why we deliberately do NOT include the about-to-be-stopped
     // old containers in the rendered upstreams.
-    let triggers_caddy_load = crate::proxy::proxy_enabled(config)
-        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
-            || crate::proxy::is_proxied(service));
     if triggers_caddy_load {
         push_caddy_config(
             ops,
@@ -2624,6 +2644,49 @@ services:
             names.get("web"),
             Some(&vec!["web-OLDHASH-0".to_string()]),
             "exited containers must be filtered out for non-in-flight services"
+        );
+    }
+
+    /// Regression: the cleanup-only branch of `finalize_one_host`
+    /// (every replica already running, an old generation still up)
+    /// must push Caddy before it stops the old container. The old
+    /// generation is there because an earlier deploy died after the
+    /// new one became healthy, possibly at the Caddy push, so Caddy
+    /// may still route only to the old container. Here the push
+    /// fails (no proxy container), so nothing may be stopped.
+    #[tokio::test]
+    async fn cleanup_only_finalize_pushes_caddy_before_stopping_old() {
+        let cfg = config_proxied_service();
+        let service = &cfg.services[0];
+        let ops = FakeDockerOps::new();
+        // `discover_admin_target` lookup: no proxy container running.
+        ops.push_list_containers(Ok(Vec::new()));
+
+        let prep = HostPrep {
+            host: Host {
+                user: "deploy".into(),
+                address: "host-a".into(),
+            },
+            replicas: vec![ReplicaPrep {
+                name: "api-NEWHASH".into(),
+                already_running: true,
+            }],
+            existing: vec![
+                container_with_state("api-NEWHASH", "running"),
+                container_with_state("api-OLDHASH", "running"),
+            ],
+            stop_first: false,
+        };
+        let mut sink = |_e: DeployEvent| {};
+        let result = finalize_one_host(&ops, &cfg, service, prep, None, &mut sink).await;
+
+        assert!(result.is_err(), "the failed Caddy push must abort");
+        let calls = ops.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, crate::docker_ops::RecordedCall::StopContainer(..))),
+            "old container stopped before Caddy was pushed: {calls:?}"
         );
     }
 
