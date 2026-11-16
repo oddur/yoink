@@ -766,6 +766,7 @@ pub async fn emit_operator(
 /// know the tag (e.g. `cmd_up`'s `tag_overrides`) can patch it in via
 /// the `tag_for` parameter, keyed by service name.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one flat match, one arm per `DeployEvent` variant
 pub fn map_deploy_event(
     service: Option<&str>,
     event: &crate::deploy::DeployEvent,
@@ -851,6 +852,21 @@ pub fn map_deploy_event(
                 service: svc(),
                 container: container.clone(),
                 log_tail: lines.clone(),
+            },
+        )),
+        // No log lines to record, but the failure itself still is:
+        // the container is removed right after, so this record is all
+        // that is left of it.
+        DeployEvent::ContainerLogTailUnavailable {
+            host,
+            container,
+            error,
+        } => Some((
+            host.clone(),
+            AuditEventKind::DeployFailed {
+                service: svc(),
+                container: container.clone(),
+                log_tail: vec![format!("(yoink: could not fetch container logs: {error})")],
             },
         )),
         DeployEvent::Done { host, container } => Some((
@@ -1421,6 +1437,32 @@ mod tests {
             }
             other => panic!("unexpected kind: {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_deploy_event_records_deploy_failed_when_logs_are_unavailable() {
+        use crate::deploy::DeployEvent;
+        let ev = DeployEvent::ContainerLogTailUnavailable {
+            host: "h1".into(),
+            container: "api-ab12cd34".into(),
+            error: "ssh session closed".into(),
+        };
+        let (host, kind) = map_deploy_event(Some("api"), &ev, &|_| "v1".into()).unwrap();
+        assert_eq!(host, "h1");
+        let AuditEventKind::DeployFailed {
+            service,
+            container,
+            log_tail,
+        } = kind
+        else {
+            panic!("unexpected kind: {kind:?}");
+        };
+        assert_eq!(service, "api");
+        assert_eq!(container, "api-ab12cd34");
+        assert_eq!(
+            log_tail,
+            vec!["(yoink: could not fetch container logs: ssh session closed)".to_string()]
+        );
     }
 
     #[test]

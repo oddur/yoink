@@ -145,7 +145,7 @@ For each replica of each service, yoink does:
 3. Otherwise: pull the image (or skip when an earlier `load_images_to_hosts` phase already shipped the build artifact, or when `--no-registry` forced local-only mode), create the new container with the resolved name (`<service>-<short_hash>` or `<service>-<short_hash>-<idx>` for replicas), start it.
 4. Probe the configured healthcheck (`healthcheck_path` HTTP GET, or a TCP-connect probe on `port` if no path is set). Retry on a backoff until it passes or `healthcheck_timeout` elapses.
 5. On healthy: stop the previous-generation container (waiting `drain_timeout` for graceful shutdown), then force-remove it.
-6. On healthcheck failure: leave the new container running but exited, leave the old one running, surface the error. The operator inspects via `yoink logs` / `yoink shell` and either fixes config or rolls back.
+6. On healthcheck failure: remove every container the failed attempt created for the service on that host (the replica that failed and any replicas that already passed), leave the old one running, surface the error. The last 30 log lines of the failed container are printed and written to the audit log as `DeployFailed`.
 
 Replicas run sequentially (one container at a time per replica index) so capacity stays at N-1 during the swap. Across services in the same wave, swaps run concurrently.
 
