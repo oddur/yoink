@@ -13,7 +13,7 @@
 //! `HEARTBEAT_INTERVAL`. Three failure modes:
 //!
 //! - **Yoink finishes cleanly** → `release()` aborts the heartbeat
-//!   task and force-removes the sentinel. Next deploy: sentinel
+//!   task and force-removes its own sentinel (by id). Next deploy: sentinel
 //!   doesn't exist → instant acquire.
 //! - **Yoink crashes / SIGKILL / network drop** → the heartbeat task
 //!   dies with the process. The sentinel notices the heartbeat is
@@ -60,6 +60,11 @@ pub enum LockError {
 /// `HEARTBEAT_STALE_SECS` and the next deploy can reap it.
 pub struct HostLock {
     host: Host,
+    /// Id of the sentinel *this* holder created. Heartbeat and release
+    /// address the sentinel by id, never by name: if our sentinel
+    /// exited and another operator reaped it, the name points at
+    /// their live lock.
+    id: String,
     heartbeat: Option<JoinHandle<()>>,
     released: bool,
 }
@@ -130,8 +135,14 @@ impl HostLock {
         // Start by id, not by name. If a concurrent operator took our
         // created-but-not-started container for an orphan and replaced
         // it, the name now points at *their* sentinel; starting by id
-        // fails with a 404 instead of silently sharing their lock.
-        ops.start_container(&host, &id).await.map_err(docker_err)?;
+        // fails instead of silently sharing their lock: a 404 once
+        // their remove finished, a 409 while it is in progress. Either
+        // way they hold the lock now.
+        match ops.start_container(&host, &id).await {
+            Ok(()) => {}
+            Err(e) if is_conflict(&e) || is_not_found(&e) => return Err(already_held(&host)),
+            Err(e) => return Err(docker_err(e)),
+        }
 
         // No external initial-touch — the script itself touches
         // `HEARTBEAT_FILE` as its first action (see
@@ -143,6 +154,7 @@ impl HostLock {
 
         Ok(Self {
             host,
+            id,
             heartbeat: None,
             released: false,
         })
@@ -155,6 +167,7 @@ impl HostLock {
     /// requiring it on `acquire` forces every test to clone-into-Arc.
     pub fn spawn_heartbeat(&mut self, ops: std::sync::Arc<dyn DockerOps>) {
         let host = self.host.clone();
+        let id = self.id.clone();
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
             tick.tick().await; // first tick fires immediately; we did
@@ -163,11 +176,7 @@ impl HostLock {
             loop {
                 tick.tick().await;
                 if let Err(e) = ops
-                    .exec_oneshot(
-                        &host,
-                        LOCK_NAME,
-                        vec!["touch".into(), HEARTBEAT_FILE.into()],
-                    )
+                    .exec_oneshot(&host, &id, vec!["touch".into(), HEARTBEAT_FILE.into()])
                     .await
                 {
                     // A single failure (transient ssh blip) is fine —
@@ -199,7 +208,10 @@ impl HostLock {
             // task is the expected outcome — discard it.
             let _ = task.await;
         }
-        let _ = ops.force_remove_container(&self.host, LOCK_NAME).await;
+        // By id: after missed heartbeats our sentinel may have been
+        // reaped and replaced, and removing by name would delete the
+        // new holder's live lock. A missing id is success.
+        let _ = ops.force_remove_container(&self.host, &self.id).await;
         self.released = true;
     }
 }
@@ -243,16 +255,22 @@ fn already_held(host: &Host) -> LockError {
 /// `true` for the daemon's 409: a name conflict on create, or a
 /// non-force remove of a running container.
 fn is_conflict(e: &DockerError) -> bool {
-    matches!(
-        e,
+    daemon_status(e) == Some(409)
+}
+
+/// `true` for the daemon's 404: the container id no longer exists.
+fn is_not_found(e: &DockerError) -> bool {
+    daemon_status(e) == Some(404)
+}
+
+fn daemon_status(e: &DockerError) -> Option<u16> {
+    match e {
         DockerError::Bollard {
-            source: bollard::errors::Error::DockerResponseServerError {
-                status_code: 409,
-                ..
-            },
+            source: bollard::errors::Error::DockerResponseServerError { status_code, .. },
             ..
-        }
-    )
+        } => Some(*status_code),
+        _ => None,
+    }
 }
 
 /// Tiny `sh` script that runs as PID 1 in the sentinel container.
@@ -287,11 +305,15 @@ mod tests {
     }
 
     fn conflict() -> DockerError {
+        daemon_error(409)
+    }
+
+    fn daemon_error(status_code: u16) -> DockerError {
         DockerError::Bollard {
             host: "10.0.0.1".into(),
             source: bollard::errors::Error::DockerResponseServerError {
-                status_code: 409,
-                message: "Conflict".into(),
+                status_code,
+                message: "scripted".into(),
             },
         }
     }
@@ -448,6 +470,84 @@ mod tests {
                 .any(|c| matches!(c, RecordedCall::PullImage(..)))
         );
         lock.release(&ops).await;
+    }
+
+    /// A created its sentinel, B took the not-yet-started container
+    /// for an orphan and replaced it. A's start must go to A's own id
+    /// and A must report the lock as held: 404 when B's remove has
+    /// finished, 409 while the daemon still has it marked for removal.
+    #[tokio::test]
+    async fn acquire_reports_held_when_own_sentinel_was_reaped_before_start() {
+        for status in [404, 409] {
+            let ops = FakeDockerOps::new();
+            ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
+            ops.push_create_container(Ok("abc123".into()));
+            ops.push_start_container(Err(daemon_error(status)));
+
+            let err = HostLock::acquire(&ops, host()).await.err().expect("held");
+
+            assert!(err.to_string().contains("another deploy in progress"));
+            assert_eq!(
+                ops.calls().last(),
+                Some(&RecordedCall::StartContainer(host(), "abc123".into()))
+            );
+            assert_eq!(removals(&ops), vec![]);
+        }
+    }
+
+    /// Any other start failure is not "held" and keeps its cause.
+    #[tokio::test]
+    async fn acquire_surfaces_other_start_errors() {
+        let ops = FakeDockerOps::new();
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
+        ops.push_create_container(Ok("abc123".into()));
+        ops.push_start_container(Err(daemon_error(500)));
+
+        let err = HostLock::acquire(&ops, host()).await.err().expect("error");
+
+        assert!(!err.to_string().contains("another deploy in progress"));
+    }
+
+    /// A holder whose sentinel exited (missed heartbeats) and was
+    /// reaped by a later holder must not remove the later holder's
+    /// sentinel on release: release removes the id it created, never
+    /// the shared name.
+    #[tokio::test]
+    async fn release_removes_own_sentinel_by_id_not_by_name() {
+        let ops = FakeDockerOps::new();
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
+        ops.push_create_container(Ok("abc123".into()));
+        ops.push_start_container(Ok(()));
+        ops.push_force_remove(Ok(()));
+
+        let lock = HostLock::acquire(&ops, host()).await.expect("acquire");
+        lock.release(&ops).await;
+
+        assert_eq!(
+            removals(&ops),
+            vec![RecordedCall::ForceRemoveContainer(host(), "abc123".into())]
+        );
+    }
+
+    /// Same invariant for the heartbeat: it must touch our own
+    /// sentinel, not keep a later holder's alive by name.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_execs_into_own_sentinel_by_id() {
+        let ops = std::sync::Arc::new(FakeDockerOps::new());
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
+        ops.push_create_container(Ok("abc123".into()));
+        ops.push_start_container(Ok(()));
+
+        let mut lock = HostLock::acquire(&*ops, host()).await.expect("acquire");
+        lock.spawn_heartbeat(ops.clone());
+        tokio::time::sleep(HEARTBEAT_INTERVAL + Duration::from_secs(1)).await;
+        lock.release(&*ops).await;
+
+        assert!(ops.calls().contains(&RecordedCall::ExecOneshot(
+            host(),
+            "abc123".into(),
+            vec!["touch".into(), HEARTBEAT_FILE.into()],
+        )));
     }
 
     #[tokio::test]
