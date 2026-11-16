@@ -45,6 +45,8 @@ No additional fields. The time between the paired events is the hold time of the
 
 ### `HookStarted`, `HookFinished`
 
+yoink writes the hook events to the operator log, with the origin `"operator"`. `yoink audit log --origin host` does not show them.
+
 | field | type |
 |---|---|
 | `name` | string |
@@ -168,7 +170,6 @@ Readers accept these variants, but yoink writes none of them to a log file.
 | Variant | Reason |
 |---|---|
 | `PullFinished`, `ContainerRemoved`, `RollbackStarted`, `RollbackFinished`, `ContainerPruned`, `SecretsRotated`, `FileUploaded` | No command emits the event. |
-| `HookStarted`, `HookFinished` | The events have no host address, so the host log writer drops them. |
 
 ## Forensic vs. progress
 
@@ -193,7 +194,7 @@ The two files have the same line shape and different paths:
 
 | origin | path | who writes |
 |---|---|---|
-| `operator` | `$XDG_STATE_HOME/yoink/audit/events.jsonl` (defaults to `~/.local/state/yoink/audit/`) | The `yoink` process of the operator, as a local file write. Holds `RunStarted`, `RunFinished`, and `WebhookFired`. |
+| `operator` | `$XDG_STATE_HOME/yoink/audit/events.jsonl` (defaults to `~/.local/state/yoink/audit/`) | The `yoink` process of the operator, as a local file write. Holds `RunStarted`, `RunFinished`, `HookStarted`, `HookFinished`, and `WebhookFired`. |
 | `host` | `/var/lib/yoink/audit/events.jsonl` on each host | The operator over SSH (`cat >>`). Permissions are `0640`, and the owner is the SSH deploy user. Holds all other events. |
 
 - **Rotation**: when an active file is larger than 5 MiB after a write, yoink renames it to `events-<UTC-timestamp>.jsonl`. The next write starts a new active file.

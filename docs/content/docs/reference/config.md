@@ -14,7 +14,8 @@ The canonical source of the `yoink.yaml` schema is [`yoink/src/config.rs`](https
 | `hosts` | list of [Host](#host) | `[]` | Deploy targets. Config load accepts an empty list. A command that connects to a host needs a minimum of one entry. |
 | `deploy` | [Deploy](#deploy) | `networks: [yoink]` | Defaults that apply across services (networks). |
 | `secrets` | [Secrets](#secrets) | unset | Secret provider config. Required if a service uses `secrets:` or `env_from_secrets:`. |
-| `registry` | [Registry](#registry) | unset | Image-pull credentials. Not necessary when yoink builds every service locally, or when all pulls come from public registries. |
+| `registries` | list of [Registry](#registry) | `[]` | Image-pull credentials for more than one registry. Mutually exclusive with `registry`. |
+| `registry` | [Registry](#registry) | unset | Image-pull credentials for one registry. Not necessary when yoink builds every service locally, or when all pulls come from public registries. |
 | `proxy` | [Proxy](#proxy) | unset | Bundled Caddy reverse proxy. A service with `domain:` enables it. |
 | `services` | list of [Service](#service) | `[]` | Services to deploy, inline or in fragments that `include:` loads. |
 | `hooks` | [Hooks](#hooks) | `{}` | Top-level hooks that do not belong to one service. Only `pre_deploy:` exists. |
@@ -166,6 +167,14 @@ secrets:
 | `password_secret` | string | Name of the secret that holds the token or password. |
 
 yoink resolves these secrets at deploy time. It passes them as `X-Registry-Auth` on each pull of an image from `server`. A pull from another registry is anonymous. As a result, a public image such as the default proxy image `caddy:2` still pulls.
+
+To pull from more than one private registry, use the `registries:` list. Each pull uses the entry whose `server` hosts the image. Config load rejects a config that sets `registry:` and `registries:`, and a list that names one registry two times.
+
+```yaml
+registries:
+  - { server: ghcr.io, username_secret: GHCR_USERNAME, password_secret: GHCR_TOKEN }
+  - { server: quay.io, username_secret: QUAY_USERNAME, password_secret: QUAY_TOKEN }
+```
 
 ## Proxy
 
@@ -383,7 +392,7 @@ On a hook, `tag: { service: api }` resolves to the tag that yoink deploys for th
 
 ## Includes
 
-yoink resolves `include:` globs relative to the directory of the config file and parses each matched file as a fragment. A fragment can contain only `services:`, `hosts:`, and `hooks.pre_deploy:`. yoink appends these lists to the lists of the entry config. All other top-level fields (`deploy`, `secrets`, `registry`, `proxy`, `slug`) belong only in the entry config.
+yoink resolves `include:` globs relative to the directory of the config file and parses each matched file as a fragment. A fragment can contain only `services:`, `hosts:`, and `hooks.pre_deploy:`. yoink appends these lists to the lists of the entry config. All other top-level fields (`deploy`, `secrets`, `registry`, `registries`, `proxy`, `slug`) belong only in the entry config.
 
 ```yaml
 # yoink.prod.yaml

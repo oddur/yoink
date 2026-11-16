@@ -15,7 +15,7 @@ Every subcommand accepts these flags:
 | `-c, --config <PATH>` | Path to the config file. Default: `yoink.yaml` in the current directory. |
 | `-v, --verbose` | More log output: `-v` info, `-vv` debug, `-vvv` trace. The default level is warn. |
 | `-q, --quiet` | Less stderr output: `-q` hides progress lines, `-qq` hides all but errors. Does not change stdout. |
-| `--color <auto\|always\|never>` | When to color output. Default: `auto`. `NO_COLOR` disables color in all cases. |
+| `--color <auto\|always\|never>` | Reserved. yoink accepts the flag, but it has no effect. Color depends on terminal detection. `NO_COLOR` disables color. |
 | `--require-latest-config` | Stops with an error if the upstream branch has commits to the config file that are not in `HEAD`. Without the flag, yoink prints a warning. |
 | `-h, --help` | Help for the subcommand. |
 | `-V, --version` | Prints the version. |

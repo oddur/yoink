@@ -69,6 +69,13 @@ pub struct Config {
     /// `docker login` creds) will pull successfully.
     #[serde(default)]
     pub registry: Option<RegistryConfig>,
+    /// Credentials for several registries: a list of the same shape as
+    /// `registry:`. Each pull uses the entry whose `server` hosts the
+    /// image. Mutually exclusive with `registry:`, which is equivalent
+    /// to a one-entry list. Read both through
+    /// [`Config::configured_registries`].
+    #[serde(default)]
+    pub registries: Vec<RegistryConfig>,
     /// Optional reverse-proxy config. The proxy is auto-enabled when
     /// any service declares `domain:`; this block only needs to be set
     /// when overriding defaults (e.g. to set `email:` for ACME or to
@@ -1695,29 +1702,38 @@ impl Config {
         self.services.iter().any(|svc| svc.build.is_none())
     }
 
-    /// Iterate the non-build services whose `image:` host matches the
-    /// configured registry. Empty when no `registry:` is set, no
-    /// service uses it, or every using service has a `build:` block.
-    /// Drives both `requires_configured_registry()` and the doctor's
+    /// Every configured registry: the single `registry:` block, or the
+    /// entries of `registries:`. Validation rejects a config that sets
+    /// both, so the order is the order in the config file. All readers
+    /// of registry credentials go through this accessor.
+    pub fn configured_registries(&self) -> impl Iterator<Item = &RegistryConfig> {
+        self.registry.iter().chain(self.registries.iter())
+    }
+
+    /// Iterate the non-build services whose `image:` host matches
+    /// `registry.server`. Empty when no service uses that registry, or
+    /// every using service has a `build:` block. Drives both
+    /// `requires_configured_registry()` and the doctor's
     /// orphan-registry check.
-    pub fn services_using_configured_registry(&self) -> impl Iterator<Item = &ServiceConfig> {
-        let server = self.registry.as_ref().map(|r| r.server.as_str());
+    pub fn services_using_registry<'a>(
+        &'a self,
+        registry: &'a RegistryConfig,
+    ) -> impl Iterator<Item = &'a ServiceConfig> {
         self.services.iter().filter(move |svc| {
-            let Some(server) = server else { return false };
-            svc.build.is_none() && crate::docker::image_on_registry(&svc.image, server)
+            svc.build.is_none() && crate::docker::image_on_registry(&svc.image, &registry.server)
         })
     }
 
-    /// True iff some non-build service's image is hosted on the
-    /// configured registry, i.e. the configured creds will actually be
-    /// used at deploy time. Used by `yoink doctor` to flag orphan
-    /// `registry:` blocks; not used to drive auto `--no-registry`
+    /// True iff some non-build service's image is hosted on a
+    /// configured registry, i.e. configured creds will actually be
+    /// used at deploy time. Not used to drive auto `--no-registry`
     /// (that's `any_service_requires_pull`, which is intentionally
     /// narrower — Docker Hub library images like `postgres` should
     /// still be host-pulled, not unregistry-shipped).
     #[must_use]
     pub fn requires_configured_registry(&self) -> bool {
-        self.services_using_configured_registry().next().is_some()
+        self.configured_registries()
+            .any(|reg| self.services_using_registry(reg).next().is_some())
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
@@ -1973,6 +1989,24 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "deploy.networks must declare at least one network".into(),
             ));
+        }
+        if self.registry.is_some() && !self.registries.is_empty() {
+            return Err(ConfigError::Invalid(
+                "`registry:` and `registries:` are mutually exclusive; \
+                 move the `registry:` block into the `registries:` list"
+                    .into(),
+            ));
+        }
+        let mut registry_hosts: BTreeMap<String, &str> = BTreeMap::new();
+        for reg in &self.registries {
+            let host = crate::docker::canonical_registry_host(&reg.server);
+            if let Some(first) = registry_hosts.insert(host, &reg.server) {
+                return Err(ConfigError::Invalid(format!(
+                    "registries: `{first}` and `{}` are the same registry; \
+                     each registry may appear only once",
+                    reg.server
+                )));
+            }
         }
         // `apply_secrets_profiles_to_hooks` (run by `load_from_path`
         // before `validate`) already calls `validate_secrets_profiles`
@@ -3817,6 +3851,143 @@ services:
         assert!(!c.requires_configured_registry());
         // And nothing requires a pull at all.
         assert!(!c.any_service_requires_pull());
+    }
+
+    // -- multiple registries ------------------------------------------
+
+    /// Config with one ghcr.io service and the given registry YAML.
+    fn config_with_registry_yaml(registry_yaml: &str) -> String {
+        format!(
+            r#"
+hosts:
+  - {{ address: h, user: u }}
+{registry_yaml}
+services:
+  - name: api
+    image: ghcr.io/me/api
+    tag: v1
+    run: {{ port: 8080, healthcheck_path: / }}
+"#
+        )
+    }
+
+    #[test]
+    fn registries_list_parses_and_is_yielded_in_order() {
+        let c = Config::parse_str(&config_with_registry_yaml(
+            r"registries:
+  - server: ghcr.io
+    username_secret: GHCR_USER
+    password_secret: GHCR_TOKEN
+  - server: quay.io
+    username_secret: QUAY_USER
+    password_secret: QUAY_TOKEN",
+        ))
+        .unwrap();
+        assert!(c.registry.is_none());
+        let servers: Vec<&str> = c
+            .configured_registries()
+            .map(|r| r.server.as_str())
+            .collect();
+        assert_eq!(servers, ["ghcr.io", "quay.io"]);
+        let quay = c.configured_registries().nth(1).unwrap();
+        assert_eq!(quay.username_secret, "QUAY_USER");
+        assert_eq!(quay.password_secret, "QUAY_TOKEN");
+        assert!(c.requires_configured_registry());
+    }
+
+    #[test]
+    fn single_registry_block_is_a_one_entry_list() {
+        let c = Config::parse_str(&config_with_registry_yaml(
+            r"registry:
+  server: ghcr.io
+  username_secret: U
+  password_secret: P",
+        ))
+        .unwrap();
+        assert!(c.registries.is_empty());
+        let servers: Vec<&str> = c
+            .configured_registries()
+            .map(|r| r.server.as_str())
+            .collect();
+        assert_eq!(servers, ["ghcr.io"]);
+    }
+
+    #[test]
+    fn no_registry_fields_yield_no_registries() {
+        let c = Config::parse_str(&config_with_registry_yaml("")).unwrap();
+        assert_eq!(c.configured_registries().count(), 0);
+        assert!(!c.requires_configured_registry());
+    }
+
+    #[test]
+    fn registry_and_registries_together_are_rejected() {
+        let err = Config::parse_str(&config_with_registry_yaml(
+            r"registry:
+  server: ghcr.io
+  username_secret: U
+  password_secret: P
+registries:
+  - server: quay.io
+    username_secret: U2
+    password_secret: P2",
+        ))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`registry:` and `registries:` are mutually exclusive"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn duplicate_registry_servers_are_rejected() {
+        for (a, b) in [
+            ("ghcr.io", "ghcr.io"),
+            ("ghcr.io", "https://GHCR.io/"),
+            ("ghcr.io", "ghcr.io:443"),
+            ("docker.io", "index.docker.io"),
+            ("registry-1.docker.io", "https://index.docker.io/v1/"),
+        ] {
+            let err = Config::parse_str(&config_with_registry_yaml(&format!(
+                r"registries:
+  - server: {a}
+    username_secret: U
+    password_secret: P
+  - server: {b}
+    username_secret: U2
+    password_secret: P2"
+            )))
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("are the same registry"), "{a} / {b}: {msg}");
+            assert!(msg.contains(a) && msg.contains(b), "{a} / {b}: {msg}");
+        }
+    }
+
+    #[test]
+    fn registries_entry_rejects_unknown_fields() {
+        let err = Config::parse_str(&config_with_registry_yaml(
+            r"registries:
+  - server: ghcr.io
+    username_secret: U
+    password_secret: P
+    helper: osxkeychain",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "{err}");
+    }
+
+    #[test]
+    fn registries_is_rejected_in_an_include_fragment() {
+        let err = yaml_serde::from_str::<ConfigFragment>(
+            r"registries:
+  - server: ghcr.io
+    username_secret: U
+    password_secret: P
+",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("registries"), "{err}");
     }
 
     // -- secrets profiles ---------------------------------------------

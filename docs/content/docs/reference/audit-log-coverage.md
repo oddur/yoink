@@ -11,13 +11,13 @@ yoink records each `yoink up` run. A rollback deploys through `up`, so yoink rec
 - `LockAcquired` / `LockReleased`: one pair for each host. The time between the two events is the hold time of the lock.
 - `ContainerCreated`: one for each completed swap of a service on a host.
 - `DeployFailed` with `log_tail` when a healthcheck never passes.
+- `HookStarted` / `HookFinished`: one pair for each hook run, in the operator log. A failed hook has no `HookFinished`.
 - `WebhookFired`: one for each webhook call.
 - Progress events, for example `PullStarted`, `NetworkReady`, and `HealthcheckHealthy`. These events give more detail for triage.
 
 ## Not recorded
 
 - `yoink prune` and `yoink secrets rotate`. These commands write no events.
-- Hook runs. yoink writes `HookStarted` and `HookFinished` to no log file.
 - Read commands: `status`, `history`, `doctor`, `diff`, `tui`, `audit log`, `secrets show`, `secrets env`. A run of `audit log` does not appear in its own output.
 - Operator identity other than `$USER@$HOSTNAME`. No central identity provider exists. The field is for information only.
 - Secret values. Event payloads contain names, never values.

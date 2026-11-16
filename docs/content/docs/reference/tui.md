@@ -178,6 +178,7 @@ The pane shows the individual sealed secrets. It uses the same on-disk format as
 | `↑↓` / `j` `k` | select a key |
 | `r` | reveal or mask the values |
 | `/` | filter on a substring |
+| `a` | add a secret (age provider only). In this pane, `7` opens Audit. |
 | `enter` | edit the selected value (age provider only) |
 | `x` | remove the selected secret, with confirmation (age provider only) |
 
@@ -243,7 +244,7 @@ Reconcile-one, reconcile-all, and prune show a centered modal that streams the d
 
 ## Filter conventions
 
-Dashboard, Hosts, HostDetail, Services, ServiceDetail, and Secrets have the same filter:
+Dashboard, Hosts, HostDetail, Services, ServiceDetail, Resources, and Secrets have the same filter:
 
 - `/` starts input mode. `Backspace` removes a character, `Enter` applies, and `Esc` cancels.
 - Outside input mode, `Esc` clears an active filter.
@@ -256,6 +257,7 @@ Dashboard, Hosts, HostDetail, Services, ServiceDetail, and Secrets have the same
 | HostDetail | container name, service, state, status text |
 | Services | service name |
 | ServiceDetail | host, container name, state |
+| Resources | Images: host, id, tags. Volumes: host, name, driver. Networks: host, name, driver, scope. |
 | Secrets | key |
 
 ## Help overlay (`?`)
