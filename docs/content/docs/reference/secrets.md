@@ -40,7 +40,7 @@ yoink asks for each item by name. It does not list or search the keychain. A com
 | You select "Deny" on the system prompt | yoink stops with an error. It does not read the key files. |
 | The same identity is in the keychain and in a key file | yoink uses the keychain. `yoink doctor` shows a warning. |
 
-The release binaries are not code-signed. macOS connects a keychain item to the binary that created it. As a result, macOS can show the keychain prompt again after each upgrade of yoink.
+The release binaries are not code-signed. macOS connects a keychain item to the binary that created it. As a result, macOS shows the keychain prompt again after each upgrade of yoink, and it shows the prompt to each other program that asks for the item. While the prompt is open, yoink waits.
 
 ## `provider: command`
 

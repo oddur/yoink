@@ -134,7 +134,9 @@ yoink asks for a confirmation. Make sure that you have a backup before you remov
 
 ## Troubleshooting
 
-**macOS asks for the keychain password after an upgrade.** The release binaries are not code-signed, and macOS connects a keychain item to the binary that created it. Enter the password and select "Always Allow".
+**macOS asks for the keychain password after an upgrade.** The release binaries are not code-signed, and macOS connects a keychain item to the binary that created it. A new binary is a different program to macOS. Enter the password and select "Always Allow".
+
+**A script or a cron job on the Mac stops and does not continue.** macOS shows the keychain prompt and waits for an answer. yoink cannot continue until you answer. For an unattended run, set `YOINK_AGE_KEY`. yoink then does not read the keychain.
 
 **`access to the keychain item … was denied`.** You selected "Deny" on the system prompt. yoink does not continue with a key file after a refusal. Run the command again and allow access, or set `YOINK_AGE_KEY`.
 
