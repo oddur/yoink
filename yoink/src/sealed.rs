@@ -216,7 +216,7 @@ pub fn resolve_identity(recipients: &[String]) -> Result<ResolvedIdentity, Seale
     resolve_identity_with(
         env::var(AGE_KEY_ENV).ok(),
         env::var(AGE_KEY_FILE_ENV).ok(),
-        &*crate::keychain::system_store(),
+        crate::keychain::system_store(),
         &keys_dir()?,
         &legacy_identity_path()?,
         recipients,

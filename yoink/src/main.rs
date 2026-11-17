@@ -1392,7 +1392,19 @@ async fn run(cli: Cli) -> Result<()> {
         )?;
     }
 
-    resolve_sealed_host_addresses(&mut config).await?;
+    // Sealed host addresses need the age identity, and the identity can
+    // sit behind a keychain prompt. Commands that never dial a host do
+    // not get that prompt for nothing.
+    if !matches!(
+        cli.command,
+        Command::Validate { .. }
+            | Command::Completions { .. }
+            | Command::ProxyRender
+            | Command::ProxyDockerfile
+            | Command::Secrets { .. }
+    ) {
+        resolve_sealed_host_addresses(&mut config).await?;
+    }
 
     match cli.command {
         Command::Add {
@@ -5182,7 +5194,7 @@ fn age_recipients(config: &Config) -> &[String] {
 }
 
 /// The credential store, or an error on a platform without one.
-fn require_keychain() -> Result<Box<dyn yoink::keychain::IdentityStore>> {
+fn require_keychain() -> Result<&'static dyn yoink::keychain::IdentityStore> {
     let store = yoink::keychain::system_store();
     if !store.supported() {
         anyhow::bail!("`--keychain` is supported on macOS only");

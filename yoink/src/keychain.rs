@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 /// Keychain service name of every yoink identity item.
 pub const SERVICE: &str = "is.yoink.age-identity";
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum StoreError {
     /// The user said no on the system prompt. Identity resolution stops
     /// here: a refusal must not be bypassed through a copy on disk.
@@ -49,21 +49,84 @@ pub trait IdentityStore: Send + Sync {
     fn delete(&self, recipient: &str) -> Result<bool, StoreError>;
 }
 
-/// The store of this platform.
+/// The store of this platform, behind a cache that lives as long as
+/// the process.
+///
+/// One yoink run resolves the identity more than once (sealed host
+/// addresses, then the deploy itself, then per-host ssh keys). Without
+/// the cache each of those is a keychain read, and each read can be a
+/// system prompt when the user allowed access once and not always. The
+/// cache makes it one read, so at most one prompt, for each recipient
+/// in a run. A refusal is cached too: yoink does not ask again after
+/// "Deny".
 #[must_use]
-pub fn system_store() -> Box<dyn IdentityStore> {
+pub fn system_store() -> &'static dyn IdentityStore {
     #[cfg(target_os = "macos")]
-    {
-        Box::new(macos::Keychain)
-    }
+    type Platform = macos::Keychain;
     #[cfg(not(target_os = "macos"))]
-    {
-        Box::new(NoStore)
+    type Platform = NoStore;
+    static STORE: std::sync::OnceLock<Cached<Platform>> = std::sync::OnceLock::new();
+    STORE.get_or_init(|| Cached::new(Platform::default()))
+}
+
+type Lookup = Result<Option<Zeroizing<String>>, StoreError>;
+
+/// Remembers every lookup of the wrapped store.
+pub struct Cached<S> {
+    inner: S,
+    seen: std::sync::Mutex<std::collections::BTreeMap<String, Lookup>>,
+}
+
+impl<S> Cached<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            seen: std::sync::Mutex::default(),
+        }
+    }
+
+    fn seen(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, Lookup>> {
+        // A poisoned lock only means another thread panicked mid-insert;
+        // the map itself is still usable.
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl<S: IdentityStore> IdentityStore for Cached<S> {
+    fn supported(&self) -> bool {
+        self.inner.supported()
+    }
+    fn get(&self, recipient: &str) -> Lookup {
+        if let Some(hit) = self.seen().get(recipient) {
+            return hit.clone();
+        }
+        // The lock is not held across the read: the read can block on a
+        // system prompt.
+        tracing::debug!("keychain read for {recipient}");
+        let result = self.inner.get(recipient);
+        self.seen().insert(recipient.to_string(), result.clone());
+        result
+    }
+    fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError> {
+        self.inner.set(recipient, identity)?;
+        self.seen().insert(
+            recipient.to_string(),
+            Ok(Some(Zeroizing::new(identity.to_string()))),
+        );
+        Ok(())
+    }
+    fn delete(&self, recipient: &str) -> Result<bool, StoreError> {
+        let removed = self.inner.delete(recipient)?;
+        self.seen().insert(recipient.to_string(), Ok(None));
+        Ok(removed)
     }
 }
 
 /// A store that holds nothing. Used on platforms without a keychain,
 /// and by callers that must not touch the real one.
+#[derive(Default)]
 pub struct NoStore;
 
 impl IdentityStore for NoStore {
@@ -97,6 +160,7 @@ mod macos {
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
     const ERR_SEC_USER_CANCELED: i32 = -128;
 
+    #[derive(Default)]
     pub struct Keychain;
 
     /// Only an explicit "Deny" on the prompt (`errSecUserCanceled`) is
@@ -209,5 +273,81 @@ pub(crate) mod fake {
         fn delete(&self, recipient: &str) -> Result<bool, StoreError> {
             Ok(self.items.lock().unwrap().remove(recipient).is_some())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::fake::FakeStore;
+    use super::*;
+
+    /// Counts the reads that reach the wrapped store.
+    #[derive(Default)]
+    struct Counting {
+        inner: FakeStore,
+        reads: AtomicUsize,
+    }
+
+    impl IdentityStore for Counting {
+        fn supported(&self) -> bool {
+            true
+        }
+        fn get(&self, recipient: &str) -> Lookup {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(recipient)
+        }
+        fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError> {
+            self.inner.set(recipient, identity)
+        }
+        fn delete(&self, recipient: &str) -> Result<bool, StoreError> {
+            self.inner.delete(recipient)
+        }
+    }
+
+    /// One run resolves the identity several times. Each read can be a
+    /// keychain prompt, so only the first may reach the keychain.
+    #[test]
+    fn cached_store_reads_each_recipient_once() {
+        let store = Cached::new(Counting {
+            inner: FakeStore::with("age1a", "secret-a"),
+            ..Counting::default()
+        });
+        for _ in 0..3 {
+            assert_eq!(store.get("age1a").unwrap().unwrap().as_str(), "secret-a");
+            assert!(store.get("age1missing").unwrap().is_none());
+        }
+        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// After "Deny" yoink does not put the prompt up a second time.
+    #[test]
+    fn cached_store_does_not_ask_again_after_a_refusal() {
+        let store = Cached::new(Counting {
+            inner: FakeStore {
+                fail: Some(StoreError::Denied {
+                    recipient: String::new(),
+                }),
+                ..FakeStore::default()
+            },
+            ..Counting::default()
+        });
+        for _ in 0..3 {
+            assert!(matches!(store.get("age1a"), Err(StoreError::Denied { .. })));
+        }
+        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cached_store_follows_set_and_delete() {
+        let store = Cached::new(Counting::default());
+        assert!(store.get("age1a").unwrap().is_none());
+        store.set("age1a", "secret-a").unwrap();
+        assert_eq!(store.get("age1a").unwrap().unwrap().as_str(), "secret-a");
+        assert!(store.delete("age1a").unwrap());
+        assert!(store.get("age1a").unwrap().is_none());
+        // Only the first lookup reached the store.
+        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 1);
     }
 }
