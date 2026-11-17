@@ -22,7 +22,7 @@ Run this command in the project directory:
 yoink secrets key import --keychain
 ```
 
-yoink finds the key file for the recipients of the project. It stores the identity in the keychain and reads it back. Then it asks before it deletes the file. To delete without a question, add `-y`. If the file holds more than one identity, yoink imports the first one and keeps the file.
+yoink finds the key file for the recipients of the project. It stores the identity in the keychain and reads it back. Then it asks before it deletes the file. To delete without a question, add `-y`. yoink keeps the file in three cases: the file holds more than one identity, `YOINK_AGE_KEY_FILE` points at the file, or the recipient of the key is not in `secrets.recipients:` of the project.
 
 To import a different file, give its path:
 
@@ -40,7 +40,7 @@ yoink secrets key list
 * keychain  age1qz…
 ```
 
-The row with `*` is the identity that yoink uses. If a `file` row shows the same recipient, the key is still on disk. Delete that file.
+The row with `*` is the identity that yoink uses. This command never opens the keychain prompt. If macOS needs your permission for the item, no row has a `*`, and a message tells you why. If a `file` row shows the same recipient, the key is still on disk. Delete that file.
 
 ### Keep a backup [step]
 

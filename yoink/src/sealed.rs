@@ -378,10 +378,11 @@ pub fn keychain_identity(
             },
             Ok(None) => {}
             Err(denied @ StoreError::Denied { .. }) => return Err(denied.into()),
+            // Permission is per item: another recipient's item can be
+            // readable when this one is not. Note it and go on.
             Err(StoreError::Unavailable(reason)) => {
-                tracing::debug!("keychain not available ({reason}); using key files");
-                lookup.unavailable = Some(reason);
-                return Ok(lookup);
+                tracing::debug!("keychain item for {recipient} not available ({reason})");
+                lookup.unavailable.get_or_insert(reason);
             }
         }
     }
@@ -1355,6 +1356,37 @@ BAZ=plain
         );
         let found = keychain_identity(&store, std::slice::from_ref(&public)).unwrap();
         assert_eq!(found.identity.unwrap().to_public().to_string(), public);
+    }
+
+    /// Permission is per item. An item that cannot be read must not
+    /// hide a readable item of the next recipient.
+    #[test]
+    fn keychain_lookup_continues_past_an_unavailable_item() {
+        use crate::keychain::IdentityStore;
+        use zeroize::Zeroizing;
+        struct OneLocked(FakeStore);
+        impl IdentityStore for OneLocked {
+            fn supported(&self) -> bool {
+                true
+            }
+            fn get(&self, r: &str) -> Result<Option<Zeroizing<String>>, StoreError> {
+                if r == "age1locked" {
+                    return Err(StoreError::Unavailable("needs permission".into()));
+                }
+                self.0.get(r)
+            }
+            fn set(&self, r: &str, i: &str, l: &str) -> Result<(), StoreError> {
+                self.0.set(r, i, l)
+            }
+            fn delete(&self, r: &str) -> Result<bool, StoreError> {
+                self.0.delete(r)
+            }
+        }
+        let (secret, public) = keygen();
+        let store = OneLocked(FakeStore::with(&public, secret.as_str()));
+        let found = keychain_identity(&store, &["age1locked".into(), public.clone()]).unwrap();
+        assert_eq!(found.identity.unwrap().to_public().to_string(), public);
+        assert_eq!(found.unavailable.as_deref(), Some("needs permission"));
     }
 
     /// A broken item for one recipient must not hide a good item for

@@ -153,8 +153,12 @@ impl SecretsState {
     /// Returns true when a retry was started, so the app can reload
     /// its own copy of the bundle too.
     pub fn retry_if_failed(&mut self) -> bool {
-        if matches!(self.bundle, LoadStatus::Failed(_)) {
-            crate::keychain::system_store().retry_failures();
+        // Only when the keychain has a failure to forget. A missing
+        // secrets.age or a decrypt error gives the same answer again,
+        // and a reload on each visit would only repeat the toast.
+        if matches!(self.bundle, LoadStatus::Failed(_))
+            && crate::keychain::system_store().retry_failures()
+        {
             self.bundle = LoadStatus::NotLoaded;
             return true;
         }
@@ -691,10 +695,7 @@ fn load(config: &Config) -> LoadStatus {
                 Ok(id) => id,
                 // The key exists but the keychain did not hand it out.
                 // A new key would not decrypt secrets.age.
-                Err(
-                    e @ (sealed::SealedError::Keychain(_)
-                    | sealed::SealedError::KeychainUnavailable { .. }),
-                ) => {
+                Err(e) if e.is_keychain() => {
                     return LoadStatus::Failed(format!(
                         "cannot read secrets: {e}\n\nUnlock the keychain or be ready to allow yoink, then leave this pane and open it again."
                     ));

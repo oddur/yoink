@@ -4821,7 +4821,20 @@ fn run_bootstrap(command: &Command, config_path: &Path) -> Option<Result<()>> {
     // config when it loads (for the recipients and the "this project"
     // marker) and work without it: a key of a deleted project can be
     // removed, and a key can be restored before the repo is cloned.
-    let config = || Config::load_from_path(config_path).ok();
+    let config = || match Config::load_from_path(config_path) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            // A config that exists but does not load is not "no
+            // project". Say so: the recipients are unknown.
+            if config_path.exists() {
+                eprintln!(
+                    "warning: {} did not load ({e}); continuing without the project",
+                    config_path.display()
+                );
+            }
+            None
+        }
+    };
     match command {
         Command::Secrets {
             action:
@@ -5325,6 +5338,41 @@ fn cmd_secrets_key_generate_keychain(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Why `import --keychain` must leave the source key file in place, or
+/// `None` when it can offer to delete it. The file goes only when yoink
+/// will find the key in the keychain afterwards and nothing else still
+/// points at the file.
+fn import_keeps_file(
+    file: &Path,
+    extra_identities: usize,
+    env_key_file: Option<&str>,
+    recipient_in_config: bool,
+) -> Option<String> {
+    use yoink::sealed::AGE_KEY_FILE_ENV;
+    let same_file = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if extra_identities > 0 {
+        return Some(format!(
+            "it holds {extra_identities} more identity line(s), and only the first was imported"
+        ));
+    }
+    if env_key_file.is_some_and(|e| same_file(Path::new(e.trim()), file)) {
+        return Some(format!(
+            "{AGE_KEY_FILE_ENV} points at it, and that variable is read before the keychain"
+        ));
+    }
+    if !recipient_in_config {
+        return Some(
+            "its recipient is not in `secrets.recipients:` of a loaded config, so yoink \
+             would not look for it in the keychain"
+                .into(),
+        );
+    }
+    None
+}
+
 fn cmd_secrets_key_import(
     config: Option<&Config>,
     config_path: &Path,
@@ -5400,13 +5448,16 @@ fn cmd_secrets_key_import(
     // documented restore from a password manager).
     let mut other_copy = file.is_none();
     if let Some(p) = file {
-        if extra_identities > 0 {
+        let env_file = std::env::var(sealed::AGE_KEY_FILE_ENV).ok();
+        let keep_because = import_keeps_file(
+            &p,
+            extra_identities,
+            env_file.as_deref(),
+            recipients.contains(&public),
+        );
+        if let Some(why) = keep_because {
             other_copy = true;
-            eprintln!(
-                "kept {}: it holds {extra_identities} more identity line(s), and only the first \
-                 was imported",
-                p.display()
-            );
+            eprintln!("kept {}: {why}", p.display());
         } else if confirm(
             &format!("delete the key file {}?", p.display()),
             ConfirmKind::DefaultNo,
@@ -5649,18 +5700,40 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
         return Ok(());
     }
     // The star follows the real resolution, not the row order. Prompts
-    // are off for it: this list must never open a keychain dialog. An
-    // item that needs permission then counts as "not available", and
-    // the message below says so.
-    let resolved = {
+    // are off for it: this list must never open a keychain dialog.
+    //
+    // That has one blind spot. If the keychain holds an item that needs
+    // your permission, a real command would ask and use the keychain,
+    // while the quiet lookup here falls through to a key file. A star
+    // on that file would be wrong, so then no row gets one.
+    let (resolved, unread) = {
         let quiet = yoink::keychain::no_prompts();
         if quiet.active() {
-            sealed::resolve_identity(recipients)
+            // The reason, when an item exists that could not be read.
+            let unread = sealed::keychain_identity(yoink::keychain::system_store(), recipients)
+                .ok()
+                .filter(|l| l.identity.is_none())
+                .and_then(|l| l.unavailable);
+            (sealed::resolve_identity(recipients), unread)
         } else {
-            Err(sealed::SealedError::KeychainUnavailable {
-                reason: "prompts could not be turned off, so the keychain was not read".into(),
-            })
+            let why = "prompts could not be turned off".to_string();
+            (
+                Err(sealed::SealedError::KeychainUnavailable {
+                    reason: why.clone(),
+                }),
+                Some(why),
+            )
         }
+    };
+    // An environment variable outranks the keychain, so an unread
+    // keychain item changes nothing then.
+    let env_supplies = matches!(
+        resolved.as_ref().map(|r| &r.source),
+        Ok(sealed::IdentitySource::EnvKey | sealed::IdentitySource::EnvFile(_))
+    );
+    let resolved = match unread {
+        Some(reason) if !env_supplies => Err(sealed::SealedError::KeychainUnavailable { reason }),
+        _ => resolved,
     };
     let used = resolved
         .as_ref()
@@ -5686,8 +5759,8 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
         // Prompts were off for this list, so an item that needs your
         // permission could not be read. That is not a lost key.
         Err(sealed::SealedError::KeychainUnavailable { reason }) => eprintln!(
-            "the keychain item was not read ({reason}). A command that uses the key, \
-             for example `yoink secrets show`, asks for permission."
+            "no star: the keychain item was not read ({reason}). A command that uses the \
+             key, for example `yoink secrets show`, asks for permission and then uses it."
         ),
         Err(e) => eprintln!("yoink cannot load an identity: {e}"),
     }
@@ -6490,6 +6563,36 @@ mod tests {
         GitFallbackFailure, check_git_fallback, extract_image_tag, parse_as_pairs,
         parse_tag_overrides_with, previous_generation, rollback_tag,
     };
+
+    /// `import --keychain` deletes a key file only when nothing is lost:
+    /// yoink will find the key in the keychain, and no variable or
+    /// second identity still depends on the file.
+    #[test]
+    fn import_keeps_the_file_unless_deleting_is_safe() {
+        use super::import_keeps_file;
+        use std::path::Path;
+        let file = Path::new("/tmp/yoink-test-does-not-exist.key");
+        assert!(import_keeps_file(file, 0, None, true).is_none());
+        // A second identity in the file.
+        assert!(
+            import_keeps_file(file, 1, None, true)
+                .unwrap()
+                .contains("more identity")
+        );
+        // YOINK_AGE_KEY_FILE points at the file.
+        assert!(
+            import_keeps_file(file, 0, Some(" /tmp/yoink-test-does-not-exist.key "), true)
+                .unwrap()
+                .contains("YOINK_AGE_KEY_FILE")
+        );
+        assert!(import_keeps_file(file, 0, Some("/tmp/other.key"), true).is_none());
+        // The recipient is not in a loaded config.
+        assert!(
+            import_keeps_file(file, 0, None, false)
+                .unwrap()
+                .contains("recipients")
+        );
+    }
 
     fn tag_test_services() -> Vec<yoink::config::ServiceConfig> {
         yoink::config::Config::parse_str(

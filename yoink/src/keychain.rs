@@ -3,8 +3,9 @@
 //! On macOS the store is the login keychain. Each identity is one
 //! generic-password item: service [`SERVICE`], account = the age
 //! recipient (`age1…`), value = the identity (`AGE-SECRET-KEY-1…`).
-//! yoink asks for one item per recipient by name; it never lists or
-//! searches the keychain.
+//! To decrypt, yoink asks for one item per recipient by name. It
+//! searches the keychain only for item names (`key list`), never for
+//! a secret.
 //!
 //! The point is narrow: no plaintext key on disk or in backups. An item
 //! in the login keychain is encrypted with the login password, and
@@ -69,8 +70,11 @@ pub trait IdentityStore: Send + Sync {
     /// `get` asks the store again. A long-running session (the TUI)
     /// calls it before a reload: a "Deny", a locked keychain or a key
     /// that was imported in another terminal must not stick for the
-    /// life of the process.
-    fn retry_failures(&self) {}
+    /// life of the process. Returns true when something was forgotten,
+    /// that is, when a retry can give another answer.
+    fn retry_failures(&self) -> bool {
+        false
+    }
     /// Create or replace the item for `recipient`. `label` names a new
     /// item; an item that exists keeps the name it has.
     fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError>;
@@ -187,9 +191,11 @@ impl<S: IdentityStore> IdentityStore for Cached<S> {
         seen.insert(recipient.to_string(), result.clone());
         result
     }
-    fn retry_failures(&self) {
-        self.seen()
-            .retain(|_, lookup| matches!(lookup, Ok(Some(_))));
+    fn retry_failures(&self) -> bool {
+        let mut seen = self.seen();
+        let before = seen.len();
+        seen.retain(|_, lookup| matches!(lookup, Ok(Some(_))));
+        seen.len() != before
     }
     fn list(&self) -> Result<Vec<StoredItem>, StoreError> {
         self.inner.list()
@@ -520,7 +526,8 @@ mod tests {
             "still the cached miss"
         );
 
-        store.retry_failures();
+        assert!(store.retry_failures());
+        assert!(!store.retry_failures(), "nothing left to forget");
         assert_eq!(store.get("age1b").unwrap().unwrap().as_str(), "secret-b");
         store.get("age1a").unwrap();
         // age1a once, age1b twice.
