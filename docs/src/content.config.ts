@@ -23,6 +23,10 @@ export const collections = {
     loader: glob({ pattern: '*.{md,mdx}', base: './content/blog' }),
     schema: page.extend({ date: z.coerce.date(), author: z.string().optional() }),
   }),
+  changelog: defineCollection({
+    loader: glob({ pattern: '*.md', base: './content/changelog' }),
+    schema: z.object({ version: z.string(), date: z.coerce.date() }),
+  }),
   about: defineCollection({
     loader: glob({ pattern: 'about.mdx', base: './content' }),
     schema: page,
