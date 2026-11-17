@@ -29,8 +29,23 @@ repos:
   - repo: https://github.com/trufflesecurity/trufflehog
     rev: v3.95.2
     hooks:
-      # Pre-push only: `--since-commit HEAD` reads committed history, so a
-      # pre-commit invocation can't see staged content yet.
+      # Scans the commits that the push sends, at pre-push.
+      #
+      # Two things made the old entry scan nothing:
+      # - trufflehog sees `PRE_COMMIT=1` and switches to a mode for the
+      #   pre-commit stage, where it looks at staged changes only. At
+      #   pre-push nothing is staged. `env -u PRE_COMMIT` turns that off.
+      # - `--since-commit HEAD` is an empty range.
+      #
+      # pre-commit gives the pushed range in PRE_COMMIT_FROM_REF and
+      # PRE_COMMIT_TO_REF. They are empty on the first push of a repo,
+      # and then the whole history is scanned.
       - id: trufflehog
-        entry: trufflehog git file://. --since-commit HEAD --results=verified --fail --trust-local-git-config
+        entry: >-
+          bash -c 'if [ -n "$PRE_COMMIT_FROM_REF" ]; then
+          set -- --since-commit "$PRE_COMMIT_FROM_REF" --branch "$PRE_COMMIT_TO_REF";
+          else set --; fi;
+          exec env -u PRE_COMMIT trufflehog git file://. "$@"
+          --results=verified --fail --trust-local-git-config'
+        always_run: true
         stages: [pre-push]
