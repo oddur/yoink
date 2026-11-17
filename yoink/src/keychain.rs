@@ -86,7 +86,7 @@ pub trait IdentityStore: Send + Sync {
 /// Held while yoink must not put up a keychain prompt. See [`no_prompts`].
 pub struct NoPrompts {
     #[cfg(target_os = "macos")]
-    _lock: Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+    lock: Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
 }
 
 /// Turn keychain prompts off until the returned value is dropped. A
@@ -94,12 +94,28 @@ pub struct NoPrompts {
 /// treats that as "the keychain cannot answer".
 ///
 /// For shell completion: a TAB press must never open a system dialog.
+impl NoPrompts {
+    /// False when prompts could not be turned off. The caller must then
+    /// stay away from the keychain: a read can still open a dialog.
+    #[must_use]
+    pub fn active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.lock.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // No store, so no prompt to turn off.
+            true
+        }
+    }
+}
+
 #[must_use]
 pub fn no_prompts() -> NoPrompts {
     NoPrompts {
         #[cfg(target_os = "macos")]
-        _lock: security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()
-            .ok(),
+        lock: security_framework::os::macos::keychain::SecKeychain::disable_user_interaction().ok(),
     }
 }
 
@@ -239,28 +255,31 @@ mod macos {
     /// A refusal on the access prompt stops identity resolution; every
     /// other failure lets it continue with the key files.
     ///
-    /// - `errSecUserCanceled` (-128) is what macOS returns for "Deny" on
-    ///   the access prompt. Observed on macOS with an ad-hoc signed
-    ///   binary; yoink then stopped and did not read a key file that
-    ///   held the same identity.
-    /// - `errSecAuthFailed` (-25293) is not observed. It follows a
-    ///   failed password entry in the prompt, so it is treated as a
-    ///   refusal too. The wrong direction to err in is the silent one:
-    ///   classed as "not available", yoink would read the key file
-    ///   after the user did not grant access.
-    /// - Everything else means the store cannot answer, for example
-    ///   `errSecInteractionNotAllowed` for a locked keychain with no
-    ///   GUI session (SSH into the Mac). That case is not observed
-    ///   either.
+    /// Both codes below were observed on macOS with an ad-hoc signed
+    /// binary that was not on the item's access list:
+    ///
+    /// - `errSecUserCanceled` (-128): the user selected "Deny" on the
+    ///   prompt. A refusal. yoink stopped and did not read a key file
+    ///   that held the same identity.
+    /// - `errSecAuthFailed` (-25293): macOS needed the user's permission
+    ///   and could not ask, because prompts were turned off
+    ///   ([`super::no_prompts`]). Nobody refused, so this is "cannot
+    ///   answer". A session with no GUI (SSH into the Mac) is the same
+    ///   situation, which is why it must fall through to the key files.
+    ///
+    /// Every other code also means the store cannot answer.
     fn classify(err: Error, recipient: &str) -> StoreError {
         tracing::debug!(
             "keychain error for {recipient}: {err} (OSStatus {})",
             err.code()
         );
         match err.code() {
-            ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED => StoreError::Denied {
+            ERR_SEC_USER_CANCELED => StoreError::Denied {
                 recipient: recipient.to_string(),
             },
+            ERR_SEC_AUTH_FAILED => StoreError::Unavailable(
+                "macOS needs your permission for this item and could not ask".into(),
+            ),
             code => StoreError::Unavailable(format!("{err} (OSStatus {code})")),
         }
     }
@@ -288,17 +307,20 @@ mod macos {
         }
 
         fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError> {
-            // An item that exists is updated by service and account
-            // only, and keeps its name. The library's update reuses the
-            // whole query: with a label in it, an item that carries a
-            // different name is not found and the update fails.
-            let exists = self.list()?.iter().any(|item| item.recipient == recipient);
-            let result = if exists {
-                set_generic_password(SERVICE, recipient, identity.as_bytes())
-            } else {
-                let mut options = PasswordOptions::new_generic_password(SERVICE, recipient);
-                options.set_label(label);
-                set_generic_password_options(identity.as_bytes(), options)
+            // First a labelled write: it adds a new item with its name,
+            // or updates an item that carries this same name.
+            let mut options = PasswordOptions::new_generic_password(SERVICE, recipient);
+            options.set_label(label);
+            let labelled = set_generic_password_options(identity.as_bytes(), options);
+            let result = match labelled {
+                // The item exists under another name. The library's
+                // update reuses the whole query, name included, so it
+                // found nothing. Update by service and account only;
+                // the item keeps the name it has.
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => {
+                    set_generic_password(SERVICE, recipient, identity.as_bytes())
+                }
+                other => other,
             };
             result.map_err(|e| classify(e, recipient))
         }

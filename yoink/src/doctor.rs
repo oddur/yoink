@@ -199,6 +199,7 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
                 &public,
                 &resolved.source,
                 recipients.len(),
+                recipients.contains(&public),
                 file_copy.as_deref(),
                 store.supported(),
             )
@@ -245,6 +246,7 @@ fn identity_findings(
     public: &str,
     source: &sealed::IdentitySource,
     recipient_count: usize,
+    in_recipients: bool,
     file_copy: Option<&std::path::Path>,
     keychain_supported: bool,
 ) -> Vec<Finding> {
@@ -285,6 +287,10 @@ fn identity_findings(
             );
         }
     } else if keychain_supported
+        // The legacy file loads without a recipient match. A key that is
+        // not in `secrets.recipients:` would be stored under a name
+        // yoink never asks for, so the import is not offered.
+        && in_recipients
         && matches!(
             source,
             IdentitySource::KeysDir(_) | IdentitySource::Legacy(_)
@@ -1034,7 +1040,14 @@ mod tests {
 
     #[test]
     fn identity_findings_report_the_source() {
-        let f = identity_findings("age1x", &sealed::IdentitySource::EnvKey, 2, None, true);
+        let f = identity_findings(
+            "age1x",
+            &sealed::IdentitySource::EnvKey,
+            2,
+            true,
+            None,
+            true,
+        );
         assert_eq!(f.len(), 1);
         assert!(
             f[0].detail
@@ -1051,6 +1064,7 @@ mod tests {
             "age1x",
             &sealed::IdentitySource::Keychain,
             2,
+            true,
             Some(path),
             true,
         );
@@ -1065,7 +1079,14 @@ mod tests {
 
     #[test]
     fn identity_findings_warn_on_a_single_keychain_only_recipient() {
-        let f = identity_findings("age1x", &sealed::IdentitySource::Keychain, 1, None, true);
+        let f = identity_findings(
+            "age1x",
+            &sealed::IdentitySource::Keychain,
+            1,
+            true,
+            None,
+            true,
+        );
         assert_eq!(
             titles(&f)[1],
             (
@@ -1074,7 +1095,14 @@ mod tests {
             )
         );
         // A second recipient is the backup: no warning.
-        let f = identity_findings("age1x", &sealed::IdentitySource::Keychain, 2, None, true);
+        let f = identity_findings(
+            "age1x",
+            &sealed::IdentitySource::Keychain,
+            2,
+            true,
+            None,
+            true,
+        );
         assert_eq!(f.len(), 1);
     }
 
@@ -1083,17 +1111,25 @@ mod tests {
     #[test]
     fn identity_findings_hint_at_the_keychain_for_a_key_file_on_macos() {
         let source = sealed::IdentitySource::KeysDir("/tmp/k.key".into());
-        let f = identity_findings("age1x", &source, 1, None, true);
+        let f = identity_findings("age1x", &source, 1, true, None, true);
         assert_eq!(
             titles(&f)[1],
             (Severity::Pass, "the age identity is a plaintext key file")
         );
         assert!(f[1].fix.as_deref().unwrap().contains("import --keychain"));
-        assert_eq!(identity_findings("age1x", &source, 1, None, false).len(), 1);
+        assert_eq!(
+            identity_findings("age1x", &source, 1, true, None, false).len(),
+            1
+        );
+        // A legacy key that is not a recipient of the project: no hint.
+        assert_eq!(
+            identity_findings("age1x", &source, 1, false, None, true).len(),
+            1
+        );
         // `YOINK_AGE_KEY_FILE` outranks the keychain: no hint.
         let env_file = sealed::IdentitySource::EnvFile("/tmp/k.key".into());
         assert_eq!(
-            identity_findings("age1x", &env_file, 1, None, true).len(),
+            identity_findings("age1x", &env_file, 1, true, None, true).len(),
             1
         );
     }

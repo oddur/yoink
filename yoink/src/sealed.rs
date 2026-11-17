@@ -185,6 +185,16 @@ pub fn load_identity(recipients: &[String]) -> Result<x25519::Identity, SealedEr
     resolve_identity(recipients).map(|r| r.identity)
 }
 
+impl SealedError {
+    /// True when the keychain is the cause: it refused, or it could not
+    /// answer and nothing else holds the key. The key probably exists,
+    /// so "generate a key" or "place a key file" is the wrong advice.
+    #[must_use]
+    pub fn is_keychain(&self) -> bool {
+        matches!(self, Self::Keychain(_) | Self::KeychainUnavailable { .. })
+    }
+}
+
 /// Where the resolved identity came from. `yoink doctor` and
 /// `yoink secrets key list` show it.
 #[derive(Debug, Clone, PartialEq, Eq)]

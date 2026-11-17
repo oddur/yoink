@@ -1475,6 +1475,14 @@ impl App {
     /// don't block startup on it — the column shows `?` for the few
     /// seconds the loader takes, then resolves to ✓/⚠ once the
     /// bundle lands.
+    /// Give a failed secrets load a new try: the pane's bundle, and the
+    /// app's own copy that the drift column reads.
+    fn retry_failed_secrets(&mut self) {
+        if self.secrets_state.retry_if_failed() {
+            self.spawn_secrets_loader();
+        }
+    }
+
     fn spawn_secrets_loader(&self) {
         let config = self.config.clone();
         let slot = self.secrets.clone();
@@ -2685,11 +2693,10 @@ impl App {
                 self.schedule_history_refresh(name.clone());
             }
             View::Secrets => {
-                // Decrypt + populate happens lazily on first render
-                // via `ensure_loaded`. Clear any half-finished edit
-                // from a previous visit so the operator starts fresh.
+                // Drop a half-finished edit. Retry a failed load, also
+                // for the app's copy that the drift column reads.
                 self.secrets_state.cancel_edit();
-                self.secrets_state.retry_if_failed();
+                self.retry_failed_secrets();
             }
             View::Resources => {
                 self.schedule_resources_refresh();

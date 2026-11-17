@@ -34,12 +34,12 @@ To decrypt, yoink tries these sources in order and stops at the first match:
 
 yoink finds an item by its service and account. The name is for you: it shows the project in Keychain Access and in `yoink secrets key list --all`. yoink does not search the keychain to decrypt. A command that has no config has no recipients, so it does not read the keychain.
 
-yoink reads the keychain only for a command that needs the identity, and one time at most for each recipient in a run. A command needs the identity when it decrypts `secrets.age`. Examples are `yoink up`, `yoink secrets show`, and `yoink doctor`. `yoink validate` and `yoink proxy-render` decrypt the file when the config has routed services. A config with `address_secret:` or `ssh_key_secret:` on a host needs the identity for each command that connects to that host, for example `yoink status`. `yoink completions` does not read the keychain. TAB completion never opens the prompt: if macOS needs your permission to read the key, completion of host names with `address_secret:` shows no names. `yoink secrets key list` reads names from the keychain, not secrets.
+yoink reads the keychain only for a command that needs the identity, and one time at most for each recipient in a run. A command needs the identity when it decrypts `secrets.age`. Examples are `yoink up`, `yoink secrets show`, and `yoink doctor`. `yoink validate` and `yoink proxy-render` decrypt the file when the config has routed services. A config with `address_secret:` or `ssh_key_secret:` on a host needs the identity for each command that connects to that host, for example `yoink status`. `yoink completions` does not read the keychain. TAB completion never opens the prompt: if macOS needs your permission to read the key, completion of host names with `address_secret:` shows no names. `yoink secrets key list` never opens the prompt. It reads the names of the items, and it reads the key only if macOS permits that without a question.
 
 | Case | Result |
 |---|---|
 | No item for any recipient | yoink continues with the key files. |
-| The keychain is locked, or the session has no GUI (SSH into the Mac) | yoink continues with the key files. If no key file holds the identity, the error names the keychain. |
+| macOS cannot ask for your permission: the session has no GUI (SSH into the Mac), or the keychain is locked | yoink continues with the key files. If no key file holds the identity, the error names the keychain. |
 | You select "Deny" on the system prompt | yoink stops with an error. It does not read the key files. |
 | The same identity is in the keychain and in a key file | yoink uses the keychain. `yoink doctor` shows a warning. |
 

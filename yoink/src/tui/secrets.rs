@@ -150,11 +150,15 @@ impl SecretsState {
     /// gets one new attempt per visit: the keychain may be unlocked
     /// now, or the operator may want to answer the prompt differently.
     /// Not on each render, which would put the prompt up in a loop.
-    pub fn retry_if_failed(&mut self) {
+    /// Returns true when a retry was started, so the app can reload
+    /// its own copy of the bundle too.
+    pub fn retry_if_failed(&mut self) -> bool {
         if matches!(self.bundle, LoadStatus::Failed(_)) {
             crate::keychain::system_store().retry_failures();
             self.bundle = LoadStatus::NotLoaded;
+            return true;
         }
+        false
     }
 
     /// Cancel any in-progress edit. Called on Esc and on view exit.

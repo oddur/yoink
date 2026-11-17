@@ -1360,7 +1360,7 @@ fn log_file_path() -> PathBuf {
 
 #[allow(clippy::too_many_lines)] // one big match dispatch; splitting buys nothing
 async fn run(cli: Cli) -> Result<()> {
-    if let Some(result) = run_bootstrap(&cli.command) {
+    if let Some(result) = run_bootstrap(&cli.command, &cli.config) {
         return result;
     }
 
@@ -1419,8 +1419,10 @@ async fn run(cli: Cli) -> Result<()> {
     ) {
         // Host-name completion reads the addresses, but a TAB press
         // must not open a system dialog: no keychain prompts for it.
-        let _quiet =
+        let quiet =
             matches!(cli.command, Command::Complete { .. }).then(yoink::keychain::no_prompts);
+        // Prompts could not be turned off: do not go near the keychain.
+        let skip = quiet.as_ref().is_some_and(|q| !q.active());
         // `doctor` and `hosts list` exist to show what is wrong, and
         // completion must stay silent: they carry on without the
         // addresses. Every other command stops on a keychain refusal.
@@ -1432,7 +1434,10 @@ async fn run(cli: Cli) -> Result<()> {
                     action: HostsAction::List
                 }
         );
-        resolve_sealed_host_addresses(&mut config, lenient).await?;
+        if !skip {
+            resolve_sealed_host_addresses(&mut config, lenient).await?;
+        }
+        drop(quiet);
     }
 
     match cli.command {
@@ -2799,7 +2804,6 @@ fn check_config_freshness(path: &std::path::Path, require_latest: bool) -> Resul
 }
 
 async fn resolve_sealed_host_addresses(config: &mut Config, lenient: bool) -> Result<()> {
-    use yoink::sealed::SealedError;
     use yoink::secrets::SecretsError;
     if !config.any_host_address_sealed() {
         return Ok(());
@@ -2809,9 +2813,9 @@ async fn resolve_sealed_host_addresses(config: &mut Config, lenient: bool) -> Re
         // The keychain said no, or could not answer and no key file
         // exists. Stop here with that reason: carrying on would fail
         // later with an unrelated connect error on an empty address.
-        Err(SecretsError::NoAgeIdentity(
-            e @ (SealedError::Keychain(_) | SealedError::KeychainUnavailable { .. }),
-        )) if !lenient => return Err(e.into()),
+        Err(SecretsError::NoAgeIdentity(e)) if e.is_keychain() && !lenient => {
+            return Err(e.into());
+        }
         Err(e) => {
             tracing::debug!(
                 error = %e,
@@ -4813,8 +4817,43 @@ fn cmd_complete(config: &Config, what: CompleteKind) {
 /// Subcommands that don't need a `yoink.yaml`. Returns `Some(result)`
 /// to short-circuit `run`'s config-load step, or `None` to fall
 /// through.
-fn run_bootstrap(command: &Command) -> Option<Result<()>> {
+fn run_bootstrap(command: &Command, config_path: &Path) -> Option<Result<()>> {
+    // The keychain commands below do not need a project. They take the
+    // config when it loads (for the recipients and the "this project"
+    // marker) and work without it: a key of a deleted project can be
+    // removed, and a key can be restored before the repo is cloned.
+    let config = || Config::load_from_path(config_path).ok();
     match command {
+        Command::Secrets {
+            action:
+                SecretsAction::Key {
+                    action: KeyAction::Remove { recipient, yes, .. },
+                },
+        } => Some(cmd_secrets_key_remove(recipient, *yes)),
+        Command::Secrets {
+            action:
+                SecretsAction::Key {
+                    action: KeyAction::List { all: true },
+                },
+        } => Some(cmd_secrets_key_list_all(config().as_ref())),
+        // With a path or `-`. Without one, import looks for the key
+        // file of the project, which needs the config.
+        Command::Secrets {
+            action:
+                SecretsAction::Key {
+                    action:
+                        KeyAction::Import {
+                            path: Some(path),
+                            yes,
+                            ..
+                        },
+                },
+        } => Some(cmd_secrets_key_import(
+            config().as_ref(),
+            config_path,
+            Some(path),
+            *yes,
+        )),
         Command::Completions { shell } => {
             cmd_completions(*shell);
             Some(Ok(()))
@@ -4840,7 +4879,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
                         },
                 },
         } => Some(if *keychain {
-            cmd_secrets_key_generate_keychain()
+            cmd_secrets_key_generate_keychain(config_path)
         } else {
             cmd_secrets_key_generate(out.clone(), *force, *print)
         }),
@@ -5112,20 +5151,23 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
                 keychain,
             } => {
                 if keychain {
-                    cmd_secrets_key_generate_keychain()
+                    cmd_secrets_key_generate_keychain(Path::new("."))
                 } else {
                     cmd_secrets_key_generate(out, force, print)
                 }
             }
             KeyAction::Public => cmd_secrets_key_public(config),
-            KeyAction::Import { path, yes, .. } => {
-                cmd_secrets_key_import(config, path.as_deref(), yes)
-            }
+            KeyAction::Import { path, yes, .. } => cmd_secrets_key_import(
+                Some(config),
+                config.config_dir.as_deref().unwrap_or(Path::new(".")),
+                path.as_deref(),
+                yes,
+            ),
             KeyAction::Export { out, force, .. } => {
                 cmd_secrets_key_export(config, out.as_deref(), force)
             }
             KeyAction::List { all: false } => cmd_secrets_key_list(config),
-            KeyAction::List { all: true } => cmd_secrets_key_list_all(config),
+            KeyAction::List { all: true } => cmd_secrets_key_list_all(Some(config)),
             KeyAction::Remove { recipient, yes, .. } => cmd_secrets_key_remove(&recipient, yes),
         },
         SecretsAction::Edit => cmd_secrets_edit(config),
@@ -5202,7 +5244,7 @@ fn cmd_secrets_ssh_key_public(config: &Config, name: &str) -> Result<()> {
 }
 
 fn cmd_secrets_key_public(config: &Config) -> Result<()> {
-    use yoink::sealed::{self, SealedError};
+    use yoink::sealed;
     // Recipients from the config let the keychain lookup and the
     // keys-dir scan pick the identity for *this* project, not whichever
     // happened to load first.
@@ -5210,9 +5252,7 @@ fn cmd_secrets_key_public(config: &Config) -> Result<()> {
         Ok(identity) => identity,
         // A refusal on the keychain prompt is its own error; "no
         // identity found" would point at the wrong fix.
-        Err(e @ (SealedError::Keychain(_) | SealedError::KeychainUnavailable { .. })) => {
-            return Err(e.into());
-        }
+        Err(e) if e.is_keychain() => return Err(e.into()),
         Err(e) => {
             return Err(anyhow::Error::new(e).context(
                 "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, \
@@ -5258,7 +5298,7 @@ fn warn_keychain_only(recipients: &[String], public: &str) {
     eprintln!("  • or keep a copy: `yoink secrets key export --keychain` into a password manager");
 }
 
-fn cmd_secrets_key_generate_keychain() -> Result<()> {
+fn cmd_secrets_key_generate_keychain(config_path: &Path) -> Result<()> {
     use yoink::sealed;
     let store = require_keychain()?;
     // A fresh identity has a fresh recipient, so no item can exist yet.
@@ -5266,7 +5306,7 @@ fn cmd_secrets_key_generate_keychain() -> Result<()> {
     store.set(
         &public,
         secret.as_str(),
-        &yoink::keychain::label_for(&project_name(None)),
+        &yoink::keychain::label_for(&project_name(config_path)),
     )?;
     eprintln!(
         "stored identity in the keychain (service {})",
@@ -5286,13 +5326,18 @@ fn cmd_secrets_key_generate_keychain() -> Result<()> {
     Ok(())
 }
 
-fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Result<()> {
+fn cmd_secrets_key_import(
+    config: Option<&Config>,
+    config_path: &Path,
+    path: Option<&str>,
+    yes: bool,
+) -> Result<()> {
     use std::io::Read as _;
     use yoink::prompt::{ConfirmKind, confirm};
     use yoink::sealed;
 
     let store = require_keychain()?;
-    let recipients = age_recipients(config);
+    let recipients = config.map_or(&[][..], age_recipients);
 
     let read_file = |p: &Path| -> Result<zeroize::Zeroizing<String>> {
         Ok(zeroize::Zeroizing::new(
@@ -5333,7 +5378,7 @@ fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Res
     store.set(
         &public,
         secret.as_str(),
-        &yoink::keychain::label_for(&project_name(Some(config))),
+        &yoink::keychain::label_for(&project_name(config_path)),
     )?;
     // Read back before anything is deleted.
     // `get_fresh`: the cache holds the value that was just written, so
@@ -5436,13 +5481,16 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> R
 }
 
 /// The project a key belongs to, for the keychain item name: the name
-/// of the folder that holds the config, or of the current folder when
-/// no config is loaded (`key generate` runs before one exists).
-fn project_name(config: Option<&Config>) -> String {
-    let dir = config
-        .and_then(|c| c.config_dir.clone())
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or_else(|| PathBuf::from("."));
+/// of the folder that holds the config. `path` is the config file
+/// (`-c`, also when it does not exist yet) or its folder.
+fn project_name(path: &Path) -> String {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    };
     std::fs::canonicalize(&dir)
         .ok()
         .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -5450,9 +5498,9 @@ fn project_name(config: Option<&Config>) -> String {
 }
 
 /// `yoink secrets key list --all`: every yoink key on this machine.
-fn cmd_secrets_key_list_all(config: &Config) -> Result<()> {
+fn cmd_secrets_key_list_all(config: Option<&Config>) -> Result<()> {
     use yoink::sealed;
-    let recipients = age_recipients(config);
+    let recipients = config.map_or(&[][..], age_recipients);
     let here = |public: &str| {
         if recipients.iter().any(|r| r == public) {
             "  (this project)"
@@ -5601,8 +5649,19 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
         eprintln!("no identity found for this project");
         return Ok(());
     }
-    // The star follows the real resolution, not the row order.
-    let resolved = sealed::resolve_identity(recipients);
+    // The star follows the real resolution, not the row order. Prompts
+    // are off for it: this list must never open a keychain dialog. An
+    // item that needs permission then counts as "not available", and
+    // the message below says so.
+    let quiet = yoink::keychain::no_prompts();
+    let resolved = if quiet.active() {
+        sealed::resolve_identity(recipients)
+    } else {
+        Err(sealed::SealedError::KeychainUnavailable {
+            reason: "prompts could not be turned off, so the keychain was not read".into(),
+        })
+    };
+    drop(quiet);
     let used = resolved
         .as_ref()
         .ok()
@@ -5624,6 +5683,12 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
     eprintln!();
     match resolved {
         Ok(_) => eprintln!("* = the identity yoink uses"),
+        // Prompts were off for this list, so an item that needs your
+        // permission could not be read. That is not a lost key.
+        Err(sealed::SealedError::KeychainUnavailable { reason }) => eprintln!(
+            "the keychain item was not read ({reason}). A command that uses the key, \
+             for example `yoink secrets show`, asks for permission."
+        ),
         Err(e) => eprintln!("yoink cannot load an identity: {e}"),
     }
     Ok(())

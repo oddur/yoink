@@ -116,7 +116,7 @@ To restore the key on a new Mac:
 op document get "yoink age key (my-project)" | yoink secrets key import --keychain -
 ```
 
-With `-`, yoink reads the identity from stdin and writes no file.
+With `-`, yoink reads the identity from stdin and writes no file. This command also operates before you clone the project.
 
 ### Without the `op` CLI
 
@@ -145,6 +145,8 @@ The name of a keychain item is the directory of the project at the time of the i
 A key of a project that you deleted stays in the list. Remove it with the command in the next section.
 
 ## Remove a key from the keychain
+
+You can run this command in any directory. A project is not necessary.
 
 ```sh
 yoink secrets key remove --keychain age1qz…
