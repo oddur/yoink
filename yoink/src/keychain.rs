@@ -191,16 +191,19 @@ mod macos {
     /// A refusal on the access prompt stops identity resolution; every
     /// other failure lets it continue with the key files.
     ///
-    /// Two codes count as a refusal. `errSecAuthFailed` is what the
-    /// legacy keychain is documented to return when the user selects
-    /// "Deny", and `errSecUserCanceled` is a cancelled password dialog.
-    /// A locked keychain with no GUI session (SSH into the Mac) returns
-    /// `errSecInteractionNotAllowed`, which is not a refusal.
-    ///
-    /// The mapping is from Apple's documentation, not from a test of
-    /// each code. The wrong direction to err in is the silent one: if a
-    /// refusal were classed as "not available", yoink would read the
-    /// key file after the user said no. So an auth failure stops.
+    /// - `errSecUserCanceled` (-128) is what macOS returns for "Deny" on
+    ///   the access prompt. Observed on macOS with an ad-hoc signed
+    ///   binary; yoink then stopped and did not read a key file that
+    ///   held the same identity.
+    /// - `errSecAuthFailed` (-25293) is not observed. It follows a
+    ///   failed password entry in the prompt, so it is treated as a
+    ///   refusal too. The wrong direction to err in is the silent one:
+    ///   classed as "not available", yoink would read the key file
+    ///   after the user did not grant access.
+    /// - Everything else means the store cannot answer, for example
+    ///   `errSecInteractionNotAllowed` for a locked keychain with no
+    ///   GUI session (SSH into the Mac). That case is not observed
+    ///   either.
     fn classify(err: Error, recipient: &str) -> StoreError {
         tracing::debug!(
             "keychain error for {recipient}: {err} (OSStatus {})",
