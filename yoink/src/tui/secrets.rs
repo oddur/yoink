@@ -672,8 +672,22 @@ fn load(config: &Config) -> LoadStatus {
                 Ok(p) => p,
                 Err(e) => return LoadStatus::Failed(e.to_string()),
             };
+            // The TUI lives long: give a refusal, a locked keychain or
+            // a key that arrived from another terminal a new chance on
+            // each reload of the pane.
+            crate::keychain::system_store().retry_failures();
             let identity = match sealed::load_identity(recipients) {
                 Ok(id) => id,
+                // The key exists but the keychain did not hand it out.
+                // A new key would not decrypt secrets.age.
+                Err(
+                    e @ (sealed::SealedError::Keychain(_)
+                    | sealed::SealedError::KeychainUnavailable { .. }),
+                ) => {
+                    return LoadStatus::Failed(format!(
+                        "cannot read secrets: {e}\n\nAllow yoink in the keychain prompt or unlock the keychain, then reload this pane."
+                    ));
+                }
                 Err(e) => {
                     return LoadStatus::Failed(format!(
                         "cannot read secrets: {e}\n\nFix locally with: yoink secrets key generate"

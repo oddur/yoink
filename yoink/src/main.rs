@@ -1023,7 +1023,7 @@ enum KeyAction {
         force: bool,
     },
     /// List the identities yoink finds for this project, with the
-    /// source of each one. The first row is the one yoink uses.
+    /// source of each one. A `*` marks the one yoink uses.
     List,
     /// macOS: delete an identity from the login keychain.
     Remove {
@@ -1402,6 +1402,14 @@ async fn run(cli: Cli) -> Result<()> {
             | Command::ProxyRender
             | Command::ProxyDockerfile
             | Command::Secrets { .. }
+            // TAB completion of a service name or a config path runs on
+            // every keypress; only host completion needs the addresses.
+            | Command::Complete {
+                what: CompleteKind::Services | CompleteKind::Configs
+            }
+            | Command::Hosts {
+                action: HostsAction::Add { .. } | HostsAction::Remove { .. }
+            }
     ) {
         resolve_sealed_host_addresses(&mut config).await?;
     }
@@ -2770,11 +2778,19 @@ fn check_config_freshness(path: &std::path::Path, require_latest: bool) -> Resul
 }
 
 async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
+    use yoink::sealed::SealedError;
+    use yoink::secrets::SecretsError;
     if !config.any_host_address_sealed() {
         return Ok(());
     }
     let bundle = match secrets::load_bundle(config).await {
         Ok(b) => b,
+        // The keychain said no, or could not answer and no key file
+        // exists. Stop here with that reason: carrying on would fail
+        // later with an unrelated connect error on an empty address.
+        Err(SecretsError::NoAgeIdentity(
+            e @ (SealedError::Keychain(_) | SealedError::KeychainUnavailable { .. }),
+        )) => return Err(e.into()),
         Err(e) => {
             tracing::debug!(
                 error = %e,
@@ -5305,11 +5321,13 @@ fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Res
         );
     }
 
-    // True while a plaintext copy of this identity is still on disk.
-    let mut on_disk = false;
+    // True while another copy of this identity exists: a key file that
+    // stays on disk, or the place that stdin was piped from (the
+    // documented restore from a password manager).
+    let mut other_copy = file.is_none();
     if let Some(p) = file {
         if extra_identities > 0 {
-            on_disk = true;
+            other_copy = true;
             eprintln!(
                 "kept {}: it holds {extra_identities} more identity line(s), and only the first \
                  was imported",
@@ -5325,14 +5343,14 @@ fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Res
             std::fs::remove_file(&p).with_context(|| format!("delete {}", p.display()))?;
             eprintln!("deleted {}", p.display());
         } else {
-            on_disk = true;
+            other_copy = true;
             eprintln!(
                 "kept {} — the key is still on disk in plaintext",
                 p.display()
             );
         }
     }
-    if !on_disk {
+    if !other_copy {
         warn_keychain_only(recipients, &public);
     }
     Ok(())
@@ -5523,14 +5541,17 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
     }
     // The star follows the real resolution, not the row order.
     let resolved = sealed::resolve_identity(recipients);
-    let used = resolved.as_ref().ok().map(|r| &r.source);
+    let used = resolved
+        .as_ref()
+        .ok()
+        .map(|r| (&r.source, r.identity.to_public().to_string()));
     let width = rows.iter().map(|r| r.label.len()).max().unwrap_or(0);
     for row in &rows {
-        let star = if row.source.is_some() && row.source.as_ref() == used {
-            "*"
-        } else {
-            " "
-        };
+        // Source and recipient: two keychain rows share one source.
+        let is_used = used.as_ref().is_some_and(|(source, recipient)| {
+            row.source.as_ref() == Some(*source) && row.recipient == *recipient
+        });
+        let star = if is_used { "*" } else { " " };
         let note = if row.note.is_empty() {
             String::new()
         } else {

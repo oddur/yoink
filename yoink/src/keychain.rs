@@ -49,6 +49,12 @@ pub trait IdentityStore: Send + Sync {
     fn get_fresh(&self, recipient: &str) -> Result<Option<Zeroizing<String>>, StoreError> {
         self.get(recipient)
     }
+    /// Forget every lookup that did not return an identity, so the next
+    /// `get` asks the store again. A long-running session (the TUI)
+    /// calls it before a reload: a "Deny", a locked keychain or a key
+    /// that was imported in another terminal must not stick for the
+    /// life of the process.
+    fn retry_failures(&self) {}
     /// Create or replace the item for `recipient`.
     fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError>;
     /// Remove the item. `false` when there was none.
@@ -123,6 +129,10 @@ impl<S: IdentityStore> IdentityStore for Cached<S> {
         seen.insert(recipient.to_string(), result.clone());
         result
     }
+    fn retry_failures(&self) {
+        self.seen()
+            .retain(|_, lookup| matches!(lookup, Ok(Some(_))));
+    }
     fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError> {
         self.inner.set(recipient, identity)?;
         self.seen().insert(
@@ -173,18 +183,31 @@ mod macos {
     // OSStatus values from <Security/SecBase.h>.
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
     const ERR_SEC_USER_CANCELED: i32 = -128;
+    const ERR_SEC_AUTH_FAILED: i32 = -25293;
 
     #[derive(Default)]
     pub struct Keychain;
 
-    /// Only an explicit "Deny" on the prompt (`errSecUserCanceled`) is
-    /// a refusal. Every other code means the store cannot answer:
-    /// a locked keychain, no GUI session, no keychain. That includes
-    /// `errSecAuthFailed`, which macOS can return with no prompt shown,
-    /// so it must not block the fall-through to the key files.
+    /// A refusal on the access prompt stops identity resolution; every
+    /// other failure lets it continue with the key files.
+    ///
+    /// Two codes count as a refusal. `errSecAuthFailed` is what the
+    /// legacy keychain is documented to return when the user selects
+    /// "Deny", and `errSecUserCanceled` is a cancelled password dialog.
+    /// A locked keychain with no GUI session (SSH into the Mac) returns
+    /// `errSecInteractionNotAllowed`, which is not a refusal.
+    ///
+    /// The mapping is from Apple's documentation, not from a test of
+    /// each code. The wrong direction to err in is the silent one: if a
+    /// refusal were classed as "not available", yoink would read the
+    /// key file after the user said no. So an auth failure stops.
     fn classify(err: Error, recipient: &str) -> StoreError {
+        tracing::debug!(
+            "keychain error for {recipient}: {err} (OSStatus {})",
+            err.code()
+        );
         match err.code() {
-            ERR_SEC_USER_CANCELED => StoreError::Denied {
+            ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED => StoreError::Denied {
                 recipient: recipient.to_string(),
             },
             code => StoreError::Unavailable(format!("{err} (OSStatus {code})")),
@@ -366,6 +389,30 @@ mod tests {
             assert!(matches!(store.get("age1a"), Err(StoreError::Denied { .. })));
         }
         assert_eq!(store.inner.reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// The TUI lives long. A refusal or a missing item must be
+    /// retryable there, while a key that was read stays cached.
+    #[test]
+    fn retry_failures_forgets_everything_but_identities() {
+        let store = Cached::new(Counting {
+            inner: FakeStore::with("age1a", "secret-a"),
+            ..Counting::default()
+        });
+        store.get("age1a").unwrap();
+        assert!(store.get("age1b").unwrap().is_none());
+        // The key for age1b arrives from another terminal.
+        store.inner.inner.set("age1b", "secret-b").unwrap();
+        assert!(
+            store.get("age1b").unwrap().is_none(),
+            "still the cached miss"
+        );
+
+        store.retry_failures();
+        assert_eq!(store.get("age1b").unwrap().unwrap().as_str(), "secret-b");
+        store.get("age1a").unwrap();
+        // age1a once, age1b twice.
+        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 3);
     }
 
     #[test]

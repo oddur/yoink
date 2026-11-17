@@ -338,7 +338,10 @@ pub fn keychain_identity(
     let mut lookup = KeychainLookup::default();
     for recipient in recipients {
         match store.get(recipient) {
-            Ok(Some(raw)) => match parse_identity(&raw) {
+            // `parse_identity_text`: the same parser as `key list` and
+            // `key export`, so the three agree about one item. It also
+            // accepts an item made by hand from a key file with comments.
+            Ok(Some(raw)) => match parse_identity_text(&raw) {
                 Ok(identity) if identity.to_public().to_string() == *recipient => {
                     lookup.identity = Some(identity);
                     return Ok(lookup);
@@ -1314,6 +1317,19 @@ BAZ=plain
             matches!(&err, SealedError::KeychainUnavailable { reason } if reason == "locked"),
             "{err}"
         );
+    }
+
+    /// An item made by hand from a key file carries comment lines.
+    /// Resolution accepts it, as `key list` and `key export` do.
+    #[test]
+    fn keychain_item_with_comment_lines_is_accepted() {
+        let (secret, public) = keygen();
+        let store = FakeStore::with(
+            &public,
+            &format!("# public key: {public}\n{}\n", secret.as_str()),
+        );
+        let found = keychain_identity(&store, std::slice::from_ref(&public)).unwrap();
+        assert_eq!(found.identity.unwrap().to_public().to_string(), public);
     }
 
     /// A broken item for one recipient must not hide a good item for

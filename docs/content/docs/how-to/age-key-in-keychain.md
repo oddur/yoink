@@ -40,7 +40,7 @@ yoink secrets key list
 * keychain  age1qz…
 ```
 
-The first row is the identity that yoink uses. If a `file` row shows the same recipient, the key is still on disk. Delete that file.
+The row with `*` is the identity that yoink uses. If a `file` row shows the same recipient, the key is still on disk. Delete that file.
 
 ### Keep a backup [step]
 
