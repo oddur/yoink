@@ -164,7 +164,7 @@ yoink asks for a confirmation. Make sure that you have a backup before you remov
 
 **`access to the keychain item … was denied`.** You selected "Deny" on the system prompt. yoink does not continue with a key file after a refusal. Run the command again and allow access, or set `YOINK_AGE_KEY`.
 
-**yoink says that the keychain does not work over SSH.** In an SSH session into the Mac, macOS does not unlock the login keychain and cannot show its prompt. yoink does not read the keychain there. Set `YOINK_AGE_KEY` for that session, for example from your password manager, or run the command on the Mac itself. The `--keychain` commands also do not operate in an SSH session.
+**yoink says that the keychain does not work in an SSH session.** In an SSH session into the Mac, macOS cannot show its prompt, so yoink does not ask. Set `YOINK_AGE_KEY` for that session, for example from your password manager, or run the command on the Mac itself. yoink finds an SSH session from the `SSH_CONNECTION`, `SSH_TTY`, and `SSH_CLIENT` variables. A tmux session that you started through SSH keeps them. The keychain continues to operate there if you selected "Always Allow" for yoink before.
 
 **`yoink doctor` shows "the age identity is in the keychain and in a key file".** Delete the key file. yoink reads the keychain copy.
 

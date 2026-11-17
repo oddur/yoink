@@ -201,7 +201,9 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
                 recipients.len(),
                 recipients.contains(&public),
                 file_copy.as_deref(),
-                store.supported(),
+                // Over SSH the import hint would point at a command that
+                // cannot ask for the permission it needs.
+                store.supported() && !crate::keychain::in_ssh_session(),
             )
         }
         // A refusal on the keychain prompt stops before the key files
@@ -220,7 +222,7 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
                 "the keychain could not be read, and no key file holds the identity",
             )
             .with_detail(e.to_string())
-            .with_fix("set YOINK_AGE_KEY for this session, or run yoink on the Mac itself"),
+            .with_fix(crate::keychain::advice()),
         ],
         Err(e) => vec![
             Finding::error(

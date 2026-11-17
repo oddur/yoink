@@ -30,10 +30,11 @@ pub enum StoreError {
          keychain prompt, or set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE"
     )]
     Denied { recipient: String },
-    /// The store cannot answer: locked keychain, no GUI session (SSH
-    /// into the Mac), or a platform without a store. Identity
-    /// resolution continues with the key files.
-    #[error("the keychain is not available: {0}")]
+    /// The store cannot answer: a locked keychain, an item that needs a
+    /// permission macOS cannot ask for (prompts are off in an SSH
+    /// session), or a platform without a store. Identity resolution
+    /// continues with the key files.
+    #[error("the keychain is not available: {0}{note}", note = ssh_note())]
     Unavailable(String),
 }
 
@@ -74,8 +75,7 @@ pub trait IdentityStore: Send + Sync {
 
 /// Held while yoink must not put up a keychain prompt. See [`no_prompts`].
 pub struct NoPrompts {
-    #[cfg(target_os = "macos")]
-    lock: Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+    active: bool,
 }
 
 impl NoPrompts {
@@ -83,28 +83,61 @@ impl NoPrompts {
     /// stay away from the keychain: a read can still open a dialog.
     #[must_use]
     pub fn active(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.lock.is_some()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // No store, so no prompt to turn off.
-            true
-        }
+        self.active
     }
 }
+
+/// How many [`NoPrompts`] values are alive, and the lock they share.
+/// Guards nest (a whole run over SSH, plus `key list` inside it); only
+/// the last one to go turns prompts back on.
+#[cfg(target_os = "macos")]
+static QUIET: std::sync::Mutex<(
+    usize,
+    Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+)> = std::sync::Mutex::new((0, None));
 
 /// Turn keychain prompts off until the returned value is dropped. A
 /// read that would prompt fails instead, and identity resolution
 /// treats that as "the keychain cannot answer".
 ///
-/// For shell completion: a TAB press must never open a system dialog.
+/// Used where a system dialog must never open: shell completion, the
+/// key list, and every command in an SSH session.
 #[must_use]
 pub fn no_prompts() -> NoPrompts {
-    NoPrompts {
+    #[cfg(target_os = "macos")]
+    {
+        use security_framework::os::macos::keychain::SecKeychain;
+        let mut quiet = QUIET
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if quiet.0 == 0 {
+            quiet.1 = SecKeychain::disable_user_interaction().ok();
+        }
+        let active = quiet.1.is_some();
+        if active {
+            quiet.0 += 1;
+        }
+        NoPrompts { active }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No store, so no prompt to turn off.
+        NoPrompts { active: true }
+    }
+}
+
+impl Drop for NoPrompts {
+    fn drop(&mut self) {
         #[cfg(target_os = "macos")]
-        lock: security_framework::os::macos::keychain::SecKeychain::disable_user_interaction().ok(),
+        if self.active {
+            let mut quiet = QUIET
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            quiet.0 = quiet.0.saturating_sub(1);
+            if quiet.0 == 0 {
+                quiet.1 = None;
+            }
+        }
     }
 }
 
@@ -123,9 +156,16 @@ pub fn system_store() -> &'static dyn IdentityStore {
     }
 }
 
-/// True in an SSH session. macOS does not unlock the login keychain
-/// for one, and it cannot show the access prompt there, so yoink does
-/// not use the keychain over SSH and says so.
+/// True when the environment says this is an SSH session.
+///
+/// macOS cannot show the keychain prompt in one. yoink therefore turns
+/// prompts off for the whole run (see `run` in main.rs) and still
+/// tries the keychain: a read that needs no question works, and one
+/// that does fails at once instead of waiting on a dialog nobody sees.
+///
+/// The variables can be stale, for example in a tmux session that was
+/// started over SSH and is used at the Mac later. That is why this is
+/// a reason to stay quiet, and not a reason to refuse.
 #[must_use]
 pub fn in_ssh_session() -> bool {
     ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"]
@@ -133,13 +173,33 @@ pub fn in_ssh_session() -> bool {
         .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
 }
 
-/// What yoink says when the keychain is asked for in an SSH session.
-pub const SSH_SESSION_REASON: &str =
-    "this is an SSH session, and the macOS keychain does not work over SSH";
+fn ssh_note() -> &'static str {
+    if in_ssh_session() {
+        " (this looks like an SSH session, where the macOS keychain does not work)"
+    } else {
+        ""
+    }
+}
+
+/// What to do when the keychain did not hand out the key.
+#[must_use]
+pub fn advice() -> &'static str {
+    advice_for(in_ssh_session())
+}
+
+fn advice_for(in_ssh_session: bool) -> &'static str {
+    if in_ssh_session {
+        "This looks like an SSH session, where macOS cannot ask for permission, so the \
+         keychain does not work here. Set YOINK_AGE_KEY or YOINK_AGE_KEY_FILE for this \
+         session, or run yoink on the Mac itself."
+    } else {
+        "If the key is in the keychain, unlock the keychain and allow yoink. Otherwise set \
+         YOINK_AGE_KEY or YOINK_AGE_KEY_FILE, or create a key with `yoink secrets key generate`."
+    }
+}
 
 /// A store that holds nothing. Used on platforms without a keychain,
 /// and by callers that must not touch the real one.
-#[derive(Default)]
 pub struct NoStore;
 
 impl IdentityStore for NoStore {
@@ -177,7 +237,6 @@ mod macos {
     const ERR_SEC_USER_CANCELED: i32 = -128;
     const ERR_SEC_AUTH_FAILED: i32 = -25293;
 
-    #[derive(Default)]
     pub struct Keychain;
 
     /// A refusal on the access prompt stops identity resolution; every
@@ -192,8 +251,9 @@ mod macos {
     /// - `errSecAuthFailed` (-25293): macOS needed the user's permission
     ///   and could not ask, because prompts were turned off
     ///   ([`super::no_prompts`]). Nobody refused, so this is "cannot
-    ///   answer". A session with no GUI (SSH into the Mac) is the same
-    ///   situation, which is why it must fall through to the key files.
+    ///   answer", and resolution falls through to the key files. yoink
+    ///   turns prompts off in an SSH session, so this is the code an
+    ///   SSH session gets for an item that needs a question.
     ///
     /// Every other code also means the store cannot answer.
     fn classify(err: Error, recipient: &str) -> StoreError {
@@ -363,5 +423,31 @@ pub(crate) mod fake {
                 })
                 .collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advice_names_ssh_only_in_an_ssh_session() {
+        assert!(advice_for(true).contains("SSH session"));
+        assert!(advice_for(true).contains("YOINK_AGE_KEY"));
+        assert!(!advice_for(false).contains("SSH"));
+        assert!(advice_for(false).contains("unlock the keychain"));
+    }
+
+    /// Guards nest: a whole run over SSH holds one, and `key list` takes
+    /// a second. The inner one must not turn prompts back on.
+    #[test]
+    fn no_prompts_guards_nest() {
+        let outer = no_prompts();
+        let inner = no_prompts();
+        assert_eq!(outer.active(), inner.active());
+        drop(inner);
+        // Still usable after the inner guard is gone.
+        let again = no_prompts();
+        assert_eq!(outer.active(), again.active());
     }
 }

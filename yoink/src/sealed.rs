@@ -59,9 +59,9 @@ pub enum SealedError {
     #[error(transparent)]
     Keychain(#[from] crate::keychain::StoreError),
     #[error(
-        "the key for this config is in the macOS keychain, and yoink could not use it \
-         ({reason}). No key file holds the key either. Set {AGE_KEY_ENV} or \
-         {AGE_KEY_FILE_ENV} for this session"
+        "the keychain could not be read ({reason}), and no key file holds an identity for \
+         this config's recipients. {}",
+        crate::keychain::advice()
     )]
     KeychainUnavailable { reason: String },
     #[error("parse age recipient {raw:?}: {reason}")]
@@ -235,65 +235,69 @@ pub fn resolve_identity(recipients: &[String]) -> Result<ResolvedIdentity, Seale
     resolve_identity_core(
         env::var(AGE_KEY_ENV).ok(),
         env::var(AGE_KEY_FILE_ENV).ok(),
-        &mut keychain_lookup,
+        keychain_lookup,
         &keys_dir()?,
         &legacy_identity_path()?,
         recipients,
     )
 }
 
-/// The keychain's answer for `recipients`, remembered for the run.
+/// The keychain's answer for `recipients`. What the keychain said about
+/// each recipient is remembered for the run.
 ///
 /// One command resolves the identity more than once (sealed host
 /// addresses, the deploy, per-host ssh keys). Each keychain read can be
 /// a system prompt when access was allowed once and not always, so the
-/// answer is kept: one read, and no second prompt after "Deny".
+/// answer is kept: one read per recipient, and no second prompt after
+/// "Deny", also when the list of recipients changes (the TUI reloads
+/// the config).
 ///
-/// The memo lives here and not in the store, so the store stays a plain
-/// "get, set, delete, list". The commands that write the keychain
-/// (`import`, `remove`) use the store directly and never see the memo.
+/// The memory lives here and not in the store, so the store stays a
+/// plain "get, set, delete, list". The commands that write the keychain
+/// (`import`, `remove`) use the store directly and never see it.
 pub fn keychain_lookup(recipients: &[String]) -> KeychainAnswer {
-    KEYCHAIN_MEMO.lookup(recipients, || {
-        keychain_identity_in(
-            crate::keychain::system_store(),
-            recipients,
-            crate::keychain::in_ssh_session(),
-        )
-    })
+    keychain_identity(
+        &Remembered {
+            memo: &KEYCHAIN_MEMO,
+            store: crate::keychain::system_store(),
+        },
+        recipients,
+    )
 }
 
-/// Forget every remembered answer that did not produce an identity, so
-/// the next lookup asks the keychain again. A long session (the TUI)
-/// calls it when the operator reopens a failed pane. Returns true when
-/// a refusal or an unread item was forgotten: only then can a retry
-/// give another answer.
+/// Forget every remembered answer that is not an identity, so the next
+/// lookup asks the keychain again. A long session (the TUI) calls it
+/// when the operator reopens a failed pane. Returns true when an error
+/// was forgotten: only then can a retry give another answer.
 #[must_use]
 pub fn forget_keychain_failures() -> bool {
     KEYCHAIN_MEMO.forget_failures()
 }
 
-/// What the keychain said: a lookup, or a refusal.
+/// What the keychain said about a list of recipients: a lookup, or a
+/// refusal.
 pub type KeychainAnswer = Result<KeychainLookup, crate::keychain::StoreError>;
+
+/// What the keychain said about one recipient.
+type KeychainItem = Result<Option<Zeroizing<String>>, crate::keychain::StoreError>;
 
 static KEYCHAIN_MEMO: KeychainMemo = KeychainMemo::new();
 
-/// Remembers one [`KeychainAnswer`] per list of recipients.
+/// Remembers one [`KeychainItem`] per recipient.
 struct KeychainMemo {
-    answers: std::sync::Mutex<std::collections::BTreeMap<Vec<String>, KeychainAnswer>>,
+    items: std::sync::Mutex<std::collections::BTreeMap<String, KeychainItem>>,
 }
 
 impl KeychainMemo {
     const fn new() -> Self {
         Self {
-            answers: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            items: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
-    fn answers(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<Vec<String>, KeychainAnswer>> {
+    fn items(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, KeychainItem>> {
         // A poisoned lock still holds a usable map.
-        self.answers
+        self.items
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -301,42 +305,60 @@ impl KeychainMemo {
     /// The remembered answer, or `ask()` on the first call. The lock is
     /// held across `ask`: two lookups at once must not put up two
     /// keychain prompts.
-    fn lookup(
-        &self,
-        recipients: &[String],
-        ask: impl FnOnce() -> KeychainAnswer,
-    ) -> KeychainAnswer {
-        let mut answers = self.answers();
-        if let Some(known) = answers.get(recipients) {
+    fn get(&self, recipient: &str, ask: impl FnOnce() -> KeychainItem) -> KeychainItem {
+        let mut items = self.items();
+        if let Some(known) = items.get(recipient) {
             return known.clone();
         }
+        tracing::debug!("keychain read for {recipient}");
         let answer = ask();
-        answers.insert(recipients.to_vec(), answer.clone());
+        items.insert(recipient.to_string(), answer.clone());
         answer
     }
 
     fn forget_failures(&self) -> bool {
-        let mut answers = self.answers();
-        // "No item" is not a failure: a teammate's recipient has no item
-        // here, and on Linux nothing has. It is forgotten too, because
-        // the key can arrive from another terminal, but it is no reason
-        // to retry.
-        let failed = |answer: &KeychainAnswer| match answer {
-            Err(_) => true,
-            Ok(lookup) => lookup.identity.is_none() && lookup.unavailable.is_some(),
-        };
-        let had_failure = answers.values().any(failed);
-        answers.retain(|_, answer| matches!(answer, Ok(lookup) if lookup.identity.is_some()));
-        had_failure
+        let mut items = self.items();
+        // "No item" is forgotten too, because the key can arrive from
+        // another terminal. It is no reason to retry: a teammate's
+        // recipient has no item here, and on Linux nothing has.
+        let had_error = items.values().any(Result::is_err);
+        items.retain(|_, item| matches!(item, Ok(Some(_))));
+        had_error
     }
 }
 
-/// Pure resolution logic — env values, the store and paths are passed
-/// in instead of being read from process state.
+/// A store that answers `get` from the memo first.
+struct Remembered<'a> {
+    memo: &'a KeychainMemo,
+    store: &'a dyn crate::keychain::IdentityStore,
+}
+
+impl crate::keychain::IdentityStore for Remembered<'_> {
+    fn supported(&self) -> bool {
+        self.store.supported()
+    }
+    fn get(&self, recipient: &str) -> KeychainItem {
+        self.memo.get(recipient, || self.store.get(recipient))
+    }
+    fn set(
+        &self,
+        recipient: &str,
+        identity: &str,
+        label: &str,
+    ) -> Result<(), crate::keychain::StoreError> {
+        self.store.set(recipient, identity, label)
+    }
+    fn delete(&self, recipient: &str) -> Result<bool, crate::keychain::StoreError> {
+        self.store.delete(recipient)
+    }
+}
+
+/// Pure resolution logic — env values, the keychain lookup and paths
+/// are passed in instead of being read from process state.
 fn resolve_identity_core(
     env_key: Option<String>,
     env_file: Option<String>,
-    keychain: &mut dyn FnMut(&[String]) -> KeychainAnswer,
+    keychain: impl FnOnce(&[String]) -> KeychainAnswer,
     keys_dir: &Path,
     legacy_path: &Path,
     recipients: &[String],
@@ -405,9 +427,9 @@ fn resolve_identity_core(
 #[derive(Default, Clone)]
 pub struct KeychainLookup {
     pub identity: Option<x25519::Identity>,
-    /// Set when the store could not answer: an SSH session, a locked
-    /// keychain, an item that needs a permission macOS cannot ask for.
-    /// Resolution continues with the key files.
+    /// Set when the store could not answer: a locked keychain, or an
+    /// item that needs a permission macOS cannot ask for (prompts are
+    /// off in an SSH session). Resolution continues with the key files.
     pub unavailable: Option<String>,
     /// Items that exist but do not hold the identity of their
     /// recipient: `(recipient, why)`. Resolution skips them; `key
@@ -427,32 +449,9 @@ pub fn keychain_identity(
     store: &dyn crate::keychain::IdentityStore,
     recipients: &[String],
 ) -> Result<KeychainLookup, crate::keychain::StoreError> {
-    keychain_identity_in(store, recipients, false)
-}
-
-/// [`keychain_identity`], with the SSH case. In an SSH session yoink
-/// does not read the keychain: macOS does not unlock it there and
-/// cannot show its prompt. If the keychain holds an item for one of
-/// the recipients, the answer says so, so that the error names SSH
-/// and not a missing key. Item names are readable without the secret.
-fn keychain_identity_in(
-    store: &dyn crate::keychain::IdentityStore,
-    recipients: &[String],
-    in_ssh_session: bool,
-) -> Result<KeychainLookup, crate::keychain::StoreError> {
     use crate::keychain::StoreError;
     let mut lookup = KeychainLookup::default();
-    if in_ssh_session {
-        let held = store
-            .list()
-            .is_ok_and(|items| items.iter().any(|i| recipients.contains(&i.recipient)));
-        if held {
-            lookup.unavailable = Some(crate::keychain::SSH_SESSION_REASON.to_string());
-        }
-        return Ok(lookup);
-    }
     for recipient in recipients {
-        tracing::debug!("keychain read for {recipient}");
         match store.get(recipient) {
             // `parse_identity_text`: the same parser as `key list` and
             // `key export`, so the three agree about one item. It also
@@ -557,11 +556,11 @@ pub fn identity_secret(identity: &x25519::Identity) -> Zeroizing<String> {
 /// Walk a keys dir looking for an identity whose public half is in
 /// `recipients`. Cheap path: filename match (`<pubkey>.key`). Slow
 /// path: open and check the public for files that don't follow the
-/// naming convention (e.g. `team.key`, `prod.key`).
+/// naming convention (e.g. `team.key`, `prod.key`). Returns the
+/// identity with the path of its file.
 ///
 /// Decoupled from `HOME` resolution so tests can drive it against a
 /// hermetic temp dir.
-/// Walk the keys dir, and return the matching identity with its path.
 fn scan_dir_for_match_path(
     dir: &Path,
     recipients: &[String],
@@ -1076,7 +1075,7 @@ mod tests {
         resolve_identity_core(
             env_key,
             env_file,
-            &mut |r| keychain_identity(store, r),
+            |r| keychain_identity(store, r),
             keys_dir,
             legacy_path,
             recipients,
@@ -1364,128 +1363,83 @@ BAZ=plain
         assert_eq!(id.to_public().to_string(), public);
     }
 
-    // -- the memo and the SSH rule --------------------------------------
+    // -- the memory of keychain answers ----------------------------------
 
     /// One run resolves the identity several times. Each read can be a
     /// keychain prompt, so only the first may reach the keychain.
     #[test]
-    fn memo_asks_once_per_list_of_recipients() {
+    fn memo_asks_once_per_recipient() {
         let memo = KeychainMemo::new();
         let mut asked = 0;
-        let recipients = vec!["age1a".to_string()];
         for _ in 0..3 {
-            let answer = memo.lookup(&recipients, || {
+            let item = memo.get("age1a", || {
                 asked += 1;
-                Ok(KeychainLookup::default())
+                Ok(None)
             });
-            assert!(answer.unwrap().identity.is_none());
+            assert!(item.unwrap().is_none());
         }
         assert_eq!(asked, 1);
-        // Another list of recipients is another question.
-        memo.lookup(&["age1b".to_string()], || {
-            asked += 1;
-            Ok(KeychainLookup::default())
-        })
-        .unwrap();
-        assert_eq!(asked, 2);
     }
 
-    /// After "Deny" yoink does not put the prompt up a second time, until
-    /// the operator asks for a retry.
+    /// The memory is per recipient. A config reload that adds a
+    /// recipient must not ask again for one that already said "Deny".
     #[test]
-    fn memo_keeps_a_refusal_until_failures_are_forgotten() {
+    fn a_longer_list_of_recipients_does_not_ask_again_after_a_refusal() {
         let memo = KeychainMemo::new();
-        let recipients = vec!["age1a".to_string()];
-        let deny = || -> KeychainAnswer {
-            Err(StoreError::Denied {
-                recipient: "age1a".into(),
-            })
-        };
-        assert!(memo.lookup(&recipients, deny).is_err());
-        // Not asked again: the closure would succeed if it ran.
-        assert!(
-            memo.lookup(&recipients, || Ok(KeychainLookup::default()))
-                .is_err()
-        );
-
-        assert!(memo.forget_failures());
-        assert!(
-            memo.lookup(&recipients, || Ok(KeychainLookup::default()))
-                .is_ok()
-        );
-    }
-
-    /// "No item" is normal. It is forgotten, but it is no reason to
-    /// retry, and an identity that was read stays.
-    #[test]
-    fn forget_failures_reports_only_real_failures() {
-        let memo = KeychainMemo::new();
-        let (secret, public) = keygen();
-        let found = KeychainLookup {
-            identity: Some(parse_identity(secret.as_str()).unwrap()),
-            ..KeychainLookup::default()
-        };
-        memo.lookup(std::slice::from_ref(&public), || Ok(found))
-            .unwrap();
-        memo.lookup(&["age1none".to_string()], || Ok(KeychainLookup::default()))
-            .unwrap();
-        assert!(!memo.forget_failures(), "a miss is not a failure");
-
-        // The identity is still remembered: the closure does not run.
-        let again = memo
-            .lookup(std::slice::from_ref(&public), || panic!("asked again"))
-            .unwrap();
-        assert!(again.identity.is_some());
-
-        // An item that could not be read is a failure.
-        let unread = KeychainLookup {
-            unavailable: Some("needs permission".into()),
-            ..KeychainLookup::default()
-        };
-        memo.lookup(&["age1locked".to_string()], || Ok(unread))
-            .unwrap();
-        assert!(memo.forget_failures());
-    }
-
-    /// In an SSH session yoink does not read the keychain. If an item
-    /// for a recipient exists, the answer names SSH.
-    #[test]
-    fn ssh_session_does_not_read_the_keychain() {
-        let (secret, public) = keygen();
-        let store = FakeStore::with(&public, secret.as_str());
-        let recipients = std::slice::from_ref(&public);
-
-        let over_ssh = keychain_identity_in(&store, recipients, true).unwrap();
-        assert!(over_ssh.identity.is_none(), "the secret must not be read");
-        assert_eq!(
-            over_ssh.unavailable.as_deref(),
-            Some(crate::keychain::SSH_SESSION_REASON)
-        );
-
-        // No item for this project: nothing to say about SSH.
-        let other = keychain_identity_in(&store, &["age1other".to_string()], true).unwrap();
-        assert!(other.identity.is_none() && other.unavailable.is_none());
-
-        // Outside SSH the same store hands the identity out.
-        assert!(
-            keychain_identity_in(&store, recipients, false)
-                .unwrap()
-                .identity
-                .is_some()
-        );
-    }
-
-    /// A store that fails every read still answers over SSH: the read
-    /// does not happen.
-    #[test]
-    fn ssh_session_never_reaches_a_prompt() {
-        let store = FakeStore {
+        let denying = FakeStore {
             fail: Some(StoreError::Denied {
                 recipient: String::new(),
             }),
             ..FakeStore::default()
         };
-        assert!(keychain_identity_in(&store, &["age1a".to_string()], true).is_ok());
+        let first = Remembered {
+            memo: &memo,
+            store: &denying,
+        };
+        assert!(keychain_identity(&first, &["age1a".to_string()]).is_err());
+
+        // The store would now answer, but age1a is remembered as denied.
+        let (secret, _) = keygen();
+        let willing = FakeStore::with("age1a", secret.as_str());
+        let second = Remembered {
+            memo: &memo,
+            store: &willing,
+        };
+        let list = ["age1a".to_string(), "age1b".to_string()];
+        assert!(keychain_identity(&second, &list).is_err());
+
+        // Until the operator asks for a retry.
+        assert!(memo.forget_failures());
+        assert!(keychain_identity(&second, &list).is_ok());
+    }
+
+    /// "No item" is normal. It is forgotten, but it is no reason to
+    /// retry, and an identity that was read stays.
+    #[test]
+    fn forget_failures_reports_only_errors() {
+        let memo = KeychainMemo::new();
+        memo.get("age1found", || Ok(Some(Zeroizing::new("secret".into()))))
+            .unwrap();
+        memo.get("age1none", || Ok(None)).unwrap();
+        assert!(!memo.forget_failures(), "a miss is not a failure");
+
+        // The identity is still remembered: the closure does not run.
+        let again = memo.get("age1found", || panic!("asked again")).unwrap();
+        assert_eq!(again.unwrap().as_str(), "secret");
+        // The miss was forgotten: the closure runs.
+        let mut asked = false;
+        memo.get("age1none", || {
+            asked = true;
+            Ok(None)
+        })
+        .unwrap();
+        assert!(asked);
+
+        let unread = memo.get("age1locked", || {
+            Err(StoreError::Unavailable("locked".into()))
+        });
+        assert!(unread.is_err());
+        assert!(memo.forget_failures());
     }
 
     // -- credential store ----------------------------------------------

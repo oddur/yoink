@@ -1360,6 +1360,13 @@ fn log_file_path() -> PathBuf {
 
 #[allow(clippy::too_many_lines)] // one big match dispatch; splitting buys nothing
 async fn run(cli: Cli) -> Result<()> {
+    // macOS cannot show the keychain prompt in an SSH session. Without
+    // this, a read that needs a question waits on a dialog nobody sees.
+    // With prompts off the read fails at once, and yoink says that the
+    // keychain does not work over SSH. A read that needs no question
+    // still works.
+    let _no_keychain_prompts = yoink::keychain::in_ssh_session().then(yoink::keychain::no_prompts);
+
     if let Some(result) = run_bootstrap(&cli.command, &cli.config) {
         return result;
     }
@@ -5348,12 +5355,6 @@ fn require_keychain() -> Result<&'static dyn yoink::keychain::IdentityStore> {
     if !store.supported() {
         anyhow::bail!("`--keychain` is supported on macOS only");
     }
-    if yoink::keychain::in_ssh_session() {
-        anyhow::bail!(
-            "`--keychain` does not work here: {}. Run this command on the Mac itself",
-            yoink::keychain::SSH_SESSION_REASON
-        );
-    }
     Ok(store)
 }
 
@@ -5576,7 +5577,10 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> R
     let lookup = sealed::keychain_identity(store, recipients)?;
     let Some(identity) = lookup.identity else {
         if let Some(reason) = lookup.unavailable {
-            anyhow::bail!("the keychain could not be read: {reason}");
+            anyhow::bail!(
+                "the keychain could not be read: {reason}. {}",
+                yoink::keychain::advice()
+            );
         }
         if let Some((recipient, why)) = lookup.skipped.first() {
             anyhow::bail!("the keychain item for {recipient} {why}");
@@ -5815,7 +5819,9 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
         Err(e) => e.is_keychain() || unread.is_some() && !env_is_set(),
     };
     let resolved = match unread {
-        Some(reason) if keychain_decides => {
+        // Over SSH prompts are off for every command, so a real command
+        // gets the same answer as this quiet lookup.
+        Some(reason) if keychain_decides && !yoink::keychain::in_ssh_session() => {
             Err(sealed::SealedError::KeychainUnavailable { reason })
         }
         _ => resolved,
@@ -5841,13 +5847,11 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
     eprintln!();
     match resolved {
         Ok(_) => eprintln!("* = the identity yoink uses"),
-        // Prompts were off for this list, so an item that needs your
-        // permission could not be read. That is not a lost key.
         // The keychain item was not read. That is not a lost key.
         Err(sealed::SealedError::KeychainUnavailable { reason }) => {
             eprintln!("no star: the keychain item was not read ({reason}).");
             if yoink::keychain::in_ssh_session() {
-                eprintln!("Set YOINK_AGE_KEY for this session.");
+                eprintln!("{}", yoink::keychain::advice());
             } else {
                 eprintln!(
                     "A command that uses the key, for example `yoink secrets show`, \
