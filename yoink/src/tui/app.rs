@@ -1469,12 +1469,6 @@ impl App {
         }
     }
 
-    /// Kick off the secrets bundle fetch in the background. The
-    /// Dashboard drift column needs the bundle to compute the
-    /// `spec_hash` that matches what `yoink up` would produce. We
-    /// don't block startup on it — the column shows `?` for the few
-    /// seconds the loader takes, then resolves to ✓/⚠ once the
-    /// bundle lands.
     /// Give a failed secrets load a new try: the pane's bundle, and the
     /// app's own copy that the drift column reads.
     fn retry_failed_secrets(&mut self) {
@@ -1483,6 +1477,12 @@ impl App {
         }
     }
 
+    /// Kick off the secrets bundle fetch in the background. The
+    /// Dashboard drift column needs the bundle to compute the
+    /// `spec_hash` that matches what `yoink up` would produce. We
+    /// don't block startup on it — the column shows `?` for the few
+    /// seconds the loader takes, then resolves to ✓/⚠ once the
+    /// bundle lands.
     fn spawn_secrets_loader(&self) {
         let config = self.config.clone();
         let slot = self.secrets.clone();

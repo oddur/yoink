@@ -70,8 +70,8 @@ pub trait IdentityStore: Send + Sync {
     /// `get` asks the store again. A long-running session (the TUI)
     /// calls it before a reload: a "Deny", a locked keychain or a key
     /// that was imported in another terminal must not stick for the
-    /// life of the process. Returns true when something was forgotten,
-    /// that is, when a retry can give another answer.
+    /// life of the process. Returns true when an error was forgotten:
+    /// only then can a retry give another answer.
     fn retry_failures(&self) -> bool {
         false
     }
@@ -93,11 +93,6 @@ pub struct NoPrompts {
     lock: Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
 }
 
-/// Turn keychain prompts off until the returned value is dropped. A
-/// read that would prompt fails instead, and identity resolution
-/// treats that as "the keychain cannot answer".
-///
-/// For shell completion: a TAB press must never open a system dialog.
 impl NoPrompts {
     /// False when prompts could not be turned off. The caller must then
     /// stay away from the keychain: a read can still open a dialog.
@@ -115,6 +110,11 @@ impl NoPrompts {
     }
 }
 
+/// Turn keychain prompts off until the returned value is dropped. A
+/// read that would prompt fails instead, and identity resolution
+/// treats that as "the keychain cannot answer".
+///
+/// For shell completion: a TAB press must never open a system dialog.
 #[must_use]
 pub fn no_prompts() -> NoPrompts {
     NoPrompts {
@@ -193,9 +193,13 @@ impl<S: IdentityStore> IdentityStore for Cached<S> {
     }
     fn retry_failures(&self) -> bool {
         let mut seen = self.seen();
-        let before = seen.len();
+        // A cached miss is forgotten too (the key may have arrived from
+        // another terminal), but only a cached error makes a retry
+        // worth it. Misses are normal: a teammate's recipient has no
+        // item here, and on Linux nothing has.
+        let had_error = seen.values().any(Result::is_err);
         seen.retain(|_, lookup| matches!(lookup, Ok(Some(_))));
-        seen.len() != before
+        had_error
     }
     fn list(&self) -> Result<Vec<StoredItem>, StoreError> {
         self.inner.list()
@@ -509,6 +513,23 @@ mod tests {
         assert_eq!(store.inner.reads.load(Ordering::SeqCst), 1);
     }
 
+    /// A refusal is what makes a retry worth it.
+    #[test]
+    fn retry_failures_reports_a_forgotten_error() {
+        let store = Cached::new(Counting {
+            inner: FakeStore {
+                fail: Some(StoreError::Denied {
+                    recipient: String::new(),
+                }),
+                ..FakeStore::default()
+            },
+            ..Counting::default()
+        });
+        assert!(store.get("age1a").is_err());
+        assert!(store.retry_failures());
+        assert!(!store.retry_failures());
+    }
+
     /// The TUI lives long. A refusal or a missing item must be
     /// retryable there, while a key that was read stays cached.
     #[test]
@@ -526,8 +547,8 @@ mod tests {
             "still the cached miss"
         );
 
-        assert!(store.retry_failures());
-        assert!(!store.retry_failures(), "nothing left to forget");
+        // Only a miss was cached: forgotten, but no reason to retry.
+        assert!(!store.retry_failures());
         assert_eq!(store.get("age1b").unwrap().unwrap().as_str(), "secret-b");
         store.get("age1a").unwrap();
         // age1a once, age1b twice.

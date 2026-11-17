@@ -251,11 +251,30 @@ fn identity_findings(
     keychain_supported: bool,
 ) -> Vec<Finding> {
     use sealed::IdentitySource;
-    let mut out = vec![
-        Finding::pass("secrets", "age identity available").with_detail(format!(
-            "loaded identity matches recipient {public} (source: {source})"
-        )),
-    ];
+    let mut out = if in_recipients {
+        vec![
+            Finding::pass("secrets", "age identity available").with_detail(format!(
+                "loaded identity matches recipient {public} (source: {source})"
+            )),
+        ]
+    } else {
+        // The legacy file loads without a recipient match. A key that
+        // is not a recipient cannot decrypt secrets.age.
+        vec![
+            Finding::warn(
+                "secrets",
+                "the age identity is not a recipient of this config",
+            )
+            .with_detail(format!(
+                "{public} (source: {source}) is not in `secrets.recipients:`, \
+                     so it cannot decrypt the sealed file"
+            ))
+            .with_fix(
+                "use the key of one of the recipients, or add this recipient and \
+                     seal the file again",
+            ),
+        ]
+    };
     if *source == IdentitySource::Keychain {
         if let Some(path) = file_copy {
             out.push(
@@ -1120,6 +1139,15 @@ mod tests {
         assert_eq!(
             identity_findings("age1x", &source, 1, true, None, false).len(),
             1
+        );
+        // It is a warning, not a pass: that key cannot decrypt the file.
+        let f = identity_findings("age1x", &source, 1, false, None, true);
+        assert_eq!(
+            titles(&f),
+            [(
+                Severity::Warn,
+                "the age identity is not a recipient of this config"
+            )]
         );
         // A legacy key that is not a recipient of the project: no hint.
         assert_eq!(

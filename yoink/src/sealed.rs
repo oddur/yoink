@@ -311,12 +311,20 @@ fn resolve_identity_with(
     }
 
     if legacy_path.exists() {
-        return Ok(ResolvedIdentity {
-            identity: load_identity_from_file(legacy_path)?,
-            source: IdentitySource::Legacy(legacy_path.to_path_buf()),
-        });
+        let identity = load_identity_from_file(legacy_path)?;
+        // The legacy file loads without a recipient match. That must
+        // not hide a keychain that could not answer: an old, unrelated
+        // age.key would be handed out, decryption would fail, and
+        // nothing would mention the keychain.
+        let matches = recipients.contains(&identity.to_public().to_string());
+        if keychain.unavailable.is_none() || matches {
+            return Ok(ResolvedIdentity {
+                identity,
+                source: IdentitySource::Legacy(legacy_path.to_path_buf()),
+            });
+        }
     }
-    // No key file either. If the keychain could not answer, say so: a
+    // No usable key file. If the keychain could not answer, say so: a
     // key that sits intact in a locked keychain must not look lost.
     if let Some(reason) = keychain.unavailable {
         return Err(SealedError::KeychainUnavailable { reason });
@@ -1322,6 +1330,31 @@ BAZ=plain
 
         let r = resolve_identity_with(None, None, &store, &keys, &legacy, &[file_public]).unwrap();
         assert!(matches!(r.source, IdentitySource::KeysDir(_)));
+    }
+
+    /// An old age.key that is not a recipient must not stand in for a
+    /// keychain that could not answer.
+    #[test]
+    fn unavailable_keychain_is_not_masked_by_an_unrelated_legacy_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        let legacy = tmp.path().join("age.key");
+        let (secret, legacy_public) = keygen();
+        write_atomically_secret(&legacy, format!("{}\n", secret.as_str()).as_bytes()).unwrap();
+        let store = FakeStore {
+            fail: Some(StoreError::Unavailable("locked".into())),
+            ..FakeStore::default()
+        };
+        // Not a recipient: the keychain is the story.
+        let Err(err) = resolve_identity_with(None, None, &store, &keys, &legacy, &["age1x".into()])
+        else {
+            panic!("the unrelated legacy key must not be used");
+        };
+        assert!(err.is_keychain(), "{err}");
+        // A recipient: the legacy key is a real fallback.
+        let r =
+            resolve_identity_with(None, None, &store, &keys, &legacy, &[legacy_public]).unwrap();
+        assert!(matches!(r.source, IdentitySource::Legacy(_)));
     }
 
     /// A keychain-only key behind a locked keychain must not look lost:

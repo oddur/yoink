@@ -1416,6 +1416,10 @@ async fn run(cli: Cli) -> Result<()> {
             | Command::Hosts {
                 action: HostsAction::Add { .. } | HostsAction::Remove { .. }
             }
+            // A local build contacts no host. `add` reloads the config
+            // and resolves again before it deploys.
+            | Command::Build { .. }
+            | Command::Add { .. }
     ) {
         // Host-name completion reads the addresses, but a TAB press
         // must not open a system dialog: no keychain prompts for it.
@@ -4505,11 +4509,28 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
     Ok(())
 }
 
+/// True when an error chain ends in a keychain refusal or a keychain
+/// that could not answer.
+fn is_keychain_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<yoink::sealed::SealedError>()
+            .is_some_and(yoink::sealed::SealedError::is_keychain)
+    })
+}
+
 async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
     use yoink::doctor::{Severity, run_doctor, tally};
 
-    let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
-        std::sync::Arc::new(build_real_ops(config, None).await?);
+    // A sealed ssh key needs the identity. If the keychain will not hand
+    // it out, doctor must still run and say so: the secrets check
+    // reports it, and the host checks fail on their own terms.
+    let ops = match build_real_ops(config, None).await {
+        Ok(ops) => ops,
+        Err(e) if is_keychain_error(&e) => yoink::docker_ops::RealDockerOps::new(),
+        Err(e) => return Err(e),
+    };
+    let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> = std::sync::Arc::new(ops);
     let findings = run_doctor(config, ops).await;
 
     if json {
@@ -5156,17 +5177,11 @@ fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
 fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     match action {
         SecretsAction::Key { action } => match action {
-            KeyAction::Generate {
-                out,
-                force,
-                print,
-                keychain,
-            } => {
-                if keychain {
-                    cmd_secrets_key_generate_keychain(Path::new("."))
-                } else {
-                    cmd_secrets_key_generate(out, force, print)
-                }
+            // These run before the config loads; see `run_bootstrap`.
+            KeyAction::Generate { .. }
+            | KeyAction::List { all: true }
+            | KeyAction::Remove { .. } => {
+                unreachable!("run_bootstrap handles this command without a config")
             }
             KeyAction::Public => cmd_secrets_key_public(config),
             KeyAction::Import { path, yes, .. } => cmd_secrets_key_import(
@@ -5179,8 +5194,6 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
                 cmd_secrets_key_export(config, out.as_deref(), force)
             }
             KeyAction::List { all: false } => cmd_secrets_key_list(config),
-            KeyAction::List { all: true } => cmd_secrets_key_list_all(Some(config)),
-            KeyAction::Remove { recipient, yes, .. } => cmd_secrets_key_remove(&recipient, yes),
         },
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
@@ -5475,6 +5488,17 @@ fn cmd_secrets_key_import(
             );
         }
     }
+    // Another plaintext copy that yoink still finds on its own.
+    if let Some((_, extra)) = sealed::file_identity_for(std::slice::from_ref(&public))? {
+        other_copy = true;
+        eprintln!(
+            "note: {} holds the same identity in plaintext",
+            extra.display()
+        );
+    }
+    if path == Some("-") {
+        eprintln!("note: keep the source of this key as your backup");
+    }
     if !other_copy {
         warn_keychain_only(recipients, &public);
     }
@@ -5586,6 +5610,14 @@ fn cmd_secrets_key_list_all(config: Option<&Config>) -> Result<()> {
     Ok(())
 }
 
+/// True when `YOINK_AGE_KEY` or `YOINK_AGE_KEY_FILE` holds a value.
+fn env_is_set() -> bool {
+    use yoink::sealed::{AGE_KEY_ENV, AGE_KEY_FILE_ENV};
+    [AGE_KEY_ENV, AGE_KEY_FILE_ENV]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|v| !v.trim().is_empty()))
+}
+
 /// One row of `yoink secrets key list`.
 struct KeyRow {
     /// `None` for a row that names something yoink could not read.
@@ -5617,7 +5649,7 @@ fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
     if let Ok(raw) = std::env::var(sealed::AGE_KEY_ENV)
         && !raw.trim().is_empty()
     {
-        let label = format!("{} env var", sealed::AGE_KEY_ENV);
+        let label = IdentitySource::EnvKey.to_string();
         rows.push(match sealed::parse_env_identity(&raw) {
             Ok(id) => {
                 let recipient = id.to_public().to_string();
@@ -5709,30 +5741,34 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
     let (resolved, unread) = {
         let quiet = yoink::keychain::no_prompts();
         if quiet.active() {
-            // The reason, when an item exists that could not be read.
+            // The reason, when any item could not be read. Also when
+            // another recipient's item was readable: a real command asks
+            // for the first one before it gets that far.
             let unread = sealed::keychain_identity(yoink::keychain::system_store(), recipients)
                 .ok()
-                .filter(|l| l.identity.is_none())
                 .and_then(|l| l.unavailable);
             (sealed::resolve_identity(recipients), unread)
         } else {
-            let why = "prompts could not be turned off".to_string();
             (
-                Err(sealed::SealedError::KeychainUnavailable {
-                    reason: why.clone(),
-                }),
-                Some(why),
+                Err(sealed::SealedError::NoRecipients),
+                Some("prompts could not be turned off".to_string()),
             )
         }
     };
-    // An environment variable outranks the keychain, so an unread
-    // keychain item changes nothing then.
-    let env_supplies = matches!(
-        resolved.as_ref().map(|r| &r.source),
-        Ok(sealed::IdentitySource::EnvKey | sealed::IdentitySource::EnvFile(_))
-    );
+    // The quiet answer is wrong only where the keychain decides: the
+    // lookup got past the environment variables (which outrank the
+    // keychain, and whose own errors must be shown as they are).
+    let keychain_decides = match &resolved {
+        Ok(r) => !matches!(
+            r.source,
+            sealed::IdentitySource::EnvKey | sealed::IdentitySource::EnvFile(_)
+        ),
+        Err(e) => e.is_keychain() || unread.is_some() && !env_is_set(),
+    };
     let resolved = match unread {
-        Some(reason) if !env_supplies => Err(sealed::SealedError::KeychainUnavailable { reason }),
+        Some(reason) if keychain_decides => {
+            Err(sealed::SealedError::KeychainUnavailable { reason })
+        }
         _ => resolved,
     };
     let used = resolved
