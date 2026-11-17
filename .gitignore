@@ -5,3 +5,5 @@ target/
 .devbox/
 .direnv/
 .claude/worktrees/
+# Local state of the Impeccable design tool: screenshots, critiques, mocks.
+.impeccable/
