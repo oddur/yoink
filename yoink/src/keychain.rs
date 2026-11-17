@@ -83,6 +83,26 @@ pub trait IdentityStore: Send + Sync {
     fn delete(&self, recipient: &str) -> Result<bool, StoreError>;
 }
 
+/// Held while yoink must not put up a keychain prompt. See [`no_prompts`].
+pub struct NoPrompts {
+    #[cfg(target_os = "macos")]
+    _lock: Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+}
+
+/// Turn keychain prompts off until the returned value is dropped. A
+/// read that would prompt fails instead, and identity resolution
+/// treats that as "the keychain cannot answer".
+///
+/// For shell completion: a TAB press must never open a system dialog.
+#[must_use]
+pub fn no_prompts() -> NoPrompts {
+    NoPrompts {
+        #[cfg(target_os = "macos")]
+        _lock: security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()
+            .ok(),
+    }
+}
+
 /// The store of this platform, behind a cache that lives as long as
 /// the process.
 ///
@@ -200,7 +220,8 @@ mod macos {
     use security_framework::base::Error;
     use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
     use security_framework::passwords::{
-        delete_generic_password, get_generic_password, set_generic_password_options,
+        delete_generic_password, get_generic_password, set_generic_password,
+        set_generic_password_options,
     };
     use security_framework::passwords_options::PasswordOptions;
     use zeroize::Zeroizing;
@@ -267,10 +288,19 @@ mod macos {
         }
 
         fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError> {
-            let mut options = PasswordOptions::new_generic_password(SERVICE, recipient);
-            options.set_label(label);
-            set_generic_password_options(identity.as_bytes(), options)
-                .map_err(|e| classify(e, recipient))
+            // An item that exists is updated by service and account
+            // only, and keeps its name. The library's update reuses the
+            // whole query: with a label in it, an item that carries a
+            // different name is not found and the update fails.
+            let exists = self.list()?.iter().any(|item| item.recipient == recipient);
+            let result = if exists {
+                set_generic_password(SERVICE, recipient, identity.as_bytes())
+            } else {
+                let mut options = PasswordOptions::new_generic_password(SERVICE, recipient);
+                options.set_label(label);
+                set_generic_password_options(identity.as_bytes(), options)
+            };
+            result.map_err(|e| classify(e, recipient))
         }
 
         fn list(&self) -> Result<Vec<StoredItem>, StoreError> {

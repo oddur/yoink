@@ -146,6 +146,17 @@ impl SecretsState {
         }
     }
 
+    /// Called when the operator opens the pane. A load that failed
+    /// gets one new attempt per visit: the keychain may be unlocked
+    /// now, or the operator may want to answer the prompt differently.
+    /// Not on each render, which would put the prompt up in a loop.
+    pub fn retry_if_failed(&mut self) {
+        if matches!(self.bundle, LoadStatus::Failed(_)) {
+            crate::keychain::system_store().retry_failures();
+            self.bundle = LoadStatus::NotLoaded;
+        }
+    }
+
     /// Cancel any in-progress edit. Called on Esc and on view exit.
     pub fn cancel_edit(&mut self) {
         self.edit = EditState::None;
@@ -672,10 +683,6 @@ fn load(config: &Config) -> LoadStatus {
                 Ok(p) => p,
                 Err(e) => return LoadStatus::Failed(e.to_string()),
             };
-            // The TUI lives long: give a refusal, a locked keychain or
-            // a key that arrived from another terminal a new chance on
-            // each reload of the pane.
-            crate::keychain::system_store().retry_failures();
             let identity = match sealed::load_identity(recipients) {
                 Ok(id) => id,
                 // The key exists but the keychain did not hand it out.
@@ -685,7 +692,7 @@ fn load(config: &Config) -> LoadStatus {
                     | sealed::SealedError::KeychainUnavailable { .. }),
                 ) => {
                     return LoadStatus::Failed(format!(
-                        "cannot read secrets: {e}\n\nAllow yoink in the keychain prompt or unlock the keychain, then reload this pane."
+                        "cannot read secrets: {e}\n\nUnlock the keychain or be ready to allow yoink, then leave this pane and open it again."
                     ));
                 }
                 Err(e) => {

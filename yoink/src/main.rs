@@ -1417,7 +1417,22 @@ async fn run(cli: Cli) -> Result<()> {
                 action: HostsAction::Add { .. } | HostsAction::Remove { .. }
             }
     ) {
-        resolve_sealed_host_addresses(&mut config).await?;
+        // Host-name completion reads the addresses, but a TAB press
+        // must not open a system dialog: no keychain prompts for it.
+        let _quiet =
+            matches!(cli.command, Command::Complete { .. }).then(yoink::keychain::no_prompts);
+        // `doctor` and `hosts list` exist to show what is wrong, and
+        // completion must stay silent: they carry on without the
+        // addresses. Every other command stops on a keychain refusal.
+        let lenient = matches!(
+            cli.command,
+            Command::Doctor { .. }
+                | Command::Complete { .. }
+                | Command::Hosts {
+                    action: HostsAction::List
+                }
+        );
+        resolve_sealed_host_addresses(&mut config, lenient).await?;
     }
 
     match cli.command {
@@ -1448,7 +1463,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // running up so the freshly-added service is included.
                 let mut reloaded = Config::load_from_path(&cli.config)
                     .with_context(|| format!("reloading {}", cli.config.display()))?;
-                resolve_sealed_host_addresses(&mut reloaded).await?;
+                resolve_sealed_host_addresses(&mut reloaded, false).await?;
                 let no_services: Vec<String> = Vec::new();
                 let no_tags: Vec<String> = Vec::new();
                 cmd_up(
@@ -2783,7 +2798,7 @@ fn check_config_freshness(path: &std::path::Path, require_latest: bool) -> Resul
     Ok(())
 }
 
-async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
+async fn resolve_sealed_host_addresses(config: &mut Config, lenient: bool) -> Result<()> {
     use yoink::sealed::SealedError;
     use yoink::secrets::SecretsError;
     if !config.any_host_address_sealed() {
@@ -2796,7 +2811,7 @@ async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
         // later with an unrelated connect error on an empty address.
         Err(SecretsError::NoAgeIdentity(
             e @ (SealedError::Keychain(_) | SealedError::KeychainUnavailable { .. }),
-        )) => return Err(e.into()),
+        )) if !lenient => return Err(e.into()),
         Err(e) => {
             tracing::debug!(
                 error = %e,
@@ -5372,7 +5387,6 @@ fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Res
 }
 
 fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> Result<()> {
-    use yoink::keychain::StoreError;
     use yoink::sealed;
     if let Some(ci_var) = detected_ci_env()
         && !is_truthy_env("YOINK_ALLOW_REVEAL_IN_CI")
@@ -5387,37 +5401,19 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> R
     if recipients.is_empty() {
         anyhow::bail!("no `secrets.recipients:` in the config, so there is no identity to look up");
     }
-    // Ask the store directly, recipient by recipient, the way
-    // resolution does. A problem with one recipient's item does not
-    // stop the search, but it is reported when nothing else is found:
-    // "no identity" would make an intact key behind a locked keychain
-    // look lost.
-    let mut found = None;
-    let mut problem: Option<String> = None;
-    for recipient in recipients {
-        match store.get(recipient) {
-            Ok(None) => {}
-            Ok(Some(raw)) => match sealed::parse_identity_text(&raw) {
-                Ok(identity) if identity.to_public().to_string() == *recipient => {
-                    found = Some(identity);
-                    break;
-                }
-                _ => {
-                    problem = Some(format!(
-                        "the keychain item for {recipient} does not hold the identity of that recipient"
-                    ));
-                }
-            },
-            // A refusal is final, as it is for resolution.
-            Err(denied @ StoreError::Denied { .. }) => return Err(denied.into()),
-            Err(e @ StoreError::Unavailable(_)) => problem = Some(e.to_string()),
+    // The same lookup as identity resolution, so the two agree about
+    // each item. Resolution ignores a locked keychain and a broken
+    // item; here they are the answer when nothing else is found, or an
+    // intact key would look lost.
+    let lookup = sealed::keychain_identity(store, recipients)?;
+    let Some(identity) = lookup.identity else {
+        if let Some(reason) = lookup.unavailable {
+            anyhow::bail!("the keychain could not be read: {reason}");
         }
-    }
-    let Some(identity) = found else {
-        match problem {
-            Some(problem) => anyhow::bail!("{problem}"),
-            None => anyhow::bail!("the keychain holds no identity for this project's recipients"),
+        if let Some((recipient, why)) = lookup.skipped.first() {
+            anyhow::bail!("the keychain item for {recipient} {why}");
         }
+        anyhow::bail!("the keychain holds no identity for this project's recipients");
     };
     let public = identity.to_public().to_string();
     let secret = sealed::identity_secret(&identity);
@@ -5503,7 +5499,6 @@ struct KeyRow {
 
 /// Every identity yoink can see for a project, in resolution order.
 fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
-    use yoink::keychain::StoreError;
     use yoink::sealed::{self, IdentitySource};
     let in_config = |public: &str| recipients.iter().any(|r| r == public);
     let note = |public: &str| {
@@ -5557,24 +5552,23 @@ fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
             None => unreadable(label, "cannot read an identity"),
         });
     }
-    let store = yoink::keychain::system_store();
-    for recipient in recipients {
-        let (source, row_note) = match store.get(recipient) {
-            Ok(None) => continue,
-            Ok(Some(raw)) => match sealed::parse_identity_text(&raw) {
-                Ok(id) if id.to_public().to_string() == *recipient => {
-                    (Some(IdentitySource::Keychain), "")
-                }
-                _ => (None, "holds a different identity; yoink skips it"),
-            },
-            Err(StoreError::Denied { .. }) => (None, "access denied"),
-            Err(StoreError::Unavailable(_)) => (None, "keychain not available"),
-        };
+    // Names only: this list must not open a keychain prompt, also when
+    // an environment variable already supplies the identity. Whether an
+    // item really holds its identity shows in the star and in the
+    // message below, which come from the real resolution.
+    let stored: Vec<String> = match yoink::keychain::system_store().list() {
+        Ok(items) => items.into_iter().map(|i| i.recipient).collect(),
+        Err(e) => {
+            rows.push(unreadable("keychain".into(), &e.to_string()));
+            Vec::new()
+        }
+    };
+    for recipient in recipients.iter().filter(|r| stored.contains(r)) {
         rows.push(KeyRow {
-            source,
+            source: Some(IdentitySource::Keychain),
             label: "keychain".into(),
             recipient: recipient.clone(),
-            note: row_note.into(),
+            note: String::new(),
         });
     }
     let legacy = sealed::legacy_identity_path()?;

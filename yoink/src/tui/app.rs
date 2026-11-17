@@ -2689,6 +2689,7 @@ impl App {
                 // via `ensure_loaded`. Clear any half-finished edit
                 // from a previous visit so the operator starts fresh.
                 self.secrets_state.cancel_edit();
+                self.secrets_state.retry_if_failed();
             }
             View::Resources => {
                 self.schedule_resources_refresh();

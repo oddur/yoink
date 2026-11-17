@@ -278,8 +278,9 @@ fn identity_findings(
                      and then secrets.age cannot be decrypted",
                     )
                     .with_fix(
-                        "add a backup recipient to `secrets.recipients:`, or store a copy \
-                     with `yoink secrets key export --keychain`",
+                        "add a backup recipient to `secrets.recipients:`. A copy made with \
+                         `yoink secrets key export --keychain` is also a backup, but yoink \
+                         cannot see it, so this warning stays",
                     ),
             );
         }

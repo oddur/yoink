@@ -60,8 +60,9 @@ pub enum SealedError {
     Keychain(#[from] crate::keychain::StoreError),
     #[error(
         "the keychain could not be read ({reason}), and no key file holds an identity for \
-         this config's recipients — unlock the keychain (it is locked in an SSH session), \
-         or set {AGE_KEY_ENV} / {AGE_KEY_FILE_ENV}"
+         this config's recipients. If the key is in the keychain, unlock it (it is locked in \
+         an SSH session). Otherwise set {AGE_KEY_ENV} / {AGE_KEY_FILE_ENV}, or create a key \
+         with `yoink secrets key generate`"
     )]
     KeychainUnavailable { reason: String },
     #[error("parse age recipient {raw:?}: {reason}")]
@@ -320,6 +321,10 @@ pub struct KeychainLookup {
     /// Set when the store could not answer (locked keychain, no GUI
     /// session). Resolution continues with the key files.
     pub unavailable: Option<String>,
+    /// Items that exist but do not hold the identity of their
+    /// recipient: `(recipient, why)`. Resolution skips them; `key
+    /// export` reports them when it finds nothing else.
+    pub skipped: Vec<(String, String)>,
 }
 
 /// Ask the store for the identity of each recipient, by name.
@@ -346,10 +351,20 @@ pub fn keychain_identity(
                     lookup.identity = Some(identity);
                     return Ok(lookup);
                 }
-                Ok(_) => tracing::debug!(
-                    "keychain item for {recipient} holds a different identity; skipping"
-                ),
-                Err(e) => tracing::debug!("keychain item for {recipient}: {e}; skipping"),
+                Ok(_) => {
+                    tracing::debug!(
+                        "keychain item for {recipient} holds a different identity; skipping"
+                    );
+                    lookup
+                        .skipped
+                        .push((recipient.clone(), "holds a different identity".into()));
+                }
+                Err(e) => {
+                    tracing::debug!("keychain item for {recipient}: {e}; skipping");
+                    lookup
+                        .skipped
+                        .push((recipient.clone(), "is not an age identity".into()));
+                }
             },
             Ok(None) => {}
             Err(denied @ StoreError::Denied { .. }) => return Err(denied.into()),
