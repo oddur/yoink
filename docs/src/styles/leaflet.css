@@ -5,6 +5,10 @@
   background: var(--paper);
   color: var(--text);
   flex: 1;
+  /* One column edge for text, code, tables and rules. 44rem holds a
+     line of about 80 characters at the reading size below, and an
+     80-column code block without a scrollbar. */
+  --prose-w: 44rem;
 }
 
 /* ── Docs frame ──────────────────────────────────────────────────────── */
@@ -177,7 +181,7 @@
   border-bottom: 3px solid var(--rule);
   padding-bottom: 1.5rem;
   margin-bottom: 2.25rem;
-  max-width: 50rem;
+  max-width: var(--prose-w);
 }
 .page-head h1 {
   overflow-wrap: break-word;
@@ -193,7 +197,7 @@
   font-size: var(--text-lede);
   line-height: 1.5;
   color: var(--text-soft);
-  max-width: 36rem;
+  text-wrap: pretty;
 }
 .page-meta {
   display: flex;
@@ -209,15 +213,19 @@
 
 /* ── Prose ───────────────────────────────────────────────────────────── */
 .prose {
-  max-width: 50rem;
+  max-width: var(--prose-w);
   overflow-wrap: break-word;
+}
+@media (min-width: 56rem) {
+  .prose {
+    font-size: 1.125rem;
+  }
+  .page-head .lede {
+    font-size: 1.25rem;
+  }
 }
 .prose > * + * {
   margin-top: 1.15rem;
-}
-.prose p,
-.prose li {
-  max-width: var(--measure);
 }
 .prose li {
   text-wrap: pretty;
@@ -316,6 +324,14 @@
   padding: 0.12em 0.36em 0.08em;
   font-size: 0.875em;
   overflow-wrap: anywhere;
+  /* a chip that must wrap keeps its padding on both pieces */
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+/* Short code (a flag, a key, a file name) stays in one piece. The
+   build marks it; long commands may still wrap. */
+.prose code.nw {
+  white-space: nowrap;
 }
 .prose a > code {
   color: inherit;
@@ -624,7 +640,7 @@
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 1rem;
-  max-width: 50rem;
+  max-width: var(--prose-w);
   margin-top: 4rem;
   border-top: 3px solid var(--rule);
   padding-top: 1.25rem;
@@ -736,6 +752,82 @@
   text-decoration: underline;
   text-decoration-thickness: 0.09em;
   text-underline-offset: 0.1em;
+}
+/* ── Changelog: one row for each release, version in the margin ───────── */
+.release:last-child {
+  border-bottom: 0;
+}
+.release {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
+  gap: 0.75rem 1.5rem;
+  padding: 2rem 0 2.25rem;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.release-head {
+  align-self: start;
+  position: sticky;
+  top: 5rem;
+}
+.release-head h2 {
+  margin: 0;
+  font-weight: 900;
+  font-stretch: 62%;
+  font-size: var(--display-xl);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.release-head h2 a {
+  color: inherit;
+  text-decoration: none;
+}
+.release-head h2 a:hover {
+  text-decoration: underline;
+  text-decoration-thickness: 0.09em;
+  text-underline-offset: 0.1em;
+}
+.release:target .release-head h2 a {
+  background: var(--mark);
+  color: var(--ink);
+  box-shadow: 0 0 0 0.12em var(--mark);
+}
+.release-head time {
+  display: block;
+  margin-top: 0.5rem;
+  font-family: var(--mono);
+  font-size: var(--text-s);
+  color: var(--text-soft);
+}
+.release-body > :first-child {
+  margin-top: 0;
+}
+.release-body h3 {
+  margin: 1.5rem 0 0.5rem;
+  font-size: var(--text-label);
+  font-weight: 800;
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--text-soft);
+}
+.release-body ul {
+  margin-block: 0;
+}
+.release-body li + li {
+  margin-top: 0.4rem;
+}
+@media (max-width: 40rem) {
+  .release {
+    grid-template-columns: 1fr;
+  }
+  .release-head {
+    position: static;
+    display: flex;
+    align-items: baseline;
+    gap: 1rem;
+  }
+  .release-head time {
+    margin-top: 0;
+  }
 }
 @media (max-width: 40rem) {
   .post-list a {

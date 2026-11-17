@@ -6,6 +6,7 @@ const { card = false, current } = Astro.props;
 const links = [
   { href: '/docs', label: 'Docs', key: 'docs' },
   { href: '/blog', label: 'Blog', key: 'blog' },
+  { href: '/changelog', label: 'Changelog', key: 'changelog', wide: true },
   { href: '/about', label: 'About', key: 'about' },
 ];
 ---
@@ -15,7 +16,7 @@ const links = [
     <a class="brand" href="/" aria-label="yoink home"><HookMark />yoink</a>
     <nav class="site-nav" aria-label="Site">
       {links.map((l) => (
-        <a href={l.href} aria-current={current === l.key ? 'true' : undefined}>{l.label}</a>
+        <a href={l.href} class={l.wide ? 'hide-s' : undefined} aria-current={current === l.key ? 'true' : undefined}>{l.label}</a>
       ))}
       <a class="hide-s" href={REPO}>GitHub</a>
       <button class="chip" type="button" data-search-open aria-label="Search the docs">

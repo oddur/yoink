@@ -1,0 +1,41 @@
+---
+import { getCollection, render } from 'astro:content';
+import Base from '@/layouts/Base.astro';
+import ProseScripts from '@/components/ProseScripts.astro';
+import { REPO } from '@/lib/site';
+import '@/styles/leaflet.css';
+
+// Newest first, by numeric version: "0.20.10" sorts after "0.20.9".
+const parts = (v: string) => v.split('.').map(Number);
+const byVersion = (a: string, b: string) => {
+  const [x, y] = [parts(a), parts(b)];
+  return y[0] - x[0] || y[1] - x[1] || y[2] - x[2];
+};
+const entries = (await getCollection('changelog')).sort((a, b) => byVersion(a.data.version, b.data.version));
+const releases = await Promise.all(
+  entries.map(async (entry) => ({ ...entry.data, Content: (await render(entry)).Content })),
+);
+const day = (d: Date) => d.toISOString().slice(0, 10);
+---
+<Base title="Changelog" description="What changed in each yoink release." current="changelog">
+  <main class="leaflet" id="main" data-pagefind-body>
+    <div class="sheet">
+      <header class="page-head">
+        <h1>Changelog</h1>
+        <p class="lede">What changed in each release, newest first. The binaries are on the <a href={`${REPO}/releases`}>GitHub releases page</a>.</p>
+      </header>
+      <div class="releases">
+        {releases.map((r) => (
+          <section class="release" aria-labelledby={`v${r.version}`}>
+            <header class="release-head">
+              <h2 id={`v${r.version}`}><a href={`#v${r.version}`}>{r.version}</a></h2>
+              <time datetime={day(r.date)}>{day(r.date)}</time>
+            </header>
+            <div class="prose release-body"><r.Content /></div>
+          </section>
+        ))}
+      </div>
+    </div>
+  </main>
+  <ProseScripts />
+</Base>

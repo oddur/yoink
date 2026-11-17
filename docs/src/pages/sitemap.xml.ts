@@ -8,6 +8,7 @@ export const GET: APIRoute = async () => {
     SITE,
     `${SITE}/about`,
     `${SITE}/blog`,
+    `${SITE}/changelog`,
     ...(await getCollection('blog')).map((p) => `${SITE}/blog/${p.id}`),
     ...(await getCollection('docs')).map((p) => SITE + docHref(p.id)),
   ];

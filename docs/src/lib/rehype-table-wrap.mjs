@@ -16,3 +16,19 @@ export function rehypeTableWrap() {
     });
   };
 }
+
+// Marks short inline code so it never splits across two lines:
+// `--tag`, `tag: latest`, `yoink up --build`. Longer code may wrap.
+const NOWRAP_MAX = 26;
+const text = (node) => (node.type === 'text' ? node.value : (node.children ?? []).map(text).join(''));
+
+export function rehypeInlineCodeNowrap() {
+  return (tree) => {
+    visit(tree, 'element', (node, _index, parent) => {
+      if (node.tagName !== 'code' || parent?.tagName === 'pre') return;
+      if (text(node).length > NOWRAP_MAX) return;
+      const cls = node.properties.className ?? [];
+      node.properties.className = [...(Array.isArray(cls) ? cls : [cls]), 'nw'];
+    });
+  };
+}

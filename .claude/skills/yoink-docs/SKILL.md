@@ -238,3 +238,7 @@ Per-page word delta (all negative):
 [NEEDS-SPEC]: none.
 [CHANGED-MEANING?]: none.
 ```
+
+## Changelog
+
+The page `/changelog` renders one file for each release from `docs/content/changelog/v<version>.md`. For each release, add a file with `version:` and `date:` in the frontmatter. Group the items under `### New`, `### Changed`, and `### Fixed`. Start each item with the area in bold (`- **proxy:** ...`). Write for a person who upgrades: say what changed for them, not which function changed.
