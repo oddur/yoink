@@ -27,7 +27,7 @@ repos:
         stages: [pre-push]
 
   - repo: https://github.com/trufflesecurity/trufflehog
-    rev: v3.93.0
+    rev: v3.95.2
     hooks:
       # Pre-push only: `--since-commit HEAD` reads committed history, so a
       # pre-commit invocation can't see staged content yet.
