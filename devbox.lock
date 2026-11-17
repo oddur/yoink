@@ -385,6 +385,70 @@
         }
       }
     },
+    "pre-commit@latest": {
+      "last_modified": "2026-04-23T13:07:47Z",
+      "resolved": "github:NixOS/nixpkgs/01fbdeef22b76df85ea168fbfe1bfd9e63681b30#pre-commit",
+      "source": "devbox-search",
+      "version": "4.5.1",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/l3ax81g9vp3p25js3g3172mzls4jps5s-pre-commit-4.5.1",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/7pdawwcg9rzbq2jx9arjqjzfc2d2pazi-pre-commit-4.5.1-dist"
+            }
+          ],
+          "store_path": "/nix/store/l3ax81g9vp3p25js3g3172mzls4jps5s-pre-commit-4.5.1"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/c6ldspwziqspm73x0bjvk7bki187qr14-pre-commit-4.5.1",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/xjd6m024kf57vzdgnjc509amwl6jxign-pre-commit-4.5.1-dist"
+            }
+          ],
+          "store_path": "/nix/store/c6ldspwziqspm73x0bjvk7bki187qr14-pre-commit-4.5.1"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/0lngxg5mlvwyavm6h44s1w7f22g5svl1-pre-commit-4.5.1",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/nd0xxl9z0vl76qdrw0n2mdb3f43zqfwn-pre-commit-4.5.1-dist"
+            }
+          ],
+          "store_path": "/nix/store/0lngxg5mlvwyavm6h44s1w7f22g5svl1-pre-commit-4.5.1"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/s5q5ayvqxv908x166b03sfrfd114ls20-pre-commit-4.5.1",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/flm3yk5mzhrnl6rbc0smja2sfca7g3zn-pre-commit-4.5.1-dist"
+            }
+          ],
+          "store_path": "/nix/store/s5q5ayvqxv908x166b03sfrfd114ls20-pre-commit-4.5.1"
+        }
+      }
+    },
     "rustup@latest": {
       "last_modified": "2026-04-01T01:09:41Z",
       "plugin_version": "0.0.1",
@@ -479,6 +543,54 @@
             }
           ],
           "store_path": "/nix/store/s65clklw6q6kjhkgcpgva0r8big3z7rh-sccache-0.14.0"
+        }
+      }
+    },
+    "trufflehog@latest": {
+      "last_modified": "2026-04-28T17:03:49Z",
+      "resolved": "github:NixOS/nixpkgs/e75f25705c2934955ee5075e62530d74aca973c6#trufflehog",
+      "source": "devbox-search",
+      "version": "3.95.2",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/yim52l3g4s3a08f983fr9icqn3vi8ly9-trufflehog-3.95.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/yim52l3g4s3a08f983fr9icqn3vi8ly9-trufflehog-3.95.2"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ym4jc4r2zz728s49yj9vc9r95g1cb3p7-trufflehog-3.95.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/ym4jc4r2zz728s49yj9vc9r95g1cb3p7-trufflehog-3.95.2"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/r4n3jp2sjgfqzlp0nnk09kkf6cxd9m5g-trufflehog-3.95.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/r4n3jp2sjgfqzlp0nnk09kkf6cxd9m5g-trufflehog-3.95.2"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/aadi89099nmwx8pk3l2xav3mwbxypkhc-trufflehog-3.95.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/aadi89099nmwx8pk3l2xav3mwbxypkhc-trufflehog-3.95.2"
         }
       }
     }
