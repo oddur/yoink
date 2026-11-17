@@ -220,7 +220,7 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
                 "the keychain could not be read, and no key file holds the identity",
             )
             .with_detail(e.to_string())
-            .with_fix("unlock the keychain, or set YOINK_AGE_KEY for this session"),
+            .with_fix("set YOINK_AGE_KEY for this session, or run yoink on the Mac itself"),
         ],
         Err(e) => vec![
             Finding::error(

@@ -156,9 +156,7 @@ impl SecretsState {
         // Only when the keychain has a failure to forget. A missing
         // secrets.age or a decrypt error gives the same answer again,
         // and a reload on each visit would only repeat the toast.
-        if matches!(self.bundle, LoadStatus::Failed(_))
-            && crate::keychain::system_store().retry_failures()
-        {
+        if matches!(self.bundle, LoadStatus::Failed(_)) && sealed::forget_keychain_failures() {
             self.bundle = LoadStatus::NotLoaded;
             return true;
         }
@@ -697,7 +695,7 @@ fn load(config: &Config) -> LoadStatus {
                 // A new key would not decrypt secrets.age.
                 Err(e) if e.is_keychain() => {
                     return LoadStatus::Failed(format!(
-                        "cannot read secrets: {e}\n\nUnlock the keychain or be ready to allow yoink, then leave this pane and open it again."
+                        "cannot read secrets: {e}\n\nBe ready to allow yoink in the keychain prompt, then leave this pane and open it again."
                     ));
                 }
                 Err(e) => {
