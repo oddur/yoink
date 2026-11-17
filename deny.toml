@@ -21,6 +21,12 @@ ignore = [
     # never reaches the shipped binary, and no newer `age` release drops it
     # yet. Drop this ignore together with the one above.
     "RUSTSEC-2026-0374",
+    # `humantime` is flagged unmaintained (no vulnerability). yoink uses
+    # it directly, and through `humantime-serde`, to parse durations in
+    # the config (`30s`, `5m`) and in `--since` / `--keep`. No maintained
+    # drop-in exists yet. Drop this ignore when yoink moves to another
+    # duration parser.
+    "RUSTSEC-2026-0542",
 ]
 
 [licenses]
