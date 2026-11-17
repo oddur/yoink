@@ -21,3 +21,9 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-
 # with `Contents: write` on the tap repo.
 publish-jobs = ["homebrew"]
 install-updater = false
+
+# dist 0.31.0 builds aarch64-apple-darwin on `macos-14`, which GitHub
+# no longer offers ("The configuration 'macos-14-arm64-us-default' is
+# not supported"). The v0.21.0 release run was cancelled by it.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
