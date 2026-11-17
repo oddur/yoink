@@ -1469,6 +1469,14 @@ impl App {
         }
     }
 
+    /// Give a failed secrets load a new try: the pane's bundle, and the
+    /// app's own copy that the drift column reads.
+    fn retry_failed_secrets(&mut self) {
+        if self.secrets_state.retry_if_failed() {
+            self.spawn_secrets_loader();
+        }
+    }
+
     /// Kick off the secrets bundle fetch in the background. The
     /// Dashboard drift column needs the bundle to compute the
     /// `spec_hash` that matches what `yoink up` would produce. We
@@ -2685,10 +2693,10 @@ impl App {
                 self.schedule_history_refresh(name.clone());
             }
             View::Secrets => {
-                // Decrypt + populate happens lazily on first render
-                // via `ensure_loaded`. Clear any half-finished edit
-                // from a previous visit so the operator starts fresh.
+                // Drop a half-finished edit. Retry a failed load, also
+                // for the app's copy that the drift column reads.
                 self.secrets_state.cancel_edit();
+                self.retry_failed_secrets();
             }
             View::Resources => {
                 self.schedule_resources_refresh();

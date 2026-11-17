@@ -64,6 +64,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 uuid = { version = "1", features = ["v7"] }
 
+# The age identity in the login keychain (`yoink secrets key … --keychain`).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }
 pretty_assertions = "1"

@@ -981,13 +981,67 @@ enum KeyAction {
         /// password manager.
         #[arg(long)]
         print: bool,
+        /// macOS: store the secret key in the login keychain instead of
+        /// a file. The key never touches disk.
+        #[arg(long, conflicts_with_all = ["out", "print", "force"])]
+        keychain: bool,
     },
     /// Print the public recipient (`age1…`) derived from the
     /// currently-resolved identity. Useful for "is the key in my
     /// shell the same one yoink.yaml expects?" sanity checks.
     /// Identity resolution: `YOINK_AGE_KEY` (raw) →
-    /// `YOINK_AGE_KEY_FILE` (path) → `~/.config/yoink/age.key`.
+    /// `YOINK_AGE_KEY_FILE` (path) → macOS keychain →
+    /// `~/.config/yoink/keys/` → `~/.config/yoink/age.key`.
     Public,
+    /// macOS: move an identity into the login keychain. Reads a key
+    /// file (default: the file that holds this project's identity) or
+    /// stdin with `-`, stores the identity, reads it back, and then
+    /// asks before it deletes the file.
+    Import {
+        /// Required. The keychain is the only import destination.
+        #[arg(long, required = true)]
+        keychain: bool,
+        /// Key file to import, or `-` for stdin. Stdin lets a restore
+        /// from a password manager skip the disk.
+        path: Option<String>,
+        /// Delete the key file after the import without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// macOS: print this project's identity from the login keychain,
+    /// for a backup. Refuses in CI, as `secrets show --reveal` does.
+    Export {
+        /// Required. The keychain is the only export source.
+        #[arg(long, required = true)]
+        keychain: bool,
+        /// Write the identity to PATH (mode 0o600) instead of stdout.
+        /// Refuses to overwrite an existing file unless `--force`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Overwrite an existing file at `--out`.
+        #[arg(long, requires = "out")]
+        force: bool,
+    },
+    /// List the identities yoink finds for this project, with the
+    /// source of each one. A `*` marks the one yoink uses.
+    List {
+        /// List every yoink key on this machine instead: each keychain
+        /// item with the project it was created for, and each key file.
+        /// Shows keys of other projects and of projects that are gone.
+        #[arg(long)]
+        all: bool,
+    },
+    /// macOS: delete an identity from the login keychain.
+    Remove {
+        /// Required. yoink removes keychain items only, never files.
+        #[arg(long, required = true)]
+        keychain: bool,
+        /// The age recipient (`age1…`) of the identity to delete.
+        recipient: String,
+        /// Delete without the confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 /// Subcommands for `yoink lock`.
@@ -1306,7 +1360,7 @@ fn log_file_path() -> PathBuf {
 
 #[allow(clippy::too_many_lines)] // one big match dispatch; splitting buys nothing
 async fn run(cli: Cli) -> Result<()> {
-    if let Some(result) = run_bootstrap(&cli.command) {
+    if let Some(result) = run_bootstrap(&cli.command, &cli.config) {
         return result;
     }
 
@@ -1344,7 +1398,50 @@ async fn run(cli: Cli) -> Result<()> {
         )?;
     }
 
-    resolve_sealed_host_addresses(&mut config).await?;
+    // Sealed host addresses need the age identity, and the identity can
+    // sit behind a keychain prompt. Commands that never dial a host do
+    // not get that prompt for this. `validate --check-hosts` does dial.
+    if !matches!(
+        cli.command,
+        Command::Validate { check_hosts: false }
+            | Command::Completions { .. }
+            | Command::ProxyRender
+            | Command::ProxyDockerfile
+            | Command::Secrets { .. }
+            // TAB completion of a service name or a config path runs on
+            // every keypress; only host completion needs the addresses.
+            | Command::Complete {
+                what: CompleteKind::Services | CompleteKind::Configs
+            }
+            | Command::Hosts {
+                action: HostsAction::Add { .. } | HostsAction::Remove { .. }
+            }
+            // A local build contacts no host. `add` reloads the config
+            // and resolves again before it deploys.
+            | Command::Build { .. }
+            | Command::Add { .. }
+    ) {
+        // Host-name completion reads the addresses, but a TAB press
+        // must not open a system dialog: no keychain prompts for it.
+        let quiet =
+            matches!(cli.command, Command::Complete { .. }).then(yoink::keychain::no_prompts);
+        // Prompts could not be turned off: do not go near the keychain.
+        let skip = quiet.as_ref().is_some_and(|q| !q.active());
+        // `doctor` and `hosts list` exist to show what is wrong, and
+        // completion must stay silent: they carry on without the
+        // addresses. Every other command stops on a keychain refusal.
+        let lenient = matches!(
+            cli.command,
+            Command::Doctor { .. }
+                | Command::Complete { .. }
+                | Command::Hosts {
+                    action: HostsAction::List
+                }
+        );
+        if !skip {
+            resolve_sealed_host_addresses(&mut config, lenient).await?;
+        }
+    }
 
     match cli.command {
         Command::Add {
@@ -1374,7 +1471,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // running up so the freshly-added service is included.
                 let mut reloaded = Config::load_from_path(&cli.config)
                     .with_context(|| format!("reloading {}", cli.config.display()))?;
-                resolve_sealed_host_addresses(&mut reloaded).await?;
+                resolve_sealed_host_addresses(&mut reloaded, false).await?;
                 let no_services: Vec<String> = Vec::new();
                 let no_tags: Vec<String> = Vec::new();
                 cmd_up(
@@ -2709,12 +2806,19 @@ fn check_config_freshness(path: &std::path::Path, require_latest: bool) -> Resul
     Ok(())
 }
 
-async fn resolve_sealed_host_addresses(config: &mut Config) -> Result<()> {
+async fn resolve_sealed_host_addresses(config: &mut Config, lenient: bool) -> Result<()> {
+    use yoink::secrets::SecretsError;
     if !config.any_host_address_sealed() {
         return Ok(());
     }
     let bundle = match secrets::load_bundle(config).await {
         Ok(b) => b,
+        // The keychain said no, or could not answer and no key file
+        // exists. Stop here with that reason: carrying on would fail
+        // later with an unrelated connect error on an empty address.
+        Err(SecretsError::NoAgeIdentity(e)) if e.is_keychain() && !lenient => {
+            return Err(e.into());
+        }
         Err(e) => {
             tracing::debug!(
                 error = %e,
@@ -4405,11 +4509,28 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
     Ok(())
 }
 
+/// True when an error chain ends in a keychain refusal or a keychain
+/// that could not answer.
+fn is_keychain_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<yoink::sealed::SealedError>()
+            .is_some_and(yoink::sealed::SealedError::is_keychain)
+    })
+}
+
 async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
     use yoink::doctor::{Severity, run_doctor, tally};
 
-    let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
-        std::sync::Arc::new(build_real_ops(config, None).await?);
+    // A sealed ssh key needs the identity. If the keychain will not hand
+    // it out, doctor must still run and say so: the secrets check
+    // reports it, and the host checks fail on their own terms.
+    let ops = match build_real_ops(config, None).await {
+        Ok(ops) => ops,
+        Err(e) if is_keychain_error(&e) => yoink::docker_ops::RealDockerOps::new(),
+        Err(e) => return Err(e),
+    };
+    let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> = std::sync::Arc::new(ops);
     let findings = run_doctor(config, ops).await;
 
     if json {
@@ -4716,8 +4837,56 @@ fn cmd_complete(config: &Config, what: CompleteKind) {
 /// Subcommands that don't need a `yoink.yaml`. Returns `Some(result)`
 /// to short-circuit `run`'s config-load step, or `None` to fall
 /// through.
-fn run_bootstrap(command: &Command) -> Option<Result<()>> {
+fn run_bootstrap(command: &Command, config_path: &Path) -> Option<Result<()>> {
+    // The keychain commands below do not need a project. They take the
+    // config when it loads (for the recipients and the "this project"
+    // marker) and work without it: a key of a deleted project can be
+    // removed, and a key can be restored before the repo is cloned.
+    let config = || match Config::load_from_path(config_path) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            // A config that exists but does not load is not "no
+            // project". Say so: the recipients are unknown.
+            if config_path.exists() {
+                eprintln!(
+                    "warning: {} did not load ({e}); continuing without the project",
+                    config_path.display()
+                );
+            }
+            None
+        }
+    };
     match command {
+        Command::Secrets {
+            action:
+                SecretsAction::Key {
+                    action: KeyAction::Remove { recipient, yes, .. },
+                },
+        } => Some(cmd_secrets_key_remove(recipient, *yes)),
+        Command::Secrets {
+            action:
+                SecretsAction::Key {
+                    action: KeyAction::List { all: true },
+                },
+        } => Some(cmd_secrets_key_list_all(config().as_ref())),
+        // With a path or `-`. Without one, import looks for the key
+        // file of the project, which needs the config.
+        Command::Secrets {
+            action:
+                SecretsAction::Key {
+                    action:
+                        KeyAction::Import {
+                            path: Some(path),
+                            yes,
+                            ..
+                        },
+                },
+        } => Some(cmd_secrets_key_import(
+            config().as_ref(),
+            config_path,
+            Some(path),
+            *yes,
+        )),
         Command::Completions { shell } => {
             cmd_completions(*shell);
             Some(Ok(()))
@@ -4734,9 +4903,19 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
         Command::Secrets {
             action:
                 SecretsAction::Key {
-                    action: KeyAction::Generate { out, force, print },
+                    action:
+                        KeyAction::Generate {
+                            out,
+                            force,
+                            print,
+                            keychain,
+                        },
                 },
-        } => Some(cmd_secrets_key_generate(out.clone(), *force, *print)),
+        } => Some(if *keychain {
+            cmd_secrets_key_generate_keychain(config_path)
+        } else {
+            cmd_secrets_key_generate(out.clone(), *force, *print)
+        }),
         Command::Init {
             host,
             force,
@@ -4998,10 +5177,23 @@ fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
 fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
     match action {
         SecretsAction::Key { action } => match action {
-            KeyAction::Generate { out, force, print } => {
-                cmd_secrets_key_generate(out, force, print)
+            // These run before the config loads; see `run_bootstrap`.
+            KeyAction::Generate { .. }
+            | KeyAction::List { all: true }
+            | KeyAction::Remove { .. } => {
+                unreachable!("run_bootstrap handles this command without a config")
             }
             KeyAction::Public => cmd_secrets_key_public(config),
+            KeyAction::Import { path, yes, .. } => cmd_secrets_key_import(
+                Some(config),
+                config.config_dir.as_deref().unwrap_or(Path::new(".")),
+                path.as_deref(),
+                yes,
+            ),
+            KeyAction::Export { out, force, .. } => {
+                cmd_secrets_key_export(config, out.as_deref(), force)
+            }
+            KeyAction::List { all: false } => cmd_secrets_key_list(config),
         },
         SecretsAction::Edit => cmd_secrets_edit(config),
         SecretsAction::Show { reveal } => cmd_secrets_show(config, reveal),
@@ -5077,20 +5269,559 @@ fn cmd_secrets_ssh_key_public(config: &Config, name: &str) -> Result<()> {
 }
 
 fn cmd_secrets_key_public(config: &Config) -> Result<()> {
-    use yoink::config::SecretsConfig;
     use yoink::sealed;
-    // Pull recipients from the config so the keys-dir scan can pick
-    // the matching identity. If the operator has many keys in
-    // ~/.config/yoink/keys/, this answers "the one for *this*
-    // project," not whichever happened to load first.
-    let recipients: &[String] = match &config.secrets {
-        Some(SecretsConfig::Age { recipients, .. }) => recipients,
-        _ => &[],
+    // Recipients from the config let the keychain lookup and the
+    // keys-dir scan pick the identity for *this* project, not whichever
+    // happened to load first.
+    let identity = match sealed::load_identity(age_recipients(config)) {
+        Ok(identity) => identity,
+        // A refusal on the keychain prompt is its own error; "no
+        // identity found" would point at the wrong fix.
+        Err(e) if e.is_keychain() => return Err(e.into()),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(
+                "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, \
+                 or place a key in ~/.config/yoink/keys/",
+            ));
+        }
     };
-    let identity = sealed::load_identity(recipients)
-        .with_context(|| "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, or place a key in ~/.config/yoink/keys/")?;
     println!("{}", identity.to_public());
     Ok(())
+}
+
+/// The `secrets.recipients:` of the config, or empty without an age block.
+fn age_recipients(config: &Config) -> &[String] {
+    use yoink::config::SecretsConfig;
+    match &config.secrets {
+        Some(SecretsConfig::Age { recipients, .. }) => recipients,
+        _ => &[],
+    }
+}
+
+/// The credential store, or an error on a platform without one.
+fn require_keychain() -> Result<&'static dyn yoink::keychain::IdentityStore> {
+    let store = yoink::keychain::system_store();
+    if !store.supported() {
+        anyhow::bail!("`--keychain` is supported on macOS only");
+    }
+    Ok(store)
+}
+
+/// A keychain-only identity is lost with the keychain. Say so when the
+/// project has no second recipient to fall back on.
+fn warn_keychain_only(recipients: &[String], public: &str) {
+    let others = recipients.iter().filter(|r| r.as_str() != public).count();
+    if others > 0 {
+        return;
+    }
+    eprintln!();
+    eprintln!("warning: this identity now lives only in the keychain. A reset keychain or a");
+    eprintln!("new Mac without a migration loses it, and then secrets.age cannot be decrypted.");
+    eprintln!("Keep a second way in:");
+    eprintln!("  • add a backup recipient: `yoink secrets key generate --print`, store the");
+    eprintln!("    secret in a password manager, and add its recipient to `secrets.recipients:`");
+    eprintln!("  • or keep a copy: `yoink secrets key export --keychain` into a password manager");
+}
+
+fn cmd_secrets_key_generate_keychain(config_path: &Path) -> Result<()> {
+    use yoink::sealed;
+    let store = require_keychain()?;
+    // A fresh identity has a fresh recipient, so no item can exist yet.
+    let (secret, public) = sealed::keygen();
+    store.set(
+        &public,
+        secret.as_str(),
+        &yoink::keychain::label_for(&project_name(config_path)),
+    )?;
+    eprintln!(
+        "stored identity in the keychain (service {})",
+        yoink::keychain::SERVICE
+    );
+    eprintln!("public recipient: {public}");
+    eprintln!();
+    eprintln!("Add this to yoink.yaml:");
+    eprintln!();
+    eprintln!("  secrets:\n    provider: age\n    recipients:\n      - {public}");
+    eprintln!();
+    eprintln!("yoink finds this key automatically once the recipient is in yoink.yaml.");
+    // A new identity is in no config yet, so it is always the only copy.
+    warn_keychain_only(&[], &public);
+    // stdout: the recipient alone, ready to pipe.
+    println!("{public}");
+    Ok(())
+}
+
+/// Why `import --keychain` must leave the source key file in place, or
+/// `None` when it can offer to delete it. The file goes only when yoink
+/// will find the key in the keychain afterwards and nothing else still
+/// points at the file.
+fn import_keeps_file(
+    file: &Path,
+    extra_identities: usize,
+    env_key_file: Option<&str>,
+    recipient_in_config: bool,
+) -> Option<String> {
+    use yoink::sealed::AGE_KEY_FILE_ENV;
+    let same_file = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if extra_identities > 0 {
+        return Some(format!(
+            "it holds {extra_identities} more identity line(s), and only the first was imported"
+        ));
+    }
+    if env_key_file.is_some_and(|e| same_file(Path::new(e.trim()), file)) {
+        return Some(format!(
+            "{AGE_KEY_FILE_ENV} points at it, and that variable is read before the keychain"
+        ));
+    }
+    if !recipient_in_config {
+        return Some(
+            "its recipient is not in `secrets.recipients:` of a loaded config, so yoink \
+             would not look for it in the keychain"
+                .into(),
+        );
+    }
+    None
+}
+
+fn cmd_secrets_key_import(
+    config: Option<&Config>,
+    config_path: &Path,
+    path: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    use std::io::Read as _;
+    use yoink::prompt::{ConfirmKind, confirm};
+    use yoink::sealed;
+
+    let store = require_keychain()?;
+    let recipients = config.map_or(&[][..], age_recipients);
+
+    let read_file = |p: &Path| -> Result<zeroize::Zeroizing<String>> {
+        Ok(zeroize::Zeroizing::new(
+            std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?,
+        ))
+    };
+    // Source: stdin, a named file, or the file that holds this
+    // project's identity.
+    let (raw, file) = match path {
+        Some("-") => {
+            let mut raw = zeroize::Zeroizing::new(String::new());
+            std::io::stdin()
+                .read_to_string(&mut raw)
+                .context("read the identity from stdin")?;
+            (raw, None)
+        }
+        Some(p) => {
+            let p = PathBuf::from(p);
+            (read_file(&p)?, Some(p))
+        }
+        None => {
+            let Some((_, p)) = sealed::file_identity_for(recipients)? else {
+                anyhow::bail!(
+                    "no key file holds an identity for this project's recipients — \
+                     pass a path, or `-` to read the identity from stdin"
+                );
+            };
+            (read_file(&p)?, Some(p))
+        }
+    };
+    // Only the first identity of the input is imported. A file with
+    // more must stay: deleting it would lose the others.
+    let extra_identities = sealed::identity_line_count(&raw).saturating_sub(1);
+    let identity = sealed::parse_identity_text(&raw)?;
+    let public = identity.to_public().to_string();
+    let secret = sealed::identity_secret(&identity);
+
+    store.set(
+        &public,
+        secret.as_str(),
+        &yoink::keychain::label_for(&project_name(config_path)),
+    )?;
+    // Read back before anything is deleted.
+    // `get_fresh`: the cache holds the value that was just written, so
+    // only a real read proves that the item is there.
+    match store.get_fresh(&public)? {
+        Some(back) if back.as_str() == secret.as_str() => {}
+        _ => anyhow::bail!(
+            "the keychain did not return the identity that was stored; the key file is untouched"
+        ),
+    }
+    eprintln!("stored identity {public} in the keychain");
+    if !recipients.is_empty() && !recipients.contains(&public) {
+        eprintln!(
+            "note: {public} is not in this project's `secrets.recipients:`, so yoink will not use it here"
+        );
+    }
+
+    // True while another copy of this identity exists: a key file that
+    // stays on disk, or the place that stdin was piped from (the
+    // documented restore from a password manager).
+    let mut other_copy = file.is_none();
+    if let Some(p) = file {
+        let env_file = std::env::var(sealed::AGE_KEY_FILE_ENV).ok();
+        let keep_because = import_keeps_file(
+            &p,
+            extra_identities,
+            env_file.as_deref(),
+            recipients.contains(&public),
+        );
+        if let Some(why) = keep_because {
+            other_copy = true;
+            eprintln!("kept {}: {why}", p.display());
+        } else if confirm(
+            &format!("delete the key file {}?", p.display()),
+            ConfirmKind::DefaultNo,
+            yes,
+        )? {
+            // Unlinked, not wiped: an SSD gives no guarantee that an
+            // overwrite reaches the old blocks.
+            std::fs::remove_file(&p).with_context(|| format!("delete {}", p.display()))?;
+            eprintln!("deleted {}", p.display());
+        } else {
+            other_copy = true;
+            eprintln!(
+                "kept {} — the key is still on disk in plaintext",
+                p.display()
+            );
+        }
+    }
+    // Another plaintext copy that yoink still finds on its own.
+    if let Some((_, extra)) = sealed::file_identity_for(std::slice::from_ref(&public))? {
+        other_copy = true;
+        eprintln!(
+            "note: {} holds the same identity in plaintext",
+            extra.display()
+        );
+    }
+    if path == Some("-") {
+        eprintln!("note: keep the source of this key as your backup");
+    }
+    if !other_copy {
+        warn_keychain_only(recipients, &public);
+    }
+    Ok(())
+}
+
+fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> Result<()> {
+    use yoink::sealed;
+    if let Some(ci_var) = detected_ci_env()
+        && !is_truthy_env("YOINK_ALLOW_REVEAL_IN_CI")
+    {
+        anyhow::bail!(
+            "refusing to export the age identity: detected CI environment (${ci_var} is set). \
+             If this is intentional, set YOINK_ALLOW_REVEAL_IN_CI=1"
+        );
+    }
+    let store = require_keychain()?;
+    let recipients = age_recipients(config);
+    if recipients.is_empty() {
+        anyhow::bail!("no `secrets.recipients:` in the config, so there is no identity to look up");
+    }
+    // The same lookup as identity resolution, so the two agree about
+    // each item. Resolution ignores a locked keychain and a broken
+    // item; here they are the answer when nothing else is found, or an
+    // intact key would look lost.
+    let lookup = sealed::keychain_identity(store, recipients)?;
+    let Some(identity) = lookup.identity else {
+        if let Some(reason) = lookup.unavailable {
+            anyhow::bail!("the keychain could not be read: {reason}");
+        }
+        if let Some((recipient, why)) = lookup.skipped.first() {
+            anyhow::bail!("the keychain item for {recipient} {why}");
+        }
+        anyhow::bail!("the keychain holds no identity for this project's recipients");
+    };
+    let public = identity.to_public().to_string();
+    let secret = sealed::identity_secret(&identity);
+    if let Some(path) = out {
+        if path.exists() && !force {
+            anyhow::bail!(
+                "{} already exists — pass --force to overwrite",
+                path.display()
+            );
+        }
+        let body = format!("# public key: {public}\n{}\n", secret.as_str());
+        sealed::write_atomically_secret(path, body.as_bytes())?;
+        eprintln!("wrote identity {public} to {} (mode 0600)", path.display());
+    } else {
+        // stdout: the secret alone, so a pipe captures exactly the key.
+        eprintln!("identity {public} — secret on stdout:");
+        println!("{}", secret.as_str());
+    }
+    Ok(())
+}
+
+/// The project a key belongs to, for the keychain item name: the name
+/// of the folder that holds the config. `path` is the config file
+/// (`-c`, also when it does not exist yet) or its folder.
+fn project_name(path: &Path) -> String {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    };
+    std::fs::canonicalize(&dir)
+        .ok()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "unknown project".into())
+}
+
+/// `yoink secrets key list --all`: every yoink key on this machine.
+fn cmd_secrets_key_list_all(config: Option<&Config>) -> Result<()> {
+    use yoink::sealed;
+    let recipients = config.map_or(&[][..], age_recipients);
+    let here = |public: &str| {
+        if recipients.iter().any(|r| r == public) {
+            "  (this project)"
+        } else {
+            ""
+        }
+    };
+    let store = yoink::keychain::system_store();
+    let items = store.list()?;
+    let files = sealed::file_identities()?;
+    if items.is_empty() && files.is_empty() {
+        eprintln!("no yoink keys on this machine");
+        return Ok(());
+    }
+    let width = items.iter().map(|i| i.label.len()).max().unwrap_or(0);
+    if !items.is_empty() {
+        println!("keychain:");
+        for item in &items {
+            println!(
+                "  {:<width$}  {}{}",
+                item.label,
+                item.recipient,
+                here(&item.recipient)
+            );
+        }
+    }
+    if !files.is_empty() {
+        println!("key files:");
+        for (public, path) in &files {
+            println!("  {}  {public}{}", path.display(), here(public));
+        }
+    }
+    Ok(())
+}
+
+/// True when `YOINK_AGE_KEY` or `YOINK_AGE_KEY_FILE` holds a value.
+fn env_is_set() -> bool {
+    use yoink::sealed::{AGE_KEY_ENV, AGE_KEY_FILE_ENV};
+    [AGE_KEY_ENV, AGE_KEY_FILE_ENV]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|v| !v.trim().is_empty()))
+}
+
+/// One row of `yoink secrets key list`.
+struct KeyRow {
+    /// `None` for a row that names something yoink could not read.
+    source: Option<yoink::sealed::IdentitySource>,
+    label: String,
+    recipient: String,
+    note: String,
+}
+
+/// Every identity yoink can see for a project, in resolution order.
+fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
+    use yoink::sealed::{self, IdentitySource};
+    let in_config = |public: &str| recipients.iter().any(|r| r == public);
+    let note = |public: &str| {
+        if recipients.is_empty() || in_config(public) {
+            String::new()
+        } else {
+            "not in secrets.recipients".to_string()
+        }
+    };
+    let unreadable = |label: String, why: &str| KeyRow {
+        source: None,
+        label,
+        recipient: "-".into(),
+        note: why.into(),
+    };
+    let mut rows: Vec<KeyRow> = Vec::new();
+
+    if let Ok(raw) = std::env::var(sealed::AGE_KEY_ENV)
+        && !raw.trim().is_empty()
+    {
+        let label = IdentitySource::EnvKey.to_string();
+        rows.push(match sealed::parse_env_identity(&raw) {
+            Ok(id) => {
+                let recipient = id.to_public().to_string();
+                KeyRow {
+                    source: Some(IdentitySource::EnvKey),
+                    label,
+                    note: note(&recipient),
+                    recipient,
+                }
+            }
+            Err(_) => unreadable(label, "not a valid identity"),
+        });
+    }
+    if let Ok(path) = std::env::var(sealed::AGE_KEY_FILE_ENV)
+        && !path.trim().is_empty()
+    {
+        let path = PathBuf::from(path.trim());
+        let label = format!("{} ({})", sealed::AGE_KEY_FILE_ENV, path.display());
+        let identity = sealed::identity_from_file(&path).ok();
+        rows.push(match identity {
+            Some(id) => {
+                let recipient = id.to_public().to_string();
+                KeyRow {
+                    source: Some(IdentitySource::EnvFile(path)),
+                    label,
+                    note: note(&recipient),
+                    recipient,
+                }
+            }
+            None => unreadable(label, "cannot read an identity"),
+        });
+    }
+    // Names only: this list must not open a keychain prompt, also when
+    // an environment variable already supplies the identity. Whether an
+    // item really holds its identity shows in the star and in the
+    // message below, which come from the real resolution.
+    let stored: Vec<String> = match yoink::keychain::system_store().list() {
+        Ok(items) => items.into_iter().map(|i| i.recipient).collect(),
+        Err(e) => {
+            rows.push(unreadable("keychain".into(), &e.to_string()));
+            Vec::new()
+        }
+    };
+    for recipient in recipients.iter().filter(|r| stored.contains(r)) {
+        rows.push(KeyRow {
+            source: Some(IdentitySource::Keychain),
+            label: "keychain".into(),
+            recipient: recipient.clone(),
+            note: String::new(),
+        });
+    }
+    let legacy = sealed::legacy_identity_path()?;
+    for (recipient, path) in sealed::file_identities()? {
+        // Key files of other projects stay out of the list. The legacy
+        // file is always shown: yoink loads it without a recipient match.
+        let is_legacy = path == legacy;
+        if !is_legacy && !in_config(&recipient) {
+            continue;
+        }
+        rows.push(KeyRow {
+            label: format!("file {}", path.display()),
+            source: Some(if is_legacy {
+                IdentitySource::Legacy(path)
+            } else {
+                IdentitySource::KeysDir(path)
+            }),
+            note: note(&recipient),
+            recipient,
+        });
+    }
+    Ok(rows)
+}
+
+fn cmd_secrets_key_list(config: &Config) -> Result<()> {
+    use yoink::sealed;
+    let recipients = age_recipients(config);
+    let rows = collect_key_rows(recipients)?;
+    if rows.is_empty() {
+        eprintln!("no identity found for this project");
+        return Ok(());
+    }
+    // The star follows the real resolution, not the row order. Prompts
+    // are off for it: this list must never open a keychain dialog.
+    //
+    // That has one blind spot. If the keychain holds an item that needs
+    // your permission, a real command would ask and use the keychain,
+    // while the quiet lookup here falls through to a key file. A star
+    // on that file would be wrong, so then no row gets one.
+    let (resolved, unread) = {
+        let quiet = yoink::keychain::no_prompts();
+        if quiet.active() {
+            // The reason, when any item could not be read. Also when
+            // another recipient's item was readable: a real command asks
+            // for the first one before it gets that far.
+            let unread = sealed::keychain_identity(yoink::keychain::system_store(), recipients)
+                .ok()
+                .and_then(|l| l.unavailable);
+            (sealed::resolve_identity(recipients), unread)
+        } else {
+            (
+                Err(sealed::SealedError::NoRecipients),
+                Some("prompts could not be turned off".to_string()),
+            )
+        }
+    };
+    // The quiet answer is wrong only where the keychain decides: the
+    // lookup got past the environment variables (which outrank the
+    // keychain, and whose own errors must be shown as they are).
+    let keychain_decides = match &resolved {
+        Ok(r) => !matches!(
+            r.source,
+            sealed::IdentitySource::EnvKey | sealed::IdentitySource::EnvFile(_)
+        ),
+        Err(e) => e.is_keychain() || unread.is_some() && !env_is_set(),
+    };
+    let resolved = match unread {
+        Some(reason) if keychain_decides => {
+            Err(sealed::SealedError::KeychainUnavailable { reason })
+        }
+        _ => resolved,
+    };
+    let used = resolved
+        .as_ref()
+        .ok()
+        .map(|r| (&r.source, r.identity.to_public().to_string()));
+    let width = rows.iter().map(|r| r.label.len()).max().unwrap_or(0);
+    for row in &rows {
+        // Source and recipient: two keychain rows share one source.
+        let is_used = used.as_ref().is_some_and(|(source, recipient)| {
+            row.source.as_ref() == Some(*source) && row.recipient == *recipient
+        });
+        let star = if is_used { "*" } else { " " };
+        let note = if row.note.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", row.note)
+        };
+        println!("{star} {:<width$}  {}{note}", row.label, row.recipient);
+    }
+    eprintln!();
+    match resolved {
+        Ok(_) => eprintln!("* = the identity yoink uses"),
+        // Prompts were off for this list, so an item that needs your
+        // permission could not be read. That is not a lost key.
+        Err(sealed::SealedError::KeychainUnavailable { reason }) => eprintln!(
+            "no star: the keychain item was not read ({reason}). A command that uses the \
+             key, for example `yoink secrets show`, asks for permission and then uses it."
+        ),
+        Err(e) => eprintln!("yoink cannot load an identity: {e}"),
+    }
+    Ok(())
+}
+
+fn cmd_secrets_key_remove(recipient: &str, yes: bool) -> Result<()> {
+    use yoink::prompt::{ConfirmKind, confirm};
+    let store = require_keychain()?;
+    if !confirm(
+        &format!(
+            "delete the keychain identity for {recipient}? Without another copy, \
+             secrets sealed to it cannot be decrypted."
+        ),
+        ConfirmKind::Destructive,
+        yes,
+    )? {
+        anyhow::bail!("aborted");
+    }
+    if store.delete(recipient)? {
+        eprintln!("deleted the keychain identity for {recipient}");
+        Ok(())
+    } else {
+        anyhow::bail!("the keychain holds no identity for {recipient}")
+    }
 }
 
 fn cmd_secrets_key_generate(out: Option<PathBuf>, force: bool, print: bool) -> Result<()> {
@@ -5868,6 +6599,36 @@ mod tests {
         GitFallbackFailure, check_git_fallback, extract_image_tag, parse_as_pairs,
         parse_tag_overrides_with, previous_generation, rollback_tag,
     };
+
+    /// `import --keychain` deletes a key file only when nothing is lost:
+    /// yoink will find the key in the keychain, and no variable or
+    /// second identity still depends on the file.
+    #[test]
+    fn import_keeps_the_file_unless_deleting_is_safe() {
+        use super::import_keeps_file;
+        use std::path::Path;
+        let file = Path::new("/tmp/yoink-test-does-not-exist.key");
+        assert!(import_keeps_file(file, 0, None, true).is_none());
+        // A second identity in the file.
+        assert!(
+            import_keeps_file(file, 1, None, true)
+                .unwrap()
+                .contains("more identity")
+        );
+        // YOINK_AGE_KEY_FILE points at the file.
+        assert!(
+            import_keeps_file(file, 0, Some(" /tmp/yoink-test-does-not-exist.key "), true)
+                .unwrap()
+                .contains("YOINK_AGE_KEY_FILE")
+        );
+        assert!(import_keeps_file(file, 0, Some("/tmp/other.key"), true).is_none());
+        // The recipient is not in a loaded config.
+        assert!(
+            import_keeps_file(file, 0, None, false)
+                .unwrap()
+                .contains("recipients")
+        );
+    }
 
     fn tag_test_services() -> Vec<yoink::config::ServiceConfig> {
         yoink::config::Config::parse_str(

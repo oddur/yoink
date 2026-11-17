@@ -184,14 +184,44 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
         ];
     }
 
-    match sealed::load_identity(recipients) {
-        Ok(identity) => {
-            let public = identity.to_public().to_string();
-            vec![
-                Finding::pass("secrets", "age identity available")
-                    .with_detail(format!("loaded identity matches recipient {public}")),
-            ]
+    match sealed::resolve_identity(recipients) {
+        Ok(resolved) => {
+            let public = resolved.identity.to_public().to_string();
+            let store = crate::keychain::system_store();
+            // Search for this identity only. A search over every recipient
+            // stops at the first key file it finds, which can be the file
+            // of another recipient.
+            let file_copy = sealed::file_identity_for(std::slice::from_ref(&public))
+                .ok()
+                .flatten()
+                .map(|(_, path)| path);
+            identity_findings(
+                &public,
+                &resolved.source,
+                recipients.len(),
+                recipients.contains(&public),
+                file_copy.as_deref(),
+                store.supported(),
+            )
         }
+        // A refusal on the keychain prompt stops before the key files
+        // are read, so "place a key file" would be the wrong fix.
+        Err(e @ sealed::SealedError::Keychain(_)) => vec![
+            Finding::error("secrets", "the keychain refused access to the age identity")
+                .with_detail(e.to_string())
+                .with_fix(
+                    "run the command again and allow yoink in the keychain prompt, \
+                     or set YOINK_AGE_KEY",
+                ),
+        ],
+        Err(e @ sealed::SealedError::KeychainUnavailable { .. }) => vec![
+            Finding::error(
+                "secrets",
+                "the keychain could not be read, and no key file holds the identity",
+            )
+            .with_detail(e.to_string())
+            .with_fix("unlock the keychain, or set YOINK_AGE_KEY for this session"),
+        ],
         Err(e) => vec![
             Finding::error(
                 "secrets",
@@ -205,6 +235,96 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
             ),
         ],
     }
+}
+
+/// Findings about where the identity lives. Pure, so tests cover each
+/// case without a keychain.
+///
+/// `file_copy` is a key file that holds the same identity.
+/// `keychain_supported` is true on macOS.
+fn identity_findings(
+    public: &str,
+    source: &sealed::IdentitySource,
+    recipient_count: usize,
+    in_recipients: bool,
+    file_copy: Option<&std::path::Path>,
+    keychain_supported: bool,
+) -> Vec<Finding> {
+    use sealed::IdentitySource;
+    let mut out = if in_recipients {
+        vec![
+            Finding::pass("secrets", "age identity available").with_detail(format!(
+                "loaded identity matches recipient {public} (source: {source})"
+            )),
+        ]
+    } else {
+        // The legacy file loads without a recipient match. A key that
+        // is not a recipient cannot decrypt secrets.age.
+        vec![
+            Finding::warn(
+                "secrets",
+                "the age identity is not a recipient of this config",
+            )
+            .with_detail(format!(
+                "{public} (source: {source}) is not in `secrets.recipients:`, \
+                     so it cannot decrypt the sealed file"
+            ))
+            .with_fix(
+                "use the key of one of the recipients, or add this recipient and \
+                     seal the file again",
+            ),
+        ]
+    };
+    if *source == IdentitySource::Keychain {
+        if let Some(path) = file_copy {
+            out.push(
+                Finding::warn(
+                    "secrets",
+                    "the age identity is in the keychain and in a key file",
+                )
+                .with_detail(format!(
+                    "{} holds the same identity in plaintext",
+                    path.display()
+                ))
+                .with_fix(format!(
+                    "delete {} — yoink reads the keychain copy",
+                    path.display()
+                )),
+            );
+        } else if recipient_count == 1 {
+            out.push(
+                Finding::warn("secrets", "the only recipient is a keychain-only identity")
+                    .with_detail(
+                        "a reset keychain or a new Mac without a migration loses the key, \
+                     and then secrets.age cannot be decrypted",
+                    )
+                    .with_fix(
+                        "add a backup recipient to `secrets.recipients:`. A copy made with \
+                         `yoink secrets key export --keychain` is also a backup, but yoink \
+                         cannot see it, so this warning stays",
+                    ),
+            );
+        }
+    } else if keychain_supported
+        // The legacy file loads without a recipient match. A key that is
+        // not in `secrets.recipients:` would be stored under a name
+        // yoink never asks for, so the import is not offered.
+        && in_recipients
+        && matches!(
+            source,
+            IdentitySource::KeysDir(_) | IdentitySource::Legacy(_)
+        )
+    {
+        // Not for `YOINK_AGE_KEY_FILE`: the env var outranks the
+        // keychain, so an import would change nothing.
+        // An info line, not a warning: the exit code does not change.
+        out.push(
+            Finding::pass("secrets", "the age identity is a plaintext key file").with_fix(
+                "optional: `yoink secrets key import --keychain` moves it into the macOS keychain",
+            ),
+        );
+    }
+    out
 }
 
 // ---------- config: build blocks vs image refs ----------
@@ -929,6 +1049,118 @@ fn check_secret_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn titles(findings: &[Finding]) -> Vec<(Severity, &str)> {
+        findings
+            .iter()
+            .map(|f| (f.severity, f.title.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn identity_findings_report_the_source() {
+        let f = identity_findings(
+            "age1x",
+            &sealed::IdentitySource::EnvKey,
+            2,
+            true,
+            None,
+            true,
+        );
+        assert_eq!(f.len(), 1);
+        assert!(
+            f[0].detail
+                .as_deref()
+                .unwrap()
+                .contains("YOINK_AGE_KEY env var")
+        );
+    }
+
+    #[test]
+    fn identity_findings_warn_when_keychain_and_file_hold_the_same_key() {
+        let path = std::path::Path::new("/tmp/k.key");
+        let f = identity_findings(
+            "age1x",
+            &sealed::IdentitySource::Keychain,
+            2,
+            true,
+            Some(path),
+            true,
+        );
+        assert_eq!(
+            titles(&f)[1],
+            (
+                Severity::Warn,
+                "the age identity is in the keychain and in a key file"
+            )
+        );
+    }
+
+    #[test]
+    fn identity_findings_warn_on_a_single_keychain_only_recipient() {
+        let f = identity_findings(
+            "age1x",
+            &sealed::IdentitySource::Keychain,
+            1,
+            true,
+            None,
+            true,
+        );
+        assert_eq!(
+            titles(&f)[1],
+            (
+                Severity::Warn,
+                "the only recipient is a keychain-only identity"
+            )
+        );
+        // A second recipient is the backup: no warning.
+        let f = identity_findings(
+            "age1x",
+            &sealed::IdentitySource::Keychain,
+            2,
+            true,
+            None,
+            true,
+        );
+        assert_eq!(f.len(), 1);
+    }
+
+    /// The hint to move a key file into the keychain is an info line on
+    /// macOS only, and never a warning.
+    #[test]
+    fn identity_findings_hint_at_the_keychain_for_a_key_file_on_macos() {
+        let source = sealed::IdentitySource::KeysDir("/tmp/k.key".into());
+        let f = identity_findings("age1x", &source, 1, true, None, true);
+        assert_eq!(
+            titles(&f)[1],
+            (Severity::Pass, "the age identity is a plaintext key file")
+        );
+        assert!(f[1].fix.as_deref().unwrap().contains("import --keychain"));
+        assert_eq!(
+            identity_findings("age1x", &source, 1, true, None, false).len(),
+            1
+        );
+        // It is a warning, not a pass: that key cannot decrypt the file.
+        let f = identity_findings("age1x", &source, 1, false, None, true);
+        assert_eq!(
+            titles(&f),
+            [(
+                Severity::Warn,
+                "the age identity is not a recipient of this config"
+            )]
+        );
+        // A legacy key that is not a recipient of the project: no hint.
+        assert_eq!(
+            identity_findings("age1x", &source, 1, false, None, true).len(),
+            1
+        );
+        // `YOINK_AGE_KEY_FILE` outranks the keychain: no hint.
+        let env_file = sealed::IdentitySource::EnvFile("/tmp/k.key".into());
+        assert_eq!(
+            identity_findings("age1x", &env_file, 1, true, None, true).len(),
+            1
+        );
+    }
 
     #[test]
     fn arches_compatible_pairs() {

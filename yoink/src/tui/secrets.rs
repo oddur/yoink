@@ -146,6 +146,25 @@ impl SecretsState {
         }
     }
 
+    /// Called when the operator opens the pane. A load that failed
+    /// gets one new attempt per visit: the keychain may be unlocked
+    /// now, or the operator may want to answer the prompt differently.
+    /// Not on each render, which would put the prompt up in a loop.
+    /// Returns true when a retry was started, so the app can reload
+    /// its own copy of the bundle too.
+    pub fn retry_if_failed(&mut self) -> bool {
+        // Only when the keychain has a failure to forget. A missing
+        // secrets.age or a decrypt error gives the same answer again,
+        // and a reload on each visit would only repeat the toast.
+        if matches!(self.bundle, LoadStatus::Failed(_))
+            && crate::keychain::system_store().retry_failures()
+        {
+            self.bundle = LoadStatus::NotLoaded;
+            return true;
+        }
+        false
+    }
+
     /// Cancel any in-progress edit. Called on Esc and on view exit.
     pub fn cancel_edit(&mut self) {
         self.edit = EditState::None;
@@ -674,6 +693,13 @@ fn load(config: &Config) -> LoadStatus {
             };
             let identity = match sealed::load_identity(recipients) {
                 Ok(id) => id,
+                // The key exists but the keychain did not hand it out.
+                // A new key would not decrypt secrets.age.
+                Err(e) if e.is_keychain() => {
+                    return LoadStatus::Failed(format!(
+                        "cannot read secrets: {e}\n\nUnlock the keychain or be ready to allow yoink, then leave this pane and open it again."
+                    ));
+                }
                 Err(e) => {
                     return LoadStatus::Failed(format!(
                         "cannot read secrets: {e}\n\nFix locally with: yoink secrets key generate"
