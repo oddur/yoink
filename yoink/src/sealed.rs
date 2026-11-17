@@ -58,6 +58,12 @@ pub enum SealedError {
     IdentityParse(String),
     #[error(transparent)]
     Keychain(#[from] crate::keychain::StoreError),
+    #[error(
+        "the keychain could not be read ({reason}), and no key file holds an identity for \
+         this config's recipients — unlock the keychain (it is locked in an SSH session), \
+         or set {AGE_KEY_ENV} / {AGE_KEY_FILE_ENV}"
+    )]
+    KeychainUnavailable { reason: String },
     #[error("parse age recipient {raw:?}: {reason}")]
     RecipientParse { raw: String, reason: String },
     #[error(
@@ -276,7 +282,8 @@ fn resolve_identity_with(
         }
     }
 
-    if let Some(identity) = keychain_identity(store, recipients)? {
+    let keychain = keychain_identity(store, recipients)?;
+    if let Some(identity) = keychain.identity {
         return Ok(ResolvedIdentity {
             identity,
             source: IdentitySource::Keychain,
@@ -298,7 +305,21 @@ fn resolve_identity_with(
             source: IdentitySource::Legacy(legacy_path.to_path_buf()),
         });
     }
+    // No key file either. If the keychain could not answer, say so: a
+    // key that sits intact in a locked keychain must not look lost.
+    if let Some(reason) = keychain.unavailable {
+        return Err(SealedError::KeychainUnavailable { reason });
+    }
     Err(SealedError::NoIdentity(legacy_path.to_path_buf()))
+}
+
+/// What the store said about a list of recipients.
+#[derive(Default)]
+pub struct KeychainLookup {
+    pub identity: Option<x25519::Identity>,
+    /// Set when the store could not answer (locked keychain, no GUI
+    /// session). Resolution continues with the key files.
+    pub unavailable: Option<String>,
 }
 
 /// Ask the store for the identity of each recipient, by name.
@@ -312,13 +333,15 @@ fn resolve_identity_with(
 pub fn keychain_identity(
     store: &dyn crate::keychain::IdentityStore,
     recipients: &[String],
-) -> Result<Option<x25519::Identity>, SealedError> {
+) -> Result<KeychainLookup, SealedError> {
     use crate::keychain::StoreError;
+    let mut lookup = KeychainLookup::default();
     for recipient in recipients {
         match store.get(recipient) {
             Ok(Some(raw)) => match parse_identity(&raw) {
                 Ok(identity) if identity.to_public().to_string() == *recipient => {
-                    return Ok(Some(identity));
+                    lookup.identity = Some(identity);
+                    return Ok(lookup);
                 }
                 Ok(_) => tracing::debug!(
                     "keychain item for {recipient} holds a different identity; skipping"
@@ -329,11 +352,12 @@ pub fn keychain_identity(
             Err(denied @ StoreError::Denied { .. }) => return Err(denied.into()),
             Err(StoreError::Unavailable(reason)) => {
                 tracing::debug!("keychain not available ({reason}); using key files");
-                return Ok(None);
+                lookup.unavailable = Some(reason);
+                return Ok(lookup);
             }
         }
     }
-    Ok(None)
+    Ok(lookup)
 }
 
 /// The key file that holds an identity for one of `recipients`: a file
@@ -353,6 +377,19 @@ pub fn file_identity_for(
         return Ok(Some((identity, legacy)));
     }
     Ok(None)
+}
+
+/// Parse a raw identity the way `YOINK_AGE_KEY` is read: the whole
+/// value, trimmed. `yoink secrets key list` uses it so that its rows
+/// agree with what resolution loads.
+pub fn parse_env_identity(raw: &str) -> Result<x25519::Identity, SealedError> {
+    parse_identity(raw.trim())
+}
+
+/// Load an identity from a key file, with the same mode check and
+/// parsing as resolution.
+pub fn identity_from_file(path: &Path) -> Result<x25519::Identity, SealedError> {
+    load_identity_from_file(path)
 }
 
 /// Parse an identity from text that may carry `#` comment lines, as a
@@ -1169,7 +1206,7 @@ BAZ=plain
 
     // -- credential store ----------------------------------------------
 
-    use crate::keychain::{StoreError, fake::FakeStore};
+    use crate::keychain::{IdentityStore as _, StoreError, fake::FakeStore};
 
     /// A temp keys dir with one key file, plus a legacy path that does
     /// not exist. Returns `(tmp, keys_dir, legacy, public_of_the_file)`.
@@ -1258,6 +1295,38 @@ BAZ=plain
         assert!(matches!(r.source, IdentitySource::KeysDir(_)));
     }
 
+    /// A keychain-only key behind a locked keychain must not look lost:
+    /// the error names the keychain, not a missing key file.
+    #[test]
+    fn unavailable_keychain_and_no_key_file_names_the_keychain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        let legacy = tmp.path().join("age.key");
+        let store = FakeStore {
+            fail: Some(StoreError::Unavailable("locked".into())),
+            ..FakeStore::default()
+        };
+        let Err(err) = resolve_identity_with(None, None, &store, &keys, &legacy, &["age1x".into()])
+        else {
+            panic!("no identity is available");
+        };
+        assert!(
+            matches!(&err, SealedError::KeychainUnavailable { reason } if reason == "locked"),
+            "{err}"
+        );
+    }
+
+    /// A broken item for one recipient must not hide a good item for
+    /// the next recipient.
+    #[test]
+    fn keychain_lookup_continues_past_an_item_that_is_not_an_identity() {
+        let (secret, public) = keygen();
+        let store = FakeStore::with("age1broken", "\u{fffd}\u{fffd} not a key");
+        store.set(&public, secret.as_str()).unwrap();
+        let found = keychain_identity(&store, &["age1broken".into(), public.clone()]).unwrap();
+        assert_eq!(found.identity.unwrap().to_public().to_string(), public);
+    }
+
     /// "Deny" on the prompt stops resolution. A copy of the key on disk
     /// must not turn a refusal into a silent yes.
     #[test]
@@ -1296,7 +1365,7 @@ BAZ=plain
             }),
             ..FakeStore::default()
         };
-        assert!(keychain_identity(&store, &[]).unwrap().is_none());
+        assert!(keychain_identity(&store, &[]).unwrap().identity.is_none());
     }
 
     /// An item filed under one recipient that holds another identity is
@@ -1306,7 +1375,12 @@ BAZ=plain
         let (other_secret, _) = keygen();
         let (_, public) = keygen();
         let store = FakeStore::with(&public, other_secret.as_str());
-        assert!(keychain_identity(&store, &[public]).unwrap().is_none());
+        assert!(
+            keychain_identity(&store, &[public])
+                .unwrap()
+                .identity
+                .is_none()
+        );
     }
 
     /// A key file with two identities must be recognisable, so that

@@ -43,6 +43,12 @@ pub trait IdentityStore: Send + Sync {
     fn supported(&self) -> bool;
     /// The identity for `recipient`, or `None` when no item exists.
     fn get(&self, recipient: &str) -> Result<Option<Zeroizing<String>>, StoreError>;
+    /// [`Self::get`] that always asks the store itself, never a cache.
+    /// `import` uses it to prove that a stored item can be read back
+    /// before it deletes the key file.
+    fn get_fresh(&self, recipient: &str) -> Result<Option<Zeroizing<String>>, StoreError> {
+        self.get(recipient)
+    }
     /// Create or replace the item for `recipient`.
     fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError>;
     /// Remove the item. `false` when there was none.
@@ -99,14 +105,22 @@ impl<S: IdentityStore> IdentityStore for Cached<S> {
         self.inner.supported()
     }
     fn get(&self, recipient: &str) -> Lookup {
-        if let Some(hit) = self.seen().get(recipient) {
+        // The lock is held across the read on purpose. Two tasks that
+        // miss at the same time would otherwise both reach the keychain
+        // and put up two prompts for one recipient.
+        let mut seen = self.seen();
+        if let Some(hit) = seen.get(recipient) {
             return hit.clone();
         }
-        // The lock is not held across the read: the read can block on a
-        // system prompt.
         tracing::debug!("keychain read for {recipient}");
         let result = self.inner.get(recipient);
-        self.seen().insert(recipient.to_string(), result.clone());
+        seen.insert(recipient.to_string(), result.clone());
+        result
+    }
+    fn get_fresh(&self, recipient: &str) -> Lookup {
+        let mut seen = self.seen();
+        let result = self.inner.get_fresh(recipient);
+        seen.insert(recipient.to_string(), result.clone());
         result
     }
     fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError> {
@@ -185,12 +199,13 @@ mod macos {
         fn get(&self, recipient: &str) -> Result<Option<Zeroizing<String>>, StoreError> {
             match get_generic_password(SERVICE, recipient) {
                 Ok(bytes) => {
+                    // An item that is not UTF-8 is not an identity. Hand
+                    // it on as text anyway: the caller then skips this
+                    // one item, the same way it skips an item that
+                    // holds a different identity, and still asks for
+                    // the other recipients.
                     let bytes = Zeroizing::new(bytes);
-                    let text = std::str::from_utf8(&bytes).map_err(|_| {
-                        StoreError::Unavailable(format!(
-                            "the keychain item for {recipient} is not valid UTF-8"
-                        ))
-                    })?;
+                    let text = Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned());
                     Ok(Some(Zeroizing::new(text.trim().to_string())))
                 }
                 Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
@@ -319,6 +334,20 @@ mod tests {
             assert!(store.get("age1missing").unwrap().is_none());
         }
         assert_eq!(store.inner.reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// `import` must not trust the cache: `set` seeds it with the value
+    /// that was just written, so a cached read-back proves nothing.
+    #[test]
+    fn get_fresh_asks_the_store_and_not_the_cache() {
+        let store = Cached::new(Counting::default());
+        store.set("age1a", "secret-a").unwrap();
+        // The item vanishes behind the cache's back.
+        store.inner.inner.items.lock().unwrap().clear();
+        assert_eq!(store.get("age1a").unwrap().unwrap().as_str(), "secret-a");
+        assert!(store.get_fresh("age1a").unwrap().is_none());
+        // The fresh result replaces the stale cache entry.
+        assert!(store.get("age1a").unwrap().is_none());
     }
 
     /// After "Deny" yoink does not put the prompt up a second time.

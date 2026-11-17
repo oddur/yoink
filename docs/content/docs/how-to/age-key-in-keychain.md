@@ -142,7 +142,7 @@ yoink asks for a confirmation. Make sure that you have a backup before you remov
 
 **`access to the keychain item … was denied`.** You selected "Deny" on the system prompt. yoink does not continue with a key file after a refusal. Run the command again and allow access, or set `YOINK_AGE_KEY`.
 
-**yoink does not find the key in an SSH session into the Mac.** The login keychain is locked there. yoink continues with the key files and the environment variables. Set `YOINK_AGE_KEY` for that session.
+**`the keychain could not be read` in an SSH session into the Mac.** The login keychain is locked there. yoink continues with the key files and the environment variables, and it shows this error when they hold no identity. Set `YOINK_AGE_KEY` for that session.
 
 **`yoink doctor` shows "the age identity is in the keychain and in a key file".** Delete the key file. yoink reads the keychain copy.
 

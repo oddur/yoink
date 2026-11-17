@@ -1394,10 +1394,10 @@ async fn run(cli: Cli) -> Result<()> {
 
     // Sealed host addresses need the age identity, and the identity can
     // sit behind a keychain prompt. Commands that never dial a host do
-    // not get that prompt for nothing.
+    // not get that prompt for this. `validate --check-hosts` does dial.
     if !matches!(
         cli.command,
-        Command::Validate { .. }
+        Command::Validate { check_hosts: false }
             | Command::Completions { .. }
             | Command::ProxyRender
             | Command::ProxyDockerfile
@@ -5172,7 +5172,9 @@ fn cmd_secrets_key_public(config: &Config) -> Result<()> {
         Ok(identity) => identity,
         // A refusal on the keychain prompt is its own error; "no
         // identity found" would point at the wrong fix.
-        Err(e @ SealedError::Keychain(_)) => return Err(e.into()),
+        Err(e @ (SealedError::Keychain(_) | SealedError::KeychainUnavailable { .. })) => {
+            return Err(e.into());
+        }
         Err(e) => {
             return Err(anyhow::Error::new(e).context(
                 "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, \
@@ -5288,7 +5290,9 @@ fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Res
 
     store.set(&public, secret.as_str())?;
     // Read back before anything is deleted.
-    match store.get(&public)? {
+    // `get_fresh`: the cache holds the value that was just written, so
+    // only a real read proves that the item is there.
+    match store.get_fresh(&public)? {
         Some(back) if back.as_str() == secret.as_str() => {}
         _ => anyhow::bail!(
             "the keychain did not return the identity that was stored; the key file is untouched"
@@ -5335,6 +5339,7 @@ fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Res
 }
 
 fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> Result<()> {
+    use yoink::keychain::StoreError;
     use yoink::sealed;
     if let Some(ci_var) = detected_ci_env()
         && !is_truthy_env("YOINK_ALLOW_REVEAL_IN_CI")
@@ -5349,24 +5354,37 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> R
     if recipients.is_empty() {
         anyhow::bail!("no `secrets.recipients:` in the config, so there is no identity to look up");
     }
-    // Ask the store directly. `keychain_identity` treats a locked
-    // keychain as "no item", which is right for resolution and wrong
-    // here: "no identity" would make an intact key look lost.
+    // Ask the store directly, recipient by recipient, the way
+    // resolution does. A problem with one recipient's item does not
+    // stop the search, but it is reported when nothing else is found:
+    // "no identity" would make an intact key behind a locked keychain
+    // look lost.
     let mut found = None;
+    let mut problem: Option<String> = None;
     for recipient in recipients {
-        if let Some(raw) = store.get(recipient)? {
-            let identity = sealed::parse_identity_text(&raw).with_context(|| {
-                format!("the keychain item for {recipient} is not an age identity")
-            })?;
-            if identity.to_public().to_string() != *recipient {
-                anyhow::bail!("the keychain item for {recipient} holds a different identity");
-            }
-            found = Some(identity);
-            break;
+        match store.get(recipient) {
+            Ok(None) => {}
+            Ok(Some(raw)) => match sealed::parse_identity_text(&raw) {
+                Ok(identity) if identity.to_public().to_string() == *recipient => {
+                    found = Some(identity);
+                    break;
+                }
+                _ => {
+                    problem = Some(format!(
+                        "the keychain item for {recipient} does not hold the identity of that recipient"
+                    ));
+                }
+            },
+            // A refusal is final, as it is for resolution.
+            Err(denied @ StoreError::Denied { .. }) => return Err(denied.into()),
+            Err(e @ StoreError::Unavailable(_)) => problem = Some(e.to_string()),
         }
     }
     let Some(identity) = found else {
-        anyhow::bail!("the keychain holds no identity for this project's recipients");
+        match problem {
+            Some(problem) => anyhow::bail!("{problem}"),
+            None => anyhow::bail!("the keychain holds no identity for this project's recipients"),
+        }
     };
     let public = identity.to_public().to_string();
     let secret = sealed::identity_secret(&identity);
@@ -5421,7 +5439,7 @@ fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
         && !raw.trim().is_empty()
     {
         let label = format!("{} env var", sealed::AGE_KEY_ENV);
-        rows.push(match sealed::parse_identity_text(&raw) {
+        rows.push(match sealed::parse_env_identity(&raw) {
             Ok(id) => {
                 let recipient = id.to_public().to_string();
                 KeyRow {
@@ -5439,9 +5457,7 @@ fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
     {
         let path = PathBuf::from(path.trim());
         let label = format!("{} ({})", sealed::AGE_KEY_FILE_ENV, path.display());
-        let identity = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| sealed::parse_identity_text(&raw).ok());
+        let identity = sealed::identity_from_file(&path).ok();
         rows.push(match identity {
             Some(id) => {
                 let recipient = id.to_public().to_string();
@@ -5535,7 +5551,8 @@ fn cmd_secrets_key_remove(recipient: &str, yes: bool) -> Result<()> {
     let store = require_keychain()?;
     if !confirm(
         &format!(
-            "delete the keychain identity for {recipient}? Without another copy,              secrets sealed to it cannot be decrypted."
+            "delete the keychain identity for {recipient}? Without another copy, \
+             secrets sealed to it cannot be decrypted."
         ),
         ConfirmKind::Destructive,
         yes,

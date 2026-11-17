@@ -33,12 +33,12 @@ To decrypt, yoink tries these sources in order and stops at the first match:
 
 yoink asks for each item by name. It does not list or search the keychain. A command that has no config has no recipients, so it does not read the keychain.
 
-yoink reads the keychain only for a command that needs the identity, and one time at most for each recipient in a run. `yoink validate`, `yoink completions`, and `yoink proxy-render` do not read it. A config with `address_secret:` or `ssh_key_secret:` on a host needs the identity for each command that connects to that host, for example `yoink status`.
+yoink reads the keychain only for a command that needs the identity, and one time at most for each recipient in a run. A command needs the identity when it decrypts `secrets.age`. Examples are `yoink up`, `yoink secrets show`, and `yoink doctor`. `yoink validate` and `yoink proxy-render` decrypt the file when the config has routed services. A config with `address_secret:` or `ssh_key_secret:` on a host needs the identity for each command that connects to that host, for example `yoink status`. `yoink completions` does not read the keychain.
 
 | Case | Result |
 |---|---|
 | No item for any recipient | yoink continues with the key files. |
-| The keychain is locked, or the session has no GUI (SSH into the Mac) | yoink continues with the key files. |
+| The keychain is locked, or the session has no GUI (SSH into the Mac) | yoink continues with the key files. If no key file holds the identity, the error names the keychain. |
 | You select "Deny" on the system prompt | yoink stops with an error. It does not read the key files. |
 | The same identity is in the keychain and in a key file | yoink uses the keychain. `yoink doctor` shows a warning. |
 

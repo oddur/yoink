@@ -188,10 +188,12 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
         Ok(resolved) => {
             let public = resolved.identity.to_public().to_string();
             let store = crate::keychain::system_store();
-            let file_copy = sealed::file_identity_for(recipients)
+            // Search for this identity only. A search over every recipient
+            // stops at the first key file it finds, which can be the file
+            // of another recipient.
+            let file_copy = sealed::file_identity_for(std::slice::from_ref(&public))
                 .ok()
                 .flatten()
-                .filter(|(id, _)| id.to_public().to_string() == public)
                 .map(|(_, path)| path);
             identity_findings(
                 &public,
@@ -210,6 +212,14 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
                     "run the command again and allow yoink in the keychain prompt, \
                      or set YOINK_AGE_KEY",
                 ),
+        ],
+        Err(e @ sealed::SealedError::KeychainUnavailable { .. }) => vec![
+            Finding::error(
+                "secrets",
+                "the keychain could not be read, and no key file holds the identity",
+            )
+            .with_detail(e.to_string())
+            .with_fix("unlock the keychain, or set YOINK_AGE_KEY for this session"),
         ],
         Err(e) => vec![
             Finding::error(
