@@ -124,6 +124,26 @@ With `-`, yoink reads the identity from stdin and writes no file.
 2. Copy the `AGE-SECRET-KEY-1…` line into a secure note in your password manager.
 3. Clear the scrollback of your terminal.
 
+## Find the keys of all projects
+
+Each project has its own key. yoink selects the key whose recipient is in `secrets.recipients:` of the project. To see each yoink key on the computer, run:
+
+```sh
+yoink secrets key list --all
+```
+
+```text
+keychain:
+  yoink age key: blog  age1q9…
+  yoink age key: shop  age1gj…  (this project)
+key files:
+  /Users/you/.config/yoink/keys/age1x8….key  age1x8…
+```
+
+The name of a keychain item is the directory of the project at the time of the import. Keychain Access shows the same name. The command reads only names, so macOS shows no prompt.
+
+A key of a project that you deleted stays in the list. Remove it with the command in the next section.
+
 ## Remove a key from the keychain
 
 ```sh

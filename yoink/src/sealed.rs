@@ -1338,7 +1338,7 @@ BAZ=plain
     fn keychain_lookup_continues_past_an_item_that_is_not_an_identity() {
         let (secret, public) = keygen();
         let store = FakeStore::with("age1broken", "\u{fffd}\u{fffd} not a key");
-        store.set(&public, secret.as_str()).unwrap();
+        store.set(&public, secret.as_str(), "test").unwrap();
         let found = keychain_identity(&store, &["age1broken".into(), public.clone()]).unwrap();
         assert_eq!(found.identity.unwrap().to_public().to_string(), public);
     }

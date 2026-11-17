@@ -28,10 +28,11 @@ To decrypt, yoink tries these sources in order and stops at the first match:
 | Kind | Generic password |
 | Service | `is.yoink.age-identity` |
 | Account | The age recipient (`age1…`) |
+| Name | `yoink age key: <project>`. The project is the name of the directory that holds the config. yoink writes the name when it creates the item. |
 | Value | The identity (`AGE-SECRET-KEY-1…`) |
 | Sync | None. The login keychain does not sync to iCloud. |
 
-yoink asks for each item by name. It does not list or search the keychain. A command that has no config has no recipients, so it does not read the keychain.
+yoink finds an item by its service and account. The name is for you: it shows the project in Keychain Access and in `yoink secrets key list --all`. yoink does not search the keychain to decrypt. A command that has no config has no recipients, so it does not read the keychain.
 
 yoink reads the keychain only for a command that needs the identity, and one time at most for each recipient in a run. A command needs the identity when it decrypts `secrets.age`. Examples are `yoink up`, `yoink secrets show`, and `yoink doctor`. `yoink validate` and `yoink proxy-render` decrypt the file when the config has routed services. A config with `address_secret:` or `ssh_key_secret:` on a host needs the identity for each command that connects to that host, for example `yoink status`. `yoink completions` does not read the keychain.
 

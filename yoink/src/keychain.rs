@@ -36,6 +36,22 @@ pub enum StoreError {
     Unavailable(String),
 }
 
+/// One item of the store, without its secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredItem {
+    pub recipient: String,
+    /// The name shown in Keychain Access. yoink writes the project
+    /// there when it creates the item. A note for people; lookups go
+    /// by recipient.
+    pub label: String,
+}
+
+/// The item name for a project: what Keychain Access shows.
+#[must_use]
+pub fn label_for(project: &str) -> String {
+    format!("yoink age key: {project}")
+}
+
 /// A place that holds age identities, addressed by recipient.
 pub trait IdentityStore: Send + Sync {
     /// False on a platform without a store. The key commands use it to
@@ -55,8 +71,14 @@ pub trait IdentityStore: Send + Sync {
     /// that was imported in another terminal must not stick for the
     /// life of the process.
     fn retry_failures(&self) {}
-    /// Create or replace the item for `recipient`.
-    fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError>;
+    /// Create or replace the item for `recipient`. `label` names a new
+    /// item; an item that exists keeps the name it has.
+    fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError>;
+    /// Every yoink item in the store, without the secrets. Reads names
+    /// only, so the store does not ask for access to a secret.
+    fn list(&self) -> Result<Vec<StoredItem>, StoreError> {
+        Ok(Vec::new())
+    }
     /// Remove the item. `false` when there was none.
     fn delete(&self, recipient: &str) -> Result<bool, StoreError>;
 }
@@ -133,8 +155,11 @@ impl<S: IdentityStore> IdentityStore for Cached<S> {
         self.seen()
             .retain(|_, lookup| matches!(lookup, Ok(Some(_))));
     }
-    fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError> {
-        self.inner.set(recipient, identity)?;
+    fn list(&self) -> Result<Vec<StoredItem>, StoreError> {
+        self.inner.list()
+    }
+    fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError> {
+        self.inner.set(recipient, identity, label)?;
         self.seen().insert(
             recipient.to_string(),
             Ok(Some(Zeroizing::new(identity.to_string()))),
@@ -160,7 +185,7 @@ impl IdentityStore for NoStore {
     fn get(&self, _recipient: &str) -> Result<Option<Zeroizing<String>>, StoreError> {
         Ok(None)
     }
-    fn set(&self, _recipient: &str, _identity: &str) -> Result<(), StoreError> {
+    fn set(&self, _recipient: &str, _identity: &str, _label: &str) -> Result<(), StoreError> {
         Err(StoreError::Unavailable(
             "the keychain is supported on macOS only".into(),
         ))
@@ -173,12 +198,14 @@ impl IdentityStore for NoStore {
 #[cfg(target_os = "macos")]
 mod macos {
     use security_framework::base::Error;
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
     use security_framework::passwords::{
-        delete_generic_password, get_generic_password, set_generic_password,
+        delete_generic_password, get_generic_password, set_generic_password_options,
     };
+    use security_framework::passwords_options::PasswordOptions;
     use zeroize::Zeroizing;
 
-    use super::{IdentityStore, SERVICE, StoreError};
+    use super::{IdentityStore, SERVICE, StoreError, StoredItem};
 
     // OSStatus values from <Security/SecBase.h>.
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
@@ -239,9 +266,39 @@ mod macos {
             }
         }
 
-        fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError> {
-            set_generic_password(SERVICE, recipient, identity.as_bytes())
+        fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError> {
+            let mut options = PasswordOptions::new_generic_password(SERVICE, recipient);
+            options.set_label(label);
+            set_generic_password_options(identity.as_bytes(), options)
                 .map_err(|e| classify(e, recipient))
+        }
+
+        fn list(&self) -> Result<Vec<StoredItem>, StoreError> {
+            // Attributes only (`load_data` stays off): names and
+            // accounts are not protected by the item's access list.
+            let found = ItemSearchOptions::new()
+                .class(ItemClass::generic_password())
+                .service(SERVICE)
+                .load_attributes(true)
+                .limit(Limit::All)
+                .search();
+            let results = match found {
+                Ok(results) => results,
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => return Ok(Vec::new()),
+                Err(e) => return Err(classify(e, "the yoink items")),
+            };
+            let mut items: Vec<StoredItem> = results
+                .iter()
+                .filter_map(security_framework::item::SearchResult::simplify_dict)
+                .filter_map(|attrs| {
+                    Some(StoredItem {
+                        recipient: attrs.get("acct")?.clone(),
+                        label: attrs.get("labl").cloned().unwrap_or_default(),
+                    })
+                })
+                .collect();
+            items.sort_by(|a, b| (&a.label, &a.recipient).cmp(&(&b.label, &b.recipient)));
+            Ok(items)
         }
 
         fn delete(&self, recipient: &str) -> Result<bool, StoreError> {
@@ -304,7 +361,7 @@ pub(crate) mod fake {
                 .cloned()
                 .map(Zeroizing::new))
         }
-        fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError> {
+        fn set(&self, recipient: &str, identity: &str, _label: &str) -> Result<(), StoreError> {
             self.items
                 .lock()
                 .unwrap()
@@ -339,8 +396,8 @@ mod tests {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.inner.get(recipient)
         }
-        fn set(&self, recipient: &str, identity: &str) -> Result<(), StoreError> {
-            self.inner.set(recipient, identity)
+        fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError> {
+            self.inner.set(recipient, identity, label)
         }
         fn delete(&self, recipient: &str) -> Result<bool, StoreError> {
             self.inner.delete(recipient)
@@ -367,7 +424,7 @@ mod tests {
     #[test]
     fn get_fresh_asks_the_store_and_not_the_cache() {
         let store = Cached::new(Counting::default());
-        store.set("age1a", "secret-a").unwrap();
+        store.set("age1a", "secret-a", "test").unwrap();
         // The item vanishes behind the cache's back.
         store.inner.inner.items.lock().unwrap().clear();
         assert_eq!(store.get("age1a").unwrap().unwrap().as_str(), "secret-a");
@@ -405,7 +462,7 @@ mod tests {
         store.get("age1a").unwrap();
         assert!(store.get("age1b").unwrap().is_none());
         // The key for age1b arrives from another terminal.
-        store.inner.inner.set("age1b", "secret-b").unwrap();
+        store.inner.inner.set("age1b", "secret-b", "test").unwrap();
         assert!(
             store.get("age1b").unwrap().is_none(),
             "still the cached miss"
@@ -422,7 +479,7 @@ mod tests {
     fn cached_store_follows_set_and_delete() {
         let store = Cached::new(Counting::default());
         assert!(store.get("age1a").unwrap().is_none());
-        store.set("age1a", "secret-a").unwrap();
+        store.set("age1a", "secret-a", "test").unwrap();
         assert_eq!(store.get("age1a").unwrap().unwrap().as_str(), "secret-a");
         assert!(store.delete("age1a").unwrap());
         assert!(store.get("age1a").unwrap().is_none());

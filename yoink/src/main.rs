@@ -1024,7 +1024,13 @@ enum KeyAction {
     },
     /// List the identities yoink finds for this project, with the
     /// source of each one. A `*` marks the one yoink uses.
-    List,
+    List {
+        /// List every yoink key on this machine instead: each keychain
+        /// item with the project it was created for, and each key file.
+        /// Shows keys of other projects and of projects that are gone.
+        #[arg(long)]
+        all: bool,
+    },
     /// macOS: delete an identity from the login keychain.
     Remove {
         /// Required. yoink removes keychain items only, never files.
@@ -5103,7 +5109,8 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
             KeyAction::Export { out, force, .. } => {
                 cmd_secrets_key_export(config, out.as_deref(), force)
             }
-            KeyAction::List => cmd_secrets_key_list(config),
+            KeyAction::List { all: false } => cmd_secrets_key_list(config),
+            KeyAction::List { all: true } => cmd_secrets_key_list_all(config),
             KeyAction::Remove { recipient, yes, .. } => cmd_secrets_key_remove(&recipient, yes),
         },
         SecretsAction::Edit => cmd_secrets_edit(config),
@@ -5241,7 +5248,11 @@ fn cmd_secrets_key_generate_keychain() -> Result<()> {
     let store = require_keychain()?;
     // A fresh identity has a fresh recipient, so no item can exist yet.
     let (secret, public) = sealed::keygen();
-    store.set(&public, secret.as_str())?;
+    store.set(
+        &public,
+        secret.as_str(),
+        &yoink::keychain::label_for(&project_name(None)),
+    )?;
     eprintln!(
         "stored identity in the keychain (service {})",
         yoink::keychain::SERVICE
@@ -5304,7 +5315,11 @@ fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Res
     let public = identity.to_public().to_string();
     let secret = sealed::identity_secret(&identity);
 
-    store.set(&public, secret.as_str())?;
+    store.set(
+        &public,
+        secret.as_str(),
+        &yoink::keychain::label_for(&project_name(Some(config))),
+    )?;
     // Read back before anything is deleted.
     // `get_fresh`: the cache holds the value that was just written, so
     // only a real read proves that the item is there.
@@ -5420,6 +5435,59 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> R
         // stdout: the secret alone, so a pipe captures exactly the key.
         eprintln!("identity {public} — secret on stdout:");
         println!("{}", secret.as_str());
+    }
+    Ok(())
+}
+
+/// The project a key belongs to, for the keychain item name: the name
+/// of the folder that holds the config, or of the current folder when
+/// no config is loaded (`key generate` runs before one exists).
+fn project_name(config: Option<&Config>) -> String {
+    let dir = config
+        .and_then(|c| c.config_dir.clone())
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::canonicalize(&dir)
+        .ok()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "unknown project".into())
+}
+
+/// `yoink secrets key list --all`: every yoink key on this machine.
+fn cmd_secrets_key_list_all(config: &Config) -> Result<()> {
+    use yoink::sealed;
+    let recipients = age_recipients(config);
+    let here = |public: &str| {
+        if recipients.iter().any(|r| r == public) {
+            "  (this project)"
+        } else {
+            ""
+        }
+    };
+    let store = yoink::keychain::system_store();
+    let items = store.list()?;
+    let files = sealed::file_identities()?;
+    if items.is_empty() && files.is_empty() {
+        eprintln!("no yoink keys on this machine");
+        return Ok(());
+    }
+    let width = items.iter().map(|i| i.label.len()).max().unwrap_or(0);
+    if !items.is_empty() {
+        println!("keychain:");
+        for item in &items {
+            println!(
+                "  {:<width$}  {}{}",
+                item.label,
+                item.recipient,
+                here(&item.recipient)
+            );
+        }
+    }
+    if !files.is_empty() {
+        println!("key files:");
+        for (public, path) in &files {
+            println!("  {}  {public}{}", path.display(), here(public));
+        }
     }
     Ok(())
 }
