@@ -5,6 +5,10 @@
   background: var(--paper);
   color: var(--text);
   flex: 1;
+  /* One column edge for text, code, tables and rules. 44rem holds a
+     line of about 80 characters at the reading size below, and an
+     80-column code block without a scrollbar. */
+  --prose-w: 44rem;
 }
 
 /* ── Docs frame ──────────────────────────────────────────────────────── */
@@ -177,7 +181,7 @@
   border-bottom: 3px solid var(--rule);
   padding-bottom: 1.5rem;
   margin-bottom: 2.25rem;
-  max-width: 50rem;
+  max-width: var(--prose-w);
 }
 .page-head h1 {
   overflow-wrap: break-word;
@@ -193,7 +197,7 @@
   font-size: var(--text-lede);
   line-height: 1.5;
   color: var(--text-soft);
-  max-width: 36rem;
+  text-wrap: pretty;
 }
 .page-meta {
   display: flex;
@@ -209,15 +213,19 @@
 
 /* ── Prose ───────────────────────────────────────────────────────────── */
 .prose {
-  max-width: 50rem;
+  max-width: var(--prose-w);
   overflow-wrap: break-word;
+}
+@media (min-width: 56rem) {
+  .prose {
+    font-size: 1.125rem;
+  }
+  .page-head .lede {
+    font-size: 1.25rem;
+  }
 }
 .prose > * + * {
   margin-top: 1.15rem;
-}
-.prose p,
-.prose li {
-  max-width: var(--measure);
 }
 .prose li {
   text-wrap: pretty;
@@ -316,6 +324,14 @@
   padding: 0.12em 0.36em 0.08em;
   font-size: 0.875em;
   overflow-wrap: anywhere;
+  /* a chip that must wrap keeps its padding on both pieces */
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+/* Short code (a flag, a key, a file name) stays in one piece. The
+   build marks it; long commands may still wrap. */
+.prose code.nw {
+  white-space: nowrap;
 }
 .prose a > code {
   color: inherit;
@@ -624,7 +640,7 @@
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 1rem;
-  max-width: 50rem;
+  max-width: var(--prose-w);
   margin-top: 4rem;
   border-top: 3px solid var(--rule);
   padding-top: 1.25rem;

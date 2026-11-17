@@ -2,7 +2,7 @@ import { defineConfig } from 'astro/config';
 import mdx from '@astrojs/mdx';
 import { unified } from '@astrojs/markdown-remark';
 import { remarkMermaid, remarkSteps } from './src/lib/remark-mermaid.mjs';
-import { rehypeTableWrap } from './src/lib/rehype-table-wrap.mjs';
+import { rehypeTableWrap, rehypeInlineCodeNowrap } from './src/lib/rehype-table-wrap.mjs';
 
 export default defineConfig({
   site: 'https://yoink.is',
@@ -15,7 +15,7 @@ export default defineConfig({
     // time, [step] headings get numbered, and tables get a scroll container.
     processor: unified({
       remarkPlugins: [remarkMermaid, remarkSteps],
-      rehypePlugins: [rehypeTableWrap],
+      rehypePlugins: [rehypeTableWrap, rehypeInlineCodeNowrap],
     }),
     shikiConfig: { theme: 'vitesse-dark', wrap: false },
   },
