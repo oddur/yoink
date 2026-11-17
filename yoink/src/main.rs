@@ -1437,7 +1437,6 @@ async fn run(cli: Cli) -> Result<()> {
         if !skip {
             resolve_sealed_host_addresses(&mut config, lenient).await?;
         }
-        drop(quiet);
     }
 
     match cli.command {
@@ -5653,15 +5652,16 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
     // are off for it: this list must never open a keychain dialog. An
     // item that needs permission then counts as "not available", and
     // the message below says so.
-    let quiet = yoink::keychain::no_prompts();
-    let resolved = if quiet.active() {
-        sealed::resolve_identity(recipients)
-    } else {
-        Err(sealed::SealedError::KeychainUnavailable {
-            reason: "prompts could not be turned off, so the keychain was not read".into(),
-        })
+    let resolved = {
+        let quiet = yoink::keychain::no_prompts();
+        if quiet.active() {
+            sealed::resolve_identity(recipients)
+        } else {
+            Err(sealed::SealedError::KeychainUnavailable {
+                reason: "prompts could not be turned off, so the keychain was not read".into(),
+            })
+        }
     };
-    drop(quiet);
     let used = resolved
         .as_ref()
         .ok()
