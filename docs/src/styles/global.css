@@ -49,6 +49,10 @@
   /* Reading measure. Archivo runs about 7.8px per character at body
      size, so `ch` overstates the line: 34rem is about 70 characters. */
   --measure: 34rem;
+  /* Docs frame: 16.5rem sidebar + 44rem text + 14rem contents, two
+     3.5rem gaps and the page gutters. The header on those pages uses
+     the same width so the two line up. */
+  --docs-w: 88.5rem;
   --body-weight: 400;
   --body-leading: 1.6;
 
@@ -451,7 +455,7 @@ samp {
 
 /* Leaflet pages line the header up with the docs frame. */
 .site-header:not(.site-header--card) .wrap {
-  max-width: 96rem;
+  max-width: var(--docs-w);
   margin-inline: auto;
   padding-inline: var(--gutter);
 }

@@ -14,10 +14,14 @@
 /* ── Docs frame ──────────────────────────────────────────────────────── */
 .docs {
   display: grid;
-  grid-template-columns: 16.5rem minmax(0, 1fr) 14rem;
+  /* The text column never grows past the prose width, so no empty
+     strip opens beside it. Spare width goes evenly into the two gaps,
+     and the frame stops where sidebar + text + contents fit exactly. */
+  grid-template-columns: 16.5rem minmax(0, var(--prose-w)) 14rem;
+  justify-content: space-between;
   gap: 0 clamp(1.5rem, 3vw, 3.5rem);
   align-items: start;
-  max-width: 96rem;
+  max-width: var(--docs-w);
   margin-inline: auto;
   padding-inline: var(--gutter);
 }
@@ -38,7 +42,8 @@
 }
 @media (max-width: 78rem) {
   .docs {
-    grid-template-columns: 15.5rem minmax(0, 1fr);
+    grid-template-columns: 15.5rem minmax(0, var(--prose-w));
+    justify-content: center;
   }
   .docs__toc {
     display: none;
@@ -46,7 +51,7 @@
 }
 @media (max-width: 56rem) {
   .docs {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, var(--prose-w));
   }
   .docs__side {
     position: static;
