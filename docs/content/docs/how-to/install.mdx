@@ -78,13 +78,41 @@ yoink does not install Docker. A deploy needs these items:
 
 ## Upgrading
 
-Run the command for your install method:
+Use the tab for your install method.
+
+<Tabs items={["Homebrew", "Cargo", "curl", "Pre-built binary"]}>
+
+  <Tab>
 
 ```sh
-brew upgrade oddur/yoink/yoink              # Homebrew
-cargo install --git https://github.com/oddur/yoink yoink --force   # cargo
-curl -LsSf https://github.com/oddur/yoink/releases/latest/download/yoink-installer.sh | sh   # installer script
+brew upgrade oddur/yoink/yoink
 ```
+
+  </Tab>
+
+  <Tab>
+
+```sh
+cargo install --git https://github.com/oddur/yoink yoink --force
+```
+
+  </Tab>
+
+  <Tab>
+
+```sh
+curl -LsSf https://github.com/oddur/yoink/releases/latest/download/yoink-installer.sh | sh
+```
+
+  </Tab>
+
+  <Tab>
+
+Download the `tar.xz` for your platform from the [latest release](https://github.com/oddur/yoink/releases/latest). Extract it, and replace the binary on your `$PATH`.
+
+  </Tab>
+
+</Tabs>
 
 The [GitHub releases page](https://github.com/oddur/yoink/releases) has the release notes for each version. yoink obeys SemVer. A minor version can add new fields, but it does not break existing `yoink.yaml` configs.
 
