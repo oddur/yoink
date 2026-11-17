@@ -9,9 +9,11 @@
 //! Identity resolution order (same code path locally and in CI):
 //!   1. `YOINK_AGE_KEY` env var — raw `AGE-SECRET-KEY-1...`
 //!   2. `YOINK_AGE_KEY_FILE` env var — path to a key file
-//!   3. Scan `~/.config/yoink/keys/*.key` for an identity whose public
+//!   3. The OS credential store (the macOS login keychain): one item
+//!      per recipient in `secrets.recipients:`. See [`crate::keychain`].
+//!   4. Scan `~/.config/yoink/keys/*.key` for an identity whose public
 //!      half matches one of the config's `secrets.recipients:`
-//!   4. Legacy `~/.config/yoink/age.key` (the pre-multi-identity default;
+//!   5. Legacy `~/.config/yoink/age.key` (the pre-multi-identity default;
 //!      still loaded so existing setups don't break on upgrade)
 //!
 //! Recipients (used by the `seal`/`edit` CLI flow) are read from the
@@ -54,6 +56,8 @@ pub enum SealedError {
     },
     #[error("parse age identity: {0}")]
     IdentityParse(String),
+    #[error(transparent)]
+    Keychain(#[from] crate::keychain::StoreError),
     #[error("parse age recipient {raw:?}: {reason}")]
     RecipientParse { raw: String, reason: String },
     #[error(
@@ -171,19 +175,66 @@ pub fn default_identity_path() -> Result<PathBuf, SealedError> {
 /// Pass `&[]` to skip the keys-dir scan (e.g. from contexts that don't
 /// have a config handy). Falls through env vars + legacy path only.
 pub fn load_identity(recipients: &[String]) -> Result<x25519::Identity, SealedError> {
-    load_identity_resolved(
+    resolve_identity(recipients).map(|r| r.identity)
+}
+
+/// Where the resolved identity came from. `yoink doctor` and
+/// `yoink secrets key list` show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentitySource {
+    /// `YOINK_AGE_KEY`.
+    EnvKey,
+    /// `YOINK_AGE_KEY_FILE`.
+    EnvFile(PathBuf),
+    /// The OS credential store (macOS login keychain).
+    Keychain,
+    /// A file in `~/.config/yoink/keys/`.
+    KeysDir(PathBuf),
+    /// `~/.config/yoink/age.key`.
+    Legacy(PathBuf),
+}
+
+impl IdentitySource {
+    /// True when the identity is a plaintext file on disk.
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::EnvFile(_) | Self::KeysDir(_) | Self::Legacy(_))
+    }
+}
+
+impl std::fmt::Display for IdentitySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnvKey => write!(f, "{AGE_KEY_ENV} env var"),
+            Self::EnvFile(p) => write!(f, "{AGE_KEY_FILE_ENV} ({})", p.display()),
+            Self::Keychain => write!(f, "keychain"),
+            Self::KeysDir(p) | Self::Legacy(p) => write!(f, "file {}", p.display()),
+        }
+    }
+}
+
+/// An identity and the source it was loaded from.
+pub struct ResolvedIdentity {
+    pub identity: x25519::Identity,
+    pub source: IdentitySource,
+}
+
+/// [`load_identity`], plus the source of the identity.
+pub fn resolve_identity(recipients: &[String]) -> Result<ResolvedIdentity, SealedError> {
+    resolve_identity_with(
         env::var(AGE_KEY_ENV).ok(),
         env::var(AGE_KEY_FILE_ENV).ok(),
+        &*crate::keychain::system_store(),
         &keys_dir()?,
         &legacy_identity_path()?,
         recipients,
     )
 }
 
-/// Pure resolution logic — env values and paths are passed in instead
-/// of being read from process state. Tests drive this directly to
-/// avoid mutating `HOME` / `YOINK_AGE_KEY*`, which would race with
+/// Resolution without the credential store. Tests drive this directly
+/// to avoid mutating `HOME` / `YOINK_AGE_KEY*`, which would race with
 /// other tests in the suite.
+#[cfg(test)]
 fn load_identity_resolved(
     env_key: Option<String>,
     env_file: Option<String>,
@@ -191,30 +242,142 @@ fn load_identity_resolved(
     legacy_path: &Path,
     recipients: &[String],
 ) -> Result<x25519::Identity, SealedError> {
+    resolve_identity_with(
+        env_key,
+        env_file,
+        &crate::keychain::NoStore,
+        keys_dir,
+        legacy_path,
+        recipients,
+    )
+    .map(|r| r.identity)
+}
+
+/// Pure resolution logic — env values, the store and paths are passed
+/// in instead of being read from process state.
+fn resolve_identity_with(
+    env_key: Option<String>,
+    env_file: Option<String>,
+    store: &dyn crate::keychain::IdentityStore,
+    keys_dir: &Path,
+    legacy_path: &Path,
+    recipients: &[String],
+) -> Result<ResolvedIdentity, SealedError> {
     if let Some(raw) = env_key {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            return parse_identity(trimmed);
+            return Ok(ResolvedIdentity {
+                identity: parse_identity(trimmed)?,
+                source: IdentitySource::EnvKey,
+            });
         }
     }
 
     if let Some(path) = env_file {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
-            return load_identity_from_file(Path::new(trimmed));
+            let path = PathBuf::from(trimmed);
+            return Ok(ResolvedIdentity {
+                identity: load_identity_from_file(&path)?,
+                source: IdentitySource::EnvFile(path),
+            });
         }
     }
 
+    if let Some(identity) = keychain_identity(store, recipients)? {
+        return Ok(ResolvedIdentity {
+            identity,
+            source: IdentitySource::Keychain,
+        });
+    }
+
     if !recipients.is_empty()
-        && let Some(identity) = scan_dir_for_match(keys_dir, recipients)?
+        && let Some((identity, path)) = scan_dir_for_match_path(keys_dir, recipients)?
     {
-        return Ok(identity);
+        return Ok(ResolvedIdentity {
+            identity,
+            source: IdentitySource::KeysDir(path),
+        });
     }
 
     if legacy_path.exists() {
-        return load_identity_from_file(legacy_path);
+        return Ok(ResolvedIdentity {
+            identity: load_identity_from_file(legacy_path)?,
+            source: IdentitySource::Legacy(legacy_path.to_path_buf()),
+        });
     }
     Err(SealedError::NoIdentity(legacy_path.to_path_buf()))
+}
+
+/// Ask the store for the identity of each recipient, by name.
+///
+/// - No item: `None`, resolution continues with the key files.
+/// - The store cannot answer (locked keychain, no GUI session): `None`
+///   as well. SSH into a Mac must keep working from a key file.
+/// - The user denied the prompt: an error. Resolution stops, so a
+///   refusal is not bypassed through a copy of the key on disk.
+/// - An item that does not hold the identity of its recipient: skipped.
+pub fn keychain_identity(
+    store: &dyn crate::keychain::IdentityStore,
+    recipients: &[String],
+) -> Result<Option<x25519::Identity>, SealedError> {
+    use crate::keychain::StoreError;
+    for recipient in recipients {
+        match store.get(recipient) {
+            Ok(Some(raw)) => match parse_identity(&raw) {
+                Ok(identity) if identity.to_public().to_string() == *recipient => {
+                    return Ok(Some(identity));
+                }
+                Ok(_) => tracing::debug!(
+                    "keychain item for {recipient} holds a different identity; skipping"
+                ),
+                Err(e) => tracing::debug!("keychain item for {recipient}: {e}; skipping"),
+            },
+            Ok(None) => {}
+            Err(denied @ StoreError::Denied { .. }) => return Err(denied.into()),
+            Err(StoreError::Unavailable(reason)) => {
+                tracing::debug!("keychain not available ({reason}); using key files");
+                return Ok(None);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The key file that holds an identity for one of `recipients`: a file
+/// in the keys dir, else the legacy path. `yoink secrets key import`
+/// and `yoink doctor` use it to find a plaintext copy.
+pub fn file_identity_for(
+    recipients: &[String],
+) -> Result<Option<(x25519::Identity, PathBuf)>, SealedError> {
+    if let Some(found) = scan_dir_for_match_path(&keys_dir()?, recipients)? {
+        return Ok(Some(found));
+    }
+    let legacy = legacy_identity_path()?;
+    if legacy.exists()
+        && let Ok(identity) = load_identity_from_file(&legacy)
+        && recipients.contains(&identity.to_public().to_string())
+    {
+        return Ok(Some((identity, legacy)));
+    }
+    Ok(None)
+}
+
+/// Parse an identity from text that may carry `#` comment lines, as a
+/// key file does. Used for `import` from a file or stdin.
+pub fn parse_identity_text(raw: &str) -> Result<x25519::Identity, SealedError> {
+    let key_line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .ok_or_else(|| SealedError::IdentityParse("no identity in the input".into()))?;
+    parse_identity(key_line)
+}
+
+/// The secret text (`AGE-SECRET-KEY-1…`) of an identity.
+#[must_use]
+pub fn identity_secret(identity: &x25519::Identity) -> Zeroizing<String> {
+    Zeroizing::new(identity.to_string().expose_secret().to_owned())
 }
 
 /// Walk a keys dir looking for an identity whose public half is in
@@ -224,10 +387,19 @@ fn load_identity_resolved(
 ///
 /// Decoupled from `HOME` resolution so tests can drive it against a
 /// hermetic temp dir.
+#[cfg(test)]
 fn scan_dir_for_match(
     dir: &Path,
     recipients: &[String],
 ) -> Result<Option<x25519::Identity>, SealedError> {
+    Ok(scan_dir_for_match_path(dir, recipients)?.map(|(identity, _)| identity))
+}
+
+/// [`scan_dir_for_match`], plus the path of the matching file.
+fn scan_dir_for_match_path(
+    dir: &Path,
+    recipients: &[String],
+) -> Result<Option<(x25519::Identity, PathBuf)>, SealedError> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         // Dir doesn't exist yet — fresh user, no keys saved. Not an error.
         return Ok(None);
@@ -248,7 +420,7 @@ fn scan_dir_for_match(
         if let Some(stem) = path.file_stem().and_then(std::ffi::OsStr::to_str)
             && recipient_set.contains(stem)
         {
-            return Ok(Some(load_identity_from_file(&path)?));
+            return Ok(Some((load_identity_from_file(&path)?, path)));
         }
         candidates.push(path);
     }
@@ -260,7 +432,7 @@ fn scan_dir_for_match(
             Ok(identity) => {
                 let public = identity.to_public().to_string();
                 if recipient_set.contains(public.as_str()) {
-                    return Ok(Some(identity));
+                    return Ok(Some((identity, path)));
                 }
             }
             Err(e) => {
@@ -974,6 +1146,161 @@ BAZ=plain
         let id = load_identity_resolved(None, None, &keys, &legacy, &["age1other".into()])
             .expect("legacy fallback");
         assert_eq!(id.to_public().to_string(), public);
+    }
+
+    // -- credential store ----------------------------------------------
+
+    use crate::keychain::{StoreError, fake::FakeStore};
+
+    /// A temp keys dir with one key file, plus a legacy path that does
+    /// not exist. Returns `(tmp, keys_dir, legacy, public_of_the_file)`.
+    fn keys_dir_with_one_key() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let (secret, public) = keygen();
+        write_atomically_secret(
+            &keys.join(format!("{public}.key")),
+            format!("{}\n", secret.as_str()).as_bytes(),
+        )
+        .unwrap();
+        let legacy = tmp.path().join("age.key");
+        (tmp, keys, legacy, public)
+    }
+
+    #[test]
+    fn keychain_identity_is_used_before_the_key_file() {
+        let (_tmp, keys, legacy, file_public) = keys_dir_with_one_key();
+        let (secret, public) = keygen();
+        let store = FakeStore::with(&public, secret.as_str());
+
+        let r = resolve_identity_with(
+            None,
+            None,
+            &store,
+            &keys,
+            &legacy,
+            &[file_public, public.clone()],
+        )
+        .unwrap();
+        assert_eq!(r.source, IdentitySource::Keychain);
+        assert_eq!(r.identity.to_public().to_string(), public);
+    }
+
+    #[test]
+    fn env_key_wins_over_the_keychain() {
+        let (_tmp, keys, legacy, _) = keys_dir_with_one_key();
+        let (env_secret, env_public) = keygen();
+        let (secret, public) = keygen();
+        let store = FakeStore::with(&public, secret.as_str());
+
+        let r = resolve_identity_with(
+            Some(env_secret.to_string()),
+            None,
+            &store,
+            &keys,
+            &legacy,
+            &[public],
+        )
+        .unwrap();
+        assert_eq!(r.source, IdentitySource::EnvKey);
+        assert_eq!(r.identity.to_public().to_string(), env_public);
+    }
+
+    #[test]
+    fn empty_keychain_falls_through_to_the_key_file() {
+        let (_tmp, keys, legacy, file_public) = keys_dir_with_one_key();
+        let store = FakeStore::default();
+
+        let r = resolve_identity_with(
+            None,
+            None,
+            &store,
+            &keys,
+            &legacy,
+            std::slice::from_ref(&file_public),
+        )
+        .unwrap();
+        assert!(matches!(r.source, IdentitySource::KeysDir(_)));
+        assert_eq!(r.identity.to_public().to_string(), file_public);
+    }
+
+    /// A locked keychain, or SSH into the Mac with no GUI session, must
+    /// not break a setup that still has a key file.
+    #[test]
+    fn unavailable_keychain_falls_through_to_the_key_file() {
+        let (_tmp, keys, legacy, file_public) = keys_dir_with_one_key();
+        let store = FakeStore {
+            fail: Some(StoreError::Unavailable("locked".into())),
+            ..FakeStore::default()
+        };
+
+        let r = resolve_identity_with(None, None, &store, &keys, &legacy, &[file_public]).unwrap();
+        assert!(matches!(r.source, IdentitySource::KeysDir(_)));
+    }
+
+    /// "Deny" on the prompt stops resolution. A copy of the key on disk
+    /// must not turn a refusal into a silent yes.
+    #[test]
+    fn denied_keychain_stops_and_does_not_use_the_key_file() {
+        let (_tmp, keys, legacy, file_public) = keys_dir_with_one_key();
+        let store = FakeStore {
+            fail: Some(StoreError::Denied {
+                recipient: String::new(),
+            }),
+            ..FakeStore::default()
+        };
+
+        let Err(err) = resolve_identity_with(
+            None,
+            None,
+            &store,
+            &keys,
+            &legacy,
+            std::slice::from_ref(&file_public),
+        ) else {
+            panic!("a denied keychain must not fall through");
+        };
+        assert!(
+            matches!(&err, SealedError::Keychain(StoreError::Denied { recipient }) if *recipient == file_public),
+            "{err}"
+        );
+    }
+
+    /// No config, no recipients: the keychain is not asked, the same
+    /// way the keys dir is not scanned.
+    #[test]
+    fn empty_recipients_do_not_touch_the_keychain() {
+        let store = FakeStore {
+            fail: Some(StoreError::Denied {
+                recipient: String::new(),
+            }),
+            ..FakeStore::default()
+        };
+        assert!(keychain_identity(&store, &[]).unwrap().is_none());
+    }
+
+    /// An item filed under one recipient that holds another identity is
+    /// not trusted.
+    #[test]
+    fn keychain_item_with_the_wrong_identity_is_skipped() {
+        let (other_secret, _) = keygen();
+        let (_, public) = keygen();
+        let store = FakeStore::with(&public, other_secret.as_str());
+        assert!(keychain_identity(&store, &[public]).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_identity_text_skips_comment_lines() {
+        let (secret, public) = keygen();
+        let text = format!(
+            "# created: now\n# public key: {public}\n{}\n",
+            secret.as_str()
+        );
+        let id = parse_identity_text(&text).unwrap();
+        assert_eq!(id.to_public().to_string(), public);
+        assert_eq!(identity_secret(&id).as_str(), secret.as_str());
+        assert!(parse_identity_text("# only a comment\n").is_err());
     }
 
     #[test]

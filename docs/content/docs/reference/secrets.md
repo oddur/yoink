@@ -13,10 +13,34 @@ To decrypt, yoink tries these sources in order and stops at the first match:
 |---|---|---|
 | 1 | `YOINK_AGE_KEY` env (raw key) | CI and managed-env contexts |
 | 2 | `YOINK_AGE_KEY_FILE` env (path) | Explicit override |
-| 3 | `~/.config/yoink/keys/*.key` | Laptop default. yoink scans the directory and picks the key whose public half matches one of the `secrets.recipients:` in `yoink.yaml`. |
-| 4 | `~/.config/yoink/age.key` | Legacy single-key path, for backward compatibility. |
+| 3 | macOS login keychain | macOS only, opt-in. yoink asks the keychain for one item for each recipient in `secrets.recipients:`. |
+| 4 | `~/.config/yoink/keys/*.key` | Laptop default. yoink scans the directory and picks the key whose public half matches one of the `secrets.recipients:` in `yoink.yaml`. |
+| 5 | `~/.config/yoink/age.key` | Legacy single-key path, for backward compatibility. |
 
-`yoink secrets key generate` writes to `~/.config/yoink/keys/` by default. `yoink secrets key public` prints the recipient of the identity that resolved, which shows the key that yoink uses in a project.
+`yoink secrets key generate` writes to `~/.config/yoink/keys/` by default. `yoink secrets key public` prints the recipient of the identity that resolved. `yoink secrets key list` shows each identity that yoink finds for the project, and its source.
+
+### Keychain items
+
+`yoink secrets key generate --keychain` and `yoink secrets key import --keychain` store an identity in the macOS login keychain.
+
+| Property | Value |
+|---|---|
+| Kind | Generic password |
+| Service | `is.yoink.age-identity` |
+| Account | The age recipient (`age1…`) |
+| Value | The identity (`AGE-SECRET-KEY-1…`) |
+| Sync | None. The login keychain does not sync to iCloud. |
+
+yoink asks for each item by name. It does not list or search the keychain. A command that has no config has no recipients, so it does not read the keychain.
+
+| Case | Result |
+|---|---|
+| No item for any recipient | yoink continues with the key files. |
+| The keychain is locked, or the session has no GUI (SSH into the Mac) | yoink continues with the key files. |
+| You select "Deny" on the system prompt | yoink stops with an error. It does not read the key files. |
+| The same identity is in the keychain and in a key file | yoink uses the keychain. `yoink doctor` shows a warning. |
+
+The release binaries are not code-signed. macOS connects a keychain item to the binary that created it. As a result, macOS can show the keychain prompt again after each upgrade of yoink.
 
 ## `provider: command`
 

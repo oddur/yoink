@@ -8,6 +8,7 @@
     "dynamic-shell-completion",
     "---Secrets & Security---",
     "sealed-secrets-workflow",
+    "age-key-in-keychain",
     "age-in-github-actions",
     "external-secrets",
     "cloudflare-origin-certs",
