@@ -203,7 +203,7 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
                 file_copy.as_deref(),
                 // Over SSH the import hint would point at a command that
                 // cannot ask for the permission it needs.
-                store.supported() && !crate::keychain::in_ssh_session(),
+                store.supported() && !crate::keychain::prompts_off(),
             )
         }
         // A refusal on the keychain prompt stops before the key files
@@ -216,12 +216,13 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
                      or set YOINK_AGE_KEY",
                 ),
         ],
-        Err(e @ sealed::SealedError::KeychainUnavailable { .. }) => vec![
+        Err(sealed::SealedError::KeychainUnavailable { reason }) => vec![
             Finding::error(
                 "secrets",
                 "the keychain could not be read, and no key file holds the identity",
             )
-            .with_detail(e.to_string())
+            // The reason only: the advice is the fix line below.
+            .with_detail(reason)
             .with_fix(crate::keychain::advice()),
         ],
         Err(e) => vec![

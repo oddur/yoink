@@ -2798,9 +2798,12 @@ enum HostAddresses {
     Quiet,
 }
 
-/// The match has no wildcard arm on purpose. A new command does not
-/// compile until someone decides whether it contacts a host, so it
-/// cannot land in the wrong group by default.
+/// The match has no wildcard arm on purpose. A new top-level command
+/// does not compile until someone decides whether it contacts a host.
+///
+/// The check stops at the top level: `Secrets { .. }` covers every
+/// `yoink secrets` subcommand. None of them contacts a host today. One
+/// that does must get its own arm here.
 fn host_addresses(command: &Command) -> HostAddresses {
     match command {
         Command::Init { .. }
@@ -5577,10 +5580,15 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> R
     let lookup = sealed::keychain_identity(store, recipients)?;
     let Some(identity) = lookup.identity else {
         if let Some(reason) = lookup.unavailable {
-            anyhow::bail!(
-                "the keychain could not be read: {reason}. {}",
-                yoink::keychain::advice()
-            );
+            // Export reads the keychain only, so the general advice
+            // (set YOINK_AGE_KEY, generate a key) does not apply.
+            let fix = if yoink::keychain::in_ssh_session() {
+                "This looks like an SSH session, where macOS cannot ask for permission. \
+                 Run this command on the Mac itself"
+            } else {
+                "Unlock the keychain and allow yoink"
+            };
+            anyhow::bail!("the keychain could not be read: {reason}. {fix}");
         }
         if let Some((recipient, why)) = lookup.skipped.first() {
             anyhow::bail!("the keychain item for {recipient} {why}");
@@ -5791,6 +5799,9 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
     // your permission, a real command would ask and use the keychain,
     // while the quiet lookup here falls through to a key file. A star
     // on that file would be wrong, so then no row gets one.
+    // True when prompts are already off for the whole run (an SSH
+    // session). A real command then gets the same answer as this list.
+    let run_is_quiet = yoink::keychain::prompts_off();
     let (resolved, unread) = {
         let quiet = yoink::keychain::no_prompts();
         if quiet.active() {
@@ -5819,9 +5830,7 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
         Err(e) => e.is_keychain() || unread.is_some() && !env_is_set(),
     };
     let resolved = match unread {
-        // Over SSH prompts are off for every command, so a real command
-        // gets the same answer as this quiet lookup.
-        Some(reason) if keychain_decides && !yoink::keychain::in_ssh_session() => {
+        Some(reason) if keychain_decides && !run_is_quiet => {
             Err(sealed::SealedError::KeychainUnavailable { reason })
         }
         _ => resolved,
@@ -5850,7 +5859,7 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
         // The keychain item was not read. That is not a lost key.
         Err(sealed::SealedError::KeychainUnavailable { reason }) => {
             eprintln!("no star: the keychain item was not read ({reason}).");
-            if yoink::keychain::in_ssh_session() {
+            if run_is_quiet {
                 eprintln!("{}", yoink::keychain::advice());
             } else {
                 eprintln!(

@@ -126,6 +126,26 @@ pub fn no_prompts() -> NoPrompts {
     }
 }
 
+/// True while a [`NoPrompts`] value holds prompts off. Callers ask this,
+/// not the environment, when they need to know whether a keychain read
+/// can open a dialog.
+#[must_use]
+pub fn prompts_off() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        QUIET
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No store, so no prompt.
+        true
+    }
+}
+
 impl Drop for NoPrompts {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
@@ -190,8 +210,9 @@ pub fn advice() -> &'static str {
 fn advice_for(in_ssh_session: bool) -> &'static str {
     if in_ssh_session {
         "This looks like an SSH session, where macOS cannot ask for permission, so the \
-         keychain does not work here. Set YOINK_AGE_KEY or YOINK_AGE_KEY_FILE for this \
-         session, or run yoink on the Mac itself."
+         keychain usually does not work here. Set YOINK_AGE_KEY or YOINK_AGE_KEY_FILE for \
+         this session, or run yoink on the Mac itself. If yoink already has access and \
+         the keychain is only locked, `security unlock-keychain` unlocks it."
     } else {
         "If the key is in the keychain, unlock the keychain and allow yoink. Otherwise set \
          YOINK_AGE_KEY or YOINK_AGE_KEY_FILE, or create a key with `yoink secrets key generate`."
@@ -411,18 +432,6 @@ pub(crate) mod fake {
         fn delete(&self, recipient: &str) -> Result<bool, StoreError> {
             Ok(self.items.lock().unwrap().remove(recipient).is_some())
         }
-        fn list(&self) -> Result<Vec<super::StoredItem>, StoreError> {
-            Ok(self
-                .items
-                .lock()
-                .unwrap()
-                .keys()
-                .map(|recipient| super::StoredItem {
-                    recipient: recipient.clone(),
-                    label: String::new(),
-                })
-                .collect())
-        }
     }
 }
 
@@ -446,8 +455,12 @@ mod tests {
         let inner = no_prompts();
         assert_eq!(outer.active(), inner.active());
         drop(inner);
-        // Still usable after the inner guard is gone.
-        let again = no_prompts();
-        assert_eq!(outer.active(), again.active());
+        // The outer guard still holds prompts off.
+        assert_eq!(prompts_off(), outer.active());
+        #[cfg(target_os = "macos")]
+        if outer.active() {
+            use security_framework::os::macos::keychain::SecKeychain;
+            assert_eq!(SecKeychain::user_interaction_allowed().ok(), Some(false));
+        }
     }
 }

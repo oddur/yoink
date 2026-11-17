@@ -229,7 +229,7 @@ pub struct ResolvedIdentity {
 
 /// [`load_identity`], plus the source of the identity.
 ///
-/// The keychain is asked once per run for a list of recipients; see
+/// The keychain is asked once per run for each recipient; see
 /// [`keychain_lookup`].
 pub fn resolve_identity(recipients: &[String]) -> Result<ResolvedIdentity, SealedError> {
     resolve_identity_core(
@@ -256,11 +256,17 @@ pub fn resolve_identity(recipients: &[String]) -> Result<ResolvedIdentity, Seale
 /// plain "get, set, delete, list". The commands that write the keychain
 /// (`import`, `remove`) use the store directly and never see it.
 pub fn keychain_lookup(recipients: &[String]) -> KeychainAnswer {
-    keychain_identity(
-        &Remembered {
-            memo: &KEYCHAIN_MEMO,
-            store: crate::keychain::system_store(),
-        },
+    // An SSH session where prompts could not be turned off: a read
+    // could wait on a dialog nobody sees. Stay away from the keychain.
+    if crate::keychain::in_ssh_session() && !crate::keychain::prompts_off() {
+        return Ok(KeychainLookup {
+            unavailable: Some("keychain prompts could not be turned off".into()),
+            ..KeychainLookup::default()
+        });
+    }
+    let store = crate::keychain::system_store();
+    keychain_identity_by(
+        |recipient| KEYCHAIN_MEMO.get(recipient, || store.get(recipient)),
         recipients,
     )
 }
@@ -324,32 +330,6 @@ impl KeychainMemo {
         let had_error = items.values().any(Result::is_err);
         items.retain(|_, item| matches!(item, Ok(Some(_))));
         had_error
-    }
-}
-
-/// A store that answers `get` from the memo first.
-struct Remembered<'a> {
-    memo: &'a KeychainMemo,
-    store: &'a dyn crate::keychain::IdentityStore,
-}
-
-impl crate::keychain::IdentityStore for Remembered<'_> {
-    fn supported(&self) -> bool {
-        self.store.supported()
-    }
-    fn get(&self, recipient: &str) -> KeychainItem {
-        self.memo.get(recipient, || self.store.get(recipient))
-    }
-    fn set(
-        &self,
-        recipient: &str,
-        identity: &str,
-        label: &str,
-    ) -> Result<(), crate::keychain::StoreError> {
-        self.store.set(recipient, identity, label)
-    }
-    fn delete(&self, recipient: &str) -> Result<bool, crate::keychain::StoreError> {
-        self.store.delete(recipient)
     }
 }
 
@@ -424,7 +404,7 @@ fn resolve_identity_core(
 }
 
 /// What the store said about a list of recipients.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct KeychainLookup {
     pub identity: Option<x25519::Identity>,
     /// Set when the store could not answer: a locked keychain, or an
@@ -448,11 +428,20 @@ pub struct KeychainLookup {
 pub fn keychain_identity(
     store: &dyn crate::keychain::IdentityStore,
     recipients: &[String],
-) -> Result<KeychainLookup, crate::keychain::StoreError> {
+) -> KeychainAnswer {
+    keychain_identity_by(|recipient| store.get(recipient), recipients)
+}
+
+/// [`keychain_identity`] over any way to get one item: the store
+/// itself, or the store behind the memory of [`keychain_lookup`].
+fn keychain_identity_by(
+    get: impl Fn(&str) -> KeychainItem,
+    recipients: &[String],
+) -> KeychainAnswer {
     use crate::keychain::StoreError;
     let mut lookup = KeychainLookup::default();
     for recipient in recipients {
-        match store.get(recipient) {
+        match get(recipient) {
             // `parse_identity_text`: the same parser as `key list` and
             // `key export`, so the three agree about one item. It also
             // accepts an item made by hand from a key file with comments.
@@ -1061,7 +1050,7 @@ mod tests {
         .map(|r| r.identity)
     }
 
-    /// Resolution against a given store, outside an SSH session. Tests
+    /// Resolution against a given store. Tests
     /// drive this directly to avoid mutating `HOME` / `YOINK_AGE_KEY*`,
     /// which would race with other tests in the suite.
     fn resolve_identity_with(
@@ -1386,31 +1375,23 @@ BAZ=plain
     #[test]
     fn a_longer_list_of_recipients_does_not_ask_again_after_a_refusal() {
         let memo = KeychainMemo::new();
-        let denying = FakeStore {
-            fail: Some(StoreError::Denied {
-                recipient: String::new(),
-            }),
-            ..FakeStore::default()
+        let deny = |r: &str| {
+            memo.get(r, || {
+                Err(StoreError::Denied {
+                    recipient: r.to_string(),
+                })
+            })
         };
-        let first = Remembered {
-            memo: &memo,
-            store: &denying,
-        };
-        assert!(keychain_identity(&first, &["age1a".to_string()]).is_err());
+        assert!(keychain_identity_by(deny, &["age1a".to_string()]).is_err());
 
-        // The store would now answer, but age1a is remembered as denied.
-        let (secret, _) = keygen();
-        let willing = FakeStore::with("age1a", secret.as_str());
-        let second = Remembered {
-            memo: &memo,
-            store: &willing,
-        };
+        // The keychain would now answer, but age1a is remembered as denied.
+        let willing = |r: &str| memo.get(r, || Ok(None));
         let list = ["age1a".to_string(), "age1b".to_string()];
-        assert!(keychain_identity(&second, &list).is_err());
+        assert!(keychain_identity_by(willing, &list).is_err());
 
         // Until the operator asks for a retry.
         assert!(memo.forget_failures());
-        assert!(keychain_identity(&second, &list).is_ok());
+        assert!(keychain_identity_by(willing, &list).is_ok());
     }
 
     /// "No item" is normal. It is forgotten, but it is no reason to
