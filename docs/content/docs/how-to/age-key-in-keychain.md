@@ -22,7 +22,7 @@ Run this command in the project directory:
 yoink secrets key import --keychain
 ```
 
-yoink finds the key file for the recipients of the project. It stores the identity in the keychain and reads it back. Then it asks before it deletes the file. To delete without a question, add `-y`.
+yoink finds the key file for the recipients of the project. It stores the identity in the keychain and reads it back. Then it asks before it deletes the file. To delete without a question, add `-y`. If the file holds more than one identity, yoink imports the first one and keeps the file.
 
 To import a different file, give its path:
 

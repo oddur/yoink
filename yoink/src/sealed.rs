@@ -194,14 +194,6 @@ pub enum IdentitySource {
     Legacy(PathBuf),
 }
 
-impl IdentitySource {
-    /// True when the identity is a plaintext file on disk.
-    #[must_use]
-    pub fn is_file(&self) -> bool {
-        matches!(self, Self::EnvFile(_) | Self::KeysDir(_) | Self::Legacy(_))
-    }
-}
-
 impl std::fmt::Display for IdentitySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -374,6 +366,34 @@ pub fn parse_identity_text(raw: &str) -> Result<x25519::Identity, SealedError> {
     parse_identity(key_line)
 }
 
+/// How many identities a key file text holds. A file with more than
+/// one must not be deleted after an import of the first.
+#[must_use]
+pub fn identity_line_count(raw: &str) -> usize {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .count()
+}
+
+/// Every readable identity in the keys dir, then the legacy file:
+/// `(recipient, path)`. For `yoink secrets key list`.
+pub fn file_identities() -> Result<Vec<(String, PathBuf)>, SealedError> {
+    let mut out = Vec::new();
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(keys_dir()?)
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    paths.retain(|p| p.extension().and_then(std::ffi::OsStr::to_str) == Some("key"));
+    paths.sort();
+    paths.push(legacy_identity_path()?);
+    for path in paths {
+        if let Ok(identity) = load_identity_from_file(&path) {
+            out.push((identity.to_public().to_string(), path));
+        }
+    }
+    Ok(out)
+}
+
 /// The secret text (`AGE-SECRET-KEY-1…`) of an identity.
 #[must_use]
 pub fn identity_secret(identity: &x25519::Identity) -> Zeroizing<String> {
@@ -451,13 +471,12 @@ fn load_identity_from_file(path: &Path) -> Result<x25519::Identity, SealedError>
         path: path.to_path_buf(),
         source,
     })?;
-    // Identity files may carry `# created: ...` comments above the key.
-    let key_line = raw
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .ok_or_else(|| SealedError::IdentityParse(format!("{} is empty", path.display())))?;
-    parse_identity(key_line)
+    parse_identity_text(&raw).map_err(|e| match e {
+        SealedError::IdentityParse(reason) => {
+            SealedError::IdentityParse(format!("{}: {reason}", path.display()))
+        }
+        other => other,
+    })
 }
 
 /// Refuse to load an age identity from a world-readable / group-readable
@@ -1288,6 +1307,20 @@ BAZ=plain
         let (_, public) = keygen();
         let store = FakeStore::with(&public, other_secret.as_str());
         assert!(keychain_identity(&store, &[public]).unwrap().is_none());
+    }
+
+    /// A key file with two identities must be recognisable, so that
+    /// `import --keychain` does not delete the one it did not import.
+    #[test]
+    fn identity_line_count_counts_only_key_lines() {
+        let (a, _) = keygen();
+        let (b, _) = keygen();
+        assert_eq!(identity_line_count("# comment\n\n"), 0);
+        assert_eq!(identity_line_count(&format!("# c\n{}\n", a.as_str())), 1);
+        assert_eq!(
+            identity_line_count(&format!("{}\n# c\n{}\n", a.as_str(), b.as_str())),
+            2
+        );
     }
 
     #[test]

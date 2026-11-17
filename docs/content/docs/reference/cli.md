@@ -199,9 +199,9 @@ yoink reads these environment variables:
 | `--force` | Overwrites an existing identity at the destination. |
 | `yoink secrets key public` | Prints the recipient of the identity that yoink uses now. |
 | `yoink secrets key list` | Lists each identity that yoink finds for the project, with its source (env var, keychain, file). The first row is the identity that yoink uses. |
-| `yoink secrets key generate --keychain` | macOS. Generates an identity and stores it in the login keychain. The identity does not go to disk. `--force` replaces an item. |
-| `yoink secrets key import --keychain [PATH \| -]` | macOS. Stores an identity in the login keychain. The source is a key file, the key file of the project when you give no path, or stdin with `-`. For a file, yoink reads the item back and then asks before it deletes the file. `-y` deletes without a question. |
-| `yoink secrets key export --keychain` | macOS. Prints the identity of the project from the login keychain. `--out PATH` writes a file (mode 0600). The command stops in CI unless `YOINK_ALLOW_REVEAL_IN_CI=1` is set. |
+| `yoink secrets key generate --keychain` | macOS. Generates an identity and stores it in the login keychain. The identity does not go to disk. |
+| `yoink secrets key import --keychain [PATH \| -]` | macOS. Stores an identity in the login keychain. The source is a key file, the key file of the project when you give no path, or stdin with `-`. For a file, yoink reads the item back and then asks before it deletes the file. `-y` deletes without a question. yoink imports the first identity of the input. It keeps a file that holds more than one identity. |
+| `yoink secrets key export --keychain` | macOS. Prints the identity of the project from the login keychain. `--out PATH` writes a file (mode 0600), and `--force` replaces a file that exists. The command stops in CI unless `YOINK_ALLOW_REVEAL_IN_CI=1` is set. |
 | `yoink secrets key remove --keychain <RECIPIENT>` | macOS. Deletes the keychain item for a recipient, after a confirmation. `-y` skips the confirmation. |
 | `yoink secrets edit` | Decrypts the sealed file into `$EDITOR` and seals it again on save. Creates the file if it does not exist. The path is `secrets.file:` (default `secrets.age`). |
 | `yoink secrets show` | Prints `KEY=value` with masked values. |

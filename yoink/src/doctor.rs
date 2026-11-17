@@ -201,6 +201,16 @@ fn check_secrets(config: &Config) -> Vec<Finding> {
                 store.supported(),
             )
         }
+        // A refusal on the keychain prompt stops before the key files
+        // are read, so "place a key file" would be the wrong fix.
+        Err(e @ sealed::SealedError::Keychain(_)) => vec![
+            Finding::error("secrets", "the keychain refused access to the age identity")
+                .with_detail(e.to_string())
+                .with_fix(
+                    "run the command again and allow yoink in the keychain prompt, \
+                     or set YOINK_AGE_KEY",
+                ),
+        ],
         Err(e) => vec![
             Finding::error(
                 "secrets",
@@ -263,7 +273,14 @@ fn identity_findings(
                     ),
             );
         }
-    } else if keychain_supported && source.is_file() {
+    } else if keychain_supported
+        && matches!(
+            source,
+            IdentitySource::KeysDir(_) | IdentitySource::Legacy(_)
+        )
+    {
+        // Not for `YOINK_AGE_KEY_FILE`: the env var outranks the
+        // keychain, so an import would change nothing.
         // An info line, not a warning: the exit code does not change.
         out.push(
             Finding::pass("secrets", "the age identity is a plaintext key file").with_fix(
@@ -1062,6 +1079,12 @@ mod tests {
         );
         assert!(f[1].fix.as_deref().unwrap().contains("import --keychain"));
         assert_eq!(identity_findings("age1x", &source, 1, None, false).len(), 1);
+        // `YOINK_AGE_KEY_FILE` outranks the keychain: no hint.
+        let env_file = sealed::IdentitySource::EnvFile("/tmp/k.key".into());
+        assert_eq!(
+            identity_findings("age1x", &env_file, 1, None, true).len(),
+            1
+        );
     }
 
     #[test]

@@ -96,16 +96,17 @@ mod macos {
     // OSStatus values from <Security/SecBase.h>.
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
     const ERR_SEC_USER_CANCELED: i32 = -128;
-    const ERR_SEC_AUTH_FAILED: i32 = -25293;
 
     pub struct Keychain;
 
-    /// "Deny" on the prompt and a wrong keychain password are refusals.
-    /// Everything else (locked keychain, no GUI session, no keychain)
-    /// means the store cannot answer.
+    /// Only an explicit "Deny" on the prompt (`errSecUserCanceled`) is
+    /// a refusal. Every other code means the store cannot answer:
+    /// a locked keychain, no GUI session, no keychain. That includes
+    /// `errSecAuthFailed`, which macOS can return with no prompt shown,
+    /// so it must not block the fall-through to the key files.
     fn classify(err: Error, recipient: &str) -> StoreError {
         match err.code() {
-            ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED => StoreError::Denied {
+            ERR_SEC_USER_CANCELED => StoreError::Denied {
                 recipient: recipient.to_string(),
             },
             code => StoreError::Unavailable(format!("{err} (OSStatus {code})")),

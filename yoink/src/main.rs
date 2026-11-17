@@ -983,7 +983,7 @@ enum KeyAction {
         print: bool,
         /// macOS: store the secret key in the login keychain instead of
         /// a file. The key never touches disk.
-        #[arg(long, conflicts_with_all = ["out", "print"])]
+        #[arg(long, conflicts_with_all = ["out", "print", "force"])]
         keychain: bool,
     },
     /// Print the public recipient (`age1…`) derived from the
@@ -1015,8 +1015,12 @@ enum KeyAction {
         #[arg(long, required = true)]
         keychain: bool,
         /// Write the identity to PATH (mode 0o600) instead of stdout.
+        /// Refuses to overwrite an existing file unless `--force`.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Overwrite an existing file at `--out`.
+        #[arg(long, requires = "out")]
+        force: bool,
     },
     /// List the identities yoink finds for this project, with the
     /// source of each one. The first row is the one yoink uses.
@@ -4787,7 +4791,7 @@ fn run_bootstrap(command: &Command) -> Option<Result<()>> {
                         },
                 },
         } => Some(if *keychain {
-            cmd_secrets_key_generate_keychain(*force)
+            cmd_secrets_key_generate_keychain()
         } else {
             cmd_secrets_key_generate(out.clone(), *force, *print)
         }),
@@ -5059,7 +5063,7 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
                 keychain,
             } => {
                 if keychain {
-                    cmd_secrets_key_generate_keychain(force)
+                    cmd_secrets_key_generate_keychain()
                 } else {
                     cmd_secrets_key_generate(out, force, print)
                 }
@@ -5068,7 +5072,9 @@ fn cmd_secrets(config: &Config, action: SecretsAction) -> Result<()> {
             KeyAction::Import { path, yes, .. } => {
                 cmd_secrets_key_import(config, path.as_deref(), yes)
             }
-            KeyAction::Export { out, .. } => cmd_secrets_key_export(config, out.as_deref()),
+            KeyAction::Export { out, force, .. } => {
+                cmd_secrets_key_export(config, out.as_deref(), force)
+            }
             KeyAction::List => cmd_secrets_key_list(config),
             KeyAction::Remove { recipient, yes, .. } => cmd_secrets_key_remove(&recipient, yes),
         },
@@ -5146,18 +5152,22 @@ fn cmd_secrets_ssh_key_public(config: &Config, name: &str) -> Result<()> {
 }
 
 fn cmd_secrets_key_public(config: &Config) -> Result<()> {
-    use yoink::config::SecretsConfig;
-    use yoink::sealed;
-    // Pull recipients from the config so the keys-dir scan can pick
-    // the matching identity. If the operator has many keys in
-    // ~/.config/yoink/keys/, this answers "the one for *this*
-    // project," not whichever happened to load first.
-    let recipients: &[String] = match &config.secrets {
-        Some(SecretsConfig::Age { recipients, .. }) => recipients,
-        _ => &[],
+    use yoink::sealed::{self, SealedError};
+    // Recipients from the config let the keychain lookup and the
+    // keys-dir scan pick the identity for *this* project, not whichever
+    // happened to load first.
+    let identity = match sealed::load_identity(age_recipients(config)) {
+        Ok(identity) => identity,
+        // A refusal on the keychain prompt is its own error; "no
+        // identity found" would point at the wrong fix.
+        Err(e @ SealedError::Keychain(_)) => return Err(e.into()),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(
+                "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, \
+                 or place a key in ~/.config/yoink/keys/",
+            ));
+        }
     };
-    let identity = sealed::load_identity(recipients)
-        .with_context(|| "no age identity found — set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE, or place a key in ~/.config/yoink/keys/")?;
     println!("{}", identity.to_public());
     Ok(())
 }
@@ -5196,13 +5206,11 @@ fn warn_keychain_only(recipients: &[String], public: &str) {
     eprintln!("  • or keep a copy: `yoink secrets key export --keychain` into a password manager");
 }
 
-fn cmd_secrets_key_generate_keychain(force: bool) -> Result<()> {
+fn cmd_secrets_key_generate_keychain() -> Result<()> {
     use yoink::sealed;
     let store = require_keychain()?;
+    // A fresh identity has a fresh recipient, so no item can exist yet.
     let (secret, public) = sealed::keygen();
-    if !force && store.get(&public)?.is_some() {
-        anyhow::bail!("the keychain already holds an identity for {public} — pass --force");
-    }
     store.set(&public, secret.as_str())?;
     eprintln!(
         "stored identity in the keychain (service {})",
@@ -5230,32 +5238,39 @@ fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Res
     let store = require_keychain()?;
     let recipients = age_recipients(config);
 
+    let read_file = |p: &Path| -> Result<zeroize::Zeroizing<String>> {
+        Ok(zeroize::Zeroizing::new(
+            std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?,
+        ))
+    };
     // Source: stdin, a named file, or the file that holds this
     // project's identity.
-    let (identity, file) = match path {
+    let (raw, file) = match path {
         Some("-") => {
             let mut raw = zeroize::Zeroizing::new(String::new());
             std::io::stdin()
                 .read_to_string(&mut raw)
                 .context("read the identity from stdin")?;
-            (sealed::parse_identity_text(&raw)?, None)
+            (raw, None)
         }
         Some(p) => {
             let p = PathBuf::from(p);
-            let raw = zeroize::Zeroizing::new(
-                std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?,
-            );
-            (sealed::parse_identity_text(&raw)?, Some(p))
+            (read_file(&p)?, Some(p))
         }
         None => {
-            let Some((identity, p)) = sealed::file_identity_for(recipients)? else {
+            let Some((_, p)) = sealed::file_identity_for(recipients)? else {
                 anyhow::bail!(
-                    "no key file holds an identity for this project's recipients —                      pass a path, or `-` to read the identity from stdin"
+                    "no key file holds an identity for this project's recipients — \
+                     pass a path, or `-` to read the identity from stdin"
                 );
             };
-            (identity, Some(p))
+            (read_file(&p)?, Some(p))
         }
     };
+    // Only the first identity of the input is imported. A file with
+    // more must stay: deleting it would lose the others.
+    let extra_identities = sealed::identity_line_count(&raw).saturating_sub(1);
+    let identity = sealed::parse_identity_text(&raw)?;
     let public = identity.to_public().to_string();
     let secret = sealed::identity_secret(&identity);
 
@@ -5274,34 +5289,47 @@ fn cmd_secrets_key_import(config: &Config, path: Option<&str>, yes: bool) -> Res
         );
     }
 
+    // True while a plaintext copy of this identity is still on disk.
+    let mut on_disk = false;
     if let Some(p) = file {
-        // The file is unlinked, not wiped: an SSD gives no guarantee
-        // that an overwrite reaches the old blocks.
-        if confirm(
+        if extra_identities > 0 {
+            on_disk = true;
+            eprintln!(
+                "kept {}: it holds {extra_identities} more identity line(s), and only the first \
+                 was imported",
+                p.display()
+            );
+        } else if confirm(
             &format!("delete the key file {}?", p.display()),
             ConfirmKind::DefaultNo,
             yes,
         )? {
+            // Unlinked, not wiped: an SSD gives no guarantee that an
+            // overwrite reaches the old blocks.
             std::fs::remove_file(&p).with_context(|| format!("delete {}", p.display()))?;
             eprintln!("deleted {}", p.display());
         } else {
+            on_disk = true;
             eprintln!(
                 "kept {} — the key is still on disk in plaintext",
                 p.display()
             );
         }
     }
-    warn_keychain_only(recipients, &public);
+    if !on_disk {
+        warn_keychain_only(recipients, &public);
+    }
     Ok(())
 }
 
-fn cmd_secrets_key_export(config: &Config, out: Option<&Path>) -> Result<()> {
+fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> Result<()> {
     use yoink::sealed;
     if let Some(ci_var) = detected_ci_env()
         && !is_truthy_env("YOINK_ALLOW_REVEAL_IN_CI")
     {
         anyhow::bail!(
-            "refusing to export the age identity: detected CI environment (${ci_var} is set).              If this is intentional, set YOINK_ALLOW_REVEAL_IN_CI=1"
+            "refusing to export the age identity: detected CI environment (${ci_var} is set). \
+             If this is intentional, set YOINK_ALLOW_REVEAL_IN_CI=1"
         );
     }
     let store = require_keychain()?;
@@ -5309,12 +5337,34 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>) -> Result<()> {
     if recipients.is_empty() {
         anyhow::bail!("no `secrets.recipients:` in the config, so there is no identity to look up");
     }
-    let Some(identity) = sealed::keychain_identity(&*store, recipients)? else {
+    // Ask the store directly. `keychain_identity` treats a locked
+    // keychain as "no item", which is right for resolution and wrong
+    // here: "no identity" would make an intact key look lost.
+    let mut found = None;
+    for recipient in recipients {
+        if let Some(raw) = store.get(recipient)? {
+            let identity = sealed::parse_identity_text(&raw).with_context(|| {
+                format!("the keychain item for {recipient} is not an age identity")
+            })?;
+            if identity.to_public().to_string() != *recipient {
+                anyhow::bail!("the keychain item for {recipient} holds a different identity");
+            }
+            found = Some(identity);
+            break;
+        }
+    }
+    let Some(identity) = found else {
         anyhow::bail!("the keychain holds no identity for this project's recipients");
     };
     let public = identity.to_public().to_string();
     let secret = sealed::identity_secret(&identity);
     if let Some(path) = out {
+        if path.exists() && !force {
+            anyhow::bail!(
+                "{} already exists — pass --force to overwrite",
+                path.display()
+            );
+        }
         let body = format!("# public key: {public}\n{}\n", secret.as_str());
         sealed::write_atomically_secret(path, body.as_bytes())?;
         eprintln!("wrote identity {public} to {} (mode 0600)", path.display());
@@ -5326,81 +5376,146 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_secrets_key_list(config: &Config) -> Result<()> {
-    use yoink::sealed;
-    let recipients = age_recipients(config);
+/// One row of `yoink secrets key list`.
+struct KeyRow {
+    /// `None` for a row that names something yoink could not read.
+    source: Option<yoink::sealed::IdentitySource>,
+    label: String,
+    recipient: String,
+    note: String,
+}
+
+/// Every identity yoink can see for a project, in resolution order.
+fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
+    use yoink::keychain::StoreError;
+    use yoink::sealed::{self, IdentitySource};
     let in_config = |public: &str| recipients.iter().any(|r| r == public);
-    let mut rows: Vec<(String, String, &str)> = Vec::new();
     let note = |public: &str| {
-        if in_config(public) {
-            ""
+        if recipients.is_empty() || in_config(public) {
+            String::new()
         } else {
-            "not in secrets.recipients"
+            "not in secrets.recipients".to_string()
         }
     };
+    let unreadable = |label: String, why: &str| KeyRow {
+        source: None,
+        label,
+        recipient: "-".into(),
+        note: why.into(),
+    };
+    let mut rows: Vec<KeyRow> = Vec::new();
 
     if let Ok(raw) = std::env::var(sealed::AGE_KEY_ENV)
-        && let Ok(id) = sealed::parse_identity_text(&raw)
+        && !raw.trim().is_empty()
     {
-        let public = id.to_public().to_string();
-        rows.push((
-            format!("{} env var", sealed::AGE_KEY_ENV),
-            public.clone(),
-            note(&public),
-        ));
+        let label = format!("{} env var", sealed::AGE_KEY_ENV);
+        rows.push(match sealed::parse_identity_text(&raw) {
+            Ok(id) => {
+                let recipient = id.to_public().to_string();
+                KeyRow {
+                    source: Some(IdentitySource::EnvKey),
+                    label,
+                    note: note(&recipient),
+                    recipient,
+                }
+            }
+            Err(_) => unreadable(label, "not a valid identity"),
+        });
     }
     if let Ok(path) = std::env::var(sealed::AGE_KEY_FILE_ENV)
-        && let Ok(raw) = std::fs::read_to_string(path.trim())
-        && let Ok(id) = sealed::parse_identity_text(&raw)
+        && !path.trim().is_empty()
     {
-        let public = id.to_public().to_string();
-        rows.push((
-            format!("{} ({})", sealed::AGE_KEY_FILE_ENV, path.trim()),
-            public.clone(),
-            note(&public),
-        ));
+        let path = PathBuf::from(path.trim());
+        let label = format!("{} ({})", sealed::AGE_KEY_FILE_ENV, path.display());
+        let identity = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| sealed::parse_identity_text(&raw).ok());
+        rows.push(match identity {
+            Some(id) => {
+                let recipient = id.to_public().to_string();
+                KeyRow {
+                    source: Some(IdentitySource::EnvFile(path)),
+                    label,
+                    note: note(&recipient),
+                    recipient,
+                }
+            }
+            None => unreadable(label, "cannot read an identity"),
+        });
     }
     let store = yoink::keychain::system_store();
     for recipient in recipients {
-        match store.get(recipient) {
-            Ok(Some(_)) => rows.push(("keychain".into(), recipient.clone(), "")),
-            Ok(None) => {}
-            Err(e) => rows.push(("keychain".into(), recipient.clone(), leak_note(&e))),
+        let (source, row_note) = match store.get(recipient) {
+            Ok(None) => continue,
+            Ok(Some(raw)) => match sealed::parse_identity_text(&raw) {
+                Ok(id) if id.to_public().to_string() == *recipient => {
+                    (Some(IdentitySource::Keychain), "")
+                }
+                _ => (None, "holds a different identity; yoink skips it"),
+            },
+            Err(StoreError::Denied { .. }) => (None, "access denied"),
+            Err(StoreError::Unavailable(_)) => (None, "keychain not available"),
+        };
+        rows.push(KeyRow {
+            source,
+            label: "keychain".into(),
+            recipient: recipient.clone(),
+            note: row_note.into(),
+        });
+    }
+    let legacy = sealed::legacy_identity_path()?;
+    for (recipient, path) in sealed::file_identities()? {
+        // Key files of other projects stay out of the list. The legacy
+        // file is always shown: yoink loads it without a recipient match.
+        let is_legacy = path == legacy;
+        if !is_legacy && !in_config(&recipient) {
+            continue;
         }
+        rows.push(KeyRow {
+            label: format!("file {}", path.display()),
+            source: Some(if is_legacy {
+                IdentitySource::Legacy(path)
+            } else {
+                IdentitySource::KeysDir(path)
+            }),
+            note: note(&recipient),
+            recipient,
+        });
     }
-    if let Some((id, path)) = sealed::file_identity_for(recipients)? {
-        rows.push((
-            format!("file {}", path.display()),
-            id.to_public().to_string(),
-            "",
-        ));
-    }
+    Ok(rows)
+}
 
+fn cmd_secrets_key_list(config: &Config) -> Result<()> {
+    use yoink::sealed;
+    let recipients = age_recipients(config);
+    let rows = collect_key_rows(recipients)?;
     if rows.is_empty() {
         eprintln!("no identity found for this project");
         return Ok(());
     }
-    let width = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
-    for (i, (source, public, note)) in rows.iter().enumerate() {
-        let used = if i == 0 { "*" } else { " " };
-        let note = if note.is_empty() {
+    // The star follows the real resolution, not the row order.
+    let resolved = sealed::resolve_identity(recipients);
+    let used = resolved.as_ref().ok().map(|r| &r.source);
+    let width = rows.iter().map(|r| r.label.len()).max().unwrap_or(0);
+    for row in &rows {
+        let star = if row.source.is_some() && row.source.as_ref() == used {
+            "*"
+        } else {
+            " "
+        };
+        let note = if row.note.is_empty() {
             String::new()
         } else {
-            format!("  ({note})")
+            format!("  ({})", row.note)
         };
-        println!("{used} {source:<width$}  {public}{note}");
+        println!("{star} {:<width$}  {}{note}", row.label, row.recipient);
     }
     eprintln!();
-    eprintln!("* = the identity yoink uses");
-    Ok(())
-}
-
-/// A short, static note for a keychain row that could not be read.
-fn leak_note(err: &yoink::keychain::StoreError) -> &'static str {
-    match err {
-        yoink::keychain::StoreError::Denied { .. } => "access denied",
-        yoink::keychain::StoreError::Unavailable(_) => "keychain not available",
+    match resolved {
+        Ok(_) => eprintln!("* = the identity yoink uses"),
+        Err(e) => eprintln!("yoink cannot load an identity: {e}"),
     }
+    Ok(())
 }
 
 fn cmd_secrets_key_remove(recipient: &str, yes: bool) -> Result<()> {
