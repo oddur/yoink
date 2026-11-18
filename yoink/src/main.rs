@@ -1360,6 +1360,13 @@ fn log_file_path() -> PathBuf {
 
 #[allow(clippy::too_many_lines)] // one big match dispatch; splitting buys nothing
 async fn run(cli: Cli) -> Result<()> {
+    // macOS cannot show the keychain prompt in an SSH session. Without
+    // this, a read that needs a question waits on a dialog nobody sees.
+    // With prompts off the read fails at once, and yoink says that the
+    // keychain does not work over SSH. A read that needs no question
+    // still works.
+    let _no_keychain_prompts = yoink::keychain::in_ssh_session().then(yoink::keychain::no_prompts);
+
     if let Some(result) = run_bootstrap(&cli.command, &cli.config) {
         return result;
     }
@@ -1399,47 +1406,17 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     // Sealed host addresses need the age identity, and the identity can
-    // sit behind a keychain prompt. Commands that never dial a host do
-    // not get that prompt for this. `validate --check-hosts` does dial.
-    if !matches!(
-        cli.command,
-        Command::Validate { check_hosts: false }
-            | Command::Completions { .. }
-            | Command::ProxyRender
-            | Command::ProxyDockerfile
-            | Command::Secrets { .. }
-            // TAB completion of a service name or a config path runs on
-            // every keypress; only host completion needs the addresses.
-            | Command::Complete {
-                what: CompleteKind::Services | CompleteKind::Configs
+    // sit behind a keychain prompt. Each command says what it needs.
+    match host_addresses(&cli.command) {
+        HostAddresses::NotNeeded => {}
+        HostAddresses::Required => resolve_sealed_host_addresses(&mut config, false).await?,
+        HostAddresses::BestEffort => resolve_sealed_host_addresses(&mut config, true).await?,
+        HostAddresses::Quiet => {
+            // If prompts cannot be turned off, stay away from the keychain.
+            let quiet = yoink::keychain::no_prompts();
+            if quiet.active() {
+                resolve_sealed_host_addresses(&mut config, true).await?;
             }
-            | Command::Hosts {
-                action: HostsAction::Add { .. } | HostsAction::Remove { .. }
-            }
-            // A local build contacts no host. `add` reloads the config
-            // and resolves again before it deploys.
-            | Command::Build { .. }
-            | Command::Add { .. }
-    ) {
-        // Host-name completion reads the addresses, but a TAB press
-        // must not open a system dialog: no keychain prompts for it.
-        let quiet =
-            matches!(cli.command, Command::Complete { .. }).then(yoink::keychain::no_prompts);
-        // Prompts could not be turned off: do not go near the keychain.
-        let skip = quiet.as_ref().is_some_and(|q| !q.active());
-        // `doctor` and `hosts list` exist to show what is wrong, and
-        // completion must stay silent: they carry on without the
-        // addresses. Every other command stops on a keychain refusal.
-        let lenient = matches!(
-            cli.command,
-            Command::Doctor { .. }
-                | Command::Complete { .. }
-                | Command::Hosts {
-                    action: HostsAction::List
-                }
-        );
-        if !skip {
-            resolve_sealed_host_addresses(&mut config, lenient).await?;
         }
     }
 
@@ -2804,6 +2781,83 @@ fn check_config_freshness(path: &std::path::Path, require_latest: bool) -> Resul
         lag.upstream,
     );
     Ok(())
+}
+
+/// What a command needs from the `address_secret:` hosts at startup.
+enum HostAddresses {
+    /// The command contacts no host. Do not decrypt for it.
+    NotNeeded,
+    /// The command contacts hosts. A keychain refusal stops it here,
+    /// with that reason, instead of later on an empty address.
+    Required,
+    /// The command exists to show what is wrong. It runs on without
+    /// the addresses.
+    BestEffort,
+    /// Shell completion: best effort, and a TAB press must never open
+    /// a keychain dialog.
+    Quiet,
+}
+
+/// The match has no wildcard arm on purpose. A new top-level command
+/// does not compile until someone decides whether it contacts a host.
+///
+/// The check stops at the top level: `Secrets { .. }` covers every
+/// `yoink secrets` subcommand. None of them contacts a host today. One
+/// that does must get its own arm here.
+fn host_addresses(command: &Command) -> HostAddresses {
+    match command {
+        Command::Init { .. }
+        | Command::Completions { .. }
+        | Command::ProxyRender
+        | Command::ProxyDockerfile
+        | Command::Secrets { .. }
+        // A local build contacts no host. `add` reloads the config and
+        // resolves again before it deploys.
+        | Command::Build { .. }
+        | Command::Add { .. }
+        | Command::Validate { check_hosts: false }
+        | Command::Complete {
+            what: CompleteKind::Services | CompleteKind::Configs,
+        }
+        | Command::Hosts {
+            action: HostsAction::Add { .. } | HostsAction::Remove { .. },
+        } => HostAddresses::NotNeeded,
+
+        Command::Complete {
+            what: CompleteKind::Hosts,
+        } => HostAddresses::Quiet,
+
+        Command::Doctor { .. }
+        | Command::Hosts {
+            action: HostsAction::List,
+        } => HostAddresses::BestEffort,
+
+        Command::Validate { check_hosts: true }
+        | Command::Preflight { .. }
+        | Command::Up { .. }
+        | Command::Status { .. }
+        | Command::Rollback { .. }
+        | Command::Prune { .. }
+        | Command::Exec { .. }
+        | Command::Logs { .. }
+        | Command::Version { .. }
+        | Command::Shell { .. }
+        | Command::Pf { .. }
+        | Command::Vscode { .. }
+        | Command::Debug { .. }
+        | Command::Tui { .. }
+        | Command::Restart { .. }
+        | Command::Kill { .. }
+        | Command::Pull { .. }
+        | Command::History { .. }
+        | Command::Audit { .. }
+        | Command::Top { .. }
+        | Command::Networks { .. }
+        | Command::Volumes { .. }
+        | Command::Dump { .. }
+        | Command::Lock { .. }
+        | Command::Diff { .. } => HostAddresses::Required,
+    }
 }
 
 async fn resolve_sealed_host_addresses(config: &mut Config, lenient: bool) -> Result<()> {
@@ -5441,9 +5495,8 @@ fn cmd_secrets_key_import(
         &yoink::keychain::label_for(&project_name(config_path)),
     )?;
     // Read back before anything is deleted.
-    // `get_fresh`: the cache holds the value that was just written, so
-    // only a real read proves that the item is there.
-    match store.get_fresh(&public)? {
+    // The store has no cache, so this is a real read of the item.
+    match store.get(&public)? {
         Some(back) if back.as_str() == secret.as_str() => {}
         _ => anyhow::bail!(
             "the keychain did not return the identity that was stored; the key file is untouched"
@@ -5527,7 +5580,15 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> R
     let lookup = sealed::keychain_identity(store, recipients)?;
     let Some(identity) = lookup.identity else {
         if let Some(reason) = lookup.unavailable {
-            anyhow::bail!("the keychain could not be read: {reason}");
+            // Export reads the keychain only, so the general advice
+            // (set YOINK_AGE_KEY, generate a key) does not apply.
+            let fix = if yoink::keychain::in_ssh_session() {
+                "This looks like an SSH session, where macOS cannot ask for permission. \
+                 Run this command on the Mac itself"
+            } else {
+                "Unlock the keychain and allow yoink"
+            };
+            anyhow::bail!("the keychain could not be read: {reason}. {fix}");
         }
         if let Some((recipient, why)) = lookup.skipped.first() {
             anyhow::bail!("the keychain item for {recipient} {why}");
@@ -5650,7 +5711,7 @@ fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
         && !raw.trim().is_empty()
     {
         let label = IdentitySource::EnvKey.to_string();
-        rows.push(match sealed::parse_env_identity(&raw) {
+        rows.push(match sealed::parse_identity(raw.trim()) {
             Ok(id) => {
                 let recipient = id.to_public().to_string();
                 KeyRow {
@@ -5668,7 +5729,7 @@ fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
     {
         let path = PathBuf::from(path.trim());
         let label = format!("{} ({})", sealed::AGE_KEY_FILE_ENV, path.display());
-        let identity = sealed::identity_from_file(&path).ok();
+        let identity = sealed::load_identity_from_file(&path).ok();
         rows.push(match identity {
             Some(id) => {
                 let recipient = id.to_public().to_string();
@@ -5738,13 +5799,16 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
     // your permission, a real command would ask and use the keychain,
     // while the quiet lookup here falls through to a key file. A star
     // on that file would be wrong, so then no row gets one.
+    // True when prompts are already off for the whole run (an SSH
+    // session). A real command then gets the same answer as this list.
+    let run_is_quiet = yoink::keychain::prompts_off();
     let (resolved, unread) = {
         let quiet = yoink::keychain::no_prompts();
         if quiet.active() {
             // The reason, when any item could not be read. Also when
             // another recipient's item was readable: a real command asks
             // for the first one before it gets that far.
-            let unread = sealed::keychain_identity(yoink::keychain::system_store(), recipients)
+            let unread = sealed::keychain_lookup(recipients)
                 .ok()
                 .and_then(|l| l.unavailable);
             (sealed::resolve_identity(recipients), unread)
@@ -5766,7 +5830,7 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
         Err(e) => e.is_keychain() || unread.is_some() && !env_is_set(),
     };
     let resolved = match unread {
-        Some(reason) if keychain_decides => {
+        Some(reason) if keychain_decides && !run_is_quiet => {
             Err(sealed::SealedError::KeychainUnavailable { reason })
         }
         _ => resolved,
@@ -5792,12 +5856,18 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
     eprintln!();
     match resolved {
         Ok(_) => eprintln!("* = the identity yoink uses"),
-        // Prompts were off for this list, so an item that needs your
-        // permission could not be read. That is not a lost key.
-        Err(sealed::SealedError::KeychainUnavailable { reason }) => eprintln!(
-            "no star: the keychain item was not read ({reason}). A command that uses the \
-             key, for example `yoink secrets show`, asks for permission and then uses it."
-        ),
+        // The keychain item was not read. That is not a lost key.
+        Err(sealed::SealedError::KeychainUnavailable { reason }) => {
+            eprintln!("no star: the keychain item was not read ({reason}).");
+            if run_is_quiet {
+                eprintln!("{}", yoink::keychain::advice());
+            } else {
+                eprintln!(
+                    "A command that uses the key, for example `yoink secrets show`, \
+                     asks for permission and then uses it."
+                );
+            }
+        }
         Err(e) => eprintln!("yoink cannot load an identity: {e}"),
     }
     Ok(())

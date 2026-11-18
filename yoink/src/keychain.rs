@@ -30,10 +30,11 @@ pub enum StoreError {
          keychain prompt, or set YOINK_AGE_KEY / YOINK_AGE_KEY_FILE"
     )]
     Denied { recipient: String },
-    /// The store cannot answer: locked keychain, no GUI session (SSH
-    /// into the Mac), or a platform without a store. Identity
-    /// resolution continues with the key files.
-    #[error("the keychain is not available: {0}")]
+    /// The store cannot answer: a locked keychain, an item that needs a
+    /// permission macOS cannot ask for (prompts are off in an SSH
+    /// session), or a platform without a store. Identity resolution
+    /// continues with the key files.
+    #[error("the keychain is not available: {0}{note}", note = ssh_note())]
     Unavailable(String),
 }
 
@@ -60,21 +61,6 @@ pub trait IdentityStore: Send + Sync {
     fn supported(&self) -> bool;
     /// The identity for `recipient`, or `None` when no item exists.
     fn get(&self, recipient: &str) -> Result<Option<Zeroizing<String>>, StoreError>;
-    /// [`Self::get`] that always asks the store itself, never a cache.
-    /// `import` uses it to prove that a stored item can be read back
-    /// before it deletes the key file.
-    fn get_fresh(&self, recipient: &str) -> Result<Option<Zeroizing<String>>, StoreError> {
-        self.get(recipient)
-    }
-    /// Forget every lookup that did not return an identity, so the next
-    /// `get` asks the store again. A long-running session (the TUI)
-    /// calls it before a reload: a "Deny", a locked keychain or a key
-    /// that was imported in another terminal must not stick for the
-    /// life of the process. Returns true when an error was forgotten:
-    /// only then can a retry give another answer.
-    fn retry_failures(&self) -> bool {
-        false
-    }
     /// Create or replace the item for `recipient`. `label` names a new
     /// item; an item that exists keeps the name it has.
     fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError>;
@@ -89,8 +75,7 @@ pub trait IdentityStore: Send + Sync {
 
 /// Held while yoink must not put up a keychain prompt. See [`no_prompts`].
 pub struct NoPrompts {
-    #[cfg(target_os = "macos")]
-    lock: Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+    active: bool,
 }
 
 impl NoPrompts {
@@ -98,130 +83,144 @@ impl NoPrompts {
     /// stay away from the keychain: a read can still open a dialog.
     #[must_use]
     pub fn active(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.lock.is_some()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // No store, so no prompt to turn off.
-            true
-        }
+        self.active
     }
 }
+
+/// How many [`NoPrompts`] values are alive, and the lock they share.
+/// Guards nest (a whole run over SSH, plus `key list` inside it); only
+/// the last one to go turns prompts back on.
+#[cfg(target_os = "macos")]
+static QUIET: std::sync::Mutex<(
+    usize,
+    Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+)> = std::sync::Mutex::new((0, None));
 
 /// Turn keychain prompts off until the returned value is dropped. A
 /// read that would prompt fails instead, and identity resolution
 /// treats that as "the keychain cannot answer".
 ///
-/// For shell completion: a TAB press must never open a system dialog.
+/// Used where a system dialog must never open: shell completion, the
+/// key list, and every command in an SSH session.
 #[must_use]
 pub fn no_prompts() -> NoPrompts {
-    NoPrompts {
-        #[cfg(target_os = "macos")]
-        lock: security_framework::os::macos::keychain::SecKeychain::disable_user_interaction().ok(),
+    #[cfg(target_os = "macos")]
+    {
+        use security_framework::os::macos::keychain::SecKeychain;
+        let mut quiet = QUIET
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if quiet.0 == 0 {
+            quiet.1 = SecKeychain::disable_user_interaction().ok();
+        }
+        let active = quiet.1.is_some();
+        if active {
+            quiet.0 += 1;
+        }
+        NoPrompts { active }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No store, so no prompt to turn off.
+        NoPrompts { active: true }
     }
 }
 
-/// The store of this platform, behind a cache that lives as long as
-/// the process.
-///
-/// One yoink run resolves the identity more than once (sealed host
-/// addresses, then the deploy itself, then per-host ssh keys). Without
-/// the cache each of those is a keychain read, and each read can be a
-/// system prompt when the user allowed access once and not always. The
-/// cache makes it one read, so at most one prompt, for each recipient
-/// in a run. A refusal is cached too: yoink does not ask again after
-/// "Deny".
+/// True while a [`NoPrompts`] value holds prompts off. Callers ask this,
+/// not the environment, when they need to know whether a keychain read
+/// can open a dialog.
+#[must_use]
+pub fn prompts_off() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        QUIET
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No store, so no prompt.
+        true
+    }
+}
+
+impl Drop for NoPrompts {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.active {
+            let mut quiet = QUIET
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            quiet.0 = quiet.0.saturating_sub(1);
+            if quiet.0 == 0 {
+                quiet.1 = None;
+            }
+        }
+    }
+}
+
+/// The store of this platform. It holds no state: every call goes to
+/// the keychain. Identity resolution remembers its own result for the
+/// run; see `sealed::resolve_identity`.
 #[must_use]
 pub fn system_store() -> &'static dyn IdentityStore {
     #[cfg(target_os = "macos")]
-    type Platform = macos::Keychain;
+    {
+        &macos::Keychain
+    }
     #[cfg(not(target_os = "macos"))]
-    type Platform = NoStore;
-    static STORE: std::sync::OnceLock<Cached<Platform>> = std::sync::OnceLock::new();
-    STORE.get_or_init(|| Cached::new(Platform::default()))
-}
-
-type Lookup = Result<Option<Zeroizing<String>>, StoreError>;
-
-/// Remembers every lookup of the wrapped store.
-pub struct Cached<S> {
-    inner: S,
-    seen: std::sync::Mutex<std::collections::BTreeMap<String, Lookup>>,
-}
-
-impl<S> Cached<S> {
-    pub fn new(inner: S) -> Self {
-        Self {
-            inner,
-            seen: std::sync::Mutex::default(),
-        }
-    }
-
-    fn seen(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, Lookup>> {
-        // A poisoned lock only means another thread panicked mid-insert;
-        // the map itself is still usable.
-        self.seen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        &NoStore
     }
 }
 
-impl<S: IdentityStore> IdentityStore for Cached<S> {
-    fn supported(&self) -> bool {
-        self.inner.supported()
+/// True when the environment says this is an SSH session.
+///
+/// macOS cannot show the keychain prompt in one. yoink therefore turns
+/// prompts off for the whole run (see `run` in main.rs) and still
+/// tries the keychain: a read that needs no question works, and one
+/// that does fails at once instead of waiting on a dialog nobody sees.
+///
+/// The variables can be stale, for example in a tmux session that was
+/// started over SSH and is used at the Mac later. That is why this is
+/// a reason to stay quiet, and not a reason to refuse.
+#[must_use]
+pub fn in_ssh_session() -> bool {
+    ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+}
+
+fn ssh_note() -> &'static str {
+    if in_ssh_session() {
+        " (this looks like an SSH session, where the macOS keychain does not work)"
+    } else {
+        ""
     }
-    fn get(&self, recipient: &str) -> Lookup {
-        // The lock is held across the read on purpose. Two tasks that
-        // miss at the same time would otherwise both reach the keychain
-        // and put up two prompts for one recipient.
-        let mut seen = self.seen();
-        if let Some(hit) = seen.get(recipient) {
-            return hit.clone();
-        }
-        tracing::debug!("keychain read for {recipient}");
-        let result = self.inner.get(recipient);
-        seen.insert(recipient.to_string(), result.clone());
-        result
-    }
-    fn get_fresh(&self, recipient: &str) -> Lookup {
-        let mut seen = self.seen();
-        let result = self.inner.get_fresh(recipient);
-        seen.insert(recipient.to_string(), result.clone());
-        result
-    }
-    fn retry_failures(&self) -> bool {
-        let mut seen = self.seen();
-        // A cached miss is forgotten too (the key may have arrived from
-        // another terminal), but only a cached error makes a retry
-        // worth it. Misses are normal: a teammate's recipient has no
-        // item here, and on Linux nothing has.
-        let had_error = seen.values().any(Result::is_err);
-        seen.retain(|_, lookup| matches!(lookup, Ok(Some(_))));
-        had_error
-    }
-    fn list(&self) -> Result<Vec<StoredItem>, StoreError> {
-        self.inner.list()
-    }
-    fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError> {
-        self.inner.set(recipient, identity, label)?;
-        self.seen().insert(
-            recipient.to_string(),
-            Ok(Some(Zeroizing::new(identity.to_string()))),
-        );
-        Ok(())
-    }
-    fn delete(&self, recipient: &str) -> Result<bool, StoreError> {
-        let removed = self.inner.delete(recipient)?;
-        self.seen().insert(recipient.to_string(), Ok(None));
-        Ok(removed)
+}
+
+/// What to do when the keychain did not hand out the key.
+#[must_use]
+pub fn advice() -> &'static str {
+    advice_for(in_ssh_session())
+}
+
+fn advice_for(in_ssh_session: bool) -> &'static str {
+    if in_ssh_session {
+        "This looks like an SSH session, where macOS cannot ask for permission, so the \
+         keychain usually does not work here. Set YOINK_AGE_KEY or YOINK_AGE_KEY_FILE for \
+         this session, or run yoink on the Mac itself. If yoink already has access and \
+         the keychain is only locked, `security unlock-keychain` unlocks it."
+    } else {
+        "If the key is in the keychain, unlock the keychain and allow yoink. Otherwise set \
+         YOINK_AGE_KEY or YOINK_AGE_KEY_FILE, or create a key with `yoink secrets key generate`."
     }
 }
 
 /// A store that holds nothing. Used on platforms without a keychain,
 /// and by callers that must not touch the real one.
-#[derive(Default)]
 pub struct NoStore;
 
 impl IdentityStore for NoStore {
@@ -259,7 +258,6 @@ mod macos {
     const ERR_SEC_USER_CANCELED: i32 = -128;
     const ERR_SEC_AUTH_FAILED: i32 = -25293;
 
-    #[derive(Default)]
     pub struct Keychain;
 
     /// A refusal on the access prompt stops identity resolution; every
@@ -274,8 +272,9 @@ mod macos {
     /// - `errSecAuthFailed` (-25293): macOS needed the user's permission
     ///   and could not ask, because prompts were turned off
     ///   ([`super::no_prompts`]). Nobody refused, so this is "cannot
-    ///   answer". A session with no GUI (SSH into the Mac) is the same
-    ///   situation, which is why it must fall through to the key files.
+    ///   answer", and resolution falls through to the key files. yoink
+    ///   turns prompts off in an SSH session, so this is the code an
+    ///   SSH session gets for an item that needs a question.
     ///
     /// Every other code also means the store cannot answer.
     fn classify(err: Error, recipient: &str) -> StoreError {
@@ -438,132 +437,30 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::fake::FakeStore;
     use super::*;
 
-    /// Counts the reads that reach the wrapped store.
-    #[derive(Default)]
-    struct Counting {
-        inner: FakeStore,
-        reads: AtomicUsize,
-    }
-
-    impl IdentityStore for Counting {
-        fn supported(&self) -> bool {
-            true
-        }
-        fn get(&self, recipient: &str) -> Lookup {
-            self.reads.fetch_add(1, Ordering::SeqCst);
-            self.inner.get(recipient)
-        }
-        fn set(&self, recipient: &str, identity: &str, label: &str) -> Result<(), StoreError> {
-            self.inner.set(recipient, identity, label)
-        }
-        fn delete(&self, recipient: &str) -> Result<bool, StoreError> {
-            self.inner.delete(recipient)
-        }
-    }
-
-    /// One run resolves the identity several times. Each read can be a
-    /// keychain prompt, so only the first may reach the keychain.
     #[test]
-    fn cached_store_reads_each_recipient_once() {
-        let store = Cached::new(Counting {
-            inner: FakeStore::with("age1a", "secret-a"),
-            ..Counting::default()
-        });
-        for _ in 0..3 {
-            assert_eq!(store.get("age1a").unwrap().unwrap().as_str(), "secret-a");
-            assert!(store.get("age1missing").unwrap().is_none());
+    fn advice_names_ssh_only_in_an_ssh_session() {
+        assert!(advice_for(true).contains("SSH session"));
+        assert!(advice_for(true).contains("YOINK_AGE_KEY"));
+        assert!(!advice_for(false).contains("SSH"));
+        assert!(advice_for(false).contains("unlock the keychain"));
+    }
+
+    /// Guards nest: a whole run over SSH holds one, and `key list` takes
+    /// a second. The inner one must not turn prompts back on.
+    #[test]
+    fn no_prompts_guards_nest() {
+        let outer = no_prompts();
+        let inner = no_prompts();
+        assert_eq!(outer.active(), inner.active());
+        drop(inner);
+        // The outer guard still holds prompts off.
+        assert_eq!(prompts_off(), outer.active());
+        #[cfg(target_os = "macos")]
+        if outer.active() {
+            use security_framework::os::macos::keychain::SecKeychain;
+            assert_eq!(SecKeychain::user_interaction_allowed().ok(), Some(false));
         }
-        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 2);
-    }
-
-    /// `import` must not trust the cache: `set` seeds it with the value
-    /// that was just written, so a cached read-back proves nothing.
-    #[test]
-    fn get_fresh_asks_the_store_and_not_the_cache() {
-        let store = Cached::new(Counting::default());
-        store.set("age1a", "secret-a", "test").unwrap();
-        // The item vanishes behind the cache's back.
-        store.inner.inner.items.lock().unwrap().clear();
-        assert_eq!(store.get("age1a").unwrap().unwrap().as_str(), "secret-a");
-        assert!(store.get_fresh("age1a").unwrap().is_none());
-        // The fresh result replaces the stale cache entry.
-        assert!(store.get("age1a").unwrap().is_none());
-    }
-
-    /// After "Deny" yoink does not put the prompt up a second time.
-    #[test]
-    fn cached_store_does_not_ask_again_after_a_refusal() {
-        let store = Cached::new(Counting {
-            inner: FakeStore {
-                fail: Some(StoreError::Denied {
-                    recipient: String::new(),
-                }),
-                ..FakeStore::default()
-            },
-            ..Counting::default()
-        });
-        for _ in 0..3 {
-            assert!(matches!(store.get("age1a"), Err(StoreError::Denied { .. })));
-        }
-        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 1);
-    }
-
-    /// A refusal is what makes a retry worth it.
-    #[test]
-    fn retry_failures_reports_a_forgotten_error() {
-        let store = Cached::new(Counting {
-            inner: FakeStore {
-                fail: Some(StoreError::Denied {
-                    recipient: String::new(),
-                }),
-                ..FakeStore::default()
-            },
-            ..Counting::default()
-        });
-        assert!(store.get("age1a").is_err());
-        assert!(store.retry_failures());
-        assert!(!store.retry_failures());
-    }
-
-    /// The TUI lives long. A refusal or a missing item must be
-    /// retryable there, while a key that was read stays cached.
-    #[test]
-    fn retry_failures_forgets_everything_but_identities() {
-        let store = Cached::new(Counting {
-            inner: FakeStore::with("age1a", "secret-a"),
-            ..Counting::default()
-        });
-        store.get("age1a").unwrap();
-        assert!(store.get("age1b").unwrap().is_none());
-        // The key for age1b arrives from another terminal.
-        store.inner.inner.set("age1b", "secret-b", "test").unwrap();
-        assert!(
-            store.get("age1b").unwrap().is_none(),
-            "still the cached miss"
-        );
-
-        // Only a miss was cached: forgotten, but no reason to retry.
-        assert!(!store.retry_failures());
-        assert_eq!(store.get("age1b").unwrap().unwrap().as_str(), "secret-b");
-        store.get("age1a").unwrap();
-        // age1a once, age1b twice.
-        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn cached_store_follows_set_and_delete() {
-        let store = Cached::new(Counting::default());
-        assert!(store.get("age1a").unwrap().is_none());
-        store.set("age1a", "secret-a", "test").unwrap();
-        assert_eq!(store.get("age1a").unwrap().unwrap().as_str(), "secret-a");
-        assert!(store.delete("age1a").unwrap());
-        assert!(store.get("age1a").unwrap().is_none());
-        // Only the first lookup reached the store.
-        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 1);
     }
 }

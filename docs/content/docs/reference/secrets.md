@@ -39,7 +39,8 @@ yoink reads the keychain only for a command that needs the identity, and one tim
 | Case | Result |
 |---|---|
 | No item for any recipient | yoink continues with the key files. |
-| macOS cannot ask for your permission: the session has no GUI (SSH into the Mac), or the keychain is locked | yoink continues with the key files. If no key file holds the identity, the error names the keychain. |
+| An SSH session into the Mac | yoink never opens the prompt, because macOS cannot show it there. If macOS permits the read without a question, yoink uses the key. If not, yoink continues with the key files. If no key file holds the identity, the error says that the keychain does not work in an SSH session. yoink finds an SSH session from the `SSH_CONNECTION`, `SSH_TTY`, and `SSH_CLIENT` variables. A remote session that does not have them, for example after `sudo -u`, is not found, and yoink can wait there for a prompt that you cannot see. |
+| A locked keychain | yoink continues with the key files. If no key file holds the identity, the error names the keychain. |
 | You select "Deny" on the system prompt | yoink stops with an error. It does not read the key files. |
 | The same identity is in the keychain and in a key file | yoink uses the keychain. `yoink doctor` shows a warning. |
 
