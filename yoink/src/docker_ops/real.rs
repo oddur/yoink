@@ -18,6 +18,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use super::exec_io::{collect_attached, settle_stdin_write};
 use super::{
     BUILD_TIMEOUT, ContainerDetail, ContainerInfo, ContainerStats, DockerError, DockerEvent,
     DockerEventKind, DockerOps, DockerVersion, ExecKind, ExecSession, HostInfo, ImageInfo,
@@ -345,38 +346,14 @@ impl RealDockerOps {
             .await
             .map_err(|s| Self::err(host, s))?;
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let bollard::exec::StartExecResults::Attached {
-            mut output,
-            mut input,
-        } = exec_results
-        {
-            if let Some(bytes) = stdin {
-                use tokio::io::AsyncWriteExt as _;
-                input
-                    .write_all(&bytes)
+        let (stdout, stderr, stdin_write) = match exec_results {
+            bollard::exec::StartExecResults::Attached { output, input } => {
+                collect_attached(output, input, stdin)
                     .await
-                    .map_err(|e| DockerError::Invalid(format!("write exec stdin: {e}")))?;
-                input
-                    .shutdown()
-                    .await
-                    .map_err(|e| DockerError::Invalid(format!("close exec stdin: {e}")))?;
+                    .map_err(|e| Self::err(host, e))?
             }
-            while let Some(item) = output.next().await {
-                match item {
-                    Ok(
-                        bollard::container::LogOutput::StdOut { message }
-                        | bollard::container::LogOutput::Console { message },
-                    ) => stdout.push_str(&String::from_utf8_lossy(&message)),
-                    Ok(bollard::container::LogOutput::StdErr { message }) => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(bollard::container::LogOutput::StdIn { .. }) => {}
-                    Err(e) => return Err(Self::err(host, e)),
-                }
-            }
-        }
+            bollard::exec::StartExecResults::Detached => (String::new(), String::new(), Ok(())),
+        };
 
         let exec_id = exec.id.as_str();
         let inspect = self
@@ -385,11 +362,14 @@ impl RealDockerOps {
                 |docker| async move { docker.inspect_exec(exec_id).await },
             )
             .await?;
-        Ok(OneShotResult {
-            exit_code: inspect.exit_code.unwrap_or(0),
-            stdout,
-            stderr,
-        })
+        settle_stdin_write(
+            stdin_write,
+            OneShotResult {
+                exit_code: inspect.exit_code.unwrap_or(0),
+                stdout,
+                stderr,
+            },
+        )
     }
 }
 

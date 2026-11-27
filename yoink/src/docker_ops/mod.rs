@@ -4,6 +4,7 @@
 //! socket). `FakeDockerOps` returns scripted typed responses so the rest
 //! of the crate is testable without spawning real containers.
 
+mod exec_io;
 mod fake;
 mod real;
 
