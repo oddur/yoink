@@ -784,7 +784,7 @@ pub async fn deploy_service(
     // every host has a fully-configured container that's just one
     // `docker start` away from running.
     let mut prepared: Vec<HostPrep> = Vec::with_capacity(hosts.len());
-    for host in &hosts {
+    for host in hosts {
         let prep =
             prepare_one_host(ops, config, service, tag, secrets, host, force, on_event).await?;
         prepared.push(prep);
@@ -871,11 +871,10 @@ async fn prepare_one_host(
     service: &ServiceConfig,
     tag: &str,
     secrets: Option<&SecretsBundle>,
-    host: &Host,
+    host: Host,
     force: bool,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<HostPrep, DeployError> {
-    let host = host.clone();
     on_event(DeployEvent::Started {
         service: service.name.clone(),
         tag: tag.to_string(),
@@ -4137,7 +4136,7 @@ services:
     #[tokio::test]
     async fn build_upstream_names_excludes_old_replicas_for_in_flight_service() {
         let cfg = config_proxied_service();
-        let routed: Vec<&ServiceConfig> = cfg.services.iter().filter(|s| s.is_proxied()).collect();
+        let routed = cfg.proxied_services();
 
         // Both old AND new replicas show up as `running` if we ever
         // queried — the override should bypass the query entirely.
@@ -4208,7 +4207,7 @@ services:
 "#,
         )
         .unwrap();
-        let routed: Vec<&ServiceConfig> = cfg.services.iter().filter(|s| s.is_proxied()).collect();
+        let routed = cfg.proxied_services();
 
         let ops = FakeDockerOps::new();
         // api: in-flight, query should be skipped via override.

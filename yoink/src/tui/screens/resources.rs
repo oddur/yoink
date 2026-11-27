@@ -209,7 +209,7 @@ impl ResourcesState {
         match self.current_tab() {
             ResourceTab::Images => {
                 let img = self.images.get(src)?;
-                let host = host_for_address(config, &img.host)?;
+                let host = config.host(&img.host)?;
                 let label = if let Some(tag) = img.repo_tags.first() {
                     format!("{tag} ({})", img.id)
                 } else {
@@ -230,7 +230,7 @@ impl ResourcesState {
             }
             ResourceTab::Volumes => {
                 let v = self.volumes.get(src)?;
-                let host = host_for_address(config, &v.host)?;
+                let host = config.host(&v.host)?;
                 Some(ResourceTarget {
                     host,
                     kind: ResourceTab::Volumes,
@@ -240,7 +240,7 @@ impl ResourcesState {
             }
             ResourceTab::Networks => {
                 let n = self.networks.get(src)?;
-                let host = host_for_address(config, &n.host)?;
+                let host = config.host(&n.host)?;
                 Some(ResourceTarget {
                     host,
                     kind: ResourceTab::Networks,
@@ -581,10 +581,6 @@ impl ResourcesState {
             .block(block);
         frame.render_stateful_widget(table, area, &mut self.networks_table);
     }
-}
-
-fn host_for_address(config: &Config, address: &str) -> Option<Host> {
-    config.host(address)
 }
 
 /// Background-friendly fetch — fans out per-host across all three

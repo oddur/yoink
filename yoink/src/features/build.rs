@@ -353,7 +353,6 @@ pub async fn load_images_to_hosts(
         .expect("static progress template parses");
 
         let loads = hosts.iter().map(|host| {
-            let host = host.clone();
             let bar = multi.add(ProgressBar::new_spinner().with_style(style.clone()));
             bar.set_prefix(format!("{} → {}", short_image(image_ref), host.address));
             if interactive {
@@ -362,7 +361,7 @@ pub async fn load_images_to_hosts(
             let bar_for_progress = bar.clone();
             let image_ref = image_ref.clone();
             async move {
-                deliver_image(transport, ops, &host, &image_ref, &bar, move |n| {
+                deliver_image(transport, ops, host, &image_ref, &bar, move |n| {
                     bar_for_progress.inc(n);
                 })
                 .await

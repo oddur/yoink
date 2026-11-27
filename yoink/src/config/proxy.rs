@@ -40,7 +40,7 @@ impl Config {
         {
             return explicit;
         }
-        self.services.iter().any(|s| s.domain.is_some())
+        self.services.iter().any(ServiceConfig::is_proxied)
     }
 
     /// The managed Caddy build (`proxy.xcaddy:`), when configured.
@@ -225,7 +225,7 @@ impl Config {
 
         // Add the synthesized proxy service if not already present
         // (idempotent for tests that round-trip Config → render → re-parse).
-        if !self.services.iter().any(|s| s.name == PROXY_SERVICE_NAME) {
+        if self.service(PROXY_SERVICE_NAME).is_none() {
             let proxy_cfg = self.proxy.clone().unwrap_or_default();
             self.services.push(synthesized_proxy_service(&proxy_cfg));
         }
@@ -664,10 +664,7 @@ services:
         // `parse_str` may already inject; a second call must not change it.
         cfg.inject_implicit_proxy().expect("inject ok");
 
-        let nets = |name: &str| {
-            let svc = cfg.services.iter().find(|s| s.name == name).unwrap();
-            svc.effective_networks(&cfg.deploy)
-        };
+        let nets = |name: &str| cfg.networks_for(cfg.service(name).unwrap());
         assert_eq!(nets("api"), ["app", INGRESS_NETWORK]);
         assert_eq!(nets("worker"), ["app"]);
         assert_eq!(nets(PROXY_SERVICE_NAME), [INGRESS_NETWORK, ADMIN_NETWORK]);
@@ -695,7 +692,7 @@ services:
             .find(|s| s.name == PROXY_SERVICE_NAME)
             .expect("proxy synthesized");
         assert!(matches!(proxy.kind, Some(ServiceKind::Proxy)));
-        let api = cfg.services.iter().find(|s| s.name == "api").unwrap();
+        let api = cfg.service("api").unwrap();
         assert!(
             api.networks
                 .as_ref()

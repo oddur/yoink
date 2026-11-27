@@ -200,7 +200,7 @@ fn build_service_row<'a>(
     // Expected = replicas × real hosts the service is configured to
     // run on.
     let expected = cfg_service.map_or(running, |s| {
-        config.fleet_for(s).len() * s.run.replicas as usize
+        config.fleet_size_for(s) * s.run.replicas as usize
     });
     let running_str = format!("{running}/{expected}");
     let health = summarize_health(&containers);

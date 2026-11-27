@@ -38,6 +38,7 @@ use crate::base::host::Host;
 use crate::config::Config;
 use crate::docker_ops::{DockerEvent, DockerEventKind, DockerOps, LogLine};
 use crate::features::status::StatusReport;
+use crate::tui::{chrome, editor, pf, ui, vscode};
 
 use super::container_detail::{self, ContainerDetailRefresh, ContainerDetailState, StatsHistory};
 use super::dashboard::{self, DashboardRefresh, DashboardState};
@@ -848,8 +849,8 @@ pub struct App {
     /// container_port)`. Created by `f`, closed by `Shift-F` (all)
     /// or by dropping the App. Each entry owns its `SshTunnel`
     /// child; Drop kills the ssh subprocess on session exit.
-    forwards: crate::tui::pf::PortForwardState,
-    vscode: crate::tui::vscode::VscodeSessionState,
+    forwards: pf::PortForwardState,
+    vscode: vscode::VscodeSessionState,
     /// `Some((service, tag))` while a reconcile-confirmation modal
     /// is open. `y` / Enter confirms; anything else cancels.
     reconcile_target: Option<(String, String)>,
@@ -946,7 +947,7 @@ pub struct App {
     /// Set when the operator pressed `E` to edit the config in
     /// `$EDITOR`. Drained by `run_loop`, which suspends the alt-
     /// screen, runs the editor synchronously, and re-enters the TUI.
-    pending_editor: Option<crate::tui::editor::EditorTarget>,
+    pending_editor: Option<editor::EditorTarget>,
     /// Drives the spinner glyph in `loading…` rows. Advanced on a
     /// dedicated 100 ms tick so the animation looks alive even when
     /// the slower data ticks aren't firing.
@@ -989,8 +990,8 @@ impl App {
             kill_target: None,
             drift: super::drift::DriftState::default(),
             doctor: super::doctor::DoctorState::default(),
-            forwards: crate::tui::pf::PortForwardState::default(),
-            vscode: crate::tui::vscode::VscodeSessionState::default(),
+            forwards: pf::PortForwardState::default(),
+            vscode: vscode::VscodeSessionState::default(),
             reconcile_target: None,
             prune_target: false,
             reconcile_all_target: false,
@@ -1021,7 +1022,7 @@ impl App {
             log_tx,
             log_rx,
             event_tasks: Vec::new(),
-            config_source: crate::tui::chrome::config_source(&config_path),
+            config_source: chrome::config_source(&config_path),
             config_path,
             pending_editor: None,
             throbber_state: throbber_widgets_tui::ThrobberState::default(),
@@ -1044,7 +1045,7 @@ impl App {
             return Ok(());
         };
         restore_terminal(terminal, mouse).context("restore terminal for $EDITOR")?;
-        let status = crate::tui::editor::run_editor(&target);
+        let status = editor::run_editor(&target);
         *terminal = setup_terminal(mouse).context("re-setup terminal after $EDITOR")?;
         terminal.clear().context("clear terminal after $EDITOR")?;
         match status {
@@ -1069,8 +1070,9 @@ impl App {
     }
 
     /// The next message from a background task. Channels are polled
-    /// in a fixed order, so a busy one cannot starve the ones before
-    /// it. `None` once every channel is closed.
+    /// in a fixed order (updates, log lines, shell bytes, shell
+    /// sessions, jobs), the same order the run loop used before.
+    /// `None` once every channel is closed.
     async fn next_inbound(&mut self) -> Option<Inbound> {
         tokio::select! {
             biased;
@@ -1110,13 +1112,13 @@ impl App {
     /// to "open at line 1" when the focused object isn't a service or
     /// host (e.g. the dashboard or the secrets pane), or when the
     /// matching block can't be located in the root config file.
-    fn editor_target_for_current_view(&self) -> crate::tui::editor::EditorTarget {
+    fn editor_target_for_current_view(&self) -> editor::EditorTarget {
         let yaml = std::fs::read_to_string(&self.config_path).unwrap_or_default();
         let line = match &self.view {
             View::ServiceDetail(name) | View::ServiceHistory(name) => {
-                crate::tui::editor::find_service_line(&yaml, name)
+                editor::find_service_line(&yaml, name)
             }
-            View::HostDetail(host) => crate::tui::editor::find_host_line(&yaml, &host.address),
+            View::HostDetail(host) => editor::find_host_line(&yaml, &host.address),
             View::ContainerDetail { container, .. } | View::ContainerLogs { container, .. } => {
                 // Look up the service this container belongs to: try
                 // each declared service name as a `<name>-` prefix and
@@ -1130,11 +1132,11 @@ impl App {
                             || container.starts_with(&format!("{}-", s.name))
                     })
                     .max_by_key(|s| s.name.len())
-                    .and_then(|s| crate::tui::editor::find_service_line(&yaml, &s.name))
+                    .and_then(|s| editor::find_service_line(&yaml, &s.name))
             }
             _ => None,
         };
-        crate::tui::editor::EditorTarget {
+        editor::EditorTarget {
             path: self.config_path.clone(),
             line,
         }
@@ -1146,12 +1148,11 @@ impl App {
     /// `yoink.service` label. `None` when the current view has no
     /// notion of a focused row (Logs / Resources / Secrets).
     fn drift_focus(&self) -> Option<(Host, String)> {
-        let host_for = |addr: &str| -> Option<Host> { self.config.host(addr) };
         match &self.view {
             View::Dashboard => {
                 let row = self.dashboard.selected()?;
                 let service = row.service?;
-                host_for(&row.host).map(|h| (h, service))
+                self.config.host(&row.host).map(|h| (h, service))
             }
             View::HostDetail(host) => self
                 .host_detail
@@ -1219,7 +1220,7 @@ impl App {
     /// "from <repo>(*)" label, which piggybacks on this slow tick so
     /// `git status` doesn't run at render rate.
     fn maybe_reload_config(&mut self) {
-        self.config_source = crate::tui::chrome::config_source(&self.config_path);
+        self.config_source = chrome::config_source(&self.config_path);
         let mut new_config = match Config::load_from_path(&self.config_path) {
             Ok(c) => c,
             Err(e) => {
@@ -1285,7 +1286,7 @@ impl App {
             self.push_toast(format!("nothing to copy ({label} buffer empty)"));
             return;
         }
-        match crate::tui::ui::copy_to_clipboard(text) {
+        match ui::copy_to_clipboard(text) {
             Ok(n) => self.push_toast(format!("✓ copied {label} ({n} bytes)")),
             Err(e) => self.push_toast(format!("✗ copy failed: {e}")),
         }
@@ -2521,7 +2522,7 @@ impl App {
 
     /// Per-pane filter helpers — Logs has its own (older) filter that
     /// pre-dates the shared `FilterState`; everything else routes here.
-    fn pane_filter(&mut self) -> Option<&mut crate::tui::ui::FilterState> {
+    fn pane_filter(&mut self) -> Option<&mut ui::FilterState> {
         match &self.view {
             View::Dashboard => Some(&mut self.dashboard.filter),
             View::Hosts => Some(&mut self.hosts.filter),
@@ -3162,7 +3163,7 @@ impl App {
                 sidecar,
                 target_container,
             } => {
-                self.forwards.insert(crate::tui::pf::ActiveForward::new(
+                self.forwards.insert(pf::ActiveForward::new(
                     &host,
                     &service,
                     endpoint,
@@ -3184,7 +3185,7 @@ impl App {
                 if let Err(e) = crate::features::pf::open_in_browser(&url) {
                     self.push_toast(format!("✗ open browser: {e} — paste {url}"));
                 }
-                self.vscode.insert(crate::tui::vscode::ActiveSession::new(
+                self.vscode.insert(vscode::ActiveSession::new(
                     &host, &service, url, tunnel, sidecar,
                 ));
             }
@@ -3625,7 +3626,7 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
-        let (header_area, mut pane_area) = crate::tui::ui::split_with_header(frame.area());
+        let (header_area, mut pane_area) = ui::split_with_header(frame.area());
         // Slice one row off the bottom per active footer (port-forward,
         // vscode). Goal: operators can't forget they have an open
         // session — the band stays visible across every pane.
@@ -3691,7 +3692,7 @@ impl App {
             "7 Audit",
         ];
         let selected_tab = Some(self.view.top_section());
-        crate::tui::ui::render_header(
+        ui::render_header(
             frame,
             header_area,
             &tabs,
@@ -3804,7 +3805,7 @@ impl App {
 
         if self.show_help {
             let lines = self.view.help_lines();
-            crate::tui::ui::render_modal(frame, "yoink help (? to close)", &lines);
+            ui::render_modal(frame, "yoink help (? to close)", &lines);
         }
         if let Some((host, container)) = &self.kill_target {
             let host_line = format!("host:        {}", host.address);
@@ -3820,11 +3821,11 @@ impl App {
                 "[y] / Enter   confirm",
                 "[any]         cancel",
             ];
-            crate::tui::ui::render_modal(frame, "kill container?", &lines);
+            ui::render_modal(frame, "kill container?", &lines);
         }
         if let Some((title, body)) = self.secrets_state.confirm_modal_lines() {
             let lines: Vec<&str> = body.iter().map(String::as_str).collect();
-            crate::tui::ui::render_modal(frame, title, &lines);
+            ui::render_modal(frame, title, &lines);
         }
         if let Some((service, tag)) = &self.reconcile_target {
             let svc_line = format!("service:  {service}");
@@ -3845,7 +3846,7 @@ impl App {
                 "[y] / Enter   confirm",
                 "[any]         cancel",
             ];
-            crate::tui::ui::render_modal(frame, "reconcile service?", &lines);
+            ui::render_modal(frame, "reconcile service?", &lines);
         }
         if self.reconcile_all_target {
             let svc_count = format!("services: {}", self.config.service_count());
@@ -3865,7 +3866,7 @@ impl App {
                 "[y] / Enter   confirm",
                 "[any]         cancel",
             ];
-            crate::tui::ui::render_modal(frame, "reconcile ALL services?", &lines);
+            ui::render_modal(frame, "reconcile ALL services?", &lines);
         }
         if let Some(target) = &self.resource_remove_target {
             let kind = match target.kind {
@@ -3890,7 +3891,7 @@ impl App {
                 "[y] / Enter   confirm",
                 "[any]         cancel",
             ];
-            crate::tui::ui::render_modal(frame, &title, &lines);
+            ui::render_modal(frame, &title, &lines);
         }
         if let Some((kind, dangling_only)) = &self.resource_prune_target {
             let host_count = format!("hosts:  {}", self.config.host_count());
@@ -3926,7 +3927,7 @@ impl App {
                 "[y] / Enter   confirm",
                 "[any]         cancel",
             ];
-            crate::tui::ui::render_modal(frame, title, &lines);
+            ui::render_modal(frame, title, &lines);
         }
         if self.prune_target {
             let host_count = format!("hosts:    {}", self.config.host_count());
@@ -3943,7 +3944,7 @@ impl App {
                 "[y] / Enter   confirm",
                 "[any]         cancel",
             ];
-            crate::tui::ui::render_modal(frame, "prune containers?", &lines);
+            ui::render_modal(frame, "prune containers?", &lines);
         }
         if let Some(progress) = self.job_progress.as_ref() {
             let lines: Vec<String> = progress.lines.iter().cloned().collect();
@@ -3971,7 +3972,7 @@ impl App {
                     .iter()
                     .map(|(name, status)| (name.clone(), status.label(), status.color()))
                     .collect();
-                crate::tui::ui::render_status_log_modal(
+                ui::render_status_log_modal(
                     frame,
                     &title,
                     &status_rows,
@@ -3981,14 +3982,7 @@ impl App {
                     running_throbber,
                 );
             } else {
-                crate::tui::ui::render_log_modal(
-                    frame,
-                    &title,
-                    &lines,
-                    success,
-                    failure,
-                    running_throbber,
-                );
+                ui::render_log_modal(frame, &title, &lines, success, failure, running_throbber);
             }
         }
 
@@ -4015,7 +4009,7 @@ impl App {
             let mut body: Vec<&str> = modal.lines.iter().map(String::as_str).collect();
             body.push("");
             body.push("[Esc] / Enter   dismiss");
-            crate::tui::ui::render_modal(frame, &modal.title, &body);
+            ui::render_modal(frame, &modal.title, &body);
         }
     }
 }

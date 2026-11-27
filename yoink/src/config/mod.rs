@@ -1597,17 +1597,11 @@ impl Config {
     /// bare host with no user and no port.
     #[must_use]
     pub fn host_or_bare(&self, address: &str) -> Host {
-        self.hosts
-            .iter()
-            .find(|h| h.address == address)
-            .map_or_else(
-                || Host {
-                    user: String::new(),
-                    address: address.to_string(),
-                    port: None,
-                },
-                Host::from,
-            )
+        self.host(address).unwrap_or_else(|| Host {
+            user: String::new(),
+            address: address.to_string(),
+            port: None,
+        })
     }
 
     /// Every configured host, as the target Docker and ssh calls take,
@@ -1626,6 +1620,13 @@ impl Config {
             .into_iter()
             .map(Host::from)
             .collect()
+    }
+
+    /// How many hosts `service` runs on: the length of
+    /// [`Config::fleet_for`] without building the hosts.
+    #[must_use]
+    pub fn fleet_size_for(&self, service: &ServiceConfig) -> usize {
+        service.applicable_hosts(&self.hosts).len()
     }
 
     /// How many hosts the config declares.

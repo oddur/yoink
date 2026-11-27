@@ -4,7 +4,7 @@
 /// Short enough for a label value or an image tag, long enough that
 /// two different inputs do not collide in practice.
 #[must_use]
-pub fn short_sha256(s: &str) -> String {
+pub(crate) fn short_sha256(s: &str) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write;
     let mut h = Sha256::new();

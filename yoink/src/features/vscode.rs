@@ -357,7 +357,7 @@ pub async fn cmd_vscode(
         }
     };
 
-    if host.address == "local" {
+    if host.is_local() {
         return Err(VscodeError::LocalHost {
             service: service_name.to_string(),
         }
