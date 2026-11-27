@@ -61,6 +61,37 @@ where
     Ok((stdout, stderr, written))
 }
 
+/// Number of `inspect_exec` calls before an exec that has no exit code
+/// is an error. The output stream has ended, so the process is about to
+/// exit; this gives it about one second.
+const EXIT_CODE_POLLS: u32 = 10;
+const EXIT_CODE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The exit code of an exec whose output stream has ended. `inspect`
+/// calls `inspect_exec`. While the exec runs or has no exit code, poll
+/// it again. If it still has no exit code after [`EXIT_CODE_POLLS`]
+/// calls, return an error: an unknown result is not a success.
+pub(super) async fn exec_exit_code<F, Fut>(mut inspect: F) -> Result<i64, DockerError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bollard::models::ExecInspectResponse, DockerError>>,
+{
+    for poll in 1..=EXIT_CODE_POLLS {
+        let resp = inspect().await?;
+        if resp.running != Some(true)
+            && let Some(code) = resp.exit_code
+        {
+            return Ok(code);
+        }
+        if poll < EXIT_CODE_POLLS {
+            tokio::time::sleep(EXIT_CODE_POLL_INTERVAL).await;
+        }
+    }
+    Err(DockerError::Invalid(
+        "exec output ended but the daemon reports no exit code; the result is unknown".into(),
+    ))
+}
+
 /// Combine the stdin write result with the process result. A process
 /// that failed explains itself better than the `Broken pipe` of its
 /// stdin, so its result wins. A process that exited 0 without all of
@@ -146,6 +177,56 @@ mod tests {
             .unwrap();
         written.unwrap();
         assert_eq!(reader.await.unwrap(), b"0123456789");
+    }
+
+    fn inspected(
+        running: Option<bool>,
+        exit_code: Option<i64>,
+    ) -> bollard::models::ExecInspectResponse {
+        bollard::models::ExecInspectResponse {
+            running,
+            exit_code,
+            ..Default::default()
+        }
+    }
+
+    /// `exit_code: None` became exit 0, so a `caddy reload` with an
+    /// unknown result counted as a successful push.
+    #[tokio::test(start_paused = true)]
+    async fn an_exec_with_no_exit_code_is_an_error_not_exit_0() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let err = exec_exit_code(|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(inspected(Some(true), None)) }
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no exit code"), "got {err}");
+        assert_eq!(calls.into_inner(), EXIT_CODE_POLLS);
+
+        let err = exec_exit_code(|| async { Ok(inspected(Some(false), None)) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no exit code"), "got {err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exec_exit_code_waits_until_the_exec_stops() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let code = exec_exit_code(|| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Ok(if n < 2 {
+                    inspected(Some(true), None)
+                } else {
+                    inspected(Some(false), Some(3))
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, 3);
+        assert_eq!(calls.into_inner(), 3);
     }
 
     fn result(exit_code: i64) -> OneShotResult {

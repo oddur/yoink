@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use super::exec_io::{collect_attached, settle_stdin_write};
+use super::exec_io::{collect_attached, exec_exit_code, settle_stdin_write};
 use super::{
     BUILD_TIMEOUT, ContainerDetail, ContainerInfo, ContainerStats, DockerError, DockerEvent,
     DockerEventKind, DockerOps, DockerVersion, ExecKind, ExecSession, HostInfo, ImageInfo,
@@ -356,16 +356,17 @@ impl RealDockerOps {
         };
 
         let exec_id = exec.id.as_str();
-        let inspect = self
-            .with_retry(
+        let exit_code = exec_exit_code(|| {
+            self.with_retry(
                 host,
                 |docker| async move { docker.inspect_exec(exec_id).await },
             )
-            .await?;
+        })
+        .await?;
         settle_stdin_write(
             stdin_write,
             OneShotResult {
-                exit_code: inspect.exit_code.unwrap_or(0),
+                exit_code,
                 stdout,
                 stderr,
             },
