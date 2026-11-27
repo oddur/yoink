@@ -194,19 +194,34 @@ mod tests {
     /// Regression: when `docker save` failed, the load error returned
     /// first and the save stderr was lost. The user saw only a generic
     /// load error.
+    ///
+    /// The save has exited before `load_failure` runs, so the result
+    /// does not depend on a race against `SAVE_EXIT_GRACE`.
     #[tokio::test]
     async fn failed_save_surfaces_its_stderr_when_the_load_fails() {
-        let mut save = Command::new("sh");
-        save.arg("-c")
-            .arg("echo 'Error response from daemon: reference does not exist' >&2; exit 1");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("echo 'Error response from daemon: reference does not exist' >&2; exit 1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = String::new();
+            let _ = stderr.read_to_string(&mut buf).await;
+            buf
+        });
+        assert!(!child.wait().await.unwrap().success());
 
-        // No scripted load result: the fake load fails, as a real
-        // daemon does on an empty tar.
-        let ops = FakeDockerOps::new();
-        let host = Host::local();
-        let err = save_and_load_with(save, "app:v1", &ops, &host, |_| ())
-            .await
-            .unwrap_err();
+        let err = load_failure(
+            child,
+            stderr_task,
+            "app:v1",
+            DockerError::Invalid("short tar".into()),
+        )
+        .await;
 
         assert!(
             matches!(err, TarballError::SaveAndLoadFailed { .. }),
