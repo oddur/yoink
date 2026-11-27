@@ -205,23 +205,27 @@ pub fn harden_tmpfs_options(opts: &str) -> String {
 }
 
 /// Append `:ro` to a bind-mount string unless it already specifies a
-/// mode (`:ro` or `:rw` as a colon-delimited token, possibly followed
-/// by `SELinux` flags like `:Z`). Operator opts in to writable bind
-/// mounts with explicit `:rw`. Removes the "I bind-mounted a config
-/// dir and the app started scribbling on /etc on the host" footgun.
+/// mode (`ro` or `rw` as a token of the third colon-delimited field,
+/// e.g. `:rw,Z`). Other options alone (an `SELinux` label like `:Z`,
+/// propagation, `nocopy`) do not choose a mode, so `ro` is added in
+/// front of them: `src:dst:Z` becomes `src:dst:ro,Z`. Operator opts in
+/// to writable bind mounts with explicit `:rw`. Removes the "I
+/// bind-mounted a config dir and the app started scribbling on /etc on
+/// the host" footgun.
 #[must_use]
 pub fn default_bind_to_ro(bind: &str) -> String {
     // A bind has the shape "src:dst" or "src:dst:mode[,opt,opt]".
-    // The mode token (when present) is the third colon-separated
-    // field; on the bare two-field form, append `:ro`.
-    let colon_count = bind.matches(':').count();
-    if colon_count >= 2 {
-        // Already has a mode (or SELinux options) — leave verbatim.
-        // We DON'T inspect for `:ro`/`:rw` explicitly; any third
-        // field counts as the operator having decided.
-        bind.to_string()
-    } else {
-        format!("{bind}:ro")
+    // Docker accepts the comma-separated options in any order.
+    let mut parts = bind.splitn(3, ':');
+    let (Some(src), Some(dst)) = (parts.next(), parts.next()) else {
+        return format!("{bind}:ro");
+    };
+    match parts.next() {
+        None => format!("{bind}:ro"),
+        Some(opts) if opts.is_empty() || opts.split(',').any(|o| o == "ro" || o == "rw") => {
+            bind.to_string()
+        }
+        Some(opts) => format!("{src}:{dst}:ro,{opts}"),
     }
 }
 
@@ -361,6 +365,19 @@ mod tests {
             default_bind_to_ro("/host:/container:rw,Z"),
             "/host:/container:rw,Z"
         );
+    }
+
+    /// Regression: a bind with only an `SELinux` label (`:Z`) counted as
+    /// a chosen mode and was mounted read-write.
+    #[test]
+    fn default_bind_to_ro_adds_ro_in_front_of_options_without_a_mode() {
+        assert_eq!(
+            default_bind_to_ro("/etc/app:/etc/app:Z"),
+            "/etc/app:/etc/app:ro,Z"
+        );
+        assert_eq!(default_bind_to_ro("/h:/c:z,rshared"), "/h:/c:ro,z,rshared");
+        assert_eq!(default_bind_to_ro("/h:/c:Z,ro"), "/h:/c:Z,ro");
+        assert_eq!(default_bind_to_ro("/h:/c:ro"), "/h:/c:ro");
     }
 
     #[test]
