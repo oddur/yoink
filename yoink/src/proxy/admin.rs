@@ -336,7 +336,9 @@ const REDACTED_PEM: &str = "<redacted PEM>";
 
 /// Replace `-----BEGIN <kind>----- … -----END <kind>-----` regions
 /// with a placeholder; an unterminated BEGIN is over-redacted to the
-/// end of the body (better than leaking).
+/// end of the body (better than leaking). An END line without its
+/// closing dashes is redacted to the end of that line, or to the next
+/// `-----BEGIN ` if that comes first.
 fn redact_pem_blocks(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
@@ -352,11 +354,21 @@ fn redact_pem_blocks(body: &str) -> String {
             return out;
         };
         // Search for the closing `-----` after the `-----END ` prefix:
-        // the prefix itself starts with `-----`.
+        // the prefix itself starts with `-----`. Do not search past the
+        // end of the END line or into the next block: the dashes of a
+        // later `-----BEGIN ` are not the closing dashes.
         let label_start = end_marker_pos + "-----END ".len();
-        let block_end = after_begin[label_start..]
+        let label = &after_begin[label_start..];
+        let line_end = [label.find('\n'), label.find("-----BEGIN ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(label.len());
+        let block_end = label[..line_end]
             .find("-----")
-            .map_or(after_begin.len(), |idx| label_start + idx + "-----".len());
+            .map_or(label_start + line_end, |idx| {
+                label_start + idx + "-----".len()
+            });
         out.push_str(REDACTED_PEM);
         rest = &after_begin[block_end..];
     }
@@ -505,6 +517,38 @@ services:
         assert_eq!(
             redact_pem_blocks(body),
             "a <redacted PEM> b <redacted PEM> c"
+        );
+    }
+
+    /// An END line without its closing dashes made the search find the
+    /// dashes of the next `-----BEGIN `, so the next block leaked.
+    #[test]
+    fn redact_end_line_without_dashes_keeps_next_block_redacted() {
+        let body = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE\n\
+                    -----BEGIN PRIVATE KEY-----\nSECRET\n-----END PRIVATE KEY-----";
+        let out = redact_pem_blocks(body);
+        assert!(!out.contains("SECRET"), "got: {out}");
+        assert!(!out.contains("AAA"), "got: {out}");
+        assert_eq!(out, "<redacted PEM>\n<redacted PEM>");
+    }
+
+    /// On one line (a JSON-escaped body), an END without dashes stops
+    /// at the next `-----BEGIN `.
+    #[test]
+    fn redact_end_without_dashes_stops_at_next_begin() {
+        let body = "-----BEGIN CERTIFICATE-----AAA-----END CERTIFICATE \
+                    -----BEGIN PRIVATE KEY-----SECRET-----END PRIVATE KEY----- tail";
+        assert_eq!(redact_pem_blocks(body), "<redacted PEM><redacted PEM> tail");
+    }
+
+    #[test]
+    fn redact_several_blocks_keeps_text_between_them() {
+        let body = "x -----BEGIN A-----\n1\n-----END A-----\ny\n\
+                    -----BEGIN B-----\n2\n-----END B-----\nz\n\
+                    -----BEGIN C-----\n3\n-----END C----- w";
+        assert_eq!(
+            redact_pem_blocks(body),
+            "x <redacted PEM>\ny\n<redacted PEM>\nz\n<redacted PEM> w"
         );
     }
 
