@@ -777,6 +777,14 @@ pub async fn deploy_service(
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<ServiceDeployReport, DeployError> {
     let hosts = config.fleet_for(service);
+    // A service with `hosts: []` deploys nothing, so it runs no hooks.
+    if hosts.is_empty() {
+        return Ok(ServiceDeployReport {
+            service: service.name.clone(),
+            tag: tag.to_string(),
+            hosts: Vec::new(),
+        });
+    }
 
     // ── Phase 1: PREPARE ──────────────────────────────────────────
     // For every host: ensure network, pull image, upload files,
@@ -785,9 +793,15 @@ pub async fn deploy_service(
     // `docker start` away from running.
     let mut prepared: Vec<HostPrep> = Vec::with_capacity(hosts.len());
     for host in hosts {
-        let prep =
-            prepare_one_host(ops, config, service, tag, secrets, host, force, on_event).await?;
-        prepared.push(prep);
+        match prepare_one_host(ops, config, service, tag, secrets, host, force, on_event).await {
+            Ok(prep) => prepared.push(prep),
+            Err(e) => {
+                // Do not leave the replicas created on earlier hosts
+                // behind in `created` state.
+                cleanup_prepared_replicas(ops, &prepared).await;
+                return Err(e);
+            }
+        }
     }
 
     // ── Phase 2: HOOKS ────────────────────────────────────────────
@@ -810,16 +824,7 @@ pub async fn deploy_service(
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
         });
-        if let Err(e) = run_hook(
-            ops,
-            config,
-            Some(&service.name),
-            hook,
-            &resolved_tag,
-            secrets,
-        )
-        .await
-        {
+        if let Err(e) = run_hook(ops, config, Some(service), hook, &resolved_tag, secrets).await {
             cleanup_prepared_replicas(ops, &prepared).await;
             return Err(e);
         }
@@ -831,9 +836,18 @@ pub async fn deploy_service(
     // ── Phase 3: FINALIZE ─────────────────────────────────────────
     // Start each pre-created container, healthcheck, swap out old.
     let mut host_results = Vec::with_capacity(prepared.len());
-    for prep in prepared {
-        let result = finalize_one_host(ops, config, service, prep, secrets, on_event).await?;
-        host_results.push(result);
+    let mut pending = prepared.into_iter();
+    while let Some(prep) = pending.next() {
+        match finalize_one_host(ops, config, service, prep, secrets, on_event).await {
+            Ok(result) => host_results.push(result),
+            Err(e) => {
+                // `finalize_one_host` unwinds its own host. The hosts
+                // not finalized yet still hold this attempt's replicas
+                // in `created` state; remove them too.
+                cleanup_prepared_replicas(ops, pending.as_slice()).await;
+                return Err(e);
+            }
+        }
     }
     Ok(ServiceDeployReport {
         service: service.name.clone(),
@@ -2036,13 +2050,13 @@ fn resolve_hook_tag(
 /// here only has to honor that invariant.
 ///
 /// `service` is the owning service for a service-scoped hook, `None`
-/// for a top-level one. It goes into the container name so two
+/// for a top-level one. Its name goes into the container name so two
 /// services deployed in the same wave with a same-named hook at the
 /// same tag don't fight over one name.
 async fn run_hook(
     ops: &dyn DockerOps,
     config: &Config,
-    service: Option<&str>,
+    service: Option<&ServiceConfig>,
     hook: &HookSpec,
     tag: &str,
     secrets: Option<&SecretsBundle>,
@@ -2050,14 +2064,10 @@ async fn run_hook(
     if hook.is_subprocess() {
         return run_subprocess_hook(config, hook, secrets).await;
     }
-    let host = config
-        .fleet()
-        .into_iter()
-        .next()
-        .ok_or_else(|| DeployError::Hook {
-            name: hook.name.clone(),
-            message: "no hosts configured".into(),
-        })?;
+    let (host, hook_network) = hook_target(config, service).ok_or_else(|| DeployError::Hook {
+        name: hook.name.clone(),
+        message: "no hosts configured".into(),
+    })?;
 
     let image = hook
         .image
@@ -2071,20 +2081,15 @@ async fn run_hook(
             source,
         })?;
 
-    // Hooks share the deploy's first network so they can reach
-    // services on it (e.g. a migration hook hitting the database).
-    // Operators with stricter isolation needs can put their hooks
-    // on a dedicated network and put it first in deploy.networks.
-    let hook_network = config.networks().first().map_or("bridge", String::as_str);
     let body = docker::build_hook_container(
         image,
         tag,
-        hook_network,
+        &hook_network,
         hook.entrypoint.as_deref(),
         &hook.cmd,
         &hook_env(hook, secrets),
     );
-    let container_name = hook_container_name(service, &hook.name, tag);
+    let container_name = hook_container_name(service.map(|s| s.name.as_str()), &hook.name, tag);
     // The name is deterministic, so a hook container left behind by an
     // interrupted deploy (Ctrl-C, dropped ssh link) would fail the
     // create with a 409 name conflict on every later deploy. Reap it
@@ -2131,6 +2136,25 @@ async fn run_hook(
         });
     }
     Ok(())
+}
+
+/// The host and network a container hook runs on. A top-level hook
+/// uses the first host of the fleet. A service hook uses the first
+/// host of its service, so it runs where the service runs. Both join
+/// the first of `deploy.networks` (`bridge` when the list is empty).
+/// `None` when there is no host.
+fn hook_target(config: &Config, service: Option<&ServiceConfig>) -> Option<(Host, String)> {
+    let hosts = match service {
+        Some(svc) => config.fleet_for(svc),
+        None => config.fleet(),
+    };
+    let host = hosts.into_iter().next()?;
+    let network = config
+        .networks()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "bridge".to_string());
+    Some((host, network))
 }
 
 /// Docker allows only `[a-zA-Z0-9_.-]` in a container name. A digest
@@ -2739,6 +2763,99 @@ services:
             )),
             "the serving generation must not be stopped or removed: {calls:?}"
         );
+    }
+
+    fn config_two_hosts() -> Config {
+        Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+  - { address: host-b, user: deploy }
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Script a successful prepare (pull, list, remove-by-name, create)
+    /// for one host.
+    fn push_prepare_ok(ops: &FakeDockerOps) {
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![]));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+    }
+
+    async fn deploy_two_hosts(ops: &FakeDockerOps) -> DeployError {
+        let cfg = config_two_hosts();
+        let mut sink = |_e: DeployEvent| {};
+        deploy_service(
+            ops,
+            &cfg,
+            &cfg.services[0],
+            "v2",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err()
+    }
+
+    /// Hosts whose replica was force-removed after `after` calls.
+    fn hosts_removed_from(ops: &FakeDockerOps, after: usize) -> Vec<String> {
+        ops.calls()[after..]
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRemoveContainer(h, _) => Some(h.address.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression: prepare failed on host-b and the replica already
+    /// created on host-a stayed behind in `created` state.
+    #[tokio::test(start_paused = true)]
+    async fn prepare_failure_on_later_host_removes_earlier_host_replicas() {
+        let ops = FakeDockerOps::new();
+        push_prepare_ok(&ops);
+        ops.push_pull_image(Err(DockerError::Invalid("pull failed".into())));
+        let _ = deploy_two_hosts(&ops).await;
+
+        let calls = ops.calls();
+        let created = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::CreateContainer(..)))
+            .expect("host-a replica created");
+        assert_eq!(
+            hosts_removed_from(&ops, created),
+            vec!["host-a".to_string()]
+        );
+    }
+
+    /// Regression: finalize failed on host-a and the replica created on
+    /// host-b, not finalized yet, stayed behind in `created` state.
+    #[tokio::test(start_paused = true)]
+    async fn finalize_failure_removes_replicas_of_hosts_not_finalized() {
+        let ops = FakeDockerOps::new();
+        push_prepare_ok(&ops);
+        push_prepare_ok(&ops);
+        ops.push_start_container(Err(DockerError::Invalid("start failed".into())));
+        let _ = deploy_two_hosts(&ops).await;
+
+        let calls = ops.calls();
+        let start = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::StartContainer(..)))
+            .expect("a start was attempted");
+        let mut removed = hosts_removed_from(&ops, start);
+        removed.sort();
+        assert_eq!(removed, vec!["host-a".to_string(), "host-b".to_string()]);
     }
 
     /// Replica 0 passes, replica 1 fails. Replica 0 must not survive:
@@ -3946,6 +4063,146 @@ services:
             &Host::from(&cfg.hosts[0]),
             "yoink-hook-app-a-migrate-v42",
         );
+    }
+
+    /// Regression: a service hook ran on the first host of the whole
+    /// fleet, even when its service runs on other hosts. It now runs
+    /// on the first host of the service. The network stays the first
+    /// of `deploy.networks`, the same as for a top-level hook.
+    #[test]
+    fn service_hook_targets_the_service_host_and_the_first_deploy_network() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: web-1, user: deploy }
+  - { address: db-1, user: deploy }
+deploy:
+  networks: [edge, data]
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: v1
+    hosts: [db-1]
+    networks: [data]
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap();
+        let (host, network) = hook_target(&cfg, Some(&cfg.services[0])).unwrap();
+        assert_eq!(host.address, "db-1");
+        assert_eq!(network, "edge");
+        let (host, network) = hook_target(&cfg, None).unwrap();
+        assert_eq!(host.address, "web-1");
+        assert_eq!(network, "edge");
+    }
+
+    /// Regression: a service with `hosts: []` and a container hook
+    /// failed the deploy with "no hosts configured". It deploys
+    /// nothing, so it runs no hooks.
+    #[tokio::test(start_paused = true)]
+    async fn service_with_no_hosts_runs_no_hooks() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: web-1, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: v1
+    hosts: []
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/api
+        tag: { service: api }
+        cmd: ["bin/migrate"]
+"#,
+        )
+        .unwrap();
+
+        let ops = FakeDockerOps::new();
+        let mut events = Vec::new();
+        let mut sink = |e: DeployEvent| events.push(e);
+        let report = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "v1",
+            &BTreeMap::new(),
+            None,
+            true,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+
+        assert!(report.hosts.is_empty());
+        assert!(ops.calls().is_empty(), "{:?}", ops.calls());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DeployEvent::HookStarted { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// End to end: `deploy_service` runs the hook of a service pinned
+    /// to `db-1` on `db-1`, not on the first host of the fleet.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_runs_on_a_host_of_its_service() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: web-1, user: deploy }
+  - { address: db-1, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: v1
+    hosts: [db-1]
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/api
+        tag: { service: api }
+        cmd: ["bin/migrate"]
+"#,
+        )
+        .unwrap();
+
+        let ops = happy_ops(&[]);
+        ops.push_pull_image(Ok(()));
+        ops.push_remove_stopped(Ok(StoppedRemoval::Absent));
+        // Exit non-zero so the deploy stops right after the hook.
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+
+        let mut sink = |_e: DeployEvent| {};
+        let _ = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "v1",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+
+        let hook_hosts: Vec<String> = ops
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::docker_ops::RecordedCall::RunOneShot(h, _) => Some(h.address),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hook_hosts, vec!["db-1".to_string()]);
     }
 
     /// #108 end to end: a service on the configured registry pulls with

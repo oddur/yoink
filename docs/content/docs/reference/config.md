@@ -231,7 +231,7 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `image` | string | required | Image reference, without the tag. |
 | `tag` | string | unset | Literal tag. See [Tag overrides at deploy time](#tag-overrides-at-deploy-time). |
 | `build` | [Build](#build) | unset | Local-build config. Required for the `--build` flow. |
-| `hosts` | list of string | all hosts | Restricts the hosts that run this service. The strings match `hosts[].address`. |
+| `hosts` | list of string | all hosts | Restricts the hosts that run this service. The strings match `hosts[].address`. With an empty list, yoink deploys nothing for the service and runs none of its hooks. |
 | `depends_on` | list of string | `[]` | Names of other services. A topological sort of these names gives the wave order. Must be a DAG. |
 | `networks` | list of string | every network in `deploy.networks` | Docker networks to attach. Each one must be declared in `deploy.networks`. Config load rejects an empty list. The default does not include the proxy networks: a service with `domain:` also joins `yoink-ingress`, and only the proxy joins `yoink-proxy-admin`. |
 | `secrets` | list of string | `[]` | Secret names. Each secret becomes an env var of the same name. |
@@ -244,8 +244,8 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `domain` | string \| list of string | unset | One or more hostnames that the bundled proxy routes to this service. The field enables the proxy. Requires `run.port`. See the [proxy guide](/docs/explanation/proxy). |
 | `path_prefix` | string | unset | Matches this path glob in addition to `domain:`, so that many services can share a hostname. yoink puts routes with a path constraint before the catch-all routes. |
 | `tls` | enum | `auto` (when `domain:` set) | `auto` = ACME with Let's Encrypt. `off` = HTTP only. `cert` = inline cert from sealed secrets (with `tls_cert_secret:` and `tls_key_secret:`). |
-| `tls_cert_secret` | string | unset | Sealed-secret name that holds the PEM cert. Required when `tls: cert`. |
-| `tls_key_secret` | string | unset | Sealed-secret name that holds the PEM private key. Required when `tls: cert`. |
+| `tls_cert_secret` | string | unset | Sealed-secret name that holds the PEM cert. Required when `tls: cert` and `proxy.tls:` is unset. Without it, the service uses the cert of `proxy.tls:`. |
+| `tls_key_secret` | string | unset | Sealed-secret name that holds the PEM private key. Set it together with `tls_cert_secret`. |
 | `upstream_h2c` | bool | `false` | The proxy connects to the backend over HTTP/2 cleartext. Required for native gRPC backends (Tonic, grpc-go, grpc-java). |
 | `compression` | bool | `false` | Emits `encode gzip zstd`. Has no effect behind a CDN. |
 | `canonical_domain` | string | unset | One of the `domain:` entries. yoink sends a 308 redirect from every other entry to it (apex and www patterns). |
@@ -276,9 +276,9 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `entrypoint` | list of string | image default | Overrides `ENTRYPOINT`. |
 | `cmd` | list of string | image default | Overrides `CMD`. |
 | `publish` | list of string | `[]` | Host port mappings (`"80:80"`, `"443:443/udp"`). |
-| `binds` | list of string | `[]` | Host bind mounts (`"src:dst:mode"`). The default mode is `:ro`. |
+| `binds` | list of string | `[]` | Host bind mounts (`"src:dst"` or `"src:dst:mode"`). With no third field, the mode is `:ro`. A third field must contain `ro` or `rw`. Config load rejects a third field that is empty (`src:dst:`) or that has only other options (for example `src:dst:Z`). To keep an option, put the mode in front of it: `ro,Z` or `rw,Z`. yoink hashes each bind as you write it. When you add `ro` or `rw` to an existing bind, the spec hash changes, so yoink redeploys that service one time on the next `yoink up`. |
 | `volumes` | list of string | `[]` | Named docker volumes. |
-| `files` | list of string | `[]` | Files that yoink uploads to the host and mounts read-only (`"local_path:container_path[:ro]"`). `:ro` is optional. Validation rejects `:rw`. yoink hashes the content into `spec_hash`, so an edit triggers a redeploy. The files go to `~/.local/state/yoink/files/` of the SSH user on the host, so no root access is necessary. For data that the container must write, use `binds` or `volumes`. |
+| `files` | list of string | `[]` | Files that yoink uploads to the host and mounts read-only (`"local_path:container_path[:ro]"`). `:ro` is optional. Validation rejects `rw` in the last field (`:rw`, `:rw,Z`) and an empty last field (`local:dst:`). yoink hashes the content into `spec_hash`, so an edit triggers a redeploy. yoink mounts an entry with options and no mode (`./app.conf:/etc/app.conf:Z`) as `ro,Z`. The spec hash does not change for this, so a running container keeps its old mount until it redeploys. To apply the new mount now, run `yoink up --force`. The files go to `~/.local/state/yoink/files/` of the SSH user on the host, so no root access is necessary. For data that the container must write, use `binds` or `volumes`. |
 | `options` | [RunOptions](#runoptions) | hardened defaults | Resource limits and security flags. |
 
 ## RunOptions
@@ -287,7 +287,7 @@ The defaults are a hardened profile. Each service can override them.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `memory` | string | unset | Memory limit (`"512Mi"`, `"1Gi"`). |
+| `memory` | string | unset | Memory limit (`"512Mi"`, `"1Gi"`). The minimum is 6 MiB (`"6m"`), because Docker rejects a smaller limit. `"0"` means no limit. Validation rejects a negative value. |
 | `cpus` | string | unset | CPU limit in cores of CPU time (`"1.5"` = 1.5 cores). |
 | `pids_limit` | integer | `1024` | Limit against fork bombs. |
 | `cap_drop` | list of string | `["ALL"]` | Linux capabilities that the container loses. |
@@ -326,7 +326,7 @@ The two places use the same [Hook](#hook) entry shape. A non-zero exit stops the
 
 The presence of `image:` selects one of two flavors:
 
-- **Container hook** (`image:` and `tag:` set): yoink pulls the image and runs `cmd:` in docker on the first host in `hosts:`. It is for pinned tool images, or for isolation from your filesystem.
+- **Container hook** (`image:` and `tag:` set): yoink pulls the image and runs `cmd:` in docker on the first host in `hosts:`. A hook of a service runs on the first host in the top-level `hosts:` list that the service runs on. All container hooks join the first network in `deploy.networks`. It is for pinned tool images, or for isolation from your filesystem.
 - **Subprocess hook** (no `image:`, no `tag:`): yoink runs `cmd[0]` directly on your computer (or on the CI runner). The hook inherits the parent env. It is for tools that are already on PATH, for example `terraform`, `dbmate`, `alembic`, `gcloud`. See [Run Terraform from a hook](/docs/how-to/terraform-from-hooks).
 
 | Field | Type | Default | Notes |

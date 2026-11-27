@@ -560,6 +560,7 @@ services:
                     containers: vec![api_b],
                 },
             ],
+            failed: Vec::new(),
         }
     }
 

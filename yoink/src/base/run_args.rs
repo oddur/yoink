@@ -72,6 +72,11 @@ pub enum BuildError {
     #[error("invalid memory value {0:?}: expected like \"512m\", \"512Mi\", or \"1Gi\"")]
     Memory(String),
     #[error(
+        "invalid memory value {0:?}: the smallest limit Docker accepts is 6 MiB (\"6m\"); \
+         use \"0\" for no limit"
+    )]
+    MemoryBelowMinimum(String),
+    #[error(
         "invalid cpus value {0:?}: expected an absolute core count like \"2\", \"1.5\", or \"500m\""
     )]
     Cpus(String),
@@ -86,9 +91,15 @@ pub enum BuildError {
     Publish(String),
 }
 
+/// The smallest memory limit the Docker daemon accepts on Linux
+/// (`linuxMinMemory`, 6 MiB). `0` is also accepted: it means no limit.
+const DOCKER_MIN_MEMORY: i64 = 6 * 1_024 * 1_024;
+
 /// Parse a docker-style memory value: bare bytes (`536870912`), or with
 /// suffix `b`, `k`, `m`, `g` (case-insensitive). Returns the value in
-/// bytes as `i64` (bollard's type).
+/// bytes as `i64` (bollard's type). Rejects what the Docker daemon
+/// rejects: a negative value, or a limit above `0` and below 6 MiB.
+/// `0` stays valid (no limit).
 pub fn parse_memory(s: &str) -> Result<i64, BuildError> {
     let s = s.trim();
     if s.is_empty() {
@@ -119,7 +130,11 @@ pub fn parse_memory(s: &str) -> Result<i64, BuildError> {
         .trim()
         .parse()
         .map_err(|_| BuildError::Memory(s.to_string()))?;
-    Ok(n.saturating_mul(mult))
+    let bytes = n.saturating_mul(mult);
+    if bytes < 0 || (bytes > 0 && bytes < DOCKER_MIN_MEMORY) {
+        return Err(BuildError::MemoryBelowMinimum(s.to_string()));
+    }
+    Ok(bytes)
 }
 
 /// Case-insensitive `strip_suffix` that returns the prefix when the
@@ -195,24 +210,48 @@ pub fn harden_tmpfs_options(opts: &str) -> String {
 }
 
 /// Append `:ro` to a bind-mount string unless it already specifies a
-/// mode (`:ro` or `:rw` as a colon-delimited token, possibly followed
-/// by `SELinux` flags like `:Z`). Operator opts in to writable bind
-/// mounts with explicit `:rw`. Removes the "I bind-mounted a config
-/// dir and the app started scribbling on /etc on the host" footgun.
+/// mode (`ro` or `rw` as a token of the third colon-delimited field,
+/// e.g. `:rw,Z`). Operator opts in to writable bind mounts with
+/// explicit `:rw`. Removes the "I bind-mounted a config dir and the
+/// app started scribbling on /etc on the host" footgun.
+///
+/// Config load rejects a `run.binds` entry whose third field has no
+/// mode (see [`bind_mode_missing`]). A `files:` entry can still reach
+/// here with options and no mode (`local:/etc/app.conf:Z`), because a
+/// `files:` mount is always read-only. For that case `ro` is added in
+/// front of the options: `src:dst:Z` becomes `src:dst:ro,Z`. An empty
+/// third field gets `ro` alone: `src:dst:` becomes `src:dst:ro`.
 #[must_use]
 pub fn default_bind_to_ro(bind: &str) -> String {
     // A bind has the shape "src:dst" or "src:dst:mode[,opt,opt]".
-    // The mode token (when present) is the third colon-separated
-    // field; on the bare two-field form, append `:ro`.
-    let colon_count = bind.matches(':').count();
-    if colon_count >= 2 {
-        // Already has a mode (or SELinux options) — leave verbatim.
-        // We DON'T inspect for `:ro`/`:rw` explicitly; any third
-        // field counts as the operator having decided.
-        bind.to_string()
-    } else {
-        format!("{bind}:ro")
+    // Docker accepts the comma-separated options in any order.
+    match bind_mode_missing(bind) {
+        // An empty third field (`src:dst:`) gets the mode alone.
+        Some("") => format!("{bind}ro"),
+        Some(opts) => {
+            let src_dst = &bind[..bind.len() - opts.len() - 1];
+            format!("{src_dst}:ro,{opts}")
+        }
+        None if bind.matches(':').count() >= 2 => bind.to_string(),
+        None => format!("{bind}:ro"),
     }
+}
+
+/// The third field of `bind` when it is present but holds neither
+/// `ro` nor `rw`: options only (an `SELinux` label like `Z`,
+/// propagation, `nocopy`), or nothing at all (`src:dst:`). Docker
+/// mounts such a bind read-write, so config load rejects it.
+/// `None` for `src:dst` and for a third field with a mode.
+#[must_use]
+pub fn bind_mode_missing(bind: &str) -> Option<&str> {
+    let mut parts = bind.splitn(3, ':');
+    parts.next()?;
+    parts.next()?;
+    let opts = parts.next()?;
+    if opts.split(',').any(|o| o == "ro" || o == "rw") {
+        return None;
+    }
+    Some(opts)
 }
 
 /// Parse docker-cli `--publish` strings into a port-bindings map keyed
@@ -269,17 +308,17 @@ mod tests {
 
     #[test]
     fn parse_memory_accepts_common_suffixes() {
-        assert_eq!(parse_memory("1024").unwrap(), 1024);
+        assert_eq!(parse_memory("8388608").unwrap(), 8 * 1024 * 1024);
         assert_eq!(parse_memory("512m").unwrap(), 512 * 1024 * 1024);
         assert_eq!(parse_memory("1G").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory("64k").unwrap(), 64 * 1024);
+        assert_eq!(parse_memory("8192k").unwrap(), 8192 * 1024);
     }
 
     #[test]
     fn parse_memory_accepts_k8s_suffixes() {
         assert_eq!(parse_memory("512Mi").unwrap(), 512 * 1024 * 1024);
         assert_eq!(parse_memory("1Gi").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory("64Ki").unwrap(), 64 * 1024);
+        assert_eq!(parse_memory("8192Ki").unwrap(), 8192 * 1024);
         // Case-insensitive
         assert_eq!(parse_memory("2gi").unwrap(), 2 * 1024 * 1024 * 1024);
     }
@@ -353,6 +392,37 @@ mod tests {
         );
     }
 
+    /// Regression: a bind with only an `SELinux` label (`:Z`) counted as
+    /// a chosen mode and was mounted read-write.
+    #[test]
+    fn default_bind_to_ro_adds_ro_in_front_of_options_without_a_mode() {
+        assert_eq!(
+            default_bind_to_ro("/etc/app:/etc/app:Z"),
+            "/etc/app:/etc/app:ro,Z"
+        );
+        assert_eq!(default_bind_to_ro("/h:/c:z,rshared"), "/h:/c:ro,z,rshared");
+        assert_eq!(default_bind_to_ro("/h:/c:Z,ro"), "/h:/c:Z,ro");
+        assert_eq!(default_bind_to_ro("/h:/c:ro"), "/h:/c:ro");
+    }
+
+    /// Regression: a bind with an empty third field (`src:dst:`) passed
+    /// through unchanged, and Docker mounts that read-write. Config
+    /// load rejects it, but the helper does not depend on that.
+    #[test]
+    fn default_bind_to_ro_fills_an_empty_mode_field() {
+        assert_eq!(default_bind_to_ro("/h:/c:"), "/h:/c:ro");
+    }
+
+    #[test]
+    fn bind_mode_missing_for_options_or_an_empty_field_without_ro_or_rw() {
+        assert_eq!(bind_mode_missing("/h:/c:Z"), Some("Z"));
+        assert_eq!(bind_mode_missing("/h:/c:z,rshared"), Some("z,rshared"));
+        assert_eq!(bind_mode_missing("/h:/c:"), Some(""));
+        assert_eq!(bind_mode_missing("/h:/c"), None);
+        assert_eq!(bind_mode_missing("/h:/c:ro"), None);
+        assert_eq!(bind_mode_missing("/h:/c:rw,Z"), None);
+    }
+
     #[test]
     fn parse_cpus_rejects_non_positive_and_garbage() {
         assert!(parse_cpus("0").is_err());
@@ -367,6 +437,35 @@ mod tests {
         assert!(parse_memory("").is_err());
         assert!(parse_memory("abc").is_err());
         assert!(parse_memory("12x").is_err());
+    }
+
+    /// Regression: negative values and limits below Docker's 6 MiB
+    /// minimum parsed, and the daemon rejected them at create. `0`
+    /// means no limit in Docker and stays valid.
+    #[test]
+    fn parse_memory_rejects_what_docker_rejects() {
+        for value in ["-512m", "-1", "1024", "5m"] {
+            assert!(
+                matches!(parse_memory(value), Err(BuildError::MemoryBelowMinimum(_))),
+                "{value}"
+            );
+        }
+        assert_eq!(parse_memory("0").unwrap(), 0);
+        assert_eq!(parse_memory("6m").unwrap(), 6 * 1024 * 1024);
+    }
+
+    /// Regression: a value below 6 MiB failed with the format error
+    /// ("expected like 512m"), although its format was fine. The error
+    /// now names the minimum and says that `0` means no limit.
+    #[test]
+    fn parse_memory_below_the_minimum_names_the_minimum() {
+        let msg = parse_memory("4m").unwrap_err().to_string();
+        assert_eq!(
+            msg,
+            "invalid memory value \"4m\": the smallest limit Docker accepts is 6 MiB (\"6m\"); \
+             use \"0\" for no limit"
+        );
+        assert!(matches!(parse_memory("12x"), Err(BuildError::Memory(_))));
     }
 
     #[test]

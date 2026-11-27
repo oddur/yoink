@@ -3086,7 +3086,7 @@ impl App {
                 }
                 self.container_detail_in_flight = false;
             }
-            Update::Dashboard(data) => {
+            Update::Dashboard(mut data) => {
                 // Long error strings (ssh-probe with a Tailscale auth
                 // URL, multi-line bollard errors) get auto-popped as a
                 // modal so the URL is actually visible — the one-line
@@ -3095,8 +3095,10 @@ impl App {
                     self.show_error_modal_once("connection error", err);
                 }
                 // Services & ServiceDetail share the same StatusReport
-                // as Dashboard. Clone it into both before handing the
-                // original off to dashboard's apply (which moves it).
+                // as Dashboard. A host that did not answer keeps its
+                // last-known rows on all three. Clone the report into
+                // both before dashboard's apply moves it.
+                self.dashboard.keep_failed_hosts(&mut data, &self.config);
                 let report_clone = data.report.clone();
                 let service_names: Vec<String> =
                     self.config.service_names().map(str::to_string).collect();
@@ -3587,6 +3589,9 @@ impl App {
                 return;
             }
         };
+        for f in &report.failed {
+            self.push_toast(format!("✗ log collect {f}"));
+        }
         for host_status in report.hosts {
             for container in host_status.containers.iter().filter(|c| c.is_running()) {
                 let host = self.config.host_or_bare(&host_status.host);
@@ -4075,8 +4080,6 @@ async fn reconcile_one(
     tag: String,
     tx: UnboundedSender<JobUpdate>,
 ) {
-    use crate::deploy::lock::HostLock;
-
     let send_event = |line: String| {
         let _ = tx.send(JobUpdate::Event(line));
     };
@@ -4092,20 +4095,20 @@ async fn reconcile_one(
     // Acquire one lock per configured host. Per-host parallel like
     // cmd_up; on any failure release whatever we already grabbed and
     // bail.
-    let acquire_futs = config.fleet().into_iter().map(|host| {
-        let ops = ops.clone();
-        async move { HostLock::acquire(&*ops, host.clone()).await }
-    });
-    let mut locks = match futures_util::future::try_join_all(acquire_futs).await {
+    let locks = match crate::deploy::lock::acquire_all(&ops, config.fleet(), |host, e| {
+        send_event(format!(
+            "could not acquire the deploy lock on {}: {e}. Releasing the locks on the other hosts.",
+            host.address
+        ));
+    })
+    .await
+    {
         Ok(ls) => ls,
-        Err(e) => {
+        Err((_, e)) => {
             send_done(Err(format!("acquire deploy lock: {e}")));
             return;
         }
     };
-    for lock in &mut locks {
-        lock.spawn_heartbeat(ops.clone());
-    }
 
     let mut overrides = std::collections::BTreeMap::new();
     overrides.insert(service.clone(), tag.clone());
@@ -4145,8 +4148,6 @@ async fn reconcile_all(
     overrides: std::collections::BTreeMap<String, String>,
     tx: UnboundedSender<JobUpdate>,
 ) {
-    use crate::deploy::lock::HostLock;
-
     let send_event = |line: String| {
         let _ = tx.send(JobUpdate::Event(line));
     };
@@ -4159,20 +4160,20 @@ async fn reconcile_all(
         return;
     }
 
-    let acquire_futs = config.fleet().into_iter().map(|host| {
-        let ops = ops.clone();
-        async move { HostLock::acquire(&*ops, host.clone()).await }
-    });
-    let mut locks = match futures_util::future::try_join_all(acquire_futs).await {
+    let locks = match crate::deploy::lock::acquire_all(&ops, config.fleet(), |host, e| {
+        send_event(format!(
+            "could not acquire the deploy lock on {}: {e}. Releasing the locks on the other hosts.",
+            host.address
+        ));
+    })
+    .await
+    {
         Ok(ls) => ls,
-        Err(e) => {
+        Err((_, e)) => {
             send_done(Err(format!("acquire deploy lock: {e}")));
             return;
         }
     };
-    for lock in &mut locks {
-        lock.spawn_heartbeat(ops.clone());
-    }
 
     let secrets_ref = secrets.as_deref();
 

@@ -104,7 +104,7 @@ The wave order (`depends_on`) is global. `redis` completes on all its hosts befo
 
 ### Pre-deploy hooks
 
-A `pre_deploy` hook runs **one time**. The number of replicas and the number of hosts do not multiply the hooks, so a migration runs one time. A container hook runs on the first host in `hosts:`.
+A `pre_deploy` hook runs **one time**. The number of replicas and the number of hosts do not multiply the hooks, so a migration runs one time. A top-level container hook runs on the first host in `hosts:`. A container hook of a service runs on the first host in the top-level `hosts:` list that the service runs on. Both join the first network in `deploy.networks`.
 
 ### Pruning
 

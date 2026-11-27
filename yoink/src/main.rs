@@ -1975,24 +1975,27 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // tokio heartbeat task touches it every few seconds. If yoink
     // dies, heartbeats stop, sentinel self-exits within ~30s, and
     // the next deploy reaps it as an orphan. See `deploy/lock.rs`.
-    let acquire_futs = config.fleet().into_iter().map(|host| {
-        let ops = ops.clone();
-        async move {
-            let lock = HostLock::acquire(&*ops, host.clone())
-                .await
-                .with_context(|| format!(
-                    "could not acquire the deploy lock on {}: another `yoink up` may be in progress, or the lock step itself failed (cause below). \
-                     If you're sure no operator is deploying, the sentinel will self-exit within ~30s; \
-                     retry then. To force-clear: `docker rm -f yoink-deploy-lock` on the host.",
-                    host.address,
-                ))?;
-            anyhow::Ok(lock)
-        }
-    });
-    let mut locks: Vec<HostLock> = futures_util::future::try_join_all(acquire_futs).await?;
-    for lock in &mut locks {
-        lock.spawn_heartbeat(ops.clone());
-    }
+    // Each lock starts its heartbeat as soon as it is acquired. The
+    // first failure prints at once, while the other attempts finish
+    // and get released. Each later failure prints as it arrives.
+    let report_first_failure = |host: &yoink::base::host::Host,
+                                e: &yoink::deploy::lock::LockError| {
+        eprintln!(
+            "could not acquire the deploy lock on {}: {e}. Releasing the locks on the other hosts.",
+            host.address
+        );
+    };
+    let locks: Vec<HostLock> =
+        yoink::deploy::lock::acquire_all(&ops, config.fleet(), report_first_failure)
+        .await
+        .map_err(|(host, e)| {
+            anyhow::Error::new(e).context(format!(
+                "could not acquire the deploy lock on {}: another `yoink up` may be in progress, or the lock step itself failed (cause below). \
+                 If you're sure no operator is deploying, the sentinel will self-exit within ~30s; \
+                 retry then. To force-clear: `docker rm -f yoink-deploy-lock` on the host.",
+                host.address,
+            ))
+        })?;
 
     // Audit log: two sinks per run. The operator sink writes locally
     // and records run-level facts that aren't host-specific
@@ -2458,6 +2461,22 @@ async fn cmd_status(config: &Config, json: bool) -> Result<()> {
         println!("{out}");
     } else {
         println!("{}", output::format_status_table(&report));
+    }
+    report_unreachable_hosts(&report)
+}
+
+/// Print each host that did not answer to stderr, then fail so the
+/// command exits non-zero. The reachable hosts are already printed.
+fn report_unreachable_hosts(report: &StatusReport) -> Result<()> {
+    for f in &report.failed {
+        eprintln!("{f}");
+    }
+    if !report.failed.is_empty() {
+        anyhow::bail!(
+            "{} of {} host(s) did not answer",
+            report.failed.len(),
+            report.failed.len() + report.hosts.len()
+        );
     }
     Ok(())
 }
@@ -4143,7 +4162,7 @@ async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<(
             }
         }
     }
-    Ok(())
+    report_unreachable_hosts(&report)
 }
 
 async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> {

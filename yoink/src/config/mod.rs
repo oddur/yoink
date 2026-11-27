@@ -12,6 +12,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::base::host::{Host, split_address_port};
+use crate::base::run_args;
 
 mod proxy;
 
@@ -957,6 +958,17 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
+    /// The service's own `(tls_cert_secret, tls_key_secret)`, when it
+    /// sets both. A `tls: cert` service that sets neither uses the
+    /// `proxy.tls` cert. Validation rejects a service that sets one.
+    #[must_use]
+    pub fn own_tls_cert(&self) -> Option<(&str, &str)> {
+        Some((
+            self.tls_cert_secret.as_deref()?,
+            self.tls_key_secret.as_deref()?,
+        ))
+    }
+
     /// The networks this service will actually attach to — its
     /// declared list when set, else every network in `deploy.networks`.
     #[must_use]
@@ -1042,12 +1054,14 @@ impl Default for ServiceRun {
     }
 }
 
-/// True when a `files:` spec ends in an explicit `:rw` mode. Config
+/// True when the last field of a `files:` spec has an `rw` token
+/// among its comma-separated options (`:rw`, `:rw,Z`, `:Z,rw`). Config
 /// validation and `FileMount::parse` both reject such a spec, and
-/// share this check so they cannot disagree on what counts as `:rw`.
+/// share this check so they cannot disagree on what counts as `rw`.
 #[must_use]
 pub fn has_rw_mode(spec: &str) -> bool {
-    matches!(spec.rsplit_once(':'), Some((_, "rw")))
+    spec.rsplit_once(':')
+        .is_some_and(|(_, opts)| opts.split(',').any(|o| o == "rw"))
 }
 
 /// Per-container runtime options. **All security-relevant fields
@@ -1988,11 +2002,7 @@ impl Config {
         // identical configs on different boxes).
         let mut matched: Vec<std::path::PathBuf> = Vec::new();
         for pattern in &self.include {
-            let abs_pat = if Path::new(pattern).is_absolute() {
-                pattern.clone()
-            } else {
-                base.join(pattern).display().to_string()
-            };
+            let abs_pat = glob_under(&base, pattern);
             let entries = glob::glob(&abs_pat).map_err(|source| ConfigError::GlobPattern {
                 pattern: pattern.clone(),
                 source,
@@ -2343,11 +2353,57 @@ impl Config {
                     service.name
                 )));
             }
+            // Parse the values the container spec builder parses, so a
+            // bad value fails at load and not inside `yoink up`, after
+            // hooks and pulls ran.
+            let opts = &service.run.options;
+            let checks = [
+                (
+                    "run.options.memory",
+                    opts.memory
+                        .as_deref()
+                        .and_then(|m| run_args::parse_memory(m).err()),
+                ),
+                (
+                    "run.options.cpus",
+                    opts.cpus
+                        .as_deref()
+                        .and_then(|c| run_args::parse_cpus(c).err()),
+                ),
+                // The synthesized `_proxy` gets its publish list from
+                // `proxy.bind:`. Do not fail every command on it.
+                (
+                    "run.publish",
+                    if matches!(service.kind, Some(ServiceKind::Proxy)) {
+                        None
+                    } else {
+                        run_args::parse_port_bindings(&service.run.publish).err()
+                    },
+                ),
+            ];
+            if let Some((field, e)) = checks.into_iter().find_map(|(f, e)| e.map(|e| (f, e))) {
+                return Err(ConfigError::Invalid(format!(
+                    "service {:?}.{field}: {e}",
+                    service.name
+                )));
+            }
             for spec in &service.run.options.devices {
                 if let Err(e) = crate::base::run_args::validate_device_spec(spec) {
                     return Err(ConfigError::Invalid(format!(
                         "service {:?}.run.options.devices: {e}",
                         service.name
+                    )));
+                }
+            }
+            // A bind whose third field holds no `ro`/`rw` is ambiguous:
+            // Docker mounts it read-write, and yoink mounts every other
+            // bind read-only. Make the operator choose.
+            for bind in &service.run.binds {
+                if let Some(opts) = run_args::bind_mode_missing(bind) {
+                    return Err(ConfigError::Invalid(bind_without_mode_error(
+                        &service.name,
+                        bind,
+                        opts,
                     )));
                 }
             }
@@ -2360,6 +2416,14 @@ impl Config {
                         "service {:?}.run.files: entry {spec:?} sets `:rw`, but `files:` mounts \
                          are always read-only; use `binds:` or a volume for data the container \
                          must write",
+                        service.name
+                    )));
+                }
+                // Docker reads an empty last field as read-write.
+                if spec.ends_with(':') {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.run.files: entry {spec:?} ends in an empty mode field, \
+                         and Docker mounts it read-write; remove the last `:` or end it in `:ro`",
                         service.name
                     )));
                 }
@@ -2681,6 +2745,34 @@ impl ServiceConfig {
     }
 }
 
+/// The load error for a `run.binds` entry whose third field `opts`
+/// holds neither `ro` nor `rw`.
+fn bind_without_mode_error(service: &str, bind: &str, opts: &str) -> String {
+    if opts.is_empty() {
+        format!(
+            "service {service:?}.run.binds: bind {bind:?} ends in an empty mode field, and \
+             Docker mounts it read-write; add `ro` or `rw` after the last `:`"
+        )
+    } else {
+        format!(
+            "service {service:?}.run.binds: bind {bind:?} sets options but no mode; \
+             add `ro` or `rw` (e.g. `ro,{opts}` or `rw,{opts}`)"
+        )
+    }
+}
+
+/// The `include:` glob `pattern` as a pattern under `base`. An absolute
+/// pattern stays as written. For a relative one, the glob characters in
+/// `base` are escaped, so a config directory such as `proj[1]` matches
+/// itself literally. The user's pattern is not escaped.
+fn glob_under(base: &Path, pattern: &str) -> String {
+    if Path::new(pattern).is_absolute() {
+        return pattern.to_string();
+    }
+    let escaped_base = std::path::PathBuf::from(glob::Pattern::escape(&base.to_string_lossy()));
+    escaped_base.join(pattern).to_string_lossy().into_owned()
+}
+
 fn dest_matched_by_existing_globs(base: &Path, dest: &Path, globs: &[String]) -> bool {
     let abs_dest = if dest.is_absolute() {
         dest.to_path_buf()
@@ -2688,11 +2780,7 @@ fn dest_matched_by_existing_globs(base: &Path, dest: &Path, globs: &[String]) ->
         base.join(dest)
     };
     globs.iter().any(|pattern| {
-        let pat_path = if Path::new(pattern).is_absolute() {
-            pattern.clone()
-        } else {
-            base.join(pattern).to_string_lossy().into_owned()
-        };
+        let pat_path = glob_under(base, pattern);
         match glob::Pattern::new(&pat_path) {
             Ok(p) => p.matches_path(&abs_dest),
             Err(_) => false,
@@ -2909,6 +2997,40 @@ hooks:
         assert_eq!(cfg.deploy.networks, vec!["kamal".to_string()]);
         assert_eq!(cfg.hooks.pre_deploy.len(), 1);
         assert_eq!(cfg.hooks.pre_deploy[0].name, "migrate");
+    }
+
+    /// Regression: glob characters in the config directory were not
+    /// escaped, so a project in `proj[1]` silently skipped its include
+    /// fragments, and `include_covers` missed them too.
+    #[test]
+    fn include_glob_works_in_a_directory_with_glob_characters() {
+        let dir = write_temp_tree(&[
+            (
+                "proj[1]/yoink.yaml",
+                r#"
+hosts:
+  - { address: h1, user: root }
+include:
+  - services/*.yaml
+"#,
+            ),
+            (
+                "proj[1]/services/api.yaml",
+                r#"
+services:
+  - name: api
+    image: img/api
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+            ),
+        ]);
+        let project = dir.join("proj[1]");
+        let cfg = Config::load_from_path(&project.join("yoink.yaml")).unwrap();
+        let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["api"]);
+        assert!(cfg.include_covers(&project.join("services/web.yaml")));
+        assert!(cfg.include_covers(Path::new("services/web.yaml")));
     }
 
     #[test]
@@ -3476,6 +3598,70 @@ services:
         assert!(matches!(err, ConfigError::Invalid(m) if m.contains("port required")));
     }
 
+    fn config_with_bind(bind: &str) -> String {
+        format!(
+            r#"
+hosts:
+  - {{ address: h, user: u }}
+services:
+  - name: db
+    image: i
+    tag: v1
+    run:
+      binds:
+        - "{bind}"
+"#
+        )
+    }
+
+    /// Regression: a bind with options but no mode (`:Z`) loaded and
+    /// was mounted read-only, while Docker reads it as read-write. It
+    /// is now a load error that names the service and the bind.
+    #[test]
+    fn rejects_a_bind_with_options_but_no_mode() {
+        for (bind, opts) in [
+            ("/srv/pg:/data:Z", "Z"),
+            ("/srv/pg:/data:z", "z"),
+            ("/srv/pg:/data:rshared", "rshared"),
+            ("/srv/pg:/data:nocopy", "nocopy"),
+            ("/srv/pg:/data:Z,rshared", "Z,rshared"),
+        ] {
+            let err = Config::parse_str(&config_with_bind(bind)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "invalid config: service \"db\".run.binds: bind \"{bind}\" sets options but \
+                     no mode; add `ro` or `rw` (e.g. `ro,{opts}` or `rw,{opts}`)"
+                )
+            );
+        }
+    }
+
+    /// An empty third field (`${VAR:-}` expanded to nothing) is read
+    /// as read-write by Docker. It is a load error too.
+    #[test]
+    fn rejects_a_bind_with_an_empty_mode_field() {
+        let err = parse_via_temp(&config_with_bind("/etc/app:/etc/app:")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid config: service \"db\".run.binds: bind \"/etc/app:/etc/app:\" ends in an \
+             empty mode field, and Docker mounts it read-write; add `ro` or `rw` after the last `:`"
+        );
+    }
+
+    #[test]
+    fn accepts_binds_with_a_mode_or_no_third_field() {
+        for bind in [
+            "/srv/pg:/data",
+            "/srv/pg:/data:ro",
+            "/srv/pg:/data:rw",
+            "/srv/pg:/data:ro,Z",
+            "/srv/pg:/data:Z,rw",
+        ] {
+            Config::parse_str(&config_with_bind(bind)).unwrap();
+        }
+    }
+
     fn config_with_files_entry(entry: &str) -> String {
         format!(
             r#"
@@ -3501,6 +3687,43 @@ services:
             "invalid config: service \"api\".run.files: entry \"./data.json:/app/data.json:rw\" \
              sets `:rw`, but `files:` mounts are always read-only; use `binds:` or a volume for \
              data the container must write"
+        );
+    }
+
+    /// Regression: only a spec that ended in exactly `:rw` was
+    /// rejected, so `:rw,Z` loaded and mounted writable. Any `rw`
+    /// token in the options is now rejected.
+    #[test]
+    fn rejects_an_rw_token_among_the_options_of_a_files_entry() {
+        for entry in [
+            "./app.conf:/etc/app.conf:rw,Z",
+            "./app.conf:/etc/app.conf:Z,rw",
+        ] {
+            let err = Config::parse_str(&config_with_files_entry(entry)).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::Invalid(m) if m.contains("sets `:rw`")),
+                "{entry}: {err}"
+            );
+        }
+        for entry in [
+            "./app.conf:/etc/app.conf",
+            "./app.conf:/etc/app.conf:ro",
+            "./app.conf:/etc/app.conf:ro,Z",
+            "./app.conf:/etc/app.conf:Z",
+        ] {
+            Config::parse_str(&config_with_files_entry(entry)).unwrap();
+        }
+    }
+
+    /// An empty last field mounts read-write in Docker, so a `files:`
+    /// entry like that is rejected too.
+    #[test]
+    fn rejects_an_empty_mode_field_on_a_files_entry() {
+        let err =
+            Config::parse_str(&config_with_files_entry("./app.conf:/etc/app.conf:")).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Invalid(m) if m.contains("empty mode field")),
+            "{err}"
         );
     }
 
@@ -3609,6 +3832,71 @@ services:
         // A later-declared or earlier-declared known service is fine.
         Config::parse_str(&config("migrations")).unwrap();
         Config::parse_str(&config("api")).unwrap();
+    }
+
+    /// Regression: the `run.publish` check also ran on the synthesized
+    /// `_proxy`. A `proxy.bind:` that the publish parser rejects (an
+    /// IPv6 address) broke config load for every command.
+    #[test]
+    fn proxy_bind_is_not_checked_as_a_publish_at_load() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: u }
+proxy: { bind: "::1", email: ops@example.com }
+services:
+  - name: api
+    image: i
+    tag: v1
+    domain: api.example.com
+    run: { port: 3000 }
+"#,
+        )
+        .unwrap();
+        let proxy = cfg
+            .services
+            .iter()
+            .find(|s| matches!(s.kind, Some(ServiceKind::Proxy)))
+            .expect("the proxy is synthesized");
+        assert!(proxy.run.publish.iter().any(|p| p.starts_with("::1:")));
+    }
+
+    /// Regression: `run.options.memory`, `run.options.cpus` and
+    /// `run.publish` were parsed only by the container spec builder,
+    /// so a bad value failed inside `yoink up` after hooks and pulls.
+    #[test]
+    fn bad_run_option_values_fail_at_load() {
+        let with = |line: &str| {
+            format!(
+                r#"
+hosts:
+  - {{ address: host-a, user: u }}
+services:
+  - name: x
+    image: i
+    tag: v1
+    run:
+      port: 1
+      {line}
+"#
+            )
+        };
+        for (line, field) in [
+            ("options: { memory: 512MB }", "run.options.memory"),
+            ("options: { memory: -512m }", "run.options.memory"),
+            ("options: { cpus: lots }", "run.options.cpus"),
+            ("publish: [\"80\"]", "run.publish"),
+        ] {
+            let err = Config::parse_str(&with(line)).unwrap_err().to_string();
+            assert!(err.contains(field), "{line}: {err}");
+        }
+        for line in [
+            "options: { memory: 512m, cpus: \"1.5\" }",
+            "options: { memory: \"0\" }",
+            "publish: [\"127.0.0.1:8080:80/tcp\"]",
+        ] {
+            Config::parse_str(&with(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
+        }
     }
 
     #[test]

@@ -35,6 +35,9 @@ struct FakeState {
     /// `(image, serveraddress of the credentials)` for each pull, in
     /// call order. `None` is an anonymous pull.
     pull_auth: Vec<(String, Option<String>)>,
+    /// Host address → how long each `pull_image` on that host takes.
+    /// For tests that need one slow host.
+    pull_delays: HashMap<String, Duration>,
     load_image: VecDeque<Result<(), DockerError>>,
     build_image: VecDeque<Result<(), DockerError>>,
     /// `image:tag` → presence flag. Defaults `false` so existing tests
@@ -106,6 +109,11 @@ impl FakeDockerOps {
     }
     pub fn push_pull_image(&self, v: Result<(), DockerError>) {
         self.lock().pull_image.push_back(v);
+    }
+    /// Make every `pull_image` on `host_address` take `delay` (tokio
+    /// time, so a paused-time test can step through it).
+    pub fn delay_pulls_on(&self, host_address: &str, delay: Duration) {
+        self.lock().pull_delays.insert(host_address.into(), delay);
     }
     pub fn push_build_image(&self, v: Result<(), DockerError>) {
         self.lock().build_image.push_back(v);
@@ -232,15 +240,21 @@ impl DockerOps for FakeDockerOps {
         tag: &str,
         credentials: Option<bollard::auth::DockerCredentials>,
     ) -> Result<(), DockerError> {
-        let mut s = self.lock();
-        s.pull_auth
-            .push((image.into(), credentials.and_then(|c| c.serveraddress)));
-        s.calls.push(RecordedCall::PullImage(
-            host.clone(),
-            image.into(),
-            tag.into(),
-        ));
-        pop(&mut s.pull_image, "pull_image")
+        let delay = {
+            let mut s = self.lock();
+            s.pull_auth
+                .push((image.into(), credentials.and_then(|c| c.serveraddress)));
+            s.calls.push(RecordedCall::PullImage(
+                host.clone(),
+                image.into(),
+                tag.into(),
+            ));
+            s.pull_delays.get(&host.address).copied()
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        pop(&mut self.lock().pull_image, "pull_image")
     }
     async fn image_present(
         &self,

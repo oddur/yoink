@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ratatui::Frame;
-use ratatui::layout::Constraint;
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
@@ -176,8 +176,19 @@ impl DashboardState {
     /// Convenience for tests + sync paths.
     #[cfg(test)]
     pub async fn refresh(&mut self, ops: &dyn DockerOps, config: &Config) {
-        let data = fetch(ops, config).await;
+        let mut data = fetch(ops, config).await;
+        self.keep_failed_hosts(&mut data, config);
         self.apply(data);
+    }
+
+    /// On a partial failure, give each host that did not answer its
+    /// last-known rows, so a one-tick ssh blip does not hide them. The
+    /// error stays in `data`, so the footer still shows it. Call before
+    /// [`Self::apply`], and hand the same report to the other screens.
+    pub fn keep_failed_hosts(&self, data: &mut DashboardRefresh, config: &Config) {
+        if let (Some(report), Some(previous)) = (data.report.as_mut(), &self.report) {
+            report.keep_failed_hosts_from(previous, config);
+        }
     }
 
     /// Apply background-fetched results. `loaded` flips
@@ -185,7 +196,8 @@ impl DashboardState {
     /// ssh probe failed, etc.), the existing render path uses
     /// `last_error` to surface the failure instead of looping on
     /// `(loading…)`. Last-known good `report`/`stats` are kept on
-    /// error to ride out transient blips.
+    /// error to ride out transient blips (see also
+    /// [`Self::keep_failed_hosts`] for a partial failure).
     pub fn apply(&mut self, data: DashboardRefresh) {
         self.last_error = data.error;
         self.loaded = true;
@@ -207,6 +219,19 @@ impl DashboardState {
         throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         let layout = pane_layout(area);
+        // With a report, a fetch error means some hosts did not answer.
+        // It gets its own line above the footer, so the filter prompt
+        // and the active filter stay visible.
+        let (table_area, failed_area) = match (&self.report, &self.last_error) {
+            (Some(_), Some(_)) => {
+                let split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0), Constraint::Length(1)])
+                    .split(layout[1]);
+                (split[0], Some(split[1]))
+            }
+            _ => (layout[1], None),
+        };
 
         let services = config.service_names().collect::<Vec<_>>().join(", ");
         let header = Paragraph::new(format!(
@@ -248,7 +273,7 @@ impl DashboardState {
             .row_highlight_style(crate::tui::ui::table_highlight_style())
             .highlight_symbol(crate::tui::ui::TABLE_HIGHLIGHT_SYMBOL)
             .block(Block::default().borders(Borders::ALL).title("status"));
-        frame.render_stateful_widget(table, layout[1], &mut self.table);
+        frame.render_stateful_widget(table, table_area, &mut self.table);
 
         let exited_indicator = if self.show_exited {
             "[exited: on]"
@@ -256,7 +281,11 @@ impl DashboardState {
             "[exited: off]"
         };
         let help = format!("q quit · r refresh · e {exited_indicator} · ? help");
-        if let Some(err) = &self.last_error {
+        if let (Some(err), Some(failed_area)) = (&self.last_error, failed_area) {
+            let failed = Paragraph::new(format!("unreachable: {err}"))
+                .style(Style::default().fg(Color::Red));
+            frame.render_widget(failed, failed_area);
+        } else if let Some(err) = &self.last_error {
             let footer = Paragraph::new(format!("error: {err}  ·  {help}"))
                 .style(Style::default().fg(Color::Red));
             frame.render_widget(footer, layout[2]);
@@ -445,10 +474,19 @@ pub async fn fetch_owned(ops: Arc<dyn DockerOps>, config: Arc<Config>) -> Dashbo
 /// twice on every fast tick.
 async fn fetch(ops: &dyn DockerOps, config: &Config) -> DashboardRefresh {
     match StatusReport::collect(ops, config).await {
-        Ok(r) => DashboardRefresh {
-            report: Some(r),
-            error: None,
-        },
+        Ok(r) => {
+            let error = (!r.failed.is_empty()).then(|| {
+                r.failed
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            });
+            DashboardRefresh {
+                report: Some(r),
+                error,
+            }
+        }
         Err(e) => DashboardRefresh {
             report: None,
             error: Some(format!("{e:#}")),
@@ -467,6 +505,22 @@ mod tests {
             r#"
 hosts:
   - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: x
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap()
+    }
+
+    fn config_two_hosts() -> Config {
+        Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+  - { address: host-b, user: deploy }
 services:
   - name: app-a
     image: x
@@ -513,5 +567,121 @@ services:
         state.refresh(&ops, &config()).await;
         assert!(state.last_error.is_some());
         assert!(state.report.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_shows_reachable_hosts_and_reports_unreachable_one() {
+        let cfg = config_two_hosts();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![running_container()]));
+        ops.push_list_containers(Err(crate::docker_ops::DockerError::SshProbe {
+            host: "host-b".into(),
+            detail: "connection refused".into(),
+        }));
+        let mut state = DashboardState::new();
+        state.refresh(&ops, &cfg).await;
+        let report = state.report.as_ref().expect("reachable host is shown");
+        assert_eq!(report.hosts.len(), 1);
+        assert_eq!(report.hosts[0].host, "host-a");
+        let err = state
+            .last_error
+            .as_deref()
+            .expect("unreachable host is reported");
+        assert!(err.contains("host-b"), "{err}");
+    }
+
+    fn render_to_text(state: &mut DashboardState, cfg: &Config) -> String {
+        let backend = ratatui::backend::TestBackend::new(200, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let forwards = crate::tui::pf::PortForwardState::default();
+        let vscode = crate::tui::vscode::VscodeSessionState::default();
+        let throbber = throbber_widgets_tui::ThrobberState::default();
+        terminal
+            .draw(|frame| {
+                state.render(
+                    frame,
+                    frame.area(),
+                    cfg,
+                    None,
+                    &HashMap::new(),
+                    &forwards,
+                    &vscode,
+                    &throbber,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        buffer
+            .content
+            .chunks(width)
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Regression: while one host was down, the footer showed only the
+    /// error. The `/` prompt and the active filter were hidden. The
+    /// unreachable hosts now get their own line above the footer.
+    #[tokio::test]
+    async fn a_down_host_does_not_hide_the_filter_footer() {
+        let cfg = config_two_hosts();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![running_container()]));
+        ops.push_list_containers(Err(crate::docker_ops::DockerError::SshProbe {
+            host: "host-b".into(),
+            detail: "connection refused".into(),
+        }));
+        let mut state = DashboardState::new();
+        state.refresh(&ops, &cfg).await;
+        assert!(state.last_error.is_some());
+
+        let text = render_to_text(&mut state, &cfg);
+        assert!(text.contains("/ filter"), "{text}");
+        assert!(text.contains("unreachable:"), "{text}");
+        assert!(text.contains("host-b"), "{text}");
+
+        state.filter.begin_input();
+        state.filter.push_char('a');
+        let text = render_to_text(&mut state, &cfg);
+        assert!(text.contains("/a_"), "{text}");
+        state.filter.apply();
+        let text = render_to_text(&mut state, &cfg);
+        assert!(text.contains("filter: a"), "{text}");
+        assert!(text.contains("host-b"), "{text}");
+    }
+
+    /// Regression: on a partial failure the new report replaced the
+    /// last-known one, so a one-tick ssh blip made the rows of the
+    /// failed host vanish. Its rows stay and the footer shows the error.
+    #[tokio::test]
+    async fn partial_failure_keeps_the_rows_of_the_failed_host() {
+        let cfg = config_two_hosts();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![running_container()]));
+        ops.push_list_containers(Ok(vec![running_container()]));
+        let mut state = DashboardState::new();
+        state.refresh(&ops, &cfg).await;
+
+        ops.push_list_containers(Err(crate::docker_ops::DockerError::SshProbe {
+            host: "host-a".into(),
+            detail: "connection refused".into(),
+        }));
+        ops.push_list_containers(Ok(vec![]));
+        state.refresh(&ops, &cfg).await;
+
+        let report = state.report.as_ref().expect("report is kept");
+        let hosts: Vec<(&str, usize)> = report
+            .hosts
+            .iter()
+            .map(|h| (h.host.as_str(), h.containers.len()))
+            .collect();
+        assert_eq!(hosts, vec![("host-a", 1), ("host-b", 0)]);
+        let err = state.last_error.as_deref().expect("the error shows");
+        assert!(err.contains("host-a"), "{err}");
     }
 }

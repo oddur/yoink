@@ -141,7 +141,10 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
         bundle_fut,
         dns_fut,
     );
-    let bundle = bundle_result.ok().flatten();
+    let (bundle, bundle_error) = match bundle_result {
+        Ok(bundle) => (bundle, None),
+        Err(e) => (None, Some(e.to_string())),
+    };
     let bundle_ref = bundle.as_ref();
 
     // Every other check is sync (config walk + cached lookups).
@@ -154,6 +157,11 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
     findings.extend(check_registry_consistency(config));
     findings.extend(check_dockerfile_paths(config));
     findings.extend(check_proxied_services(config));
+    findings.extend(check_bundle_loaded(
+        config,
+        bundle.is_some(),
+        bundle_error.as_deref(),
+    ));
     findings.extend(check_tls_cert_secrets(config, bundle_ref));
     findings.extend(check_secret_references(config, bundle_ref));
     findings.extend(check_hosts_from_versions(&host_versions));
@@ -452,17 +460,20 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
     }
 
     let email = config.proxy_email();
-    if email.is_none() {
+    if email.is_none() && config.proxy_uses_acme() {
+        // `yoink up` fails at Caddy render in this case, so this is
+        // an error, not a warning.
         out.push(
-            Finding::warn(
+            Finding::error(
                 "config",
-                "`proxy.email:` is unset; Let's Encrypt registration uses a placeholder",
+                "a service uses `tls: auto` (Let's Encrypt) but `proxy.email:` is unset; \
+                 `yoink up` fails",
             )
             .with_fix(
-                "set `proxy: { email: <your real email> }` so ACME expiry warnings reach you",
+                "set `proxy: { email: <your real email> }` (or set `proxy.tls` for an inline cert)",
             ),
         );
-    } else if email.is_some_and(is_placeholder_email) {
+    } else if config.proxy_uses_acme() && email.is_some_and(is_placeholder_email) {
         out.push(
             Finding::warn(
                 "config",
@@ -683,31 +694,26 @@ async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
 // ---------- sealed.age existence ----------
 
 fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
-    let Some(SecretsConfig::Age { recipients, .. }) = &config.secrets else {
+    if !matches!(config.secrets, Some(SecretsConfig::Age { .. })) {
         return vec![Finding::pass(
             "secrets",
             "sealed file check skipped (not using `provider: age`)",
         )];
-    };
-    if recipients.is_empty() {
-        return vec![Finding::pass(
-            "secrets",
-            "sealed file check skipped (no `secrets.recipients:`)",
-        )];
     }
-    let any_refs = config
-        .services
-        .iter()
-        .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty());
-    if !any_refs {
-        return vec![Finding::pass(
-            "secrets",
-            "sealed file check skipped (no services reference secrets)",
-        )];
-    }
-    let Ok(path) = config.sealed_path() else {
-        return Vec::new();
+    // Every secrets load resolves this path first, so an escaping
+    // `secrets.file:` breaks `yoink up` whatever the services reference.
+    let path = match config.sealed_path() {
+        Ok(path) => path,
+        Err(e) => {
+            return vec![Finding::error("secrets", e.to_string()).with_fix(
+                "set `secrets.file:` to a relative path inside the directory of yoink.yaml",
+            )];
+        }
     };
+    // `load_bundle` reads the file for every `provider: age` config,
+    // before it looks at the recipients or at what the services
+    // reference. A missing file fails `yoink up`, also in a new
+    // project that has no secrets yet.
     if path.exists() {
         return vec![Finding::pass(
             "secrets",
@@ -718,11 +724,14 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
         Finding::error(
             "secrets",
             format!(
-                "{} doesn't exist but services reference secrets",
+                "{} does not exist, and `yoink up` reads it for every `provider: age` config",
                 path.display()
             ),
         )
-        .with_fix("run `yoink secrets edit` to create the bundle, then commit the file"),
+        .with_fix(
+            "run `yoink secrets edit` to create the bundle, then commit the file \
+             (or remove the `secrets:` block if the project has no secrets)",
+        ),
     ]
 }
 
@@ -899,26 +908,53 @@ fn check_tls_cert_secrets(
 ) -> Vec<Finding> {
     let proxy_default_cert = config.proxy_tls().map(|t| t.cert_secret.clone());
     let proxy_default_key = config.proxy_tls().map(|t| t.key_secret.clone());
+    let global_tls = global_proxy_tls(config);
 
-    let needs_bundle = config
-        .services
-        .iter()
-        .any(|s| matches!(s.tls, TlsMode::Cert));
-    if !needs_bundle {
+    if !tls_needs_bundle(config) {
         return vec![Finding::pass(
             "config",
             "TLS cert-mode check skipped (no services use `tls: cert`)",
         )];
     }
-    // If the bundle isn't loaded, `check_secret_references` will have
-    // already surfaced that — don't double-report.
+    // `check_bundle_loaded` reports a missing bundle.
     let Some(bundle) = bundle else {
         return Vec::new();
     };
 
     let mut out = Vec::new();
+    if let Some(tls) = global_tls {
+        let mut refs = vec![
+            ("cert_secret", tls.cert_secret.as_str()),
+            ("key_secret", tls.key_secret.as_str()),
+        ];
+        if let Some(ca) = &tls.client_auth {
+            refs.push((
+                "client_auth.trust_pool_secret",
+                ca.trust_pool_secret.as_str(),
+            ));
+        }
+        for (field, key) in refs {
+            if bundle.get(key).is_none() {
+                out.push(
+                    Finding::error(
+                        "secrets",
+                        format!(
+                            "`proxy.tls.{field}` references `{key}`, which is not in the bundle"
+                        ),
+                    )
+                    .with_fix(format!("add `{key}=<pem-bytes>` via `yoink secrets edit`")),
+                );
+            }
+        }
+    }
     for svc in &config.services {
-        if !matches!(svc.tls, TlsMode::Cert) {
+        // The Caddy config reads certs only for routed services.
+        if !svc.is_proxied() || !matches!(svc.tls, TlsMode::Cert) {
+            continue;
+        }
+        // A service that inherits the `proxy.tls` cert is covered by
+        // the check above.
+        if global_tls.is_some() && svc.own_tls_cert().is_none() {
             continue;
         }
         let cert_key = svc
@@ -943,7 +979,7 @@ fn check_tls_cert_secrets(
                         .with_fix(format!(
                             "set `{label}: <SECRET_NAME>` on the service \
                              (or `proxy.tls.{}` to inherit)",
-                            label.trim_start_matches("tls_").trim_end_matches("_secret")
+                            label.trim_start_matches("tls_")
                         )),
                     );
                 }
@@ -966,30 +1002,89 @@ fn check_tls_cert_secrets(
     out
 }
 
+/// The `proxy.tls` block when the proxy runs. The Caddy renderer
+/// resolves its secrets then, whatever `tls:` mode the services use.
+fn global_proxy_tls(config: &Config) -> Option<&crate::config::ProxyTls> {
+    config.proxy_tls().filter(|_| config.proxy_enabled())
+}
+
+/// True when the TLS certs need the secrets bundle: the proxy runs
+/// with `proxy.tls`, or with a routed service that uses `tls: cert`.
+/// With the proxy off, or for a service without `domain:`, yoink
+/// renders no Caddy config and reads no cert.
+fn tls_needs_bundle(config: &Config) -> bool {
+    config.proxy_enabled()
+        && (config.proxy_tls().is_some()
+            || config
+                .services
+                .iter()
+                .any(|s| s.is_proxied() && matches!(s.tls, TlsMode::Cert)))
+}
+
+fn services_reference_secrets(config: &Config) -> bool {
+    config
+        .services
+        .iter()
+        .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty())
+}
+
+// ---------- the bundle loads when a check needs it ----------
+
+/// One error when the bundle is needed and there is none. `loaded` is
+/// true when the bundle loaded. `load_error` is the error of the load.
+/// With a `secrets:` block, `yoink up` loads the bundle first, so a
+/// failed load is an error whatever references the secrets. Without
+/// the block the load gives no bundle and no error, so it is an error
+/// only when the services or the TLS certs need the bundle.
+fn check_bundle_loaded(config: &Config, loaded: bool, load_error: Option<&str>) -> Vec<Finding> {
+    if loaded {
+        return Vec::new();
+    }
+    let mut needs = Vec::new();
+    if services_reference_secrets(config) {
+        needs.push("services that reference secrets");
+    }
+    if tls_needs_bundle(config) {
+        needs.push("the TLS certs (`proxy.tls` or a `tls: cert` service)");
+    }
+    let what = needs.join(" and ");
+    let finding = if config.secrets.is_none() {
+        if needs.is_empty() {
+            return Vec::new();
+        }
+        Finding::error(
+            "secrets",
+            format!("{what} need the secrets bundle, but yoink.yaml has no `secrets:` block"),
+        )
+        .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)")
+    } else {
+        let title = if needs.is_empty() {
+            "`yoink up` loads the secrets bundle first, but the bundle did not load".to_string()
+        } else {
+            format!("{what} need the secrets bundle, but the bundle did not load")
+        };
+        Finding::error("secrets", title)
+            .with_detail(load_error.unwrap_or("unknown error").to_string())
+            .with_fix("fix the load error in the detail, then run `yoink doctor` again")
+    };
+    vec![finding]
+}
+
 // ---------- env_from_secrets / secrets references match the bundle ----------
 
 fn check_secret_references(
     config: &Config,
     bundle: Option<&crate::base::bundle::SecretsBundle>,
 ) -> Vec<Finding> {
-    let any_refs = config
-        .services
-        .iter()
-        .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty());
-    if !any_refs {
+    if !services_reference_secrets(config) {
         return vec![Finding::pass(
             "secrets",
             "secret-reference check skipped (no services reference secrets)",
         )];
     }
+    // `check_bundle_loaded` reports a missing bundle.
     let Some(bundle) = bundle else {
-        return vec![
-            Finding::error(
-                "secrets",
-                "services reference secrets but no bundle is configured / loadable",
-            )
-            .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)"),
-        ];
+        return Vec::new();
     };
 
     let mut out = Vec::new();
@@ -1037,6 +1132,508 @@ fn check_secret_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: doctor said nothing when `secrets.file:` points
+    /// outside the config directory. Load accepts it, and every
+    /// secrets command fails later with `PathEscape`.
+    #[test]
+    fn secrets_file_outside_config_dir_is_an_error() {
+        let config = Config::parse_str(
+            r#"
+hosts: [{ address: h1, user: deploy }]
+secrets:
+  provider: age
+  file: ../elsewhere/sealed.age
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
+services:
+  - name: api
+    image: img
+    tag: t
+    run: { port: 8080 }
+"#,
+        )
+        .expect("load accepts the path today");
+        let findings = check_sealed_file_exists(&config);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(
+            findings[0].title.contains("escapes"),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
+    /// Regression: with `provider: age`, a missing sealed file and no
+    /// service that references secrets, doctor said "skipped".
+    /// `load_bundle` reads the file for every age config, so `yoink up`
+    /// failed. Doctor now reports the missing file as an error.
+    #[tokio::test]
+    async fn missing_sealed_file_is_an_error_for_every_age_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("yoink.yaml");
+        std::fs::write(
+            &path,
+            r#"
+hosts: [{ address: h1, user: deploy }]
+secrets:
+  provider: age
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
+services:
+  - name: api
+    image: img
+    tag: t
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let config = Config::load_from_path(&path).unwrap();
+        let findings = check_sealed_file_exists(&config);
+        assert_eq!(findings.len(), 1, "{:?}", titles(&findings));
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(
+            findings[0].title.contains("does not exist"),
+            "{:?}",
+            titles(&findings)
+        );
+        // The same config fails the load that `yoink up` runs first.
+        // The read fails before any identity is loaded.
+        assert!(matches!(
+            crate::secrets::load_bundle(&config).await,
+            Err(crate::secrets::SecretsError::SealedRead { .. })
+        ));
+
+        std::fs::write(config.sealed_path().unwrap(), b"").unwrap();
+        let findings = check_sealed_file_exists(&config);
+        assert_eq!(findings[0].severity, Severity::Pass);
+    }
+
+    /// Regression: the hint named `proxy.tls.cert` / `proxy.tls.key`.
+    /// The fields are `cert_secret` / `key_secret`, and the wrong names
+    /// break config parsing (`deny_unknown_fields`).
+    #[test]
+    fn tls_cert_hint_names_the_real_proxy_tls_fields() {
+        // Load rejects a routed `tls: cert` service with no cert, so
+        // the test drops the cert names after the parse.
+        let mut config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    tls: cert
+    tls_cert_secret: API_CERT
+    tls_key_secret: API_KEY
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let api = config
+            .services
+            .iter_mut()
+            .find(|s| s.name == "api")
+            .unwrap();
+        api.tls_cert_secret = None;
+        api.tls_key_secret = None;
+        let bundle = crate::base::bundle::SecretsBundle::new(std::collections::BTreeMap::new());
+        let fixes: Vec<String> = check_tls_cert_secrets(&config, Some(&bundle))
+            .into_iter()
+            .filter_map(|f| f.fix)
+            .collect();
+        assert_eq!(fixes.len(), 2, "{fixes:?}");
+        assert!(fixes[0].contains("`proxy.tls.cert_secret`"), "{fixes:?}");
+        assert!(fixes[1].contains("`proxy.tls.key_secret`"), "{fixes:?}");
+    }
+
+    /// Regression: with only `tls: auto` services, doctor skipped the
+    /// `proxy.tls` secrets. The Caddy renderer still needs them, so
+    /// `yoink up` failed on a secret that doctor never checked.
+    #[test]
+    fn missing_proxy_tls_secret_is_an_error_with_tls_auto_services() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+secrets: { provider: age, recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy] }
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            "CF_CERT".to_string(),
+            zeroize::Zeroizing::new("cert".to_string()),
+        );
+        let bundle = crate::base::bundle::SecretsBundle::new(values);
+        let findings = check_tls_cert_secrets(&config, Some(&bundle));
+        let errors: Vec<&str> = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Error)
+            .map(|f| f.title.as_str())
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("proxy.tls.key_secret"), "{errors:?}");
+        assert!(errors[0].contains("CF_KEY"), "{errors:?}");
+    }
+
+    /// Regression: doctor only warned about a missing `proxy.email:`
+    /// while `yoink up` fails at Caddy render for a `tls: auto`
+    /// service. Doctor must report an error.
+    #[test]
+    fn missing_proxy_email_with_tls_auto_is_an_error() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let findings = check_proxied_services(&config);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.title.contains("proxy.email")),
+            "{:?}",
+            titles(&findings)
+        );
+        assert!(
+            crate::proxy::caddy::render(&config, |_| vec![], None).is_err(),
+            "up fails at render for the same config"
+        );
+    }
+
+    /// Regression: with `proxy.enabled: false`, doctor reported the
+    /// missing `proxy.email:` as an error. yoink renders no Caddy
+    /// config then, and `yoink up` succeeds.
+    #[test]
+    fn missing_proxy_email_is_no_error_when_the_proxy_is_off() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy: { enabled: false }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        assert!(!config.proxy_uses_acme());
+        let findings = check_proxied_services(&config);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.title.contains("proxy.email")),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
+    /// Regression: doctor warned about a placeholder `proxy.email:`
+    /// without ACME (here an inline `proxy.tls` cert). The address
+    /// then gets no Let's Encrypt mail, so the warning was noise.
+    #[test]
+    fn placeholder_proxy_email_is_not_reported_without_acme() {
+        let yaml = |tls: &str| {
+            format!(
+                r#"
+deploy: {{ networks: [n] }}
+hosts: [{{ address: h1, user: deploy }}]
+proxy:
+  email: you@example.com
+{tls}
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: {{ port: 8080 }}
+"#
+            )
+        };
+        let inline = Config::parse_str(&yaml(
+            "  tls:\n    cert_secret: CF_CERT\n    key_secret: CF_KEY",
+        ))
+        .unwrap();
+        assert!(!inline.proxy_uses_acme());
+        let findings = check_proxied_services(&inline);
+        assert!(
+            !findings.iter().any(|f| f.title.contains("placeholder")),
+            "{:?}",
+            titles(&findings)
+        );
+        let acme = Config::parse_str(&yaml("")).unwrap();
+        assert!(acme.proxy_uses_acme());
+        let findings = check_proxied_services(&acme);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Warn && f.title.contains("placeholder")),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
+    /// Regression: without ACME (here an inline `proxy.tls` cert),
+    /// doctor warned that "Let's Encrypt registration uses a
+    /// placeholder". No Let's Encrypt registration happens then.
+    #[test]
+    fn missing_proxy_email_is_not_reported_without_acme() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let findings = check_proxied_services(&config);
+        assert!(
+            !findings.iter().any(|f| f.title.contains("proxy.email")),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
+    /// Regression: a `tls: cert` service without `domain:`, or with the
+    /// proxy off, made doctor ask for the bundle. No Caddy config is
+    /// rendered for it, so the config deploys without a bundle.
+    #[test]
+    fn unrouted_tls_cert_services_do_not_need_the_bundle() {
+        let config = |proxy: &str, domain: &str| {
+            Config::parse_str(&format!(
+                r#"
+deploy: {{ networks: [n] }}
+hosts: [{{ address: h1, user: deploy }}]
+{proxy}
+services:
+  - name: api
+    image: img
+    tag: t
+    {domain}
+    tls: cert
+    tls_cert_secret: API_CERT
+    tls_key_secret: API_KEY
+    run: {{ port: 8080 }}
+"#
+            ))
+            .unwrap()
+        };
+        let no_domain = config("", "");
+        assert!(!tls_needs_bundle(&no_domain));
+        assert!(check_bundle_loaded(&no_domain, false, None).is_empty());
+
+        let proxy_off = config("proxy: { enabled: false }", "domain: api.example.com");
+        assert!(!tls_needs_bundle(&proxy_off));
+        assert!(check_bundle_loaded(&proxy_off, false, None).is_empty());
+
+        let routed = config("", "domain: api.example.com");
+        assert!(tls_needs_bundle(&routed));
+        assert_eq!(check_bundle_loaded(&routed, false, None).len(), 1);
+
+        // The proxy runs for `proxy.tls`, but the unrouted service
+        // needs no cert of its own in the bundle.
+        let global = config(
+            "proxy: { enabled: true, tls: { cert_secret: CF_CERT, key_secret: CF_KEY } }",
+            "",
+        );
+        let bundle = crate::base::bundle::SecretsBundle::new(
+            [("CF_CERT", "c"), ("CF_KEY", "k")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), zeroize::Zeroizing::new(v.to_string())))
+                .collect(),
+        );
+        let findings = check_tls_cert_secrets(&global, Some(&bundle));
+        assert!(
+            findings.iter().all(|f| f.severity != Severity::Error),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
+    /// Regression: with `proxy.tls` set and no bundle, doctor reported
+    /// nothing, and no other check did when no service lists
+    /// `secrets:`. `yoink up` then fails at Caddy render.
+    #[test]
+    fn tls_certs_without_a_bundle_are_an_error() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let findings = check_bundle_loaded(&config, false, None);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.title.contains("bundle")),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
+    /// Regression: with services that reference secrets and TLS certs
+    /// that need the bundle, a missing bundle was reported twice. The
+    /// fix said to set `secrets:` even when the block was set and only
+    /// the load failed.
+    #[test]
+    fn a_missing_bundle_is_reported_once_with_a_fix_for_its_cause() {
+        let yaml = |secrets: &str| {
+            format!(
+                r#"
+deploy: {{ networks: [n] }}
+hosts: [{{ address: h1, user: deploy }}]
+{secrets}
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    secrets: [DB_URL]
+    run: {{ port: 8080 }}
+"#
+            )
+        };
+        let missing = |config: &Config, error: Option<&str>| {
+            let mut findings = check_bundle_loaded(config, false, error);
+            findings.extend(check_tls_cert_secrets(config, None));
+            findings.extend(check_secret_references(config, None));
+            findings
+                .into_iter()
+                .filter(|f| f.severity == Severity::Error)
+                .collect::<Vec<_>>()
+        };
+
+        let no_block = Config::parse_str(&yaml("")).unwrap();
+        let findings = missing(&no_block, None);
+        assert_eq!(findings.len(), 1, "{:?}", titles(&findings));
+        assert!(
+            findings[0]
+                .title
+                .contains("services that reference secrets and the TLS certs")
+        );
+        assert!(findings[0].title.contains("no `secrets:` block"));
+        assert!(
+            findings[0]
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("set `secrets:`")
+        );
+
+        let block = Config::parse_str(&yaml(
+            "secrets:\n  provider: age\n  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]",
+        ))
+        .unwrap();
+        let findings = missing(&block, Some("read sealed file: not found"));
+        assert_eq!(findings.len(), 1, "{:?}", titles(&findings));
+        assert!(findings[0].title.contains("did not load"));
+        assert_eq!(
+            findings[0].detail.as_deref(),
+            Some("read sealed file: not found")
+        );
+        assert!(
+            !findings[0]
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("set `secrets:`")
+        );
+
+        assert!(check_bundle_loaded(&block, true, None).is_empty());
+    }
+
+    /// Regression: with a `secrets:` block and secrets referenced only
+    /// by a pre-deploy hook, doctor dropped the load error. `yoink up`
+    /// loads the bundle first and failed where doctor passed.
+    #[test]
+    fn a_failed_load_is_an_error_when_no_service_needs_the_bundle() {
+        let config = Config::parse_str(
+            r#"
+hosts: [{ address: h1, user: deploy }]
+secrets:
+  provider: age
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
+hooks:
+  pre_deploy:
+    - name: migrate
+      cmd: [./migrate]
+      secrets: [DB_URL]
+services:
+  - name: api
+    image: img
+    tag: t
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        assert!(!services_reference_secrets(&config));
+        assert!(!tls_needs_bundle(&config));
+        let findings = check_bundle_loaded(&config, false, Some("decrypt failed"));
+        assert_eq!(findings.len(), 1, "{:?}", titles(&findings));
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(findings[0].title.contains("did not load"));
+        assert_eq!(findings[0].detail.as_deref(), Some("decrypt failed"));
+
+        // Without a `secrets:` block the load gives no bundle and no
+        // error, and `yoink up` does not fail on it.
+        let no_block = Config::parse_str(
+            r#"
+hosts: [{ address: h1, user: deploy }]
+services:
+  - name: api
+    image: img
+    tag: t
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        assert!(check_bundle_loaded(&no_block, false, None).is_empty());
+    }
 
     fn titles(findings: &[Finding]) -> Vec<(Severity, &str)> {
         findings
