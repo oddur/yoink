@@ -609,7 +609,7 @@ const RESERVED_CONFIG_EXTRA_PATHS: &[(&[&str], &str)] = &[
     // routed service again, and other `origins` break the next push.
     (
         &["admin"],
-        "the Caddy admin API listens only on the `yoink-admin` network",
+        "remove the `admin` key from `proxy.config_extra`; yoink manages the admin block",
     ),
     (
         &["apps", "http", "servers", "main", "routes"],
@@ -981,8 +981,13 @@ services:
             });
             let msg = format!("{}", cfg.inject_implicit_proxy().unwrap_err());
             assert!(msg.contains("proxy.config_extra"), "got: {msg}");
-            assert!(msg.contains("`admin`"), "got: {msg}");
-            assert!(msg.contains(ADMIN_NETWORK), "got: {msg}");
+            assert!(
+                msg.ends_with(
+                    "remove the `admin` key from `proxy.config_extra`; \
+                     yoink manages the admin block"
+                ),
+                "got: {msg}"
+            );
         }
     }
 
