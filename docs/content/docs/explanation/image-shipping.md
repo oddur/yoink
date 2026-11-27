@@ -26,7 +26,7 @@ For each host, the sequence is:
 1. yoink starts an ephemeral [`ghcr.io/psviderski/unregistry`](https://github.com/psviderski/unregistry) sidecar. Unregistry is an OCI registry that reads and writes the image store of the host through the containerd socket. It has no separate blob storage. Images are in `docker images` immediately after a push.
 2. yoink opens a local port with an SSH tunnel to the sidecar.
 3. yoink reads the image bytes from your local Docker daemon and pushes each blob through the SSH tunnel. It sends `HEAD` first, and sends `PUT` only if the blob is missing. **This is layer-level dedup: a redeploy ships only the changed layers.**
-4. yoink removes the sidecar after the push. The sidecar also runs with `--rm`. On the next `up`, a label sweep force-removes a sidecar that a crashed run left behind.
+4. yoink removes the sidecar after the push. The sidecar also runs with `--rm`. On the next `up`, a label sweep force-removes a sidecar that a crashed run left behind. The sweep removes only sidecars that are older than one hour. Thus it does not stop the push of another operator on the same host if that push takes less than one hour.
 
 The push runs from the yoink process on your computer, not from `docker push` on your local daemon. On macOS Docker Desktop (and Rancher Desktop and Colima), the daemon lives in a Linux VM. A `docker push 127.0.0.1:<port>/...` from the daemon connects to the loopback of the VM, not to the loopback of your computer. A push from the yoink process needs no `insecure-registries` config.
 
