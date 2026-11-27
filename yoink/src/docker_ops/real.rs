@@ -1068,16 +1068,7 @@ impl DockerOps for RealDockerOps {
     ) -> Result<OneShotResult, DockerError> {
         self.ensure_probe_image(host, HEALTHCHECK_CURL_IMAGE).await;
         let probe_name = format!("yoink-probe-{container}-{}", rand_hex());
-        let body = ContainerCreateBody {
-            image: Some(HEALTHCHECK_CURL_IMAGE.to_string()),
-            cmd: Some(args),
-            host_config: Some(HostConfig {
-                network_mode: Some(format!("container:{container}")),
-                auto_remove: Some(false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let body = netns_probe_body(container, args);
         // curl stops after `--max-time`, but the create, start and wait
         // around it have no limit of their own. On a timeout the probe
         // future is dropped, so remove the probe here.
@@ -1828,6 +1819,30 @@ fn probe_body(network: &str, cmd: Vec<String>) -> ContainerCreateBody {
     probe_body_with_image(HEALTHCHECK_CURL_IMAGE, network, cmd)
 }
 
+/// Body of the curl probe of `curl_in_netns`: it shares the network
+/// namespace of `container`. The probe can print the proxy routes,
+/// which can carry secrets in headers. Thus its log driver is
+/// `json-file` on the host, whatever the daemon default is: a remote
+/// driver (for example `syslog` or `awslogs`) would send the output off
+/// the host. `run_one_shot` reads the output back and removes the
+/// probe, which also removes its log file.
+fn netns_probe_body(container: &str, args: Vec<String>) -> ContainerCreateBody {
+    ContainerCreateBody {
+        image: Some(HEALTHCHECK_CURL_IMAGE.to_string()),
+        cmd: Some(args),
+        host_config: Some(HostConfig {
+            network_mode: Some(format!("container:{container}")),
+            auto_remove: Some(false),
+            log_config: Some(bollard::models::HostConfigLogConfig {
+                typ: Some("json-file".to_string()),
+                config: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn probe_body_with_image(image: &str, network: &str, cmd: Vec<String>) -> ContainerCreateBody {
     let mut endpoints = HashMap::new();
     endpoints.insert(network.to_string(), EndpointSettings::default());
@@ -1842,5 +1857,24 @@ fn probe_body_with_image(image: &str, network: &str, cmd: Vec<String>) -> Contai
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The probe used the daemon default log driver. With a remote
+    /// driver, the route read-back of the proxy went off the host.
+    #[test]
+    fn the_netns_probe_logs_to_a_local_json_file() {
+        let body = netns_probe_body("yoink-proxy-abc", vec!["-sS".into()]);
+        let host_config = body.host_config.unwrap();
+        assert_eq!(
+            host_config.network_mode.as_deref(),
+            Some("container:yoink-proxy-abc")
+        );
+        let log = host_config.log_config.unwrap();
+        assert_eq!(log.typ.as_deref(), Some("json-file"));
     }
 }
