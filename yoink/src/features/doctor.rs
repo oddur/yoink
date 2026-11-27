@@ -948,7 +948,8 @@ fn check_tls_cert_secrets(
         }
     }
     for svc in &config.services {
-        if !matches!(svc.tls, TlsMode::Cert) {
+        // The Caddy config reads certs only for routed services.
+        if !svc.is_proxied() || !matches!(svc.tls, TlsMode::Cert) {
             continue;
         }
         // A service that inherits the `proxy.tls` cert is covered by
@@ -1008,13 +1009,16 @@ fn global_proxy_tls(config: &Config) -> Option<&crate::config::ProxyTls> {
 }
 
 /// True when the TLS certs need the secrets bundle: the proxy runs
-/// with `proxy.tls`, or a service uses `tls: cert`.
+/// with `proxy.tls`, or with a routed service that uses `tls: cert`.
+/// With the proxy off, or for a service without `domain:`, yoink
+/// renders no Caddy config and reads no cert.
 fn tls_needs_bundle(config: &Config) -> bool {
-    global_proxy_tls(config).is_some()
-        || config
-            .services
-            .iter()
-            .any(|s| matches!(s.tls, TlsMode::Cert))
+    config.proxy_enabled()
+        && (config.proxy_tls().is_some()
+            || config
+                .services
+                .iter()
+                .any(|s| s.is_proxied() && matches!(s.tls, TlsMode::Cert)))
 }
 
 fn services_reference_secrets(config: &Config) -> bool {
@@ -1208,8 +1212,9 @@ services:
     /// break config parsing (`deny_unknown_fields`).
     #[test]
     fn tls_cert_hint_names_the_real_proxy_tls_fields() {
-        // No `domain:`, so the proxy is off and load does not reject it.
-        let config = Config::parse_str(
+        // Load rejects a routed `tls: cert` service with no cert, so
+        // the test drops the cert names after the parse.
+        let mut config = Config::parse_str(
             r#"
 deploy: { networks: [n] }
 hosts: [{ address: h1, user: deploy }]
@@ -1217,11 +1222,21 @@ services:
   - name: api
     image: img
     tag: t
+    domain: api.example.com
     tls: cert
+    tls_cert_secret: API_CERT
+    tls_key_secret: API_KEY
     run: { port: 8080 }
 "#,
         )
         .unwrap();
+        let api = config
+            .services
+            .iter_mut()
+            .find(|s| s.name == "api")
+            .unwrap();
+        api.tls_cert_secret = None;
+        api.tls_key_secret = None;
         let bundle = crate::base::bundle::SecretsBundle::new(std::collections::BTreeMap::new());
         let fixes: Vec<String> = check_tls_cert_secrets(&config, Some(&bundle))
             .into_iter()
@@ -1404,6 +1419,62 @@ services:
         let findings = check_proxied_services(&config);
         assert!(
             !findings.iter().any(|f| f.title.contains("proxy.email")),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
+    /// Regression: a `tls: cert` service without `domain:`, or with the
+    /// proxy off, made doctor ask for the bundle. No Caddy config is
+    /// rendered for it, so the config deploys without a bundle.
+    #[test]
+    fn unrouted_tls_cert_services_do_not_need_the_bundle() {
+        let config = |proxy: &str, domain: &str| {
+            Config::parse_str(&format!(
+                r#"
+deploy: {{ networks: [n] }}
+hosts: [{{ address: h1, user: deploy }}]
+{proxy}
+services:
+  - name: api
+    image: img
+    tag: t
+    {domain}
+    tls: cert
+    tls_cert_secret: API_CERT
+    tls_key_secret: API_KEY
+    run: {{ port: 8080 }}
+"#
+            ))
+            .unwrap()
+        };
+        let no_domain = config("", "");
+        assert!(!tls_needs_bundle(&no_domain));
+        assert!(check_bundle_loaded(&no_domain, false, None).is_empty());
+
+        let proxy_off = config("proxy: { enabled: false }", "domain: api.example.com");
+        assert!(!tls_needs_bundle(&proxy_off));
+        assert!(check_bundle_loaded(&proxy_off, false, None).is_empty());
+
+        let routed = config("", "domain: api.example.com");
+        assert!(tls_needs_bundle(&routed));
+        assert_eq!(check_bundle_loaded(&routed, false, None).len(), 1);
+
+        // The proxy runs for `proxy.tls`, but the unrouted service
+        // needs no cert of its own in the bundle.
+        let global = config(
+            "proxy: { enabled: true, tls: { cert_secret: CF_CERT, key_secret: CF_KEY } }",
+            "",
+        );
+        let bundle = crate::base::bundle::SecretsBundle::new(
+            [("CF_CERT", "c"), ("CF_KEY", "k")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), zeroize::Zeroizing::new(v.to_string())))
+                .collect(),
+        );
+        let findings = check_tls_cert_secrets(&global, Some(&bundle));
+        assert!(
+            findings.iter().all(|f| f.severity != Severity::Error),
             "{:?}",
             titles(&findings)
         );
