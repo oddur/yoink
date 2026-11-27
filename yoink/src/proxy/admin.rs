@@ -46,6 +46,10 @@ pub enum AdminError {
     /// is not a config error.
     #[error("proxy admin API not reachable: {detail}")]
     AdminUnreachable { detail: String },
+    /// `caddy reload` did not finish within `timeout`. Not retried: a
+    /// second hang doubles the wait.
+    #[error("caddy reload in the proxy container did not finish within {timeout:?}")]
+    ReloadTimedOut { timeout: Duration },
     /// The route-count read-back after a successful `/load` failed.
     #[error("read back proxy routes: {detail}")]
     ReadBackFailed { detail: String },
@@ -72,6 +76,10 @@ impl AdminError {
         }
     }
 }
+
+/// Limit for one `caddy reload` exec, as for the HTTP push before it.
+/// The rendered config is small, so a reload that takes longer hangs.
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Pause before the second push. Long enough for a Caddy that is
 /// still starting to bind the admin port.
@@ -121,21 +129,24 @@ async fn push_once(
     };
 
     let body = serde_json::to_vec(config).expect("serde_json::Value always serializes");
-    let load = ops
-        .exec_with_stdin(
-            host,
-            container,
-            vec![
-                "caddy".into(),
-                "reload".into(),
-                "--config".into(),
-                "/dev/stdin".into(),
-                "--address".into(),
-                ADMIN_LISTEN.into(),
-            ],
-            body,
-        )
+    let reload = ops.exec_with_stdin(
+        host,
+        container,
+        vec![
+            "caddy".into(),
+            "reload".into(),
+            "--config".into(),
+            "/dev/stdin".into(),
+            "--address".into(),
+            ADMIN_LISTEN.into(),
+        ],
+        body,
+    );
+    let load = tokio::time::timeout(RELOAD_TIMEOUT, reload)
         .await
+        .map_err(|_| AdminError::ReloadTimedOut {
+            timeout: RELOAD_TIMEOUT,
+        })?
         .map_err(docker_err)?;
     if load.exit_code != 0 {
         // Caddy parser errors can echo a slice of the submitted JSON,
@@ -482,6 +493,22 @@ mod tests {
         ops.push_exec_with_stdin(Ok(exit(1, "", "Error: HTTP 400: unknown module")));
         let err = push_config(&host(), &ops, &config).await.unwrap_err();
         assert!(matches!(err, AdminError::LoadRejected { .. }), "got {err}");
+    }
+
+    /// The exec push had no time limit, so a hung `caddy reload` hung
+    /// `yoink up`. The old HTTP push stopped after 60 s.
+    #[tokio::test(start_paused = true)]
+    async fn push_stops_a_reload_that_hangs() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(0, "", "")));
+        ops.set_exec_with_stdin_delay(Duration::from_secs(3600));
+        let err = push_config(&host(), &ops, &config).await.unwrap_err();
+        assert!(
+            matches!(err, AdminError::ReloadTimedOut { timeout } if timeout == RELOAD_TIMEOUT),
+            "got {err}"
+        );
     }
 
     #[tokio::test]

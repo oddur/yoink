@@ -54,6 +54,9 @@ struct FakeState {
     healthcheck_tcp: VecDeque<Result<(), DockerError>>,
     exec_oneshot: VecDeque<Result<OneShotResult, DockerError>>,
     exec_with_stdin: VecDeque<Result<OneShotResult, DockerError>>,
+    /// How long `exec_with_stdin` waits before it answers. Lets a test
+    /// with paused time drive a caller timeout.
+    exec_with_stdin_delay: Option<std::time::Duration>,
     curl_in_netns: VecDeque<Result<OneShotResult, DockerError>>,
     fetch_logs: VecDeque<Result<Vec<String>, DockerError>>,
     one_shot: VecDeque<Result<OneShotResult, DockerError>>,
@@ -157,6 +160,9 @@ impl FakeDockerOps {
     }
     pub fn push_exec_with_stdin(&self, v: Result<OneShotResult, DockerError>) {
         self.lock().exec_with_stdin.push_back(v);
+    }
+    pub fn set_exec_with_stdin_delay(&self, d: std::time::Duration) {
+        self.lock().exec_with_stdin_delay = Some(d);
     }
     pub fn push_curl_in_netns(&self, v: Result<OneShotResult, DockerError>) {
         self.lock().curl_in_netns.push_back(v);
@@ -444,14 +450,23 @@ impl DockerOps for FakeDockerOps {
         cmd: Vec<String>,
         stdin: Vec<u8>,
     ) -> Result<OneShotResult, DockerError> {
-        let mut s = self.lock();
-        s.calls.push(RecordedCall::ExecWithStdin(
-            host.clone(),
-            container.into(),
-            cmd,
-            stdin,
-        ));
-        pop(&mut s.exec_with_stdin, "exec_with_stdin")
+        let (result, delay) = {
+            let mut s = self.lock();
+            s.calls.push(RecordedCall::ExecWithStdin(
+                host.clone(),
+                container.into(),
+                cmd,
+                stdin,
+            ));
+            (
+                pop(&mut s.exec_with_stdin, "exec_with_stdin"),
+                s.exec_with_stdin_delay,
+            )
+        };
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
+        result
     }
     async fn exec_interactive(
         &self,

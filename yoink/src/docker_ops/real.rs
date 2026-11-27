@@ -29,6 +29,10 @@ use crate::base::host::Host;
 // ───── RealDockerOps ────────────────────────────────────────────────────
 
 const HEALTHCHECK_CURL_IMAGE: &str = "curlimages/curl:8.10.1";
+/// Limit for one `curl_in_netns` probe container, from create to
+/// remove. Its curl has `--max-time 5`, so this leaves time for the
+/// container start and the docker API round trips.
+const NETNS_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Tiny image with busybox `nc -z` for TCP-only probes — curl's
 /// `--connect-only` is HTTP-scheme-bound and `telnet://` reads
 /// after connect, both of which break against servers that don't
@@ -1093,7 +1097,18 @@ impl DockerOps for RealDockerOps {
             }),
             ..Default::default()
         };
-        self.run_one_shot(host, &probe_name, body).await
+        // curl stops after `--max-time`, but the create, start and wait
+        // around it have no limit of their own. On a timeout the probe
+        // future is dropped, so remove the probe here.
+        let run = self.run_one_shot(host, &probe_name, body);
+        if let Ok(r) = tokio::time::timeout(NETNS_PROBE_TIMEOUT, run).await {
+            return r;
+        }
+        let _ = self.force_remove_container(host, &probe_name).await;
+        Err(DockerError::Invalid(format!(
+            "probe in the network namespace of {container} did not finish within \
+             {NETNS_PROBE_TIMEOUT:?}"
+        )))
     }
 
     async fn exec_with_stdin(
