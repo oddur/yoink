@@ -1975,21 +1975,16 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // tokio heartbeat task touches it every few seconds. If yoink
     // dies, heartbeats stop, sentinel self-exits within ~30s, and
     // the next deploy reaps it as an orphan. See `deploy/lock.rs`.
-    let acquire_futs = config.fleet().into_iter().map(|host| {
-        let ops = ops.clone();
-        async move {
-            let lock = HostLock::acquire(&*ops, host.clone())
-                .await
-                .with_context(|| format!(
-                    "could not acquire the deploy lock on {}: another `yoink up` may be in progress, or the lock step itself failed (cause below). \
-                     If you're sure no operator is deploying, the sentinel will self-exit within ~30s; \
-                     retry then. To force-clear: `docker rm -f yoink-deploy-lock` on the host.",
-                    host.address,
-                ))?;
-            anyhow::Ok(lock)
-        }
-    });
-    let mut locks: Vec<HostLock> = futures_util::future::try_join_all(acquire_futs).await?;
+    let mut locks: Vec<HostLock> = yoink::deploy::lock::acquire_all(&*ops, config.fleet())
+        .await
+        .map_err(|(host, e)| {
+            anyhow::Error::new(e).context(format!(
+                "could not acquire the deploy lock on {}: another `yoink up` may be in progress, or the lock step itself failed (cause below). \
+                 If you're sure no operator is deploying, the sentinel will self-exit within ~30s; \
+                 retry then. To force-clear: `docker rm -f yoink-deploy-lock` on the host.",
+                host.address,
+            ))
+        })?;
     for lock in &mut locks {
         lock.spawn_heartbeat(ops.clone());
     }

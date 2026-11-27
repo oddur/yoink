@@ -228,6 +228,40 @@ impl HostLock {
     }
 }
 
+/// Acquire the lock on every host in `hosts`, concurrently. All
+/// attempts run to completion. When one fails, the locks acquired on
+/// the other hosts are released before the error returns, so an
+/// immediate retry does not find them still held. The error carries
+/// the host that failed.
+pub async fn acquire_all<O>(ops: &O, hosts: Vec<Host>) -> Result<Vec<HostLock>, (Host, LockError)>
+where
+    O: DockerOps + ?Sized,
+{
+    let futs = hosts.into_iter().map(|host| async move {
+        let result = HostLock::acquire(ops, host.clone()).await;
+        (host, result)
+    });
+    let mut locks = Vec::new();
+    let mut first_error = None;
+    for (host, result) in futures_util::future::join_all(futs).await {
+        match result {
+            Ok(lock) => locks.push(lock),
+            Err(e) => {
+                first_error.get_or_insert((host, e));
+            }
+        }
+    }
+    match first_error {
+        None => Ok(locks),
+        Some(err) => {
+            for lock in locks {
+                lock.release(ops).await;
+            }
+            Err(err)
+        }
+    }
+}
+
 impl Drop for HostLock {
     fn drop(&mut self) {
         if let Some(task) = self.heartbeat.take() {
@@ -379,6 +413,35 @@ mod tests {
             ]
         );
         lock.release(&ops).await;
+    }
+
+    /// Regression: when the acquire failed on one host, the locks
+    /// already acquired on the other hosts were dropped without
+    /// `release()`. They stayed held for ~30s and a retry failed.
+    #[tokio::test]
+    async fn acquire_all_releases_acquired_locks_when_one_host_fails() {
+        let ops = FakeDockerOps::new();
+        ops.mark_image_present(LOCK_IMAGE_REPO, LOCK_IMAGE_TAG);
+        ops.push_create_container(Ok("abc123".into()));
+        ops.push_start_container(Ok(()));
+        ops.push_create_container(Err(daemon_error(500)));
+        ops.push_force_remove(Ok(()));
+        let other = Host {
+            user: "deploy".into(),
+            address: "10.0.0.2".into(),
+            port: None,
+        };
+
+        let (failed, _) = acquire_all(&ops, vec![host(), other.clone()])
+            .await
+            .err()
+            .expect("second host fails");
+
+        assert_eq!(failed, other);
+        assert_eq!(
+            removals(&ops),
+            vec![RecordedCall::ForceRemoveContainer(host(), "abc123".into())]
+        );
     }
 
     /// Operator B loses the create to operator A. B must bail and must

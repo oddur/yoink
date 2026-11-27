@@ -4078,8 +4078,6 @@ async fn reconcile_one(
     tag: String,
     tx: UnboundedSender<JobUpdate>,
 ) {
-    use crate::deploy::lock::HostLock;
-
     let send_event = |line: String| {
         let _ = tx.send(JobUpdate::Event(line));
     };
@@ -4095,13 +4093,9 @@ async fn reconcile_one(
     // Acquire one lock per configured host. Per-host parallel like
     // cmd_up; on any failure release whatever we already grabbed and
     // bail.
-    let acquire_futs = config.fleet().into_iter().map(|host| {
-        let ops = ops.clone();
-        async move { HostLock::acquire(&*ops, host.clone()).await }
-    });
-    let mut locks = match futures_util::future::try_join_all(acquire_futs).await {
+    let mut locks = match crate::deploy::lock::acquire_all(&*ops, config.fleet()).await {
         Ok(ls) => ls,
-        Err(e) => {
+        Err((_, e)) => {
             send_done(Err(format!("acquire deploy lock: {e}")));
             return;
         }
@@ -4148,8 +4142,6 @@ async fn reconcile_all(
     overrides: std::collections::BTreeMap<String, String>,
     tx: UnboundedSender<JobUpdate>,
 ) {
-    use crate::deploy::lock::HostLock;
-
     let send_event = |line: String| {
         let _ = tx.send(JobUpdate::Event(line));
     };
@@ -4162,13 +4154,9 @@ async fn reconcile_all(
         return;
     }
 
-    let acquire_futs = config.fleet().into_iter().map(|host| {
-        let ops = ops.clone();
-        async move { HostLock::acquire(&*ops, host.clone()).await }
-    });
-    let mut locks = match futures_util::future::try_join_all(acquire_futs).await {
+    let mut locks = match crate::deploy::lock::acquire_all(&*ops, config.fleet()).await {
         Ok(ls) => ls,
-        Err(e) => {
+        Err((_, e)) => {
             send_done(Err(format!("acquire deploy lock: {e}")));
             return;
         }
