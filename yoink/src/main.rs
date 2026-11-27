@@ -2012,6 +2012,56 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     let audit_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink> = host_audit.clone();
     let operator_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink> =
         std::sync::Arc::new(yoink::features::audit::OperatorAuditSink::new());
+    run_locked_up(
+        ops,
+        LockedUp {
+            config,
+            tag_overrides: &tag_overrides,
+            services_filter,
+            bundle: bundle.as_ref(),
+            prefetch: services_filter.is_none() && needs_pull && !no_registry,
+            rebuild_proxy: up.rebuild_proxy,
+            force,
+        },
+        locks,
+        audit_sink,
+        operator_sink,
+    )
+    .await
+}
+
+/// The part of one `yoink up` run that holds the host locks.
+struct LockedUp<'a> {
+    config: &'a Config,
+    tag_overrides: &'a std::collections::BTreeMap<String, String>,
+    services_filter: Option<&'a [String]>,
+    bundle: Option<&'a SecretsBundle>,
+    /// Pull the registry images on every host before the reconcile.
+    prefetch: bool,
+    rebuild_proxy: bool,
+    force: bool,
+}
+
+/// Emit the run-start events, prefetch, reconcile, then release
+/// `locks` and emit the run-end events. The run-end events go out on
+/// every path, also when the prefetch fails.
+#[allow(clippy::too_many_lines)] // single linear start → deploy → finish flow
+async fn run_locked_up(
+    ops: std::sync::Arc<dyn DockerOps>,
+    run: LockedUp<'_>,
+    locks: Vec<yoink::deploy::lock::HostLock>,
+    audit_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink>,
+    operator_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink>,
+) -> Result<()> {
+    let LockedUp {
+        config,
+        tag_overrides,
+        services_filter,
+        bundle,
+        prefetch,
+        rebuild_proxy,
+        force,
+    } = run;
     let run_ctx = yoink::features::audit::RunContext::new("up");
     let selected_service_names: Vec<String> = config
         .selected_services(services_filter)
@@ -2044,7 +2094,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     yoink::features::webhooks::dispatch_all(
         &config.webhooks,
         &started_ctx,
-        bundle.as_ref(),
+        bundle,
         &webhook_http,
         &operator_sink,
         &run_ctx,
@@ -2084,7 +2134,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         .iter()
         .filter_map(|s| s.tag.clone().map(|t| (s.name.clone(), t)))
         .collect();
-    for (k, v) in &tag_overrides {
+    for (k, v) in tag_overrides {
         tag_lookup.insert(k.clone(), v.clone());
     }
     let run_ctx_for_closure = run_ctx.clone();
@@ -2106,40 +2156,46 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // Skipped entirely when `--no-registry` is set (the operator chose
     // local-only mode) or when no service requires a pull (every
     // service has a `build:` block — already shipped above).
-    if services_filter.is_none() && needs_pull && !no_registry {
+    //
+    // A prefetch failure skips the reconcile but still takes the
+    // closing path below: locks released, LockReleased, RunFinished
+    // and the `run_failed` webhook.
+    let prefetch_result = if prefetch {
         let prefetch_cb: std::sync::Arc<dyn Fn(deploy::DeployEvent) + Send + Sync> =
             std::sync::Arc::new(|e| {
                 eprintln!("{}", output::format_deploy_event(None, &e));
             });
-        if let Err(e) = deploy::prefetch_images(
+        deploy::prefetch_images(
             ops.clone(),
             config,
-            &tag_overrides,
+            tag_overrides,
             services_filter,
-            bundle.as_ref(),
+            bundle,
             true,
-            up.rebuild_proxy,
+            rebuild_proxy,
             prefetch_cb,
         )
         .await
-        {
-            for lock in locks {
-                lock.release(&*ops).await;
-            }
-            return Err(e).context("prefetch images");
-        }
-    }
+    } else {
+        Ok(())
+    };
 
-    let reconcile_result = deploy::reconcile_with_options(
-        &*ops,
-        config,
-        &tag_overrides,
-        services_filter,
-        bundle.as_ref(),
-        deploy::ReconcileOptions { force },
-        &mut sink,
-    )
-    .await;
+    let (phase, reconcile_result) = match prefetch_result {
+        Err(e) => ("prefetch images", Err(e)),
+        Ok(()) => (
+            "reconcile",
+            deploy::reconcile_with_options(
+                &*ops,
+                config,
+                tag_overrides,
+                services_filter,
+                bundle,
+                deploy::ReconcileOptions { force },
+                &mut sink,
+            )
+            .await,
+        ),
+    };
 
     // Drop the synchronous closure (and its tx) so the drain task can
     // notice the channel is closed, drain pending events, and exit.
@@ -2192,7 +2248,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     yoink::features::webhooks::dispatch_all(
         &config.webhooks,
         &finished_ctx,
-        bundle.as_ref(),
+        bundle,
         &webhook_http,
         &operator_sink,
         &run_ctx,
@@ -2201,7 +2257,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     audit_sink.flush().await;
     operator_sink.flush().await;
 
-    let reports = reconcile_result.context("reconcile")?;
+    let reports = reconcile_result.context(phase)?;
     eprintln!("{}", output::format_deploy_summary(&reports));
     Ok(())
 }
@@ -7083,5 +7139,64 @@ services:
         assert!(!dir.path().join("hosts/prod.yaml").exists());
         // The same port given twice is fine.
         hosts_add(&config_path, "prod-eu-1:2200", Some(2200), "prod").unwrap();
+    }
+
+    /// A failed prefetch used to return before the run-end events. The
+    /// audit log then had a `RunStarted` with no `LockReleased` and no
+    /// `RunFinished`, and the `run_failed` webhook never fired.
+    #[tokio::test]
+    async fn up_prefetch_failure_still_emits_run_end_events() {
+        use yoink::docker_ops::{DockerError, FakeDockerOps};
+        use yoink::features::audit::{AuditEventKind, AuditSink, MemorySink};
+
+        let config = yoink::config::Config::parse_str(
+            "hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    image: img\n    tag: v1\n    run: {}\n",
+        )
+        .unwrap();
+        let fake = FakeDockerOps::new();
+        fake.push_pull_image(Err(DockerError::Invalid("pull denied".into())));
+        let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> = std::sync::Arc::new(fake);
+        let host_sink = std::sync::Arc::new(MemorySink::new());
+        let operator_sink = std::sync::Arc::new(MemorySink::new());
+        let tag_overrides = std::collections::BTreeMap::new();
+
+        let err = super::run_locked_up(
+            ops,
+            super::LockedUp {
+                config: &config,
+                tag_overrides: &tag_overrides,
+                services_filter: None,
+                bundle: None,
+                prefetch: true,
+                rebuild_proxy: false,
+                force: false,
+            },
+            Vec::new(),
+            host_sink.clone() as std::sync::Arc<dyn AuditSink>,
+            operator_sink.clone() as std::sync::Arc<dyn AuditSink>,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("prefetch images"),
+            "got {err:#}"
+        );
+        let host_events = host_sink.events().await;
+        assert!(
+            host_events
+                .iter()
+                .any(|e| e.host == "h1" && matches!(e.kind, AuditEventKind::LockReleased)),
+            "no LockReleased: {host_events:?}"
+        );
+        let operator_events = operator_sink.events().await;
+        assert!(
+            operator_events.iter().any(|e| matches!(
+                &e.kind,
+                AuditEventKind::RunFinished { ok: false, error: Some(msg), .. }
+                    if msg.contains("pull denied")
+            )),
+            "no failed RunFinished: {operator_events:?}"
+        );
     }
 }
