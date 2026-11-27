@@ -244,8 +244,8 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `domain` | string \| list of string | unset | One or more hostnames that the bundled proxy routes to this service. The field enables the proxy. Requires `run.port`. See the [proxy guide](/docs/explanation/proxy). |
 | `path_prefix` | string | unset | Matches this path glob in addition to `domain:`, so that many services can share a hostname. yoink puts routes with a path constraint before the catch-all routes. |
 | `tls` | enum | `auto` (when `domain:` set) | `auto` = ACME with Let's Encrypt. `off` = HTTP only. `cert` = inline cert from sealed secrets (with `tls_cert_secret:` and `tls_key_secret:`). |
-| `tls_cert_secret` | string | unset | Sealed-secret name that holds the PEM cert. Required when `tls: cert`. |
-| `tls_key_secret` | string | unset | Sealed-secret name that holds the PEM private key. Required when `tls: cert`. |
+| `tls_cert_secret` | string | unset | Sealed-secret name that holds the PEM cert. Required when `tls: cert` and `proxy.tls:` is unset. Without it, the service uses the cert of `proxy.tls:`. |
+| `tls_key_secret` | string | unset | Sealed-secret name that holds the PEM private key. Set it together with `tls_cert_secret`. |
 | `upstream_h2c` | bool | `false` | The proxy connects to the backend over HTTP/2 cleartext. Required for native gRPC backends (Tonic, grpc-go, grpc-java). |
 | `compression` | bool | `false` | Emits `encode gzip zstd`. Has no effect behind a CDN. |
 | `canonical_domain` | string | unset | One of the `domain:` entries. yoink sends a 308 redirect from every other entry to it (apex and www patterns). |

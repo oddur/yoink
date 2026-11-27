@@ -106,9 +106,10 @@ impl Config {
         }
 
         // Validation: any service using `tls: cert` must name both
-        // `tls_cert_secret` and `tls_key_secret` (or inherit from
-        // `proxy.tls`); reject early so the operator gets a config-time
-        // error rather than a deploy-time one.
+        // `tls_cert_secret` and `tls_key_secret`, or name neither and
+        // inherit the global `proxy.tls` cert; reject early so the
+        // operator gets a config-time error rather than a deploy-time one.
+        let has_global_cert = self.proxy_tls().is_some();
         for svc in &self.services {
             if svc.domain.is_some() && svc.run.port.is_none() {
                 return Err(ConfigError::Invalid(format!(
@@ -117,13 +118,17 @@ impl Config {
                     svc.name,
                 )));
             }
-            if matches!(svc.tls, TlsMode::Cert)
-                && (svc.tls_cert_secret.is_none() || svc.tls_key_secret.is_none())
-            {
+            let own_cert = (svc.tls_cert_secret.is_some(), svc.tls_key_secret.is_some());
+            let cert_ok = match own_cert {
+                (true, true) => true,
+                (false, false) => has_global_cert,
+                _ => false,
+            };
+            if matches!(svc.tls, TlsMode::Cert) && !cert_ok {
                 return Err(ConfigError::Invalid(format!(
                     "service {:?} sets `tls: cert` but is missing `tls_cert_secret` and/or \
                      `tls_key_secret` — both are required for the inline-cert path \
-                     (or set `proxy.tls.cert_secret` to inherit)",
+                     (or leave both unset and set `proxy.tls` to use the global cert)",
                     svc.name,
                 )));
             }

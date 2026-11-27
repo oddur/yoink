@@ -203,9 +203,12 @@ where
         }));
     }
 
+    // A `tls: cert` service without its own secrets uses the
+    // proxy-level cert above (validation allows that only when
+    // `proxy.tls` is set).
     let cert_services: Vec<&&ServiceConfig> = proxied
         .iter()
-        .filter(|s| matches!(s.tls, TlsMode::Cert))
+        .filter(|s| matches!(s.tls, TlsMode::Cert) && s.tls_cert_secret.is_some())
         .collect();
     if !cert_services.is_empty() {
         let bundle = bundle.ok_or_else(|| {
@@ -1059,6 +1062,71 @@ services:
         let json = render(&cfg, |_| vec![], Some(&SecretsBundle::new(values))).expect("render");
         assert!(json["apps"]["tls"]["automation"].is_null());
         assert!(json["apps"]["tls"]["certificates"]["load_pem"][0].is_object());
+    }
+
+    /// Regression: `tls: cert` with only the global `proxy.tls` cert
+    /// was rejected at load, with a hint to set `proxy.tls.cert_secret`,
+    /// which was already set. The service now uses the global cert.
+    #[test]
+    fn tls_cert_service_inherits_proxy_tls_cert() {
+        let yaml = r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+secrets: { provider: age, recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy] }
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    tls: cert
+    run: { port: 8080 }
+"#;
+        let cfg = parse(yaml);
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            "CF_CERT".to_string(),
+            zeroize::Zeroizing::new("cert".to_string()),
+        );
+        values.insert(
+            "CF_KEY".to_string(),
+            zeroize::Zeroizing::new("key".to_string()),
+        );
+        let json = render(&cfg, |_| vec![], Some(&SecretsBundle::new(values))).expect("render");
+        let pem = json["apps"]["tls"]["certificates"]["load_pem"]
+            .as_array()
+            .unwrap();
+        assert_eq!(pem.len(), 1);
+        assert_eq!(pem[0]["certificate"], "cert");
+    }
+
+    /// Without `proxy.tls`, `tls: cert` still needs both secrets on the
+    /// service, and one secret alone is still rejected.
+    #[test]
+    fn tls_cert_service_without_global_cert_needs_both_secrets() {
+        let base = r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+PROXY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    tls: cert
+OWN
+    run: { port: 8080 }
+"#;
+        let global = "proxy:\n  tls:\n    cert_secret: CF_CERT\n    key_secret: CF_KEY";
+        let one = "    tls_cert_secret: API_CERT";
+        for (proxy, own) in [("", ""), ("", one), (global, one)] {
+            let yaml = base.replace("PROXY", proxy).replace("OWN", own);
+            let err = Config::parse_str(&yaml).unwrap_err().to_string();
+            assert!(err.contains("`tls: cert`"), "{err}");
+        }
     }
 
     #[test]
