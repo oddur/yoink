@@ -2459,6 +2459,22 @@ async fn cmd_status(config: &Config, json: bool) -> Result<()> {
     } else {
         println!("{}", output::format_status_table(&report));
     }
+    report_unreachable_hosts(&report)
+}
+
+/// Print each host that did not answer to stderr, then fail so the
+/// command exits non-zero. The reachable hosts are already printed.
+fn report_unreachable_hosts(report: &StatusReport) -> Result<()> {
+    for f in &report.failed {
+        eprintln!("{}: {}", f.host, f.error);
+    }
+    if !report.failed.is_empty() {
+        anyhow::bail!(
+            "{} of {} host(s) did not answer",
+            report.failed.len(),
+            report.failed.len() + report.hosts.len()
+        );
+    }
     Ok(())
 }
 
@@ -4143,7 +4159,7 @@ async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<(
             }
         }
     }
-    Ok(())
+    report_unreachable_hosts(&report)
 }
 
 async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> {

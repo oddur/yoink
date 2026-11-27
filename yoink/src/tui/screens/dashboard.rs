@@ -445,10 +445,19 @@ pub async fn fetch_owned(ops: Arc<dyn DockerOps>, config: Arc<Config>) -> Dashbo
 /// twice on every fast tick.
 async fn fetch(ops: &dyn DockerOps, config: &Config) -> DashboardRefresh {
     match StatusReport::collect(ops, config).await {
-        Ok(r) => DashboardRefresh {
-            report: Some(r),
-            error: None,
-        },
+        Ok(r) => {
+            let error = (!r.failed.is_empty()).then(|| {
+                r.failed
+                    .iter()
+                    .map(|f| format!("{}: {}", f.host, f.error))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            });
+            DashboardRefresh {
+                report: Some(r),
+                error,
+            }
+        }
         Err(e) => DashboardRefresh {
             report: None,
             error: Some(format!("{e:#}")),
@@ -513,5 +522,38 @@ services:
         state.refresh(&ops, &config()).await;
         assert!(state.last_error.is_some());
         assert!(state.report.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_shows_reachable_hosts_and_reports_unreachable_one() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+  - { address: host-b, user: deploy }
+services:
+  - name: app-a
+    image: x
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![running_container()]));
+        ops.push_list_containers(Err(crate::docker_ops::DockerError::SshProbe {
+            host: "host-b".into(),
+            detail: "connection refused".into(),
+        }));
+        let mut state = DashboardState::new();
+        state.refresh(&ops, &cfg).await;
+        let report = state.report.as_ref().expect("reachable host is shown");
+        assert_eq!(report.hosts.len(), 1);
+        assert_eq!(report.hosts[0].host, "host-a");
+        let err = state
+            .last_error
+            .as_deref()
+            .expect("unreachable host is reported");
+        assert!(err.contains("host-b"), "{err}");
     }
 }

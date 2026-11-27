@@ -244,6 +244,7 @@ mod tests {
                     containers: vec![],
                 },
             ],
+            failed: Vec::new(),
         }
     }
 

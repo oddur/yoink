@@ -3587,6 +3587,9 @@ impl App {
                 return;
             }
         };
+        for f in &report.failed {
+            self.push_toast(format!("✗ log collect {}: {}", f.host, f.error));
+        }
         for host_status in report.hosts {
             for container in host_status.containers.iter().filter(|c| c.is_running()) {
                 let host = self.config.host_or_bare(&host_status.host);
