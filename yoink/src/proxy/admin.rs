@@ -291,12 +291,14 @@ fn redact_pem_blocks(body: &str) -> String {
             out.push_str(REDACTED_PEM);
             return out;
         };
-        let tail = &after_begin[end_marker_pos..];
-        let after_end_label = tail
+        // Search for the closing `-----` after the `-----END ` prefix:
+        // the prefix itself starts with `-----`.
+        let label_start = end_marker_pos + "-----END ".len();
+        let block_end = after_begin[label_start..]
             .find("-----")
-            .map_or(after_begin.len(), |idx| idx + "-----".len());
+            .map_or(after_begin.len(), |idx| label_start + idx + "-----".len());
         out.push_str(REDACTED_PEM);
-        rest = &after_begin[end_marker_pos + after_end_label..];
+        rest = &after_begin[block_end..];
     }
 }
 
@@ -332,6 +334,19 @@ mod tests {
         assert!(out.contains("<redacted PEM>"));
         assert!(!out.contains("ABCDEF"));
         assert!(out.contains("more context"));
+    }
+
+    /// The search for the closing `-----` matched the `-----` of the
+    /// `-----END ` prefix itself, so `END CERTIFICATE-----` stayed in
+    /// the output.
+    #[test]
+    fn redact_removes_the_end_line() {
+        let body = "a -----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE----- b \
+                    -----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY----- c";
+        assert_eq!(
+            redact_pem_blocks(body),
+            "a <redacted PEM> b <redacted PEM> c"
+        );
     }
 
     #[test]
