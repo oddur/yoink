@@ -785,9 +785,15 @@ pub async fn deploy_service(
     // `docker start` away from running.
     let mut prepared: Vec<HostPrep> = Vec::with_capacity(hosts.len());
     for host in hosts {
-        let prep =
-            prepare_one_host(ops, config, service, tag, secrets, host, force, on_event).await?;
-        prepared.push(prep);
+        match prepare_one_host(ops, config, service, tag, secrets, host, force, on_event).await {
+            Ok(prep) => prepared.push(prep),
+            Err(e) => {
+                // Do not leave the replicas created on earlier hosts
+                // behind in `created` state.
+                cleanup_prepared_replicas(ops, &prepared).await;
+                return Err(e);
+            }
+        }
     }
 
     // ── Phase 2: HOOKS ────────────────────────────────────────────
@@ -822,9 +828,19 @@ pub async fn deploy_service(
     // ── Phase 3: FINALIZE ─────────────────────────────────────────
     // Start each pre-created container, healthcheck, swap out old.
     let mut host_results = Vec::with_capacity(prepared.len());
-    for prep in prepared {
-        let result = finalize_one_host(ops, config, service, prep, secrets, on_event).await?;
-        host_results.push(result);
+    let mut pending = prepared.into_iter();
+    while let Some(prep) = pending.next() {
+        match finalize_one_host(ops, config, service, prep, secrets, on_event).await {
+            Ok(result) => host_results.push(result),
+            Err(e) => {
+                // `finalize_one_host` unwinds its own host. The hosts
+                // not finalized yet still hold this attempt's replicas
+                // in `created` state; remove them too.
+                let rest: Vec<HostPrep> = pending.collect();
+                cleanup_prepared_replicas(ops, &rest).await;
+                return Err(e);
+            }
+        }
     }
     Ok(ServiceDeployReport {
         service: service.name.clone(),
@@ -2741,6 +2757,99 @@ services:
             )),
             "the serving generation must not be stopped or removed: {calls:?}"
         );
+    }
+
+    fn config_two_hosts() -> Config {
+        Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+  - { address: host-b, user: deploy }
+services:
+  - name: app-a
+    image: registry.example.com/app-a
+    tag: latest
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Script a successful prepare (pull, list, remove-by-name, create)
+    /// for one host.
+    fn push_prepare_ok(ops: &FakeDockerOps) {
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![]));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+    }
+
+    async fn deploy_two_hosts(ops: &FakeDockerOps) -> DeployError {
+        let cfg = config_two_hosts();
+        let mut sink = |_e: DeployEvent| {};
+        deploy_service(
+            ops,
+            &cfg,
+            &cfg.services[0],
+            "v2",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err()
+    }
+
+    /// Hosts whose replica was force-removed after `after` calls.
+    fn hosts_removed_from(ops: &FakeDockerOps, after: usize) -> Vec<String> {
+        ops.calls()[after..]
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRemoveContainer(h, _) => Some(h.address.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression: prepare failed on host-b and the replica already
+    /// created on host-a stayed behind in `created` state.
+    #[tokio::test(start_paused = true)]
+    async fn prepare_failure_on_later_host_removes_earlier_host_replicas() {
+        let ops = FakeDockerOps::new();
+        push_prepare_ok(&ops);
+        ops.push_pull_image(Err(DockerError::Invalid("pull failed".into())));
+        let _ = deploy_two_hosts(&ops).await;
+
+        let calls = ops.calls();
+        let created = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::CreateContainer(..)))
+            .expect("host-a replica created");
+        assert_eq!(
+            hosts_removed_from(&ops, created),
+            vec!["host-a".to_string()]
+        );
+    }
+
+    /// Regression: finalize failed on host-a and the replica created on
+    /// host-b, not finalized yet, stayed behind in `created` state.
+    #[tokio::test(start_paused = true)]
+    async fn finalize_failure_removes_replicas_of_hosts_not_finalized() {
+        let ops = FakeDockerOps::new();
+        push_prepare_ok(&ops);
+        push_prepare_ok(&ops);
+        ops.push_start_container(Err(DockerError::Invalid("start failed".into())));
+        let _ = deploy_two_hosts(&ops).await;
+
+        let calls = ops.calls();
+        let start = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::StartContainer(..)))
+            .expect("a start was attempted");
+        let mut removed = hosts_removed_from(&ops, start);
+        removed.sort();
+        assert_eq!(removed, vec!["host-a".to_string(), "host-b".to_string()]);
     }
 
     /// Replica 0 passes, replica 1 fails. Replica 0 must not survive:
