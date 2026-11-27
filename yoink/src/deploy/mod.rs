@@ -1193,8 +1193,10 @@ async fn finalize_one_host(
         // proxy container itself is the exception: its predecessor
         // is already stopped (it publishes host ports) and Caddy
         // runs with `--resume`, so the new container is serving
-        // the autosaved config. Removing it would turn a rejected
-        // config push into a full outage.
+        // the autosaved config. (An autosave with a wildcard admin
+        // address from an older yoink is not resumed; then the
+        // proxy has no routes until a push succeeds.) Removing it
+        // would turn a rejected config push into a full outage.
         if !is_proxy {
             remove_attempt_replicas(ops, &host, &replicas).await;
         }

@@ -16,6 +16,8 @@ use crate::base::run_args;
 
 mod proxy;
 
+#[cfg(test)]
+pub(crate) use proxy::resumable_autosave_prefix;
 pub use proxy::{ADMIN_LISTEN, ADMIN_NETWORK, ADMIN_PORT, INGRESS_NETWORK, PROXY_SERVICE_NAME};
 
 #[derive(Debug, Error)]

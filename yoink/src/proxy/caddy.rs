@@ -1422,5 +1422,41 @@ services:
             json["admin"],
             serde_json::json!({ "listen": "127.0.0.1:2019" })
         );
+        // The proxy start script resumes an autosave only when it
+        // starts with this prefix. Caddy writes the autosave as compact
+        // JSON with sorted keys, so the autosave of this push must
+        // start with it.
+        assert!(
+            sorted_compact_json(&json).starts_with(&crate::config::resumable_autosave_prefix()),
+            "got {}",
+            sorted_compact_json(&json)
+        );
+    }
+
+    /// Compact JSON with the keys of each object in sorted order, as
+    /// Go's `json.Marshal` of a map writes it.
+    fn sorted_compact_json(v: &Value) -> String {
+        match v {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let fields: Vec<String> = keys
+                    .into_iter()
+                    .map(|k| {
+                        format!(
+                            "{}:{}",
+                            Value::String(k.clone()),
+                            sorted_compact_json(&map[k])
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", fields.join(","))
+            }
+            Value::Array(items) => {
+                let items: Vec<String> = items.iter().map(sorted_compact_json).collect();
+                format!("[{}]", items.join(","))
+            }
+            other => other.to_string(),
+        }
     }
 }

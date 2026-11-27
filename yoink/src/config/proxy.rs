@@ -443,7 +443,9 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // the last-pushed routing table instead of the empty
             // admin-only bootstrap, even before any operator runs
             // `yoink up`. On a fresh proxy (no autosave yet) the
-            // bootstrap takes effect as before.
+            // bootstrap takes effect as before. The script resumes
+            // only an autosave with the loopback admin block: see
+            // `proxy_start_script`.
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
             cmd: vec![proxy_start_script()],
             // Yoink's `cap_drop: [ALL]` default would block Caddy
@@ -477,13 +479,41 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
 /// gets the SIGTERM of `docker stop`. With a pipeline (`echo … | exec
 /// caddy …`), the shell forks for each side and stays PID 1, and the
 /// shell does not forward the signal. A short here-document needs no
-/// fork. The script uses only `sh` and `caddy`.
+/// fork. The script uses only `sh` builtins and `caddy`.
+///
+/// `caddy run --resume` ignores the bootstrap when an autosave exists.
+/// An autosave that an older yoink pushed has a wildcard admin address,
+/// so a resume of it opens the admin API to every container on
+/// `yoink-ingress`. Thus the script adds `--resume` only when the
+/// autosave starts with [`resumable_autosave_prefix`]. Caddy writes the
+/// autosave as compact JSON with sorted keys, so a push from this yoink
+/// starts with that prefix (`admin` sorts first). Any other autosave is
+/// not resumed. Caddy starts with the bootstrap and no routes, and the
+/// push of the same `yoink up` adds the routes and replaces the
+/// autosave.
 fn proxy_start_script() -> String {
+    let prefix = resumable_autosave_prefix();
     format!(
-        "exec caddy run --config /dev/stdin --resume <<'EOF'\n\
+        "head=\n\
+         if [ -f {CADDY_AUTOSAVE} ]; then IFS= read -r head < {CADDY_AUTOSAVE} || :; fi\n\
+         case $head in\n\
+         '{prefix}'*) set -- --resume ;;\n\
+         *) set -- ;;\n\
+         esac\n\
+         exec caddy run --config /dev/stdin \"$@\" <<'EOF'\n\
          {{\"admin\":{{\"listen\":\"{ADMIN_LISTEN}\"}}}}\n\
          EOF\n"
     )
+}
+
+/// Path of the Caddy autosave in the proxy container, on the
+/// `yoink_caddy_config` volume.
+const CADDY_AUTOSAVE: &str = "/config/caddy/autosave.json";
+
+/// Start of an autosave whose admin block is the loopback block that
+/// yoink pushes, and nothing more.
+pub(crate) fn resumable_autosave_prefix() -> String {
+    format!("{{\"admin\":{{\"listen\":\"{ADMIN_LISTEN}\"}},")
 }
 
 /// JSON shapes accepted by `validate_json_shape`.
@@ -765,9 +795,14 @@ services:
     /// `PATH`. The stub prints its parent PID, its arguments and its
     /// stdin.
     #[cfg(unix)]
-    fn run_start_script(script: &str) -> String {
+    fn run_start_script(script: &str, autosave: Option<&str>) -> String {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
+        let autosave_path = dir.path().join("autosave.json");
+        if let Some(body) = autosave {
+            std::fs::write(&autosave_path, body).unwrap();
+        }
+        let script = script.replace(CADDY_AUTOSAVE, &autosave_path.display().to_string());
         let stub = dir.path().join("caddy");
         std::fs::write(&stub, "#!/bin/sh\necho \"ppid=$PPID args=$*\"\ncat\n").unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -778,7 +813,7 @@ services:
         );
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(script)
+            .arg(&script)
             .env("PATH", path)
             .output()
             .unwrap();
@@ -793,20 +828,51 @@ services:
     #[cfg(unix)]
     #[test]
     fn the_start_script_execs_caddy_with_the_bootstrap_on_stdin() {
-        let out = run_start_script(&proxy_start_script());
+        let out = run_start_script(&proxy_start_script(), None);
         let mut lines = out.lines();
         assert_eq!(
             lines.next().unwrap(),
-            format!(
-                "ppid={} args=run --config /dev/stdin --resume",
-                std::process::id()
-            )
+            format!("ppid={} args=run --config /dev/stdin", std::process::id())
         );
         assert_eq!(
             lines.next().unwrap(),
             r#"{"admin":{"listen":"127.0.0.1:2019"}}"#
         );
         assert_eq!(lines.next(), None);
+    }
+
+    /// `caddy run --resume` ignores the bootstrap when an autosave
+    /// exists. An autosave from an older yoink has a wildcard admin
+    /// address, and the upgraded proxy resumed it, so the admin API
+    /// stayed open to the ingress network until a push succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn the_start_script_resumes_only_an_autosave_with_the_loopback_admin() {
+        let args = |autosave: &str| {
+            let out = run_start_script(&proxy_start_script(), Some(autosave));
+            out.lines()
+                .next()
+                .unwrap()
+                .split_once(" args=")
+                .unwrap()
+                .1
+                .to_string()
+        };
+        let fresh = "run --config /dev/stdin";
+        let resume = "run --config /dev/stdin --resume";
+        assert_eq!(
+            args(r#"{"admin":{"listen":"127.0.0.1:2019"},"apps":{"http":{}}}"#),
+            resume
+        );
+        for not_resumed in [
+            r#"{"admin":{"listen":"0.0.0.0:2019","origins":[]},"apps":{}}"#,
+            r#"{"admin":{"listen":":2019"},"apps":{}}"#,
+            r#"{"admin":{"listen":"127.0.0.1:2019","remote":{"listen":":2021"}},"apps":{}}"#,
+            r#"{"apps":{"http":{}}}"#,
+            "",
+        ] {
+            assert_eq!(args(not_resumed), fresh, "autosave {not_resumed:?}");
+        }
     }
 
     #[test]
