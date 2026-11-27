@@ -94,7 +94,7 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// container loopback, so the first push to it also works. That push
 /// carries the loopback-only admin block and moves the proxy onto it.
 ///
-/// A transient failure ([`AdminError::is_transient`]) gets one more
+/// A transient failure (see `AdminError::is_transient`) gets one more
 /// push. That is safe even when the first reload ran: `caddy reload`
 /// with the same config is idempotent. A Caddy error does not retry.
 pub async fn push_config(

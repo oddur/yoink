@@ -916,8 +916,8 @@ pub trait DockerOps: Send + Sync {
 /// `parse_inspect` (and `ContainerInfo`'s port rendering) format each
 /// port-bindings entry as `"<host_port>:<container_port>/<proto>"`.
 /// Find the entry whose container port matches `wanted` and return
-/// the host port. Used by both the unregistry transport and the
-/// proxy admin client to look up an ephemeral published port.
+/// the host port. The unregistry transport uses it to look up the
+/// ephemeral published port of its sidecar.
 #[must_use]
 pub fn parse_published_port(entries: &[String], wanted: u16) -> Option<u16> {
     let suffix = format!(":{wanted}/");

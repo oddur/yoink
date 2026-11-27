@@ -1,7 +1,14 @@
-//! HTTP healthcheck polling. Issues `DockerOps::healthcheck` (a one-shot
-//! curl container against the container's name on the shared network)
-//! until it returns 200 or the budget runs out. Backoff matches Kamal's
-//! poller: `sleep min(attempt, time_left)`.
+//! Healthcheck polling for the deploy gate. Three probes, each a
+//! one-shot container:
+//! - [`poll`]: HTTP, `DockerOps::healthcheck` (curl against the
+//!   container's name on a shared network) until it returns 200.
+//! - [`poll_tcp`]: TCP connect, `DockerOps::healthcheck_tcp`.
+//! - [`poll_in_netns`]: HTTP from a curl container in the network
+//!   namespace of the target, for the proxy admin API, which listens on
+//!   the container loopback only.
+//!
+//! Each polls until healthy or the budget runs out. Backoff matches
+//! Kamal's poller: `sleep min(attempt, time_left)`.
 
 use std::time::Duration;
 

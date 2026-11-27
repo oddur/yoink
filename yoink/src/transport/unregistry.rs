@@ -49,8 +49,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// Short on purpose — we expect a fast 200 once the sidecar is up.
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Backoff between readiness probes while the sidecar comes up.
-/// Same cadence as the proxy admin probe so async cancellation latency
-/// is uniform across yoink's network paths.
+/// Short, so a cancelled run stops waiting soon.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Error)]
