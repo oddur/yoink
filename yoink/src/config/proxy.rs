@@ -29,7 +29,8 @@ pub const ADMIN_PORT: u16 = 2019;
 
 /// Listen address of the Caddy admin API: the loopback interface of
 /// the proxy container, so no other container can reach it. yoink
-/// reaches it with `docker exec` into the proxy container.
+/// pushes with `docker exec` into the proxy container, and probes it
+/// from a curl container in the network namespace of the proxy.
 pub const ADMIN_LISTEN: &str = "127.0.0.1:2019";
 
 impl Config {
@@ -394,8 +395,9 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         hsts: false, // proxy itself doesn't serve TLS; this field is irrelevant
         run: ServiceRun {
             // Healthcheck probes Caddy's admin endpoint (`/config/`)
-            // on :2019 with `docker exec` inside the proxy container
-            // (the admin API listens on loopback only). Eliminates the
+            // on :2019 from a curl container in the network namespace
+            // of the proxy (the admin API listens on loopback only).
+            // Eliminates the
             // race where yoink-proxy is
             // "started" per docker but Caddy's HTTP server hasn't
             // bound yet — without this gate, the first /load can
@@ -404,7 +406,8 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             healthcheck_path: Some("/config/".to_string()),
             // Caddy serves :80 + :443 on the host. The admin API on
             // :2019 is not published: it listens on the loopback of
-            // the container, and yoink reaches it with `docker exec`.
+            // the container, and yoink reaches it with `docker exec`
+            // and with probes in the network namespace of the proxy.
             //
             // `proxy.bind:` (when set) prepends the bind address to
             // :80/:443 so the proxy is reachable only on that
@@ -429,7 +432,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // rewrite the proxy config, because the admin API has no
             // authentication. Caddy's default origin check accepts
             // the loopback Host headers that `caddy reload` and
-            // `wget` send. The actual routes are pushed via `/load`
+            // the curl probe send. The actual routes are pushed via `/load`
             // immediately after the container is healthy.
             //
             // `--resume` makes Caddy fall back to its autosaved

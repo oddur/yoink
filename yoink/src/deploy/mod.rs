@@ -1908,16 +1908,13 @@ async fn wait_until_healthy(
     let is_proxy = matches!(service.kind, Some(crate::config::ServiceKind::Proxy));
     let result = match service.run.healthcheck_path.as_deref() {
         // The Caddy admin API listens on the loopback of the proxy
-        // container only, so no network probe reaches it. Probe it
-        // from inside the container instead.
+        // container only, so no probe on a docker network reaches it.
+        // Probe it from a curl container in the network namespace of
+        // the proxy instead.
         Some(path) if is_proxy => {
-            let cmd = [
-                "wget".to_string(),
-                "--spider".to_string(),
-                "--quiet".to_string(),
-                format!("http://127.0.0.1:{port}{path}"),
-            ];
-            healthcheck::poll_exec(ops, host, new_name, &cmd, service.run.healthcheck_timeout).await
+            let url = format!("http://127.0.0.1:{port}{path}");
+            healthcheck::poll_in_netns(ops, host, new_name, &url, service.run.healthcheck_timeout)
+                .await
         }
         Some(path) => {
             healthcheck::poll(
@@ -4618,15 +4615,17 @@ services:
     /// container on `yoink-ingress`. That only worked because the admin
     /// API listened on every interface, which let any routed service
     /// reach it. The admin API is now loopback-only, so the gate runs
-    /// `wget` in the proxy container instead.
+    /// curl in a probe container that shares the network namespace of
+    /// the proxy. It does not exec in the proxy, so the proxy image
+    /// needs no `wget`.
     #[tokio::test]
-    async fn proxy_healthcheck_runs_inside_the_proxy_container() {
+    async fn proxy_healthcheck_probes_from_the_proxy_network_namespace() {
         let cfg = config_proxied_service();
         let proxy = cfg.service(crate::config::PROXY_SERVICE_NAME).unwrap();
         let ops = FakeDockerOps::new();
-        ops.push_exec_oneshot(Ok(crate::docker_ops::OneShotResult {
+        ops.push_curl_in_netns(Ok(crate::docker_ops::OneShotResult {
             exit_code: 0,
-            stdout: String::new(),
+            stdout: "200".into(),
             stderr: String::new(),
         }));
         let host = Host {
@@ -4642,17 +4641,19 @@ services:
         assert!(
             calls.iter().any(|c| matches!(
                 c,
-                RecordedCall::ExecOneshot(_, name, cmd)
+                RecordedCall::CurlInNetns(_, name, args)
                     if name == "yoink-proxy-new"
-                        && cmd.last().map(String::as_str)
+                        && args.last().map(String::as_str)
                             == Some("http://127.0.0.1:2019/config/")
+                        && args.windows(2).any(|w| w == ["--max-time", "5"])
             )),
             "got {calls:?}"
         );
         assert!(
-            !calls
-                .iter()
-                .any(|c| matches!(c, RecordedCall::Healthcheck(..))),
+            !calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::Healthcheck(..) | RecordedCall::ExecOneshot(..)
+            )),
             "got {calls:?}"
         );
     }

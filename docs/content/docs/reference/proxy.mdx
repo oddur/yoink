@@ -42,7 +42,7 @@ Chains that run on every request (CrowdSec, Coraza, fleet-wide rate limit) go in
 |---|---|---|---|
 | `enabled` | bool | implicit when any service has `domain:` | |
 | `email` | string | none | Registration email for Let's Encrypt. **Required when any service uses `tls: auto`.** Not used when `proxy.tls:` is set. |
-| `image` | string | `caddy:2` | Your own Caddy image, pulled from a registry. Mutually exclusive with `xcaddy:`. |
+| `image` | string | `caddy:2` | Your own Caddy image, pulled from a registry. The image must contain `caddy` and `sh`. Mutually exclusive with `xcaddy:`. |
 | `xcaddy` | block | none | Builds a custom Caddy on each host with [`xcaddy`](https://github.com/caddyserver/xcaddy). Mutually exclusive with `image:`. See the [`xcaddy:` block](#proxyxcaddy-block-caddy-plugins-without-a-registry). |
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. It persists across proxy restarts. |
 | `bind` | string | none (all interfaces) | Host IP that `:80` and `:443` bind to, for example a Tailscale IP. The admin port stays on `127.0.0.1` in all cases. |
@@ -157,7 +157,7 @@ On the next `yoink up`, each proxy host runs a two-stage xcaddy build (`caddy:2-
 |---|---|---|---|
 | `plugins` | list of strings | required (non-empty) | One entry for each Caddy module: a bare module path or `module@version`, the same syntax as `xcaddy build --with`. yoink sorts the list before it hashes and builds, so the order does not change the tag. |
 | `caddy_version` | string | unset: the latest tagged release that xcaddy finds | Caddy git tag to compile (for example `v2.8.4`). Must be a real tag in [caddyserver/caddy](https://github.com/caddyserver/caddy/tags). |
-| `base_image` | string | `caddy:2` | Runtime stage of the Dockerfile (the final `FROM`). |
+| `base_image` | string | `caddy:2` | Runtime stage of the Dockerfile (the final `FROM`). The image must contain `sh`. |
 | `builder_image` | string | `caddy:2-builder` | Builder stage, which carries xcaddy and the Go toolchain. A pin to `caddy:<v>-builder` also pins the version of the xcaddy CLI. |
 | `env` | map | `{}` | Environment variables for the builder stage, for example `GOPRIVATE` or `GOPROXY` for private Go modules. |
 | `replace` | list of strings | `[]` | Go-module replace directives, passed as `xcaddy build --replace <entry>`. |

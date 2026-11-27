@@ -54,6 +54,7 @@ struct FakeState {
     healthcheck_tcp: VecDeque<Result<(), DockerError>>,
     exec_oneshot: VecDeque<Result<OneShotResult, DockerError>>,
     exec_with_stdin: VecDeque<Result<OneShotResult, DockerError>>,
+    curl_in_netns: VecDeque<Result<OneShotResult, DockerError>>,
     fetch_logs: VecDeque<Result<Vec<String>, DockerError>>,
     one_shot: VecDeque<Result<OneShotResult, DockerError>>,
     event_streams: VecDeque<Vec<DockerEvent>>,
@@ -81,6 +82,7 @@ pub enum RecordedCall {
     HealthcheckTcp(Host, String, String, u16),
     ExecOneshot(Host, String, Vec<String>),
     ExecWithStdin(Host, String, Vec<String>, Vec<u8>),
+    CurlInNetns(Host, String, Vec<String>),
     FetchRecentLogs(Host, String, u32),
     OpenLogStream(Host, String),
     RunOneShot(Host, String),
@@ -155,6 +157,9 @@ impl FakeDockerOps {
     }
     pub fn push_exec_with_stdin(&self, v: Result<OneShotResult, DockerError>) {
         self.lock().exec_with_stdin.push_back(v);
+    }
+    pub fn push_curl_in_netns(&self, v: Result<OneShotResult, DockerError>) {
+        self.lock().curl_in_netns.push_back(v);
     }
     pub fn push_fetch_logs(&self, v: Result<Vec<String>, DockerError>) {
         self.lock().fetch_logs.push_back(v);
@@ -417,6 +422,20 @@ impl DockerOps for FakeDockerOps {
             cmd,
         ));
         pop(&mut s.exec_oneshot, "exec_oneshot")
+    }
+    async fn curl_in_netns(
+        &self,
+        host: &Host,
+        container: &str,
+        args: Vec<String>,
+    ) -> Result<OneShotResult, DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::CurlInNetns(
+            host.clone(),
+            container.into(),
+            args,
+        ));
+        pop(&mut s.curl_in_netns, "curl_in_netns")
     }
     async fn exec_with_stdin(
         &self,

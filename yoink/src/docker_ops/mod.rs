@@ -763,6 +763,21 @@ pub trait DockerOps: Send + Sync {
         cmd: Vec<String>,
     ) -> Result<OneShotResult, DockerError>;
 
+    /// Run a one-shot curl container that shares the network namespace
+    /// of `container` (`network_mode: container:<container>`), so
+    /// `127.0.0.1` in the URL is the loopback of `container`. `args`
+    /// go to curl and must start with an option (the curl image
+    /// entrypoint adds `curl` then). Collects stdout, stderr and the
+    /// exit code, and removes the probe on every path. The probe image
+    /// is the one [`Self::healthcheck`] uses, so the target image needs
+    /// no HTTP client of its own.
+    async fn curl_in_netns(
+        &self,
+        host: &Host,
+        container: &str,
+        args: Vec<String>,
+    ) -> Result<OneShotResult, DockerError>;
+
     /// [`Self::exec_oneshot`] that also writes `stdin` to the process
     /// and then closes its stdin, so the process reads to EOF. The
     /// proxy admin client sends the Caddy config this way: the config

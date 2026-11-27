@@ -39,7 +39,7 @@ yoink manages two Docker networks for you:
 - **`yoink-ingress`**: the proxy and every service with `domain:` join this network. The proxy reaches your containers by name through it.
 - **`yoink-proxy-admin`**: only the proxy joins this network.
 
-The admin API of Caddy has no authentication. Thus it listens only on `127.0.0.1:2019` inside the proxy container. yoink does not publish the admin port, and no other container can reach the admin API. To push a config, yoink runs `caddy reload` in the proxy container through `docker exec`. The config goes on stdin.
+The admin API of Caddy has no authentication. Thus it listens only on `127.0.0.1:2019` inside the proxy container. yoink does not publish the admin port, and no other container can reach the admin API. To push a config, yoink runs `caddy reload` in the proxy container through `docker exec`. The config goes on stdin. To probe the admin API, yoink starts a curl container that shares the network namespace of the proxy. Thus the proxy image does not need an HTTP client.
 
 Upstream entries name containers, not IPs. As a result, a container restart with a new IP does not break routing, because Docker DNS resolves the name. The active health checks of Caddy take dead backends out of rotation.
 

@@ -1060,6 +1060,27 @@ impl DockerOps for RealDockerOps {
         self.exec_collect(host, container, cmd, None).await
     }
 
+    async fn curl_in_netns(
+        &self,
+        host: &Host,
+        container: &str,
+        args: Vec<String>,
+    ) -> Result<OneShotResult, DockerError> {
+        self.ensure_probe_image(host, HEALTHCHECK_CURL_IMAGE).await;
+        let probe_name = format!("yoink-probe-{container}-{}", rand_hex());
+        let body = ContainerCreateBody {
+            image: Some(HEALTHCHECK_CURL_IMAGE.to_string()),
+            cmd: Some(args),
+            host_config: Some(HostConfig {
+                network_mode: Some(format!("container:{container}")),
+                auto_remove: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.run_one_shot(host, &probe_name, body).await
+    }
+
     async fn exec_with_stdin(
         &self,
         host: &Host,

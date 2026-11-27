@@ -116,36 +116,54 @@ pub async fn poll_tcp(
     .await
 }
 
-/// Poll `cmd` run with `docker exec` inside `container` until it exits
-/// 0 or `budget` elapses. Used for the proxy: its admin API listens on
-/// the container loopback, so a probe container on a docker network
-/// cannot reach it. A non-zero exit or an exec error counts as
-/// not-yet. A request the daemon rejects with a 4xx (for example, the
-/// container is not running) ends the poll at once.
-pub async fn poll_exec(
+/// Poll `url` until it returns 200 or `budget` elapses, with a curl
+/// probe container that shares the network namespace of `container`
+/// (see [`DockerOps::curl_in_netns`]). Used for the proxy: its admin
+/// API listens on the container loopback, so a probe container on a
+/// docker network cannot reach it. The probe brings its own curl, so
+/// the proxy image needs no HTTP client. A non-200 or a probe error
+/// counts as not-yet. A request the daemon rejects with a 4xx (for
+/// example, the container is not running) ends the poll at once.
+pub async fn poll_in_netns(
     ops: &dyn DockerOps,
     host: &Host,
     container: &str,
-    cmd: &[String],
+    url: &str,
     budget: Duration,
 ) -> Result<u32, HealthcheckError> {
     poll_until(budget, |attempt| async move {
-        match ops.exec_oneshot(host, container, cmd.to_vec()).await {
-            Ok(r) if r.exit_code == 0 => {
-                debug!(host = %host.address, container, attempt, "exec probe ok");
-                Ok(AttemptOutcome::Healthy)
-            }
-            Ok(r) => {
-                debug!(host = %host.address, container, attempt, exit = r.exit_code, "exec probe failed");
-                Ok(AttemptOutcome::ProbeFailed(DockerError::Invalid(format!(
-                    "exec probe exited {}: {}",
-                    r.exit_code,
-                    r.stderr.trim()
-                ))))
-            }
+        let args = vec![
+            "-sS".to_string(),
+            "-o".to_string(),
+            "/dev/null".to_string(),
+            "-w".to_string(),
+            "%{http_code}".to_string(),
+            "--max-time".to_string(),
+            "5".to_string(),
+            url.to_string(),
+        ];
+        match ops.curl_in_netns(host, container, args).await {
+            Ok(r) => match r.stdout.trim().parse::<u16>() {
+                Ok(200) => {
+                    debug!(host = %host.address, container, attempt, "netns probe ok");
+                    Ok(AttemptOutcome::Healthy)
+                }
+                Ok(status) if status != 0 => {
+                    debug!(host = %host.address, container, attempt, status, "netns probe unhealthy");
+                    Ok(AttemptOutcome::Unhealthy(status))
+                }
+                _ => {
+                    debug!(host = %host.address, container, attempt, exit = r.exit_code, "netns probe failed");
+                    Ok(AttemptOutcome::ProbeFailed(DockerError::Invalid(format!(
+                        "probe exited {}: {}",
+                        r.exit_code,
+                        r.stderr.trim()
+                    ))))
+                }
+            },
             Err(e) if e.is_daemon_rejection() => Err(e),
             Err(e) => {
-                debug!(host = %host.address, container, attempt, error = %e, "exec probe errored");
+                debug!(host = %host.address, container, attempt, error = %e, "netns probe errored");
                 Ok(AttemptOutcome::ProbeFailed(e))
             }
         }

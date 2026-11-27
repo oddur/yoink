@@ -10,7 +10,9 @@
 //! 2. Runs `caddy reload --config /dev/stdin` in it with `docker exec`
 //!    and sends the JSON on stdin. The config carries certificate
 //!    keys, so it never goes on a command line.
-//! 3. Reads the route count back with `wget` in the same container.
+//! 3. Reads the route count back with a curl probe container that
+//!    shares the network namespace of the proxy. The probe brings its
+//!    own curl, so the proxy image needs only `caddy` and `sh`.
 //!
 //! `docker exec` goes through the docker API connection that yoink
 //! already has, so this needs no SSH tunnel and no published port.
@@ -152,37 +154,49 @@ async fn read_route_count(
     ops: &dyn DockerOps,
     container: &str,
 ) -> Result<usize, AdminError> {
-    // BusyBox `wget` ships in the `caddy:2` image (the docker
-    // HEALTHCHECK uses it too).
+    // A curl probe in the network namespace of the proxy, not an exec
+    // in the proxy: a custom proxy image does not always have an HTTP
+    // client. `-w` appends the status code on its own line.
     let url = format!("http://{ADMIN_LISTEN}/config/apps/http/servers/main/routes/");
     let out = ops
-        .exec_oneshot(
+        .curl_in_netns(
             host,
             container,
-            vec!["wget".into(), "-q".into(), "-O".into(), "-".into(), url],
+            vec![
+                "-sS".into(),
+                "--max-time".into(),
+                "5".into(),
+                "-w".into(),
+                "\n%{http_code}".into(),
+                url,
+            ],
         )
         .await
         .map_err(|source| AdminError::Docker {
             host: host.address.clone(),
             source,
         })?;
-    if out.exit_code != 0 {
+    let (body, status) = out.stdout.rsplit_once('\n').unwrap_or(("", &out.stdout));
+    match status.trim() {
         // 404 = no routes object at that pointer (e.g. a config with no
         // routed services). Treat as zero rather than an error so the
         // verify step doesn't trip on legitimate empty configs.
-        let detail = exec_output(&out).trim();
-        if detail.contains("404") {
-            return Ok(0);
+        "404" => Ok(0),
+        "200" => {
+            let routes: Value =
+                serde_json::from_str(body.trim()).map_err(|e| AdminError::ReadBackFailed {
+                    detail: format!("parse routes JSON: {e}"),
+                })?;
+            Ok(routes.as_array().map_or(0, Vec::len))
         }
-        return Err(AdminError::ReadBackFailed {
-            detail: redact_pem_blocks(detail),
-        });
+        status => Err(AdminError::ReadBackFailed {
+            detail: redact_pem_blocks(&format!(
+                "HTTP status {status:?}, curl exit {}: {}",
+                out.exit_code,
+                exec_output(&out).trim()
+            )),
+        }),
     }
-    let routes: Value =
-        serde_json::from_str(out.stdout.trim()).map_err(|e| AdminError::ReadBackFailed {
-            detail: format!("parse routes JSON: {e}"),
-        })?;
-    Ok(routes.as_array().map_or(0, Vec::len))
 }
 
 const REDACTED_PEM: &str = "<redacted PEM>";
@@ -288,7 +302,7 @@ mod tests {
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![proxy_container()]));
         ops.push_exec_with_stdin(Ok(exit(0, "", "")));
-        ops.push_exec_oneshot(Ok(exit(0, "[{},{}]\n", "")));
+        ops.push_curl_in_netns(Ok(exit(0, "[{},{}]\n\n200", "")));
         push_config(&host(), &ops, &config).await.unwrap();
 
         let calls = ops.calls();
@@ -314,12 +328,21 @@ mod tests {
             ]
         );
         assert_eq!(serde_json::from_slice::<Value>(stdin).unwrap(), config);
+        // The read-back runs in a curl probe in the network namespace
+        // of the proxy, not with `wget` in the proxy image.
         assert!(calls.iter().any(|c| matches!(
             c,
-            RecordedCall::ExecOneshot(_, _, cmd)
-                if cmd.last().map(String::as_str)
-                    == Some("http://127.0.0.1:2019/config/apps/http/servers/main/routes/")
+            RecordedCall::CurlInNetns(_, container, args)
+                if container == "yoink-proxy-abc"
+                    && args.last().map(String::as_str)
+                        == Some("http://127.0.0.1:2019/config/apps/http/servers/main/routes/")
         )));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ExecOneshot(..))),
+            "got {calls:?}"
+        );
     }
 
     #[tokio::test]
@@ -345,11 +368,26 @@ mod tests {
         let ops = crate::docker_ops::FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![proxy_container()]));
         ops.push_exec_with_stdin(Ok(exit(0, "", "")));
-        ops.push_exec_oneshot(Ok(exit(
-            1,
-            "",
-            "wget: server returned error: HTTP/1.1 404 Not Found",
-        )));
+        ops.push_curl_in_netns(Ok(exit(0, "{\"error\":\"unknown path\"}\n404", "")));
         push_config(&host(), &ops, &config).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_reports_a_failed_route_read_back() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(0, "", "")));
+        ops.push_curl_in_netns(Ok(exit(
+            7,
+            "\n000",
+            "curl: (7) Failed to connect to 127.0.0.1 port 2019",
+        )));
+        let err = push_config(&host(), &ops, &config).await.unwrap_err();
+        assert!(
+            matches!(err, AdminError::ReadBackFailed { .. }),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("Failed to connect"), "got {err}");
     }
 }
