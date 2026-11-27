@@ -1975,8 +1975,9 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // tokio heartbeat task touches it every few seconds. If yoink
     // dies, heartbeats stop, sentinel self-exits within ~30s, and
     // the next deploy reaps it as an orphan. See `deploy/lock.rs`.
-    // The first failure prints at once, while the other attempts
-    // finish and get released.
+    // Each lock starts its heartbeat as soon as it is acquired. The
+    // first failure prints at once, while the other attempts finish
+    // and get released.
     let report_first_failure = |host: &yoink::base::host::Host,
                                 e: &yoink::deploy::lock::LockError| {
         eprintln!(
@@ -1984,8 +1985,8 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             host.address
         );
     };
-    let mut locks: Vec<HostLock> =
-        yoink::deploy::lock::acquire_all(&*ops, config.fleet(), report_first_failure)
+    let locks: Vec<HostLock> =
+        yoink::deploy::lock::acquire_all(&ops, config.fleet(), report_first_failure)
         .await
         .map_err(|(host, e)| {
             anyhow::Error::new(e).context(format!(
@@ -1995,9 +1996,6 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
                 host.address,
             ))
         })?;
-    for lock in &mut locks {
-        lock.spawn_heartbeat(ops.clone());
-    }
 
     // Audit log: two sinks per run. The operator sink writes locally
     // and records run-level facts that aren't host-specific

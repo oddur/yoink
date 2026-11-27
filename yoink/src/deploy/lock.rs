@@ -173,12 +173,12 @@ impl HostLock {
         })
     }
 
-    /// Spawn the heartbeat task on the caller's runtime. Separate
-    /// method (vs done in `acquire`) so the trait-object bound on
-    /// `acquire` doesn't have to be `Send + Sync + 'static` — the
-    /// `Arc<dyn DockerOps>` we have in `cmd_up` *is* both, but
-    /// requiring it on `acquire` forces every test to clone-into-Arc.
-    pub fn spawn_heartbeat(&mut self, ops: Arc<dyn DockerOps>) {
+    /// Spawn the heartbeat task on the caller's runtime. [`acquire_all`]
+    /// calls it as soon as the lock is acquired. Separate method (vs
+    /// done in `acquire`) so the trait-object bound on `acquire`
+    /// doesn't have to be `Send + Sync + 'static`, which would force
+    /// every test to clone-into-Arc.
+    fn spawn_heartbeat(&mut self, ops: Arc<dyn DockerOps>) {
         let host = self.host.clone();
         let id = self.id.clone();
         let task = tokio::spawn(async move {
@@ -229,26 +229,26 @@ impl HostLock {
     }
 }
 
-/// Acquire the lock on every host in `hosts`, concurrently.
+/// Acquire the lock on every host in `hosts`, concurrently. Each lock
+/// starts its heartbeat as soon as it is acquired, so it cannot expire
+/// while a slow host still pulls the sentinel image.
 ///
 /// All attempts run to completion. When one fails, the locks acquired
-/// on the other hosts are released before the error returns, so an immediate retry does not find them
+/// on the other hosts are released (and their heartbeats stopped)
+/// before the error returns, so an immediate retry does not find them
 /// still held. The error carries the host that failed first.
 /// `on_failure` gets that first failure at once when other attempts
 /// are still running, so the caller can show it while it waits.
-pub async fn acquire_all<O>(
-    ops: &O,
+pub async fn acquire_all(
+    ops: &Arc<dyn DockerOps>,
     hosts: Vec<Host>,
     mut on_failure: impl FnMut(&Host, &LockError),
-) -> Result<Vec<HostLock>, (Host, LockError)>
-where
-    O: DockerOps + ?Sized,
-{
+) -> Result<Vec<HostLock>, (Host, LockError)> {
     use futures_util::StreamExt as _;
     let mut pending: futures_util::stream::FuturesUnordered<_> = hosts
         .into_iter()
         .map(|host| async move {
-            let result = HostLock::acquire(ops, host.clone()).await;
+            let result = HostLock::acquire(&**ops, host.clone()).await;
             (host, result)
         })
         .collect();
@@ -256,7 +256,10 @@ where
     let mut first_error = None;
     while let Some((host, result)) = pending.next().await {
         match result {
-            Ok(lock) => locks.push(lock),
+            Ok(mut lock) => {
+                lock.spawn_heartbeat(ops.clone());
+                locks.push(lock);
+            }
             Err(e) if first_error.is_none() => {
                 if !pending.is_empty() {
                     on_failure(&host, &e);
@@ -269,7 +272,8 @@ where
     match first_error {
         None => Ok(locks),
         Some(err) => {
-            futures_util::future::join_all(locks.into_iter().map(|lock| lock.release(ops))).await;
+            futures_util::future::join_all(locks.into_iter().map(|lock| lock.release(&**ops)))
+                .await;
             Err(err)
         }
     }
@@ -445,7 +449,9 @@ mod tests {
             port: None,
         };
 
-        let (failed, _) = acquire_all(&*ops, vec![host(), other.clone()], |_, _| {})
+        let dyn_ops: Arc<dyn DockerOps> = ops.clone();
+
+        let (failed, _) = acquire_all(&dyn_ops, vec![host(), other.clone()], |_, _| {})
             .await
             .err()
             .expect("second host fails");
@@ -486,8 +492,10 @@ mod tests {
         ops.push_create_container(Ok("slow-id".into()));
         ops.push_start_container(Ok(()));
         ops.push_force_remove(Ok(()));
+        let dyn_ops: Arc<dyn DockerOps> = ops.clone();
+
         let mut reported = Vec::new();
-        let (failed, _) = acquire_all(&*ops, vec![host(), slow_host()], |h, _| {
+        let (failed, _) = acquire_all(&dyn_ops, vec![host(), slow_host()], |h, _| {
             reported.push((h.clone(), creates_on(&ops, &slow_host())));
         })
         .await
@@ -506,6 +514,87 @@ mod tests {
                 slow_host(),
                 "slow-id".into()
             )]
+        );
+    }
+
+    /// Regression: heartbeats started only after `acquire_all`
+    /// returned. While a slow host pulled the sentinel image for more
+    /// than 30s, the lock on a fast host expired, and the deploy ran
+    /// there unlocked. Each lock now beats from the moment it is
+    /// acquired.
+    #[tokio::test(start_paused = true)]
+    async fn acquire_all_starts_each_heartbeat_as_soon_as_its_lock_is_held() {
+        let ops = Arc::new(FakeDockerOps::new());
+        ops.delay_pulls_on(&slow_host().address, Duration::from_secs(60));
+        ops.push_pull_image(Ok(()));
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Ok("fast-id".into()));
+        ops.push_start_container(Ok(()));
+        ops.push_create_container(Ok("slow-id".into()));
+        ops.push_start_container(Ok(()));
+        let dyn_ops: Arc<dyn DockerOps> = ops.clone();
+
+        let locks = acquire_all(&dyn_ops, vec![host(), slow_host()], |_, _| {})
+            .await
+            .expect("both acquire");
+
+        let calls = ops.calls();
+        let slow_create = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::CreateContainer(h, _) if *h == slow_host()))
+            .expect("slow host creates its sentinel");
+        let touch = RecordedCall::ExecOneshot(
+            host(),
+            "fast-id".into(),
+            vec!["touch".into(), HEARTBEAT_FILE.into()],
+        );
+        let beats_before = calls[..slow_create].iter().filter(|c| **c == touch).count();
+        // 60s of pull at one beat per 5s, minus the skipped first tick.
+        assert!(
+            beats_before >= 10,
+            "{beats_before} beats while the slow host pulled"
+        );
+        for lock in locks {
+            lock.release(&*ops).await;
+        }
+    }
+
+    /// The release-on-failure path stops the heartbeat of each lock it
+    /// releases: no touch reaches the sentinel after its removal.
+    #[tokio::test(start_paused = true)]
+    async fn acquire_all_stops_the_heartbeats_of_the_locks_it_releases() {
+        let ops = Arc::new(FakeDockerOps::new());
+        ops.delay_pulls_on(&slow_host().address, Duration::from_secs(60));
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Ok("fast-id".into()));
+        ops.push_start_container(Ok(()));
+        ops.push_pull_image(Err(daemon_error(500)));
+        ops.push_force_remove(Ok(()));
+        let dyn_ops: Arc<dyn DockerOps> = ops.clone();
+
+        let (failed, _) = acquire_all(&dyn_ops, vec![host(), slow_host()], |_, _| {})
+            .await
+            .err()
+            .expect("slow host fails");
+        assert_eq!(failed, slow_host());
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        let calls = ops.calls();
+        let removed = calls
+            .iter()
+            .position(|c| *c == RecordedCall::ForceRemoveContainer(host(), "fast-id".into()))
+            .expect("fast lock released");
+        assert!(
+            calls[..removed]
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ExecOneshot(..))),
+            "the fast lock beat while the slow host pulled"
+        );
+        assert!(
+            !calls[removed..]
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ExecOneshot(..))),
+            "no beat after the release"
         );
     }
 
