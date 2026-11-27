@@ -326,7 +326,7 @@ The two places use the same [Hook](#hook) entry shape. A non-zero exit stops the
 
 The presence of `image:` selects one of two flavors:
 
-- **Container hook** (`image:` and `tag:` set): yoink pulls the image and runs `cmd:` in docker on the first host in `hosts:`. A hook of a service runs on the first host of that service. All container hooks join the first network in `deploy.networks`. It is for pinned tool images, or for isolation from your filesystem.
+- **Container hook** (`image:` and `tag:` set): yoink pulls the image and runs `cmd:` in docker on the first host in `hosts:`. A hook of a service runs on the first host in the top-level `hosts:` list that the service runs on. All container hooks join the first network in `deploy.networks`. It is for pinned tool images, or for isolation from your filesystem.
 - **Subprocess hook** (no `image:`, no `tag:`): yoink runs `cmd[0]` directly on your computer (or on the CI runner). The hook inherits the parent env. It is for tools that are already on PATH, for example `terraform`, `dbmate`, `alembic`, `gcloud`. See [Run Terraform from a hook](/docs/how-to/terraform-from-hooks).
 
 | Field | Type | Default | Notes |
