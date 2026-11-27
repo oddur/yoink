@@ -465,7 +465,7 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
                 "set `proxy: { email: <your real email> }` (or set `proxy.tls` for an inline cert)",
             ),
         );
-    } else if email.is_some_and(is_placeholder_email) {
+    } else if config.proxy_uses_acme() && email.is_some_and(is_placeholder_email) {
         out.push(
             Finding::warn(
                 "config",
@@ -1244,6 +1244,51 @@ services:
             !findings
                 .iter()
                 .any(|f| f.severity == Severity::Error && f.title.contains("proxy.email")),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
+    /// Regression: doctor warned about a placeholder `proxy.email:`
+    /// without ACME (here an inline `proxy.tls` cert). The address
+    /// then gets no Let's Encrypt mail, so the warning was noise.
+    #[test]
+    fn placeholder_proxy_email_is_not_reported_without_acme() {
+        let yaml = |tls: &str| {
+            format!(
+                r#"
+deploy: {{ networks: [n] }}
+hosts: [{{ address: h1, user: deploy }}]
+proxy:
+  email: you@example.com
+{tls}
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: {{ port: 8080 }}
+"#
+            )
+        };
+        let inline = Config::parse_str(&yaml(
+            "  tls:\n    cert_secret: CF_CERT\n    key_secret: CF_KEY",
+        ))
+        .unwrap();
+        assert!(!inline.proxy_uses_acme());
+        let findings = check_proxied_services(&inline);
+        assert!(
+            !findings.iter().any(|f| f.title.contains("placeholder")),
+            "{:?}",
+            titles(&findings)
+        );
+        let acme = Config::parse_str(&yaml("")).unwrap();
+        assert!(acme.proxy_uses_acme());
+        let findings = check_proxied_services(&acme);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Warn && f.title.contains("placeholder")),
             "{:?}",
             titles(&findings)
         );
