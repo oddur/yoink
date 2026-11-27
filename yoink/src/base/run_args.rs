@@ -219,17 +219,19 @@ pub fn harden_tmpfs_options(opts: &str) -> String {
 /// mode (see [`bind_mode_missing`]). A `files:` entry can still reach
 /// here with options and no mode (`local:/etc/app.conf:Z`), because a
 /// `files:` mount is always read-only. For that case `ro` is added in
-/// front of the options: `src:dst:Z` becomes `src:dst:ro,Z`.
+/// front of the options: `src:dst:Z` becomes `src:dst:ro,Z`. An empty
+/// third field gets `ro` alone: `src:dst:` becomes `src:dst:ro`.
 #[must_use]
 pub fn default_bind_to_ro(bind: &str) -> String {
     // A bind has the shape "src:dst" or "src:dst:mode[,opt,opt]".
     // Docker accepts the comma-separated options in any order.
     match bind_mode_missing(bind) {
-        Some(opts) if !opts.is_empty() => {
+        // An empty third field (`src:dst:`) gets the mode alone.
+        Some("") => format!("{bind}ro"),
+        Some(opts) => {
             let src_dst = &bind[..bind.len() - opts.len() - 1];
             format!("{src_dst}:ro,{opts}")
         }
-        Some(_) => bind.to_string(),
         None if bind.matches(':').count() >= 2 => bind.to_string(),
         None => format!("{bind}:ro"),
     }
@@ -401,6 +403,14 @@ mod tests {
         assert_eq!(default_bind_to_ro("/h:/c:z,rshared"), "/h:/c:ro,z,rshared");
         assert_eq!(default_bind_to_ro("/h:/c:Z,ro"), "/h:/c:Z,ro");
         assert_eq!(default_bind_to_ro("/h:/c:ro"), "/h:/c:ro");
+    }
+
+    /// Regression: a bind with an empty third field (`src:dst:`) passed
+    /// through unchanged, and Docker mounts that read-write. Config
+    /// load rejects it, but the helper does not depend on that.
+    #[test]
+    fn default_bind_to_ro_fills_an_empty_mode_field() {
+        assert_eq!(default_bind_to_ro("/h:/c:"), "/h:/c:ro");
     }
 
     #[test]
