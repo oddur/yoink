@@ -1692,9 +1692,19 @@ impl Config {
         if let Some(address) = address
             && hosts.is_empty()
         {
+            // The address of a sealed host is blank before resolution
+            // and a secret after it. Name the secret key instead.
+            let known = self
+                .hosts
+                .iter()
+                .map(|h| match h.address_secret.as_deref() {
+                    Some(key) => format!("<address_secret: {key}>"),
+                    None => h.address.clone(),
+                })
+                .collect();
             return Err(ConfigError::UnknownHost {
                 address: address.to_string(),
-                known: self.hosts.iter().map(|h| h.address.clone()).collect(),
+                known,
             });
         }
         Ok(hosts)
@@ -3227,6 +3237,25 @@ secrets:
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].address, "web-2");
         assert_eq!(cfg.require_fleet_matching(None).unwrap().len(), 2);
+    }
+
+    /// The known-hosts list showed `address`, which is blank for a host
+    /// with `address_secret:` before resolution and the sealed value
+    /// after it.
+    #[test]
+    fn require_fleet_matching_does_not_list_sealed_addresses() {
+        let mut cfg = Config::parse_str(
+            "hosts:\n  - { address: web-1, user: root }\n  - { address_secret: PROD_HOST, user: root }\nservices: []\n",
+        )
+        .unwrap();
+        let expected = "unknown --host \"web-3\"; known: web-1, <address_secret: PROD_HOST>";
+        let err = cfg.require_fleet_matching(Some("web-3")).unwrap_err();
+        assert_eq!(err.to_string(), expected);
+        // After resolution the address is the secret value.
+        cfg.hosts[1].address = "10.0.0.7".into();
+        let err = cfg.require_fleet_matching(Some("web-3")).unwrap_err();
+        assert_eq!(err.to_string(), expected);
+        assert!(!err.to_string().contains("10.0.0.7"));
     }
 
     /// The error said "invalid config: …" for a wrong flag, and gave an
