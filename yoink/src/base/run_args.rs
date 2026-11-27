@@ -86,9 +86,15 @@ pub enum BuildError {
     Publish(String),
 }
 
+/// The smallest memory limit the Docker daemon accepts on Linux
+/// (`linuxMinMemory`, 6 MiB). `0` is also accepted: it means no limit.
+const DOCKER_MIN_MEMORY: i64 = 6 * 1_024 * 1_024;
+
 /// Parse a docker-style memory value: bare bytes (`536870912`), or with
 /// suffix `b`, `k`, `m`, `g` (case-insensitive). Returns the value in
-/// bytes as `i64` (bollard's type).
+/// bytes as `i64` (bollard's type). Rejects what the Docker daemon
+/// rejects: a negative value, or a limit above `0` and below 6 MiB.
+/// `0` stays valid (no limit).
 pub fn parse_memory(s: &str) -> Result<i64, BuildError> {
     let s = s.trim();
     if s.is_empty() {
@@ -119,7 +125,11 @@ pub fn parse_memory(s: &str) -> Result<i64, BuildError> {
         .trim()
         .parse()
         .map_err(|_| BuildError::Memory(s.to_string()))?;
-    Ok(n.saturating_mul(mult))
+    let bytes = n.saturating_mul(mult);
+    if bytes < 0 || (bytes > 0 && bytes < DOCKER_MIN_MEMORY) {
+        return Err(BuildError::Memory(s.to_string()));
+    }
+    Ok(bytes)
 }
 
 /// Case-insensitive `strip_suffix` that returns the prefix when the
@@ -269,17 +279,17 @@ mod tests {
 
     #[test]
     fn parse_memory_accepts_common_suffixes() {
-        assert_eq!(parse_memory("1024").unwrap(), 1024);
+        assert_eq!(parse_memory("8388608").unwrap(), 8 * 1024 * 1024);
         assert_eq!(parse_memory("512m").unwrap(), 512 * 1024 * 1024);
         assert_eq!(parse_memory("1G").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory("64k").unwrap(), 64 * 1024);
+        assert_eq!(parse_memory("8192k").unwrap(), 8192 * 1024);
     }
 
     #[test]
     fn parse_memory_accepts_k8s_suffixes() {
         assert_eq!(parse_memory("512Mi").unwrap(), 512 * 1024 * 1024);
         assert_eq!(parse_memory("1Gi").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory("64Ki").unwrap(), 64 * 1024);
+        assert_eq!(parse_memory("8192Ki").unwrap(), 8192 * 1024);
         // Case-insensitive
         assert_eq!(parse_memory("2gi").unwrap(), 2 * 1024 * 1024 * 1024);
     }
@@ -367,6 +377,19 @@ mod tests {
         assert!(parse_memory("").is_err());
         assert!(parse_memory("abc").is_err());
         assert!(parse_memory("12x").is_err());
+    }
+
+    /// Regression: negative values and limits below Docker's 6 MiB
+    /// minimum parsed, and the daemon rejected them at create. `0`
+    /// means no limit in Docker and stays valid.
+    #[test]
+    fn parse_memory_rejects_what_docker_rejects() {
+        assert!(parse_memory("-512m").is_err());
+        assert!(parse_memory("-1").is_err());
+        assert!(parse_memory("1024").is_err());
+        assert!(parse_memory("5m").is_err());
+        assert_eq!(parse_memory("0").unwrap(), 0);
+        assert_eq!(parse_memory("6m").unwrap(), 6 * 1024 * 1024);
     }
 
     #[test]

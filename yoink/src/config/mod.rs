@@ -12,6 +12,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::base::host::{Host, split_address_port};
+use crate::base::run_args;
 
 mod proxy;
 
@@ -2343,6 +2344,38 @@ impl Config {
                     service.name
                 )));
             }
+            // Parse the values the container spec builder parses, so a
+            // bad value fails at load and not inside `yoink up`, after
+            // hooks and pulls ran.
+            let opts = &service.run.options;
+            let checks = [
+                (
+                    "run.options.memory",
+                    opts.memory
+                        .as_deref()
+                        .map(run_args::parse_memory)
+                        .transpose()
+                        .err(),
+                ),
+                (
+                    "run.options.cpus",
+                    opts.cpus
+                        .as_deref()
+                        .map(run_args::parse_cpus)
+                        .transpose()
+                        .err(),
+                ),
+                (
+                    "run.publish",
+                    run_args::parse_port_bindings(&service.run.publish).err(),
+                ),
+            ];
+            if let Some((field, e)) = checks.into_iter().find_map(|(f, e)| e.map(|e| (f, e))) {
+                return Err(ConfigError::Invalid(format!(
+                    "service {:?}.{field}: {e}",
+                    service.name
+                )));
+            }
             for spec in &service.run.options.devices {
                 if let Err(e) = crate::base::run_args::validate_device_spec(spec) {
                     return Err(ConfigError::Invalid(format!(
@@ -3609,6 +3642,44 @@ services:
         // A later-declared or earlier-declared known service is fine.
         Config::parse_str(&config("migrations")).unwrap();
         Config::parse_str(&config("api")).unwrap();
+    }
+
+    /// Regression: `run.options.memory`, `run.options.cpus` and
+    /// `run.publish` were parsed only by the container spec builder,
+    /// so a bad value failed inside `yoink up` after hooks and pulls.
+    #[test]
+    fn bad_run_option_values_fail_at_load() {
+        let with = |line: &str| {
+            format!(
+                r#"
+hosts:
+  - {{ address: host-a, user: u }}
+services:
+  - name: x
+    image: i
+    tag: v1
+    run:
+      port: 1
+      {line}
+"#
+            )
+        };
+        for (line, field) in [
+            ("options: { memory: 512MB }", "run.options.memory"),
+            ("options: { memory: -512m }", "run.options.memory"),
+            ("options: { cpus: lots }", "run.options.cpus"),
+            ("publish: [\"80\"]", "run.publish"),
+        ] {
+            let err = Config::parse_str(&with(line)).unwrap_err().to_string();
+            assert!(err.contains(field), "{line}: {err}");
+        }
+        for line in [
+            "options: { memory: 512m, cpus: \"1.5\" }",
+            "options: { memory: \"0\" }",
+            "publish: [\"127.0.0.1:8080:80/tcp\"]",
+        ] {
+            Config::parse_str(&with(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
+        }
     }
 
     #[test]
