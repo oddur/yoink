@@ -2,13 +2,15 @@
 //! streamed into the host's daemon through `POST /images/load`. Whole
 //! image every time; needs nothing on the host but docker.
 
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use thiserror::Error;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 
 use crate::base::host::Host;
@@ -24,7 +26,8 @@ pub enum TarballError {
     },
     /// `docker save` failed and the load on the host failed with it
     /// (it got a short or empty tar). The save stderr names the cause.
-    #[error("`docker save` for {image:?} exited with status {status}{stderr}\nthe load on the host failed too: {load}", stderr = if .stderr.is_empty() { String::new() } else { format!(":\n{}", .stderr) })]
+    /// The load error prints as the source.
+    #[error("`docker save` for {image:?} exited with status {status}{stderr}", stderr = if .stderr.is_empty() { String::new() } else { format!(":\n{}", .stderr) })]
     SaveAndLoadFailed {
         image: String,
         status: String,
@@ -115,10 +118,9 @@ async fn save_and_load_with(
         }
     });
     let body: ImageTarStream = Box::pin(stream);
-    // Wait for `docker save` also when the load fails: a failed save
-    // makes the load fail on a short tar, and only the save stderr
-    // says why (e.g. "No such image").
-    let load_result = ops.load_image(host, body).await;
+    if let Err(load) = ops.load_image(host, body).await {
+        return Err(load_failure(child, stderr_task, image_ref, load).await);
+    }
 
     let status = child.wait().await.map_err(|source| TarballError::Spawn {
         program: "docker".into(),
@@ -126,25 +128,62 @@ async fn save_and_load_with(
     })?;
     let stderr_text = stderr_task.await.unwrap_or_default();
     if !status.success() {
-        let image = image_ref.to_string();
-        let status = status.to_string();
-        let stderr = stderr_text.trim().to_string();
-        return Err(match load_result {
-            Ok(()) => TarballError::DockerSaveFailed {
-                image,
-                status,
-                stderr,
-            },
-            Err(load) => TarballError::SaveAndLoadFailed {
-                image,
-                status,
-                stderr,
-                load,
-            },
+        return Err(TarballError::DockerSaveFailed {
+            image: image_ref.to_string(),
+            status: status.to_string(),
+            stderr: stderr_text.trim().to_string(),
         });
     }
-    load_result?;
     Ok(total.load(Ordering::Relaxed))
+}
+
+/// How long a failed load waits for `docker save` to exit. A save
+/// that failed on its own has exited already (its exit closed the
+/// pipe, and the load failed on the short tar). A save that is still
+/// writing gets killed: the load error is the cause.
+const SAVE_EXIT_GRACE: Duration = Duration::from_millis(500);
+
+/// The error for a failed load. It names the save only when the save
+/// failed on its own: a non-zero exit with stderr that is not a
+/// consequence of the closed pipe. Otherwise the load error returns.
+async fn load_failure(
+    mut child: Child,
+    stderr_task: JoinHandle<String>,
+    image_ref: &str,
+    load: DockerError,
+) -> TarballError {
+    let Ok(Ok(status)) = tokio::time::timeout(SAVE_EXIT_GRACE, child.wait()).await else {
+        // The save still runs (or its status is unknown): it can block
+        // on a pipe that never closes, so do not wait on it.
+        let _ = child.start_kill();
+        stderr_task.abort();
+        return TarballError::Docker(load);
+    };
+    let stderr = stderr_task.await.unwrap_or_default().trim().to_string();
+    if status.success() || stderr.is_empty() || died_on_closed_pipe(status, &stderr) {
+        return TarballError::Docker(load);
+    }
+    TarballError::SaveAndLoadFailed {
+        image: image_ref.to_string(),
+        status: status.to_string(),
+        stderr,
+        load,
+    }
+}
+
+/// True when the save exit is a consequence of the load closing the
+/// pipe: SIGPIPE, or a "broken pipe" write error.
+fn died_on_closed_pipe(status: ExitStatus, stderr: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(libc::SIGPIPE) {
+            return true;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = status;
+    stderr.to_ascii_lowercase().contains("broken pipe")
 }
 
 #[cfg(all(test, unix))]
@@ -177,5 +216,53 @@ mod tests {
             err.to_string().contains("reference does not exist"),
             "{err}"
         );
+    }
+
+    /// Regression: the load failed on its own and closed the pipe.
+    /// `docker save` died on the broken pipe, and the error blamed the
+    /// save. The load error must return.
+    #[tokio::test]
+    async fn load_failure_returns_the_load_error_when_the_save_dies_on_the_pipe() {
+        let mut save = Command::new("sh");
+        save.arg("-c").arg("exec cat /dev/zero");
+
+        let ops = FakeDockerOps::new();
+        let host = Host::local();
+        let err = save_and_load_with(save, "app:v1", &ops, &host, |_| ())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TarballError::Docker(_)), "{err:?}");
+    }
+
+    /// A save that never exits (it blocks on a pipe that stays open)
+    /// gets killed: the load error returns without a wait on the save.
+    #[tokio::test]
+    async fn load_failure_kills_a_save_that_does_not_exit() {
+        let mut save = Command::new("sh");
+        save.arg("-c").arg("exec sleep 30");
+
+        let ops = FakeDockerOps::new();
+        let host = Host::local();
+        let started = std::time::Instant::now();
+        let err = save_and_load_with(save, "app:v1", &ops, &host, |_| ())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TarballError::Docker(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// The load error prints once: as the source, not in the message.
+    #[test]
+    fn save_and_load_failed_prints_the_load_error_once() {
+        let err = anyhow::Error::from(TarballError::SaveAndLoadFailed {
+            image: "app:v1".into(),
+            status: "exit status: 1".into(),
+            stderr: "No such image".into(),
+            load: DockerError::Invalid("short tar".into()),
+        });
+        let text = format!("{err:#}");
+        assert_eq!(text.matches("short tar").count(), 1, "{text}");
     }
 }
