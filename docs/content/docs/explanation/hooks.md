@@ -12,7 +12,7 @@ A pre-deploy hook runs a command or a container before the service swap, with ac
 | flavor | when | shape | use for |
 |---|---|---|---|
 | **subprocess** | yoink runs the binary directly on your computer (or on the CI runner). | `cmd: [...]`, no `image:`, no `tag:` | Tools that are already on your PATH: `terraform`, `dbmate`, `alembic`, `gcloud`, `stripe`. |
-| **container** | yoink pulls an image and runs the command inside Docker on the first host in `hosts:`. The hook joins the first network in `deploy.networks`. A hook of a service runs on the first host of that service. It joins the first network in `deploy.networks` that the service is on. | `image:` + `tag:` + `cmd:` | Isolation, portable runtimes, and a pinned tool version that is not on the computer of every operator. |
+| **container** | yoink pulls an image and runs the command inside Docker on the first host in `hosts:`. A hook of a service runs on the first host of that service. All container hooks join the first network in `deploy.networks`. | `image:` + `tag:` + `cmd:` | Isolation, portable runtimes, and a pinned tool version that is not on the computer of every operator. |
 
 The two flavors share `secrets:`, `env_from_secrets:`, and `secrets_profile:`. A subprocess hook needs no Dockerfile and no registry round trip.
 
