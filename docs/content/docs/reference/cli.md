@@ -78,7 +78,7 @@ yoink reads these environment variables:
 | `-s, --service <NAME>` | Limits the run to one service. Repeatable. |
 | `--tag <[NAME=]TAG>` | Overrides the tag of a service. Repeatable. See [Resolving tags](#resolving-tags). |
 | `--here` | Uses `git rev-parse --short HEAD` as the tag of every selected service. Conflicts with `--tag`. |
-| `--dry-run` | Prints the planned actions and exits. Connects to each host, but changes nothing. |
+| `--dry-run` | Prints the planned actions and exits. Connects to each host, but changes nothing. With `--service`, the orphan list shows only containers of the selected services. |
 | `--plan` | Alias of `--dry-run`. |
 | `--format <text\|markdown\|json>` | Output format of the dry run. Default: `text`, which shows `+`/`-`/`~` diffs of env keys and label keys for each service. |
 | `--watch` | Reconciles again when the config changes on disk. Polls every 2 s. Cannot combine with `--plan` or `--dry-run`. |

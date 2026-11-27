@@ -329,10 +329,19 @@ pub async fn compute(
         }
     }
 
+    // With `--service`, the plan covers only the selected services, so
+    // only their containers can be orphans. The containers of the other
+    // services are outside the plan, not orphans.
+    let in_scope = |c: &ContainerInfo| {
+        services_filter.is_none()
+            || c.yoink_service
+                .as_deref()
+                .is_some_and(|s| selected.contains(s))
+    };
     let mut orphans = Vec::new();
     for (host, containers) in &snapshot {
         for c in containers {
-            if !owned.contains(&(host.clone(), c.name.clone())) {
+            if in_scope(c) && !owned.contains(&(host.clone(), c.name.clone())) {
                 orphans.push(OrphanContainer {
                     host: host.clone(),
                     name: c.name.clone(),
@@ -913,6 +922,46 @@ mod tests {
         let j: serde_json::Value = serde_json::from_str(&r.render(Format::Json)).unwrap();
         assert_eq!(j["services"][1]["change"]["kind"], "cleanup");
         assert_eq!(j["services"][1]["change"]["stop"][0], "web-0ld0ld0");
+    }
+
+    /// `yoink up --service api --dry-run` listed the containers of the
+    /// other declared services as orphans, because the plan only claims
+    /// the containers of the selected services.
+    #[tokio::test]
+    async fn compute_with_service_filter_ignores_other_services() {
+        let cfg = crate::config::Config::parse_str(
+            r"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: latest
+    run: {}
+  - name: web
+    image: registry.example.com/web
+    tag: latest
+    run: {}
+",
+        )
+        .unwrap();
+        let api = &cfg.services[0];
+        let hash =
+            docker::compute_spec_hash(&build_desired_spec(&cfg, api, "latest", None).unwrap());
+        let api_name = deploy::container_name("api", &hash, 0, 1);
+        let api_old = deploy::container_name("api", &"b".repeat(64), 0, 1);
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![
+            running("api", &api_name, &hash, "running"),
+            running("api", &api_old, &"b".repeat(64), "exited"),
+            running("web", "web-cafef00", &"c".repeat(64), "running"),
+        ]));
+        let filter = ["api".to_string()];
+        let report = compute(&ops, &cfg, &BTreeMap::new(), Some(&filter), None)
+            .await
+            .unwrap();
+        let orphans: Vec<&str> = report.orphans.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(orphans, [api_old.as_str()]);
     }
 
     fn running(service: &str, name: &str, hash: &str, state: &str) -> ContainerInfo {
