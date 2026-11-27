@@ -61,12 +61,14 @@ impl Config {
         self.proxy.as_ref().and_then(|p| p.tls.as_ref())
     }
 
-    /// True when the proxy asks Let's Encrypt for certs: a routed
-    /// service uses `tls: auto` and no proxy-level `proxy.tls` cert
-    /// covers it. ACME then needs `proxy.email:`.
+    /// True when the proxy asks Let's Encrypt for certs: the proxy is
+    /// enabled, a routed service uses `tls: auto`, and no proxy-level
+    /// `proxy.tls` cert covers it. ACME then needs `proxy.email:`.
+    /// With the proxy off, yoink renders no Caddy config at all.
     #[must_use]
     pub fn proxy_uses_acme(&self) -> bool {
-        self.proxy_tls().is_none()
+        self.proxy_enabled()
+            && self.proxy_tls().is_none()
             && self
                 .proxied_services()
                 .iter()

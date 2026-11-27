@@ -1223,6 +1223,36 @@ services:
         );
     }
 
+    /// Regression: with `proxy.enabled: false`, doctor reported the
+    /// missing `proxy.email:` as an error. yoink renders no Caddy
+    /// config then, and `yoink up` succeeds.
+    #[test]
+    fn missing_proxy_email_is_no_error_when_the_proxy_is_off() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy: { enabled: false }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        assert!(!config.proxy_uses_acme());
+        let findings = check_proxied_services(&config);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.title.contains("proxy.email")),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
     fn titles(findings: &[Finding]) -> Vec<(Severity, &str)> {
         findings
             .iter()
