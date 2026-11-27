@@ -74,6 +74,10 @@ impl FileMount {
         if crate::config::has_rw_mode(spec) {
             return Err(FileError::ReadWrite(spec.to_string()));
         }
+        // Docker reads an empty last field as read-write.
+        if spec.ends_with(':') {
+            return Err(FileError::BadFormat(spec.to_string()));
+        }
         // Split deliberately on the *first* and *last* `:` rather than
         // by count, so container paths with colons (rare but possible)
         // aren't mangled. The trailing `:ro` is recognized only when
@@ -493,6 +497,26 @@ mod tests {
             FileMount::parse("nocolon:rw", None),
             Err(FileError::ReadWrite(_))
         ));
+    }
+
+    /// Regression: `:rw,Z` parsed, and the container path kept the
+    /// options, so the mount was writable. An empty last field mounts
+    /// read-write in Docker too.
+    #[test]
+    fn parse_rejects_rw_among_options_and_an_empty_mode_field() {
+        assert!(matches!(
+            FileMount::parse("/tmp/a.conf:/etc/a.conf:rw,Z", None),
+            Err(FileError::ReadWrite(_))
+        ));
+        assert!(matches!(
+            FileMount::parse("/tmp/a.conf:/etc/a.conf:Z,rw", None),
+            Err(FileError::ReadWrite(_))
+        ));
+        assert!(matches!(
+            FileMount::parse("/tmp/a.conf:/etc/a.conf:", None),
+            Err(FileError::BadFormat(_))
+        ));
+        FileMount::parse("/tmp/a.conf:/etc/a.conf:ro,Z", None).unwrap();
     }
 
     #[test]

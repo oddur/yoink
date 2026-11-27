@@ -1054,12 +1054,14 @@ impl Default for ServiceRun {
     }
 }
 
-/// True when a `files:` spec ends in an explicit `:rw` mode. Config
+/// True when the last field of a `files:` spec has an `rw` token
+/// among its comma-separated options (`:rw`, `:rw,Z`, `:Z,rw`). Config
 /// validation and `FileMount::parse` both reject such a spec, and
-/// share this check so they cannot disagree on what counts as `:rw`.
+/// share this check so they cannot disagree on what counts as `rw`.
 #[must_use]
 pub fn has_rw_mode(spec: &str) -> bool {
-    matches!(spec.rsplit_once(':'), Some((_, "rw")))
+    spec.rsplit_once(':')
+        .is_some_and(|(_, opts)| opts.split(',').any(|o| o == "rw"))
 }
 
 /// Per-container runtime options. **All security-relevant fields
@@ -2417,6 +2419,14 @@ impl Config {
                         service.name
                     )));
                 }
+                // Docker reads an empty last field as read-write.
+                if spec.ends_with(':') {
+                    return Err(ConfigError::Invalid(format!(
+                        "service {:?}.run.files: entry {spec:?} ends in an empty mode field, \
+                         and Docker mounts it read-write; remove the last `:` or end it in `:ro`",
+                        service.name
+                    )));
+                }
             }
             // depends_on validation (refs + duplicates + self). Cycle
             // detection lives in `topo_sort_services` since it needs
@@ -3677,6 +3687,43 @@ services:
             "invalid config: service \"api\".run.files: entry \"./data.json:/app/data.json:rw\" \
              sets `:rw`, but `files:` mounts are always read-only; use `binds:` or a volume for \
              data the container must write"
+        );
+    }
+
+    /// Regression: only a spec that ended in exactly `:rw` was
+    /// rejected, so `:rw,Z` loaded and mounted writable. Any `rw`
+    /// token in the options is now rejected.
+    #[test]
+    fn rejects_an_rw_token_among_the_options_of_a_files_entry() {
+        for entry in [
+            "./app.conf:/etc/app.conf:rw,Z",
+            "./app.conf:/etc/app.conf:Z,rw",
+        ] {
+            let err = Config::parse_str(&config_with_files_entry(entry)).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::Invalid(m) if m.contains("sets `:rw`")),
+                "{entry}: {err}"
+            );
+        }
+        for entry in [
+            "./app.conf:/etc/app.conf",
+            "./app.conf:/etc/app.conf:ro",
+            "./app.conf:/etc/app.conf:ro,Z",
+            "./app.conf:/etc/app.conf:Z",
+        ] {
+            Config::parse_str(&config_with_files_entry(entry)).unwrap();
+        }
+    }
+
+    /// An empty last field mounts read-write in Docker, so a `files:`
+    /// entry like that is rejected too.
+    #[test]
+    fn rejects_an_empty_mode_field_on_a_files_entry() {
+        let err =
+            Config::parse_str(&config_with_files_entry("./app.conf:/etc/app.conf:")).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Invalid(m) if m.contains("empty mode field")),
+            "{err}"
         );
     }
 
