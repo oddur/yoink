@@ -563,14 +563,15 @@ pub trait DockerOps: Send + Sync {
     /// network. Used post-start for multi-network attachment because
     /// docker's create-time `endpoints_config` can silently drop
     /// entries that don't match `host_config.network_mode`.
-    /// Aliases ensure the container resolves by its name on the new
+    /// `endpoint` comes from [`crate::docker::endpoint_settings`]: its
+    /// aliases ensure the container resolves by its name on the new
     /// network too. Idempotent: already-connected returns Ok.
     async fn connect_container_network(
         &self,
         host: &Host,
         container: &str,
         network: &str,
-        aliases: &[String],
+        endpoint: bollard::models::EndpointSettings,
     ) -> Result<(), DockerError>;
 
     /// List every docker volume on `host`. Used by `yoink volumes`.

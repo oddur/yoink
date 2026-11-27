@@ -392,19 +392,13 @@ impl DockerOps for RealDockerOps {
         host: &Host,
         container: &str,
         network: &str,
-        aliases: &[String],
+        endpoint: EndpointSettings,
     ) -> Result<(), DockerError> {
+        let endpoint = &endpoint;
         self.with_retry(host, |docker| async move {
             let req = bollard::models::NetworkConnectRequest {
                 container: container.to_string(),
-                endpoint_config: Some(bollard::models::EndpointSettings {
-                    aliases: if aliases.is_empty() {
-                        None
-                    } else {
-                        Some(aliases.to_vec())
-                    },
-                    ..Default::default()
-                }),
+                endpoint_config: Some(endpoint.clone()),
             };
             match docker.connect_network(network, req).await {
                 // 403 = "endpoint already exists in network" — already

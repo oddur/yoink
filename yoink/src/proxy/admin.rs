@@ -1,14 +1,19 @@
 //! Push rendered Caddy JSON to the proxy's admin API.
 //!
-//! Caddy's admin API listens on `:2019` *inside* the container and is
-//! published on the host's loopback at an ephemeral port (chosen by
-//! docker via `127.0.0.1:0:2019`). The yoink CLI:
+//! Caddy's admin API listens on `ADMIN_API_HOST` *inside* the
+//! container: the proxy IP on the `yoink-admin` network only. Docker
+//! publishes it on the host's loopback at an ephemeral port (chosen by
+//! docker via `127.0.0.1:0:2019`) and forwards that port to the
+//! gateway endpoint of the proxy, which is the `yoink-admin` endpoint.
+//! The yoink CLI:
 //!
 //! 1. Looks up the proxy container, reads the host-side admin port
 //!    from its inspect output.
 //! 2. SSH-tunnels from `operator-localhost:<rand>` to
 //!    `host-localhost:<published>`.
-//! 3. `POST`s the JSON to `http://127.0.0.1:<rand>/load`.
+//! 3. `POST`s the JSON to `http://127.0.0.1:<rand>/load`, with the
+//!    `Host` header `ADMIN_API_HOST`. Caddy rejects any other `Host`,
+//!    because its listen address is not a wildcard.
 //! 4. Drops the tunnel.
 //!
 //! Why loopback-published instead of using the container's docker IP
@@ -26,7 +31,7 @@ use crate::base::host::Host;
 use crate::docker_ops::{DockerError, DockerOps, parse_published_port};
 use crate::ssh::tunnel::{SshTunnel, TunnelError};
 
-use crate::config::{ADMIN_PORT, PROXY_SERVICE_NAME};
+use crate::config::{ADMIN_API_HOST, ADMIN_PORT, PROXY_SERVICE_NAME};
 
 /// How long the SSH tunnel + Caddy admin readiness probe each get
 /// before giving up. 20s comfortably covers a cold proxy boot on a
@@ -194,14 +199,22 @@ async fn tunnel_and_load(
     .await?;
 
     wait_until_ready(tunnel.local_port(), TUNNEL_READY_TIMEOUT).await?;
+    let result = load_and_verify(tunnel.local_port(), config).await;
+    drop(tunnel);
+    result
+}
 
-    let url = format!("http://127.0.0.1:{}/load", tunnel.local_port());
+/// `POST /load` through the tunnel at `local_port`, then read the
+/// route count back.
+async fn load_and_verify(local_port: u16, config: &Value) -> Result<(), AdminError> {
+    let url = format!("http://127.0.0.1:{local_port}/load");
     let client = reqwest::Client::builder()
         .timeout(ADMIN_API_TIMEOUT)
         .build()
         .expect("reqwest client builder");
     let resp = client
         .post(&url)
+        .header(reqwest::header::HOST, ADMIN_API_HOST)
         .json(config)
         .send()
         .await
@@ -224,8 +237,7 @@ async fn tunnel_and_load(
     // domains. Verifying upfront beats discovering it from a Cloudflare
     // 521 alert.
     let expected = route_count(config);
-    let actual = read_route_count(&client, tunnel.local_port()).await?;
-    drop(tunnel);
+    let actual = read_route_count(&client, local_port).await?;
     if expected != actual {
         return Err(AdminError::LoadVerifyMismatch { expected, actual });
     }
@@ -243,6 +255,7 @@ async fn read_route_count(client: &reqwest::Client, local_port: u16) -> Result<u
     let url = format!("http://127.0.0.1:{local_port}/config/apps/http/servers/main/routes/");
     let resp = client
         .get(&url)
+        .header(reqwest::header::HOST, ADMIN_API_HOST)
         .send()
         .await
         .map_err(|source| AdminError::Http { source })?;
@@ -295,7 +308,10 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
         .expect("reqwest client builder");
     let deadline = Instant::now() + timeout;
     loop {
-        if client.get(&url).send().await.is_ok() {
+        let probe = client
+            .get(&url)
+            .header(reqwest::header::HOST, ADMIN_API_HOST);
+        if probe.send().await.is_ok() {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -324,6 +340,82 @@ mod tests {
         let out = redact_pem_blocks(body);
         assert!(out.contains("<redacted PEM>"));
         assert!(!out.contains("MIIabc"));
+    }
+
+    /// Serve `responses.len()` HTTP requests on a loopback port, one
+    /// per connection, and return the request heads in order.
+    fn serve(responses: Vec<&'static str>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for body in responses {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read");
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let length = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().to_string())
+                    })
+                    .map_or(0, |v| v.parse::<usize>().expect("length"));
+                let mut payload = vec![0; length];
+                reader.read_exact(&mut payload).expect("body");
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                reader.get_mut().write_all(reply.as_bytes()).expect("write");
+                heads.push(head);
+            }
+            heads
+        });
+        (port, handle)
+    }
+
+    fn host_header(head: &str) -> Option<&str> {
+        head.lines().find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("host").then(|| value.trim())
+        })
+    }
+
+    /// Caddy checks `Host` against `admin.origins` because the admin
+    /// listen address is not a wildcard. Without the fixed header,
+    /// reqwest sends `127.0.0.1:<tunnel port>` and Caddy answers 403.
+    #[tokio::test]
+    async fn admin_requests_send_the_admin_host_header() {
+        let (port, server) = serve(vec!["{}", "", "[]"]);
+        wait_until_ready(port, Duration::from_secs(5))
+            .await
+            .expect("ready");
+        load_and_verify(port, &serde_json::json!({"apps": {}}))
+            .await
+            .expect("load");
+        let heads = server.join().expect("server thread");
+        assert_eq!(heads.len(), 3);
+        assert!(heads[0].starts_with("GET /config/ "), "got: {}", heads[0]);
+        assert!(heads[1].starts_with("POST /load "), "got: {}", heads[1]);
+        assert!(
+            heads[2].starts_with("GET /config/apps/http/servers/main/routes/ "),
+            "got: {}",
+            heads[2]
+        );
+        for head in &heads {
+            assert_eq!(host_header(head), Some(ADMIN_API_HOST), "got: {head}");
+        }
     }
 
     #[test]

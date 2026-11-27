@@ -16,7 +16,10 @@ use crate::base::run_args;
 
 mod proxy;
 
-pub use proxy::{ADMIN_NETWORK, ADMIN_PORT, INGRESS_NETWORK, PROXY_SERVICE_NAME};
+pub use proxy::{
+    ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_GW_PRIORITY, ADMIN_NETWORK, ADMIN_PORT, INGRESS_NETWORK,
+    PROXY_SERVICE_NAME, admin_block,
+};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {

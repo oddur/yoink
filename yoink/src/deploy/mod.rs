@@ -992,16 +992,20 @@ async fn prepare_one_host(
 
 /// Connect `name` to every network in `effective` past the first
 /// (the first is set at container create time). Same alias set on
-/// every network so callers always reach the container by name.
+/// every network so callers always reach the container by name. The
+/// proxy (`proxy`) also gets its admin endpoint settings, see
+/// [`docker::endpoint_settings`].
 async fn attach_extra_networks(
     ops: &dyn DockerOps,
     host: &Host,
     name: &str,
     effective: &[String],
     aliases: &[String],
+    proxy: bool,
 ) -> Result<(), DeployError> {
     for net in effective.iter().skip(1) {
-        ops.connect_container_network(host, name, net, aliases)
+        let endpoint = docker::endpoint_settings(net, aliases, proxy);
+        ops.connect_container_network(host, name, net, endpoint)
             .await
             .map_err(|source| DeployError::Docker {
                 host: host.address.clone(),
@@ -1047,7 +1051,8 @@ async fn start_new_replicas(
         let effective = config.networks_for(service);
         let mut aliases = vec![replica.name.clone()];
         aliases.extend(service.run.options.network_aliases.iter().cloned());
-        attach_extra_networks(ops, host, &replica.name, &effective, &aliases).await?;
+        let proxy = service.kind == Some(crate::config::ServiceKind::Proxy);
+        attach_extra_networks(ops, host, &replica.name, &effective, &aliases, proxy).await?;
         ops.start_container(host, &replica.name)
             .await
             .map_err(|source| DeployError::Docker {
@@ -1412,6 +1417,7 @@ fn build_run_spec(
         binds,
         volumes: service.run.volumes.clone(),
         docker_healthcheck: docker_healthcheck_for(service),
+        proxy: service.kind == Some(crate::config::ServiceKind::Proxy),
     }
 }
 
@@ -1433,14 +1439,18 @@ fn docker_healthcheck_for(service: &ServiceConfig) -> Option<bollard::models::He
     if service.kind != Some(crate::config::ServiceKind::Proxy) {
         return None;
     }
-    // Probe Caddy's admin endpoint on its own loopback. /config/
+    // Probe Caddy's admin endpoint at the admin API alias: Caddy
+    // listens there only, and accepts only that `Host`. /config/
     // returns the live config blob and is what yoink itself uses
     // as the deploy-time gate. BusyBox `wget --spider` exits 0 on
     // 200, non-zero otherwise — caddy:2 (alpine-based) ships it.
     Some(HealthConfig {
         test: Some(vec![
             "CMD-SHELL".into(),
-            "wget --spider --quiet http://127.0.0.1:2019/config/ || exit 1".into(),
+            format!(
+                "wget --spider --quiet http://{}/config/ || exit 1",
+                crate::config::ADMIN_API_HOST
+            ),
         ]),
         // 30 s is enough headroom for Caddy's admin loop without
         // making `docker ps` lag the actual state.
@@ -1883,6 +1893,18 @@ async fn create_pending_container(
     Ok(())
 }
 
+/// The name the HTTP healthcheck probe connects to. For the proxy it
+/// is the admin API alias: Caddy accepts only the `Host` header
+/// [`crate::config::ADMIN_API_HOST`], and curl sends `<name>:<port>`.
+/// The proxy deploys stop-first, so the alias names the new container.
+fn http_probe_target<'a>(service: &ServiceConfig, new_name: &'a str) -> &'a str {
+    if service.kind == Some(crate::config::ServiceKind::Proxy) {
+        crate::config::ADMIN_API_ALIAS
+    } else {
+        new_name
+    }
+}
+
 async fn wait_until_healthy(
     ops: &dyn DockerOps,
     host: &Host,
@@ -1911,7 +1933,7 @@ async fn wait_until_healthy(
                 ops,
                 host,
                 probe_network,
-                new_name,
+                http_probe_target(service, new_name),
                 port,
                 path,
                 service.run.healthcheck_timeout,
@@ -2279,6 +2301,66 @@ async fn run_subprocess_hook(
 mod tests {
     use super::*;
     use crate::docker_ops::{FakeDockerOps, RecordedCall};
+
+    /// The proxy is created on `yoink-admin`, the endpoint that gets
+    /// the admin API alias and gateway priority 1, so the published
+    /// admin port lands there. The deploy probe and the Docker
+    /// HEALTHCHECK use the alias, the only `Host` that Caddy accepts.
+    #[test]
+    fn proxy_run_spec_puts_the_admin_endpoint_first() {
+        use crate::config::{
+            ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_GW_PRIORITY, ADMIN_NETWORK, INGRESS_NETWORK,
+            PROXY_SERVICE_NAME,
+        };
+        let cfg = Config::parse_str(
+            r#"
+hosts: [{ address: h, user: u }]
+deploy: { networks: [app] }
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: example/api
+    tag: v1
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .expect("config parses");
+        let proxy = cfg.service(PROXY_SERVICE_NAME).expect("proxy");
+        let spec = build_run_spec(&cfg, proxy, "2", None, "yoink-proxy-x".into(), "h", &[]);
+        assert_eq!(spec.networks, [ADMIN_NETWORK, INGRESS_NETWORK]);
+        let body = docker::build_container(&spec).expect("body");
+        let endpoints = body.networking_config.unwrap().endpoints_config.unwrap();
+        let admin = &endpoints[ADMIN_NETWORK];
+        assert_eq!(admin.gw_priority, Some(ADMIN_GW_PRIORITY));
+        assert!(
+            admin
+                .aliases
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|a| a == ADMIN_API_ALIAS)
+        );
+        let ingress =
+            docker::endpoint_settings(INGRESS_NETWORK, &["yoink-proxy-x".to_string()], spec.proxy);
+        assert!(
+            !ingress
+                .aliases
+                .unwrap()
+                .iter()
+                .any(|a| a == ADMIN_API_ALIAS)
+        );
+        assert_eq!(ingress.gw_priority, None);
+
+        assert_eq!(http_probe_target(proxy, "yoink-proxy-x"), ADMIN_API_ALIAS);
+        let api = cfg.service("api").unwrap();
+        assert_eq!(http_probe_target(api, "api-x"), "api-x");
+        let test = body.healthcheck.and_then(|h| h.test).expect("healthcheck");
+        assert!(
+            test[1].contains(&format!("http://{ADMIN_API_HOST}/config/")),
+            "got: {test:?}"
+        );
+    }
 
     #[test]
     fn summarize_build_outcomes_all_success_is_none() {

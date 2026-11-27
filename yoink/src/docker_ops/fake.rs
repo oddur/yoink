@@ -220,7 +220,7 @@ impl DockerOps for FakeDockerOps {
         _host: &Host,
         _container: &str,
         _network: &str,
-        _aliases: &[String],
+        _endpoint: bollard::models::EndpointSettings,
     ) -> Result<(), DockerError> {
         Ok(())
     }

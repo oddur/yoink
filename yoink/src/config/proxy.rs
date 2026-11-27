@@ -20,14 +20,54 @@ pub const PROXY_SERVICE_NAME: &str = "yoink-proxy";
 /// name. Every service with `domain:` joins it automatically.
 pub const INGRESS_NETWORK: &str = "yoink-ingress";
 
-/// Docker network the proxy publishes its admin API on. Only the
-/// proxy itself joins this network — the yoink CLI reaches the
-/// admin API by inspecting the proxy container's IP on this network
-/// and opening an SSH-tunnelled forward to it.
-pub const ADMIN_NETWORK: &str = "yoink-proxy-admin";
+/// Docker network the Caddy admin API listens on. Only the proxy
+/// joins it. The name sorts before [`INGRESS_NETWORK`], and the proxy
+/// endpoint on it has gateway priority [`ADMIN_GW_PRIORITY`], so
+/// Docker makes it the gateway endpoint of the proxy. Docker programs
+/// published ports only for the gateway endpoint, so the loopback
+/// publish of the admin port lands on this network and not on
+/// `yoink-ingress`, where every routed service is.
+pub const ADMIN_NETWORK: &str = "yoink-admin";
+
+/// Gateway priority of the proxy endpoint on [`ADMIN_NETWORK`]. The
+/// other endpoints keep the default 0, and the highest priority wins.
+/// Docker Engine 28 added the field (API 1.48).
+pub const ADMIN_GW_PRIORITY: i64 = 1;
+
+/// Network alias that the proxy has only on [`ADMIN_NETWORK`]. Caddy
+/// binds the admin API to the one address this name resolves to, the
+/// proxy IP on that network. A service on `yoink-ingress` cannot
+/// connect to that address.
+pub const ADMIN_API_ALIAS: &str = "yoink-proxy-admin-api";
 
 /// Container port the Caddy admin API listens on (Caddy default).
 pub const ADMIN_PORT: u16 = 2019;
+
+/// The `admin.listen` address of Caddy, and the only `Host` header
+/// value that the admin API accepts. With a listen address that is not
+/// a wildcard, Caddy rejects a request whose `Host` is not in
+/// `admin.origins`. yoink sends this value on every admin request, and
+/// the deploy probe and the Docker HEALTHCHECK send it because they
+/// use this name in the URL.
+pub const ADMIN_API_HOST: &str = "yoink-proxy-admin-api:2019";
+
+/// The `admin` block of every Caddy config that yoink writes: the
+/// bootstrap of the proxy container and each `/load`. A `/load` that
+/// omits the block sets the admin API back to the Caddy default
+/// `localhost:2019`, which the published port cannot reach.
+///
+/// `enforce_origin` stays false: then Caddy checks `Origin` only when
+/// a request carries `Origin` or `Sec-Fetch-Mode`, which yoink's
+/// clients do not send. The `Host` check is on because the listen
+/// address is not a wildcard.
+#[must_use]
+pub fn admin_block() -> serde_json::Value {
+    serde_json::json!({
+        "listen": ADMIN_API_HOST,
+        "enforce_origin": false,
+        "origins": [ADMIN_API_HOST],
+    })
+}
 
 impl Config {
     /// True when the proxy should be enabled for this config — either
@@ -203,7 +243,7 @@ impl Config {
         // Pin every service that has no `networks:` to the networks the
         // operator declared, before the implicit ones are added below. A
         // service without `networks:` defaults to all of `deploy.networks`,
-        // so without this pin it would also join `yoink-proxy-admin` and
+        // so without this pin it would also join `yoink-admin` and
         // could reach the Caddy admin API, which has no authentication.
         // Only the proxy belongs on that network. An operator who lists an
         // implicit network in `deploy.networks` still gets it here.
@@ -377,7 +417,9 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         labels: std::collections::BTreeMap::default(),
         pre_deploy: Vec::new(),
         depends_on: Vec::new(),
-        networks: Some(vec![INGRESS_NETWORK.to_string(), ADMIN_NETWORK.to_string()]),
+        // The admin network first: the create-time endpoint, and the
+        // gateway endpoint (see `ADMIN_NETWORK`).
+        networks: Some(vec![ADMIN_NETWORK.to_string(), INGRESS_NETWORK.to_string()]),
         domain: None,
         tls: TlsMode::Auto,
         tls_cert_secret: None,
@@ -390,21 +432,23 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         path_prefix: None,
         hsts: false, // proxy itself doesn't serve TLS; this field is irrelevant
         run: ServiceRun {
-            // Healthcheck probes Caddy's admin endpoint (`/config/`)
-            // on the container's :2019 from inside the proxy's first
-            // network. Eliminates the race where yoink-proxy is
-            // "started" per docker but Caddy's HTTP server hasn't
-            // bound yet — without this gate, the first /load can
-            // arrive before admin is up.
+            // The deploy healthcheck probes Caddy's admin endpoint
+            // (`/config/`) at `ADMIN_API_HOST` from the admin network.
+            // Eliminates the race where yoink-proxy is "started" per
+            // docker but Caddy's HTTP server hasn't bound yet —
+            // without this gate, the first /load can arrive before
+            // admin is up.
             port: Some(ADMIN_PORT),
             healthcheck_path: Some("/config/".to_string()),
-            // Caddy serves :80 + :443 on the host. Admin API on :2019
-            // is published on 127.0.0.1 with an ephemeral host port
+            // Caddy serves :80 + :443 on the host. The admin port is
+            // published on 127.0.0.1 with an ephemeral host port
             // (`:0:2019`) so it's reachable from the host (and only
             // from the host) — docker doesn't route user-defined-
             // network container IPs from the host. yoink looks up
             // the actual host port via `inspect_container` and
-            // SSH-tunnels to it for one `/load` call.
+            // SSH-tunnels to it for one `/load` call. Docker forwards
+            // the publish to the proxy IP on `ADMIN_NETWORK`, the
+            // gateway endpoint.
             //
             // `proxy.bind:` (when set) prepends the bind address to
             // :80/:443 so the proxy is reachable only on that
@@ -424,18 +468,15 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
                 vec![
                     format!("{prefix}80:80"),
                     format!("{prefix}443:443"),
-                    "127.0.0.1:0:2019".to_string(),
+                    format!("127.0.0.1:0:{ADMIN_PORT}"),
                 ]
             },
             // Override the official caddy:2 image's entrypoint to
-            // start with a minimal bootstrap config: admin bound to
-            // 0.0.0.0:2019 (so the admin endpoint is reachable from
-            // the docker bridge — the default `localhost:2019` would
-            // refuse our SSH-tunneled `/load`), `enforce_origin: false`
-            // + a known origin (`yoink-admin`) so we can route past
-            // Caddy's host-header check by setting Host: yoink-admin
-            // on every admin request. The actual routes are pushed
-            // via `/load` immediately after the container is healthy.
+            // start with a minimal bootstrap config: the `admin_block`
+            // that every `/load` also sends. The admin API listens on
+            // `ADMIN_API_ALIAS`, the proxy IP on the admin network
+            // only. The actual routes are pushed via `/load`
+            // immediately after the container is healthy.
             //
             // `--resume` makes Caddy fall back to its autosaved
             // runtime config (`/config/caddy/autosave.json` on the
@@ -447,15 +488,10 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // `yoink up`. On a fresh proxy (no autosave yet) the
             // bootstrap takes effect as before.
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
-            cmd: vec![
-                concat!(
-                    "echo '{\"admin\":{\"listen\":\"0.0.0.0:2019\",",
-                    "\"enforce_origin\":false,",
-                    "\"origins\":[\"yoink-admin\"]}}'",
-                    " | exec caddy run --config /dev/stdin --resume",
-                )
-                .to_string(),
-            ],
+            cmd: vec![format!(
+                "echo '{}' | exec caddy run --config /dev/stdin --resume",
+                serde_json::json!({ "admin": admin_block() }),
+            )],
             // Yoink's `cap_drop: [ALL]` default would block Caddy
             // from binding :80/:443 (privileged ports). Re-add the
             // one cap that lets it; everything else stays dropped.
@@ -484,7 +520,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
 /// JSON shapes accepted by `validate_json_shape`.
 #[derive(Clone, Copy)]
 enum JsonShape {
-    /// Top-level Caddy config block (`apps`, `storage`, `admin`, ...).
+    /// Top-level Caddy config block (`apps`, `storage`, ...).
     ObjectOnly,
     /// A single handler / route, OR a list of either.
     ObjectOrArray,
@@ -514,7 +550,7 @@ fn validate_json_shape(
     Err(ConfigError::Invalid(match shape {
         JsonShape::ObjectOnly => format!(
             "{label} must be a JSON object (top-level Caddy config keys like \
-             `apps`, `storage`, `admin`)"
+             `apps`, `storage`)"
         ),
         JsonShape::ObjectOrArray => {
             format!("{label} must be a JSON object (handler) or array of handlers/routes")
@@ -532,7 +568,15 @@ fn validate_json_shape(
 /// via `proxy.tls.client_auth:` (a security regression). Other routes-
 /// shaped paths inside the rendered config (e.g. `apps.tls.automation.policies`)
 /// are also yoink-managed but the realistic operator footguns are these two.
+/// `admin` is reserved whole.
 const RESERVED_CONFIG_EXTRA_PATHS: &[(&[&str], &str)] = &[
+    // yoink binds the admin API to the admin network only, and sends
+    // a fixed `Host`. Another `listen` can open the admin API to every
+    // routed service again, and other `origins` break the next push.
+    (
+        &["admin"],
+        "the Caddy admin API listens only on the `yoink-admin` network",
+    ),
     (
         &["apps", "http", "servers", "main", "routes"],
         "set this via `proxy.global_handlers:` / `caddy_extra_json:` instead",
@@ -654,7 +698,7 @@ services:
     }
 
     /// A service without `networks:` used to default to every entry of
-    /// `deploy.networks`, which includes `yoink-proxy-admin` once the
+    /// `deploy.networks`, which includes `yoink-admin` once the
     /// proxy is on. It could then reach the unauthenticated Caddy
     /// admin API. Only the proxy may be on that network.
     #[test]
@@ -686,7 +730,7 @@ services:
         let nets = |name: &str| cfg.networks_for(cfg.service(name).unwrap());
         assert_eq!(nets("api"), ["app", INGRESS_NETWORK]);
         assert_eq!(nets("worker"), ["app"]);
-        assert_eq!(nets(PROXY_SERVICE_NAME), [INGRESS_NETWORK, ADMIN_NETWORK]);
+        assert_eq!(nets(PROXY_SERVICE_NAME), [ADMIN_NETWORK, INGRESS_NETWORK]);
         // Still declared, so each host creates it for the proxy.
         assert!(cfg.deploy.networks.iter().any(|n| n == ADMIN_NETWORK));
     }
@@ -846,6 +890,58 @@ services:
         let msg = format!("{err}");
         assert!(msg.contains("tls_connection_policies"), "got: {msg}");
         assert!(msg.contains("proxy.tls.client_auth"), "got: {msg}");
+    }
+
+    /// An `admin` override in `config_extra` could set a wildcard
+    /// `listen` again and open the admin API to every routed service.
+    #[test]
+    fn config_extra_rejects_admin_overrides() {
+        for extra in [
+            r#"{"admin":{"listen":"0.0.0.0:2019"}}"#,
+            r#"{"admin":{"origins":["example.com"]}}"#,
+            r#"{"admin":{}}"#,
+        ] {
+            let mut cfg = config_with_one_service(
+                Some(DomainSpec::Single("api.example.com".into())),
+                Some(8080),
+            );
+            cfg.proxy = Some(ProxyConfig {
+                email: Some("ops@example.com".into()),
+                config_extra: Some(extra.into()),
+                ..ProxyConfig::default()
+            });
+            let msg = format!("{}", cfg.inject_implicit_proxy().unwrap_err());
+            assert!(msg.contains("proxy.config_extra"), "got: {msg}");
+            assert!(msg.contains("`admin`"), "got: {msg}");
+            assert!(msg.contains(ADMIN_NETWORK), "got: {msg}");
+        }
+    }
+
+    /// The bootstrap config of the proxy used `0.0.0.0:2019`. With
+    /// the publish on the gateway endpoint, which was `yoink-ingress`,
+    /// every routed service could POST `/load`.
+    #[test]
+    fn bootstrap_admin_listens_on_the_admin_alias() {
+        let proxy = synthesized_proxy_service(&ProxyConfig::default());
+        let [cmd] = proxy.run.cmd.as_slice() else {
+            panic!("one shell command, got {:?}", proxy.run.cmd);
+        };
+        let json = cmd
+            .strip_prefix("echo '")
+            .and_then(|rest| rest.split_once("' | exec caddy run --config /dev/stdin --resume"))
+            .map_or_else(|| panic!("unexpected bootstrap: {cmd}"), |(json, _)| json);
+        let bootstrap: serde_json::Value = serde_json::from_str(json).expect("bootstrap is JSON");
+        assert_eq!(bootstrap["admin"], admin_block());
+        assert_eq!(bootstrap["admin"]["listen"], ADMIN_API_HOST);
+        assert_eq!(
+            bootstrap["admin"]["origins"],
+            serde_json::json!([ADMIN_API_HOST])
+        );
+        assert!(!cmd.contains("0.0.0.0"), "got: {cmd}");
+        assert_eq!(ADMIN_API_HOST, format!("{ADMIN_API_ALIAS}:{ADMIN_PORT}"));
+        // When gateway priorities tie, Docker picks the network name
+        // that sorts first.
+        assert!(ADMIN_NETWORK < INGRESS_NETWORK);
     }
 
     #[test]

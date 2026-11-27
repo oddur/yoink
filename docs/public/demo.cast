@@ -41,7 +41,7 @@
 [1.035, "o", "[203.0.113.10] pull complete\r\n"]
 [0.027, "o", "[203.0.113.10] network docs ready (exists)\r\n"]
 [0.025, "o", "[203.0.113.10] network yoink-ingress ready (exists)\r\n"]
-[0.022, "o", "[203.0.113.10] network yoink-proxy-admin ready (exists)\r\n"]
+[0.022, "o", "[203.0.113.10] network yoink-admin ready (exists)\r\n"]
 [0.166, "o", "[yoink-proxy] [203.0.113.10] yoink-proxy-ae548533 already at spec \u2014 no-op\r\n"]
 [0.0, "o", "[docs] [203.0.113.10] deploying docs:5d26e1f\r\n"]
 [0.98, "o", "[docs] [203.0.113.10] started docs-c1d70c8a-0\r\n"]

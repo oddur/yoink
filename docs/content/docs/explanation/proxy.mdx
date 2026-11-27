@@ -37,7 +37,17 @@ When any service sets `domain:`, yoink adds a `yoink-proxy` service that runs `c
 yoink manages two Docker networks for you:
 
 - **`yoink-ingress`**: the proxy and every service with `domain:` join this network. The proxy reaches your containers by name through it.
-- **`yoink-proxy-admin`**: the admin API of the proxy listens here. yoink publishes the admin port only on the loopback of the host, never on a public interface. yoink reaches it through an SSH tunnel for the duration of one `/load` call.
+- **`yoink-admin`**: only the proxy joins this network. The admin API of the proxy listens here. yoink publishes the admin port only on the loopback of the host, never on a public interface. yoink reaches it through an SSH tunnel for the duration of one `/load` call.
+
+The admin API has no authentication. Thus yoink keeps it off `yoink-ingress`:
+
+- Docker forwards a published port to one network of the container only, the gateway network. The proxy endpoint on `yoink-admin` has gateway priority 1, and the other endpoints have priority 0. Thus `yoink-admin` is the gateway network, and the admin port lands there.
+- The proxy has the alias `yoink-proxy-admin-api` on `yoink-admin` only. The admin API listens on `yoink-proxy-admin-api:2019`. Caddy binds this address to the IP of the proxy on `yoink-admin`. A service on `yoink-ingress` cannot connect to it.
+- Caddy accepts only the `Host` header `yoink-proxy-admin-api:2019`. yoink sends this header on each admin request. The deploy healthcheck of the proxy uses the same name.
+
+Earlier versions of yoink used the network `yoink-proxy-admin` and an admin API on `0.0.0.0:2019`. The next `yoink up` recreates the proxy. The new proxy loads its saved config at start, so the routes come back immediately. The first `/load` then moves the admin API to `yoink-proxy-admin-api:2019`. yoink does not remove `yoink-proxy-admin`. You can remove it on each host with `docker network rm yoink-proxy-admin`.
+
+Use one version of yoink for all operators of a project. An earlier version recreates the proxy with its own spec. That proxy does not have the alias `yoink-proxy-admin-api`, so Caddy cannot load the saved config, the container does not start, and the routes go down. A rollback of the proxy to a container of an earlier version has the same result. To recover, run `yoink up` with the newer version.
 
 Upstream entries name containers, not IPs. As a result, a container restart with a new IP does not break routing, because Docker DNS resolves the name. The active health checks of Caddy take dead backends out of rotation.
 
@@ -89,7 +99,7 @@ The entries run as a pipeline, so their order matters. Cheap filters (the CrowdS
 
 yoink does not model the global config values of Caddy as typed fields. Examples are the server-level `trusted_proxies` and `client_ip_headers`, and the top-level `storage` for shared ACME state across hosts. Top-level app blocks for plugins such as `cache-handler` and `coraza` are also in this group.
 
-`proxy.config_extra:` takes raw JSON for these values, and yoink deep-merges it into the generated config. Your value wins on every leaf conflict. Two paths are the exception: yoink rejects a write to the routes or to the TLS connection policies. A write there removes routes or disables mTLS.
+`proxy.config_extra:` takes raw JSON for these values, and yoink deep-merges it into the generated config. Your value wins on every leaf conflict. Three paths are the exception: yoink rejects a write to the routes, to the TLS connection policies, or to the `admin` block. A write there removes routes, disables mTLS, or opens the admin API to the routed services.
 
 `config_extra:` injects raw config. `global_handlers:` is the typed slot for handlers. The merge rules are in the [`config_extra:` block](/docs/reference/proxy#proxyconfig_extra-block-global-caddy-config-escape-hatch) of the reference.
 
