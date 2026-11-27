@@ -777,6 +777,8 @@ pub async fn deploy_service(
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<ServiceDeployReport, DeployError> {
     let hosts = config.fleet_for(service);
+    // A service with `hosts: []` deploys nothing, so it runs no hooks.
+    let runs_hooks = !hosts.is_empty();
 
     // ── Phase 1: PREPARE ──────────────────────────────────────────
     // For every host: ensure network, pull image, upload files,
@@ -811,7 +813,12 @@ pub async fn deploy_service(
     // deploy tag is authoritative for a self-reference.
     let mut hook_overrides = tag_overrides.clone();
     hook_overrides.insert(service.name.clone(), tag.to_string());
-    for hook in &service.pre_deploy {
+    let hooks = if runs_hooks {
+        service.pre_deploy.as_slice()
+    } else {
+        &[]
+    };
+    for hook in hooks {
         let resolved_tag = resolve_hook_tag(hook, &hook_overrides, &config.services);
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
@@ -4125,6 +4132,56 @@ services:
         assert_eq!(network, "data");
         let (_, network) = hook_target(&cfg, Some(&cfg.services[1])).unwrap();
         assert_eq!(network, "data");
+    }
+
+    /// Regression: a service with `hosts: []` and a container hook
+    /// failed the deploy with "no hosts configured". It deploys
+    /// nothing, so it runs no hooks.
+    #[tokio::test(start_paused = true)]
+    async fn service_with_no_hosts_runs_no_hooks() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: web-1, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: v1
+    hosts: []
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/api
+        tag: { service: api }
+        cmd: ["bin/migrate"]
+"#,
+        )
+        .unwrap();
+
+        let ops = FakeDockerOps::new();
+        let mut events = Vec::new();
+        let mut sink = |e: DeployEvent| events.push(e);
+        let report = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "v1",
+            &BTreeMap::new(),
+            None,
+            true,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+
+        assert!(report.hosts.is_empty());
+        assert!(ops.calls().is_empty(), "{:?}", ops.calls());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DeployEvent::HookStarted { .. })),
+            "{events:?}"
+        );
     }
 
     /// End to end: `deploy_service` runs the hook of a service pinned

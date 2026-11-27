@@ -231,7 +231,7 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `image` | string | required | Image reference, without the tag. |
 | `tag` | string | unset | Literal tag. See [Tag overrides at deploy time](#tag-overrides-at-deploy-time). |
 | `build` | [Build](#build) | unset | Local-build config. Required for the `--build` flow. |
-| `hosts` | list of string | all hosts | Restricts the hosts that run this service. The strings match `hosts[].address`. |
+| `hosts` | list of string | all hosts | Restricts the hosts that run this service. The strings match `hosts[].address`. With an empty list, yoink deploys nothing for the service and runs none of its hooks. |
 | `depends_on` | list of string | `[]` | Names of other services. A topological sort of these names gives the wave order. Must be a DAG. |
 | `networks` | list of string | every network in `deploy.networks` | Docker networks to attach. Each one must be declared in `deploy.networks`. Config load rejects an empty list. The default does not include the proxy networks: a service with `domain:` also joins `yoink-ingress`, and only the proxy joins `yoink-proxy-admin`. |
 | `secrets` | list of string | `[]` | Secret names. Each secret becomes an env var of the same name. |
