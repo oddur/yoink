@@ -433,27 +433,27 @@ async fn inspect_field_diff(
     diff.publish_added = desired_ports.difference(&current_ports).cloned().collect();
     diff.publish_removed = current_ports.difference(&desired_ports).cloned().collect();
 
-    // Memory: compare running limit vs desired limit.
-    let desired_memory_bytes: Option<i64> = service
-        .run
-        .options
-        .memory
-        .as_deref()
-        .and_then(|m| crate::base::run_args::parse_memory(m).ok());
-    let current_memory_bytes: Option<i64> = detail.memory_bytes.filter(|&b| b > 0);
-    if desired_memory_bytes != current_memory_bytes {
-        let fmt_mem = |b: Option<i64>| match b {
-            None => "unlimited".to_string(),
-            Some(n) => crate::features::output::format_bytes(n),
-        };
-        diff.memory_changed = Some(format!(
-            "{} → {}",
-            fmt_mem(current_memory_bytes),
-            fmt_mem(desired_memory_bytes)
-        ));
-    }
+    diff.memory_changed = memory_change(service.run.options.memory.as_deref(), detail.memory_bytes);
 
     Ok(diff)
+}
+
+/// The memory limit drift as `"running → desired"`, or `None`. Docker
+/// reports no limit as `0`, and `memory: "0"` also means no limit, so
+/// both sides treat a limit of `0` as none.
+fn memory_change(desired: Option<&str>, running: Option<i64>) -> Option<String> {
+    let desired = desired
+        .and_then(|m| crate::base::run_args::parse_memory(m).ok())
+        .filter(|&b| b > 0);
+    let running = running.filter(|&b| b > 0);
+    if desired == running {
+        return None;
+    }
+    let fmt_mem = |b: Option<i64>| match b {
+        None => "unlimited".to_string(),
+        Some(n) => crate::features::output::format_bytes(n),
+    };
+    Some(format!("{} → {}", fmt_mem(running), fmt_mem(desired)))
 }
 
 /// Pure-function part of `inspect_field_diff`: given current vs desired
@@ -1295,5 +1295,16 @@ services:
         assert_eq!(added, vec!["ADD"]);
         assert_eq!(removed, vec!["REMOVE"]);
         assert_eq!(changed, vec!["CHANGE"]);
+    }
+
+    /// Regression: `memory: "0"` (no limit) showed permanent drift. The
+    /// desired value was `Some(0)`, and the running `0` was filtered out.
+    #[test]
+    fn memory_zero_matches_a_container_without_a_limit() {
+        assert_eq!(memory_change(Some("0"), Some(0)), None);
+        assert_eq!(memory_change(Some("0"), None), None);
+        assert_eq!(memory_change(None, Some(0)), None);
+        assert!(memory_change(Some("512m"), Some(0)).is_some());
+        assert_eq!(memory_change(Some("512m"), Some(512 * 1024 * 1024)), None);
     }
 }
