@@ -3326,7 +3326,9 @@ async fn cmd_pf(
 
     // Resolve the path: published host endpoint OR sidecar handle.
     // `sidecar` is bound here so its Drop fires after SIGINT.
-    let resolved = pf::resolve_target(ops.clone(), &host, service, container_port, mode).await?;
+    let networks = config.networks_for(service);
+    let resolved =
+        pf::resolve_target(ops.clone(), &host, service, &networks, container_port, mode).await?;
     let (remote_dial_host, remote_port, mode_label, sidecar) = match resolved {
         pf::ResolvedTarget::Published(ep) => (ep.host_ip, ep.host_port, "published", None),
         pf::ResolvedTarget::Sidecar(handle) => {
