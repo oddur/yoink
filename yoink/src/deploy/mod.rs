@@ -2133,22 +2133,29 @@ async fn run_hook(
 
 /// The host and network a container hook runs on. A top-level hook
 /// uses the first host of the fleet and the first of `deploy.networks`.
-/// A service hook uses the first host and the first network of its
-/// service, so it runs where the service runs and can reach what the
-/// service reaches (e.g. a migration hook hitting the database).
-/// Operators with stricter isolation needs can put their hooks on a
-/// dedicated network and put it first. `None` when there is no host.
+/// A service hook uses the first host of its service, so it runs where
+/// the service runs. It joins the first network in `deploy.networks`
+/// that the service is on: a hook joins one network only, and this
+/// keeps `deploy.networks[0]` (e.g. the database network of a
+/// migration hook) whenever the service is on it. Operators with
+/// stricter isolation needs can put their hooks on a dedicated network
+/// and put it first. `None` when there is no host.
 fn hook_target(config: &Config, service: Option<&ServiceConfig>) -> Option<(Host, String)> {
-    let (hosts, networks) = match service {
-        Some(svc) => (config.fleet_for(svc), config.networks_for(svc)),
-        None => (config.fleet(), config.networks().to_vec()),
+    let declared = config.networks();
+    let (hosts, network) = match service {
+        Some(svc) => {
+            let own = config.networks_for(svc);
+            let network = declared
+                .iter()
+                .find(|n| own.contains(n))
+                .or_else(|| own.first())
+                .cloned();
+            (config.fleet_for(svc), network)
+        }
+        None => (config.fleet(), declared.first().cloned()),
     };
     let host = hosts.into_iter().next()?;
-    let network = networks
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "bridge".to_string());
-    Some((host, network))
+    Some((host, network.unwrap_or_else(|| "bridge".to_string())))
 }
 
 /// Docker allows only `[a-zA-Z0-9_.-]` in a container name. A digest
@@ -4087,6 +4094,37 @@ services:
         let (host, network) = hook_target(&cfg, None).unwrap();
         assert_eq!(host.address, "web-1");
         assert_eq!(network, "edge");
+    }
+
+    /// Regression: a service hook joined the first entry of the
+    /// service's own `networks:`. A service on `[edge, data]` with
+    /// `deploy.networks: [data, edge]` lost the `data` network (e.g. the
+    /// database of a migration hook). The `deploy.networks` order wins.
+    #[test]
+    fn service_hook_keeps_the_first_deploy_network_when_the_service_is_on_it() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: web-1, user: deploy }
+deploy:
+  networks: [data, edge]
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: v1
+    networks: [edge, data]
+    run: { port: 3000, healthcheck_path: /health }
+  - name: web
+    image: registry.example.com/web
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap();
+        let (_, network) = hook_target(&cfg, Some(&cfg.services[0])).unwrap();
+        assert_eq!(network, "data");
+        let (_, network) = hook_target(&cfg, Some(&cfg.services[1])).unwrap();
+        assert_eq!(network, "data");
     }
 
     /// End to end: `deploy_service` runs the hook of a service pinned
