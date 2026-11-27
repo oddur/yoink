@@ -27,7 +27,7 @@ pub enum TarballError {
     /// `docker save` failed and the load on the host failed with it
     /// (it got a short or empty tar). The save stderr names the cause.
     /// The load error prints as the source.
-    #[error("`docker save` for {image:?} exited with status {status}{stderr}", stderr = if .stderr.is_empty() { String::new() } else { format!(":\n{}", .stderr) })]
+    #[error("`docker save` for {image:?} exited with status {status}:\n{stderr}")]
     SaveAndLoadFailed {
         image: String,
         status: String,

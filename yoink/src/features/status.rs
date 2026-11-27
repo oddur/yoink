@@ -27,6 +27,12 @@ pub struct HostFailure {
     pub error: String,
 }
 
+impl std::fmt::Display for HostFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.host, self.error)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct StatusReport {
     pub hosts: Vec<HostStatus>,
@@ -71,18 +77,19 @@ impl StatusReport {
     /// host's containers. `failed` stays as is, so the error still
     /// shows. Hosts stay in the order of `config.fleet()`.
     pub fn keep_failed_hosts_from(&mut self, previous: &Self, config: &Config) {
-        let carried = previous.hosts.iter().filter(|prev| {
-            self.failed.iter().any(|f| f.host == prev.host)
-                && !self.hosts.iter().any(|h| h.host == prev.host)
-        });
-        let carried: Vec<HostStatus> = carried.cloned().collect();
+        let carried: Vec<HostStatus> = previous
+            .hosts
+            .iter()
+            .filter(|prev| self.failed.iter().any(|f| f.host == prev.host))
+            .cloned()
+            .collect();
         if carried.is_empty() {
             return;
         }
         self.hosts.extend(carried);
-        let fleet: Vec<String> = config.fleet().into_iter().map(|h| h.address).collect();
+        let fleet = config.fleet();
         self.hosts
-            .sort_by_key(|h| fleet.iter().position(|addr| *addr == h.host));
+            .sort_by_key(|h| fleet.iter().position(|f| f.address == h.host));
     }
 
     /// All containers for one named service across every host.

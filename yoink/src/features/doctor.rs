@@ -947,14 +947,9 @@ fn check_tls_cert_secrets(
     // `check_secret_references` reports a missing bundle only for
     // services with `secrets:`, so report it here for the TLS certs.
     let Some(bundle) = bundle else {
-        return vec![
-            Finding::error(
-                "secrets",
-                "the TLS certs (`proxy.tls` or a `tls: cert` service) need the secrets bundle, \
-                 but no bundle is configured / loadable",
-            )
-            .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)"),
-        ];
+        return vec![missing_bundle(
+            "the TLS certs (`proxy.tls` or a `tls: cert` service) need the secrets bundle",
+        )];
     };
 
     let mut out = Vec::new();
@@ -989,7 +984,7 @@ fn check_tls_cert_secrets(
         }
         // A service that inherits the `proxy.tls` cert is covered by
         // the check above.
-        if global_tls.is_some() && svc.tls_cert_secret.is_none() && svc.tls_key_secret.is_none() {
+        if global_tls.is_some() && svc.own_tls_cert().is_none() {
             continue;
         }
         let cert_key = svc
@@ -1039,6 +1034,16 @@ fn check_tls_cert_secrets(
 
 // ---------- env_from_secrets / secrets references match the bundle ----------
 
+/// The error for a check that needs the secrets bundle when there is
+/// none. `what` names what needs it.
+fn missing_bundle(what: &str) -> Finding {
+    Finding::error(
+        "secrets",
+        format!("{what} but no bundle is configured / loadable"),
+    )
+    .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)")
+}
+
 fn check_secret_references(
     config: &Config,
     bundle: Option<&crate::base::bundle::SecretsBundle>,
@@ -1054,13 +1059,7 @@ fn check_secret_references(
         )];
     }
     let Some(bundle) = bundle else {
-        return vec![
-            Finding::error(
-                "secrets",
-                "services reference secrets but no bundle is configured / loadable",
-            )
-            .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)"),
-        ];
+        return vec![missing_bundle("services reference secrets")];
     };
 
     let mut out = Vec::new();

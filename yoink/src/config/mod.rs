@@ -958,6 +958,17 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
+    /// The service's own `(tls_cert_secret, tls_key_secret)`, when it
+    /// sets both. A `tls: cert` service that sets neither uses the
+    /// `proxy.tls` cert. Validation rejects a service that sets one.
+    #[must_use]
+    pub fn own_tls_cert(&self) -> Option<(&str, &str)> {
+        Some((
+            self.tls_cert_secret.as_deref()?,
+            self.tls_key_secret.as_deref()?,
+        ))
+    }
+
     /// The networks this service will actually attach to — its
     /// declared list when set, else every network in `deploy.networks`.
     #[must_use]
@@ -1702,7 +1713,7 @@ impl Config {
                 svc.run
                     .binds
                     .iter()
-                    .filter(|b| crate::base::run_args::bind_has_options_without_mode(b))
+                    .filter(|b| run_args::bind_has_options_without_mode(b))
                     .map(|b| (svc.name.as_str(), b.as_str()))
             })
             .collect()
@@ -2366,17 +2377,13 @@ impl Config {
                     "run.options.memory",
                     opts.memory
                         .as_deref()
-                        .map(run_args::parse_memory)
-                        .transpose()
-                        .err(),
+                        .and_then(|m| run_args::parse_memory(m).err()),
                 ),
                 (
                     "run.options.cpus",
                     opts.cpus
                         .as_deref()
-                        .map(run_args::parse_cpus)
-                        .transpose()
-                        .err(),
+                        .and_then(|c| run_args::parse_cpus(c).err()),
                 ),
                 // The synthesized `_proxy` gets its publish list from
                 // `proxy.bind:`. Do not fail every command on it.

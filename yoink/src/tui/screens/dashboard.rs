@@ -176,8 +176,19 @@ impl DashboardState {
     /// Convenience for tests + sync paths.
     #[cfg(test)]
     pub async fn refresh(&mut self, ops: &dyn DockerOps, config: &Config) {
-        let data = fetch(ops, config).await;
-        self.apply(data, config);
+        let mut data = fetch(ops, config).await;
+        self.keep_failed_hosts(&mut data, config);
+        self.apply(data);
+    }
+
+    /// On a partial failure, give each host that did not answer its
+    /// last-known rows, so a one-tick ssh blip does not hide them. The
+    /// error stays in `data`, so the footer still shows it. Call before
+    /// [`Self::apply`], and hand the same report to the other screens.
+    pub fn keep_failed_hosts(&self, data: &mut DashboardRefresh, config: &Config) {
+        if let (Some(report), Some(previous)) = (data.report.as_mut(), &self.report) {
+            report.keep_failed_hosts_from(previous, config);
+        }
     }
 
     /// Apply background-fetched results. `loaded` flips
@@ -185,24 +196,14 @@ impl DashboardState {
     /// ssh probe failed, etc.), the existing render path uses
     /// `last_error` to surface the failure instead of looping on
     /// `(loading…)`. Last-known good `report`/`stats` are kept on
-    /// error to ride out transient blips. On a partial failure the
-    /// hosts that did not answer keep their last-known rows too.
-    pub fn apply(&mut self, data: DashboardRefresh, config: &Config) {
+    /// error to ride out transient blips (see also
+    /// [`Self::keep_failed_hosts`] for a partial failure).
+    pub fn apply(&mut self, data: DashboardRefresh) {
         self.last_error = data.error;
         self.loaded = true;
-        if let Some(mut report) = data.report {
-            if let Some(previous) = &self.report {
-                report.keep_failed_hosts_from(previous, config);
-            }
+        if let Some(report) = data.report {
             self.report = Some(report);
         }
-    }
-
-    /// The last report, with the last-known rows of hosts that did not
-    /// answer. `None` until a refresh succeeds.
-    #[must_use]
-    pub fn report(&self) -> Option<&StatusReport> {
-        self.report.as_ref()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -460,7 +461,7 @@ async fn fetch(ops: &dyn DockerOps, config: &Config) -> DashboardRefresh {
             let error = (!r.failed.is_empty()).then(|| {
                 r.failed
                     .iter()
-                    .map(|f| format!("{}: {}", f.host, f.error))
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(" · ")
             });
@@ -487,6 +488,22 @@ mod tests {
             r#"
 hosts:
   - { address: host-a, user: deploy }
+services:
+  - name: app-a
+    image: x
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap()
+    }
+
+    fn config_two_hosts() -> Config {
+        Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+  - { address: host-b, user: deploy }
 services:
   - name: app-a
     image: x
@@ -537,19 +554,7 @@ services:
 
     #[tokio::test]
     async fn refresh_shows_reachable_hosts_and_reports_unreachable_one() {
-        let cfg = Config::parse_str(
-            r#"
-hosts:
-  - { address: host-a, user: deploy }
-  - { address: host-b, user: deploy }
-services:
-  - name: app-a
-    image: x
-    tag: v1
-    run: { port: 3000, healthcheck_path: /health }
-"#,
-        )
-        .unwrap();
+        let cfg = config_two_hosts();
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![running_container()]));
         ops.push_list_containers(Err(crate::docker_ops::DockerError::SshProbe {
@@ -573,19 +578,7 @@ services:
     /// failed host vanish. Its rows stay and the footer shows the error.
     #[tokio::test]
     async fn partial_failure_keeps_the_rows_of_the_failed_host() {
-        let cfg = Config::parse_str(
-            r#"
-hosts:
-  - { address: host-a, user: deploy }
-  - { address: host-b, user: deploy }
-services:
-  - name: app-a
-    image: x
-    tag: v1
-    run: { port: 3000, healthcheck_path: /health }
-"#,
-        )
-        .unwrap();
+        let cfg = config_two_hosts();
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![running_container()]));
         ops.push_list_containers(Ok(vec![running_container()]));
@@ -599,7 +592,7 @@ services:
         ops.push_list_containers(Ok(vec![]));
         state.refresh(&ops, &cfg).await;
 
-        let report = state.report().expect("report is kept");
+        let report = state.report.as_ref().expect("report is kept");
         let hosts: Vec<(&str, usize)> = report
             .hosts
             .iter()

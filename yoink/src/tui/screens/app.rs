@@ -3086,7 +3086,7 @@ impl App {
                 }
                 self.container_detail_in_flight = false;
             }
-            Update::Dashboard(data) => {
+            Update::Dashboard(mut data) => {
                 // Long error strings (ssh-probe with a Tailscale auth
                 // URL, multi-line bollard errors) get auto-popped as a
                 // modal so the URL is actually visible — the one-line
@@ -3095,17 +3095,17 @@ impl App {
                     self.show_error_modal_once("connection error", err);
                 }
                 // Services & ServiceDetail share the same StatusReport
-                // as Dashboard. Dashboard's apply keeps the last-known
-                // rows of a host that did not answer, so the two get
-                // its merged report. No new report: all keep the old.
-                let fresh = data.report.is_some();
-                self.dashboard.apply(data, &self.config);
-                let report = fresh.then(|| self.dashboard.report().cloned()).flatten();
+                // as Dashboard. A host that did not answer keeps its
+                // last-known rows on all three. Clone the report into
+                // both before dashboard's apply moves it.
+                self.dashboard.keep_failed_hosts(&mut data, &self.config);
+                let report_clone = data.report.clone();
                 let service_names: Vec<String> =
                     self.config.service_names().map(str::to_string).collect();
-                self.services.apply(report.clone(), service_names);
+                self.services.apply(report_clone.clone(), service_names);
                 self.service_detail
-                    .apply(report.map(Arc::new), &self.config);
+                    .apply(report_clone.map(Arc::new), &self.config);
+                self.dashboard.apply(data);
                 self.dashboard_in_flight = false;
             }
             Update::ServiceHistory {
@@ -3590,7 +3590,7 @@ impl App {
             }
         };
         for f in &report.failed {
-            self.push_toast(format!("✗ log collect {}: {}", f.host, f.error));
+            self.push_toast(format!("✗ log collect {f}"));
         }
         for host_status in report.hosts {
             for container in host_status.containers.iter().filter(|c| c.is_running()) {

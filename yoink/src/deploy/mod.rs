@@ -778,7 +778,13 @@ pub async fn deploy_service(
 ) -> Result<ServiceDeployReport, DeployError> {
     let hosts = config.fleet_for(service);
     // A service with `hosts: []` deploys nothing, so it runs no hooks.
-    let runs_hooks = !hosts.is_empty();
+    if hosts.is_empty() {
+        return Ok(ServiceDeployReport {
+            service: service.name.clone(),
+            tag: tag.to_string(),
+            hosts: Vec::new(),
+        });
+    }
 
     // ── Phase 1: PREPARE ──────────────────────────────────────────
     // For every host: ensure network, pull image, upload files,
@@ -813,12 +819,7 @@ pub async fn deploy_service(
     // deploy tag is authoritative for a self-reference.
     let mut hook_overrides = tag_overrides.clone();
     hook_overrides.insert(service.name.clone(), tag.to_string());
-    let hooks = if runs_hooks {
-        service.pre_deploy.as_slice()
-    } else {
-        &[]
-    };
-    for hook in hooks {
+    for hook in &service.pre_deploy {
         let resolved_tag = resolve_hook_tag(hook, &hook_overrides, &config.services);
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
@@ -843,8 +844,7 @@ pub async fn deploy_service(
                 // `finalize_one_host` unwinds its own host. The hosts
                 // not finalized yet still hold this attempt's replicas
                 // in `created` state; remove them too.
-                let rest: Vec<HostPrep> = pending.collect();
-                cleanup_prepared_replicas(ops, &rest).await;
+                cleanup_prepared_replicas(ops, pending.as_slice()).await;
                 return Err(e);
             }
         }

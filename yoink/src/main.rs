@@ -2462,7 +2462,7 @@ async fn cmd_status(config: &Config, json: bool) -> Result<()> {
 /// command exits non-zero. The reachable hosts are already printed.
 fn report_unreachable_hosts(report: &StatusReport) -> Result<()> {
     for f in &report.failed {
-        eprintln!("{}: {}", f.host, f.error);
+        eprintln!("{f}");
     }
     if !report.failed.is_empty() {
         anyhow::bail!(

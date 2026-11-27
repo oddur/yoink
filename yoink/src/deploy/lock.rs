@@ -254,9 +254,7 @@ where
     match first_error {
         None => Ok(locks),
         Some(err) => {
-            for lock in locks {
-                lock.release(ops).await;
-            }
+            futures_util::future::join_all(locks.into_iter().map(|lock| lock.release(ops))).await;
             Err(err)
         }
     }

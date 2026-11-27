@@ -205,9 +205,10 @@ where
     // A `tls: cert` service without its own secrets uses the
     // proxy-level cert above (validation allows that only when
     // `proxy.tls` is set).
-    let cert_services: Vec<&&ServiceConfig> = proxied
+    let cert_services: Vec<(&ServiceConfig, (&str, &str))> = proxied
         .iter()
-        .filter(|s| matches!(s.tls, TlsMode::Cert) && s.tls_cert_secret.is_some())
+        .filter(|s| matches!(s.tls, TlsMode::Cert))
+        .filter_map(|s| Some((*s, s.own_tls_cert()?)))
         .collect();
     if !cert_services.is_empty() {
         let bundle = bundle.ok_or_else(|| {
@@ -216,9 +217,7 @@ where
                 cert_services.len(),
             )
         })?;
-        for svc in &cert_services {
-            let cert_name = svc.tls_cert_secret.as_deref().expect("validated upstream");
-            let key_name = svc.tls_key_secret.as_deref().expect("validated upstream");
+        for (svc, (cert_name, key_name)) in &cert_services {
             let cert = bundle.get(cert_name).ok_or_else(|| {
                 anyhow!(
                     "service {:?} references tls_cert_secret={cert_name:?} but the \
