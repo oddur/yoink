@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, TableState};
 use throbber_widgets_tui::{Throbber, ThrobberState};
 
-use crate::bundle::SecretsBundle;
+use crate::base::bundle::SecretsBundle;
 use crate::config::Config;
 use crate::deploy;
 use crate::docker;

@@ -15,8 +15,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::pf::SidecarHandle;
-use crate::transport::tunnel::SshTunnel;
+use crate::features::pf::SidecarHandle;
+use crate::ssh::tunnel::SshTunnel;
 
 #[derive(Default)]
 pub struct VscodeSessionState {

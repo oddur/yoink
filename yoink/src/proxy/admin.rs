@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::base::host::Host;
 use crate::docker_ops::{DockerError, DockerOps, parse_published_port};
-use crate::host::Host;
-use crate::transport::tunnel::{SshTunnel, TunnelError};
+use crate::ssh::tunnel::{SshTunnel, TunnelError};
 
 use crate::config::{ADMIN_PORT, PROXY_SERVICE_NAME};
 

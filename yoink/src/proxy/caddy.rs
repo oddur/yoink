@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::bundle::SecretsBundle;
+use crate::base::bundle::SecretsBundle;
 use crate::config::{Config, ServiceConfig, TlsMode};
 
 /// Render `cfg` into the Caddy admin-API JSON config. Container names

@@ -24,7 +24,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use zeroize::Zeroizing;
 
-use crate::bundle::SecretsBundle;
+use crate::base::bundle::SecretsBundle;
 use crate::config::{Config, SecretsConfig, SecretsFormat};
 use crate::sealed;
 

@@ -17,9 +17,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::host::Host;
-use crate::pf::PublishedEndpoint;
-use crate::transport::tunnel::SshTunnel;
+use crate::base::host::Host;
+use crate::features::pf::PublishedEndpoint;
+use crate::ssh::tunnel::SshTunnel;
 
 /// In-app collection of live forwards. Lookups are by `(host_address,
 /// service, container_port)`; the `BTreeMap` ordering gives us a stable
@@ -70,7 +70,7 @@ pub struct ActiveForward {
     /// Drop force-removes the alpine/socat container; auto-remove on
     /// docker handles the case where Drop runs after the runtime has
     /// already torn down.
-    sidecar: Option<crate::pf::SidecarHandle>,
+    sidecar: Option<crate::features::pf::SidecarHandle>,
 }
 
 impl ActiveForward {
@@ -83,7 +83,7 @@ impl ActiveForward {
         url: String,
         target_container: Option<String>,
         tunnel: SshTunnel,
-        sidecar: Option<crate::pf::SidecarHandle>,
+        sidecar: Option<crate::features::pf::SidecarHandle>,
     ) -> Self {
         Self {
             key: ForwardKey {
@@ -233,7 +233,7 @@ impl PortForwardState {
         self.refresh_footer();
         let closes: Vec<_> = drained
             .into_iter()
-            .filter_map(|fwd| fwd.sidecar.map(crate::pf::SidecarHandle::close))
+            .filter_map(|fwd| fwd.sidecar.map(crate::features::pf::SidecarHandle::close))
             .collect();
         if !closes.is_empty() {
             futures_util::future::join_all(closes).await;

@@ -18,7 +18,6 @@
 
 pub mod oci_push;
 pub mod tarball;
-pub mod tunnel;
 pub mod unregistry;
 
 /// Transport selection for the `--no-registry` image-delivery step.

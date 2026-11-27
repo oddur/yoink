@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::host::{Host, split_address_port};
+use crate::base::host::{Host, split_address_port};
 
 mod proxy;
 
@@ -536,7 +536,7 @@ impl XcaddyConfig {
             input.push_str(&r);
             input.push('\n');
         }
-        crate::hash::short_sha256(&input)
+        crate::base::hash::short_sha256(&input)
     }
 
     /// `yoink-caddy:<hash>` — the local tag produced by
@@ -1766,7 +1766,7 @@ impl Config {
     /// - `address_secret` references a key not present in the bundle.
     pub fn resolve_host_addresses(
         &mut self,
-        bundle: Option<&crate::bundle::SecretsBundle>,
+        bundle: Option<&crate::base::bundle::SecretsBundle>,
     ) -> Result<(), ConfigError> {
         for (i, host) in self.hosts.iter_mut().enumerate() {
             let Some(key) = host.address_secret.as_deref() else {
@@ -1846,7 +1846,8 @@ impl Config {
         registry: &'a RegistryConfig,
     ) -> impl Iterator<Item = &'a ServiceConfig> {
         self.services.iter().filter(move |svc| {
-            svc.build.is_none() && crate::image::image_on_registry(&svc.image, &registry.server)
+            svc.build.is_none()
+                && crate::base::image::image_on_registry(&svc.image, &registry.server)
         })
     }
 
@@ -2125,7 +2126,7 @@ impl Config {
         }
         let mut registry_hosts: BTreeMap<String, &str> = BTreeMap::new();
         for reg in &self.registries {
-            let host = crate::image::canonical_registry_host(&reg.server);
+            let host = crate::base::image::canonical_registry_host(&reg.server);
             if let Some(first) = registry_hosts.insert(host, &reg.server) {
                 return Err(ConfigError::Invalid(format!(
                     "registries: `{first}` and `{}` are the same registry; \
@@ -2338,7 +2339,7 @@ impl Config {
                 )));
             }
             for spec in &service.run.options.devices {
-                if let Err(e) = crate::run_args::validate_device_spec(spec) {
+                if let Err(e) = crate::base::run_args::validate_device_spec(spec) {
                     return Err(ConfigError::Invalid(format!(
                         "service {:?}.run.options.devices: {e}",
                         service.name
@@ -3055,7 +3056,7 @@ secrets:
 
     #[test]
     fn resolve_host_addresses_populates_from_bundle() {
-        use crate::bundle::SecretsBundle;
+        use crate::base::bundle::SecretsBundle;
         let dir = write_temp_tree(&[(
             "yoink.yaml",
             r#"
@@ -3081,7 +3082,7 @@ secrets:
 
     #[test]
     fn resolve_host_addresses_errors_on_missing_key() {
-        use crate::bundle::SecretsBundle;
+        use crate::base::bundle::SecretsBundle;
         let dir = write_temp_tree(&[(
             "yoink.yaml",
             r#"
@@ -4652,7 +4653,7 @@ hooks:
 
     #[test]
     fn sealed_address_with_port_is_rejected_without_leaking_it() {
-        use crate::bundle::SecretsBundle;
+        use crate::base::bundle::SecretsBundle;
         let dir = write_temp_tree(&[(
             "yoink.yaml",
             r#"

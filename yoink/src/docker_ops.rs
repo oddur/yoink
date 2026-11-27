@@ -24,7 +24,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::host::Host;
+use crate::base::host::Host;
 
 #[derive(Debug, Error)]
 pub enum DockerError {
@@ -538,7 +538,7 @@ pub trait DockerOps: Send + Sync {
     /// Path to the SSH private key to use when subprocess-spawning
     /// `ssh` for this host (e.g. unregistry's tunnel + probe). Returns
     /// `Some` only when the host declared `ssh_key_secret:` and the
-    /// key was decrypted into a tempfile by `ssh_keys::prepare`.
+    /// key was decrypted into a tempfile by `ssh::keys::prepare`.
     /// Default `None` for `FakeDockerOps` and the no-key case.
     fn ssh_keyfile(&self, _host: &Host) -> Option<std::path::PathBuf> {
         None
@@ -923,10 +923,10 @@ pub struct RealDockerOps {
     clients: tokio::sync::Mutex<HashMap<String, CachedClient>>,
     timeout_secs: u64,
     /// Per-host private-key tempfiles for hosts declaring
-    /// `ssh_key_secret:`. Built by `crate::ssh_keys::prepare` from the
+    /// `ssh_key_secret:`. Built by `crate::ssh::keys::prepare` from the
     /// secrets bundle; passed into bollard `connect_with_ssh` as the
     /// `keypair_path` arg, and added to `ssh_probe`'s `ssh -i`.
-    key_manager: Option<std::sync::Arc<crate::ssh_keys::KeyManager>>,
+    key_manager: Option<std::sync::Arc<crate::ssh::keys::KeyManager>>,
 }
 
 impl RealDockerOps {
@@ -936,7 +936,7 @@ impl RealDockerOps {
     }
 
     #[must_use]
-    pub fn with_key_manager(km: Option<std::sync::Arc<crate::ssh_keys::KeyManager>>) -> Self {
+    pub fn with_key_manager(km: Option<std::sync::Arc<crate::ssh::keys::KeyManager>>) -> Self {
         Self {
             clients: tokio::sync::Mutex::new(HashMap::new()),
             timeout_secs: 120,
@@ -986,17 +986,17 @@ impl RealDockerOps {
                 .as_ref()
                 .and_then(|km| km.key_for(host))
                 .map(|p| p.to_string_lossy().into_owned());
-            crate::ssh_probe::probe(host, keyfile.as_deref())
+            crate::ssh::probe::probe(host, keyfile.as_deref())
                 .await
                 .map_err(|detail| DockerError::SshProbe {
                     host: host.address.clone(),
                     detail,
                 })?;
             // bollard's own ssh connector cannot dial a non-default
-            // port (see `crate::bollard_ssh`), so a host with `port:`
+            // port (see `crate::ssh::bollard`), so a host with `port:`
             // goes through yoink's copy of it.
             match host.ssh_port() {
-                Some(port) => crate::bollard_ssh::connect(host, port, keyfile, self.timeout_secs),
+                Some(port) => crate::ssh::bollard::connect(host, port, keyfile, self.timeout_secs),
                 None => Docker::connect_with_ssh(
                     &key,
                     self.timeout_secs,
@@ -1529,7 +1529,7 @@ impl DockerOps for RealDockerOps {
         image: &str,
         tag: &str,
     ) -> Result<bool, DockerError> {
-        let reference = crate::image::image_reference(image, tag);
+        let reference = crate::base::image::image_reference(image, tag);
         self.with_retry(host, |docker| {
             let reference = reference.clone();
             async move {
@@ -2751,7 +2751,7 @@ impl FakeDockerOps {
     /// Mark `image:tag` as already present so `image_present` returns
     /// `true` and the caller skips its pull/build.
     pub fn mark_image_present(&self, image: &str, tag: &str) {
-        let key = crate::image::image_reference(image, tag);
+        let key = crate::base::image::image_reference(image, tag);
         self.lock().images_present.insert(key, true);
     }
     pub fn push_list_containers(&self, v: Result<Vec<ContainerInfo>, DockerError>) {
@@ -2886,7 +2886,7 @@ impl DockerOps for FakeDockerOps {
         image: &str,
         tag: &str,
     ) -> Result<bool, DockerError> {
-        let key = crate::image::image_reference(image, tag);
+        let key = crate::base::image::image_reference(image, tag);
         Ok(*self.lock().images_present.get(&key).unwrap_or(&false))
     }
     async fn load_image(&self, host: &Host, _body: ImageTarStream) -> Result<(), DockerError> {

@@ -11,8 +11,8 @@ use thiserror::Error;
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
 
+use crate::base::host::Host;
 use crate::docker_ops::{DockerError, DockerOps, ImageTarStream};
-use crate::host::Host;
 
 #[derive(Debug, Error)]
 pub enum TarballError {

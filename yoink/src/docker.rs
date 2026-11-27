@@ -11,12 +11,12 @@ use bollard::models::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::config::RunOptions;
-use crate::image::image_reference;
-use crate::run_args::{
+use crate::base::image::image_reference;
+use crate::base::run_args::{
     BuildError, default_bind_to_ro, harden_tmpfs_options, parse_cpus, parse_device, parse_memory,
     parse_port_bindings,
 };
+use crate::config::RunOptions;
 
 /// Number of hex characters from the spec hash that go into the
 /// container name suffix. 8 chars = 32 bits = ~65k services before 50%
