@@ -524,7 +524,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
             cmd: vec![format!(
                 "echo '{}' | exec caddy run --config /dev/stdin --resume",
-                serde_json::json!({ "admin": admin_block() }),
+                bootstrap_config(),
             )],
             // Yoink's `cap_drop: [ALL]` default would block Caddy
             // from binding :80/:443 (privileged ports). Re-add the
@@ -549,6 +549,18 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             ..ServiceRun::default()
         },
     }
+}
+
+/// The bootstrap Caddy config of the proxy: only [`admin_block`]. The
+/// string is part of the proxy `cmd`, and thus of the spec hash. It is
+/// written out with a fixed key order, because the key order of a
+/// `serde_json::Value` depends on the `preserve_order` feature. A
+/// dependency that turns that feature on would otherwise change the
+/// hash and recreate the proxy on every host.
+fn bootstrap_config() -> String {
+    format!(
+        r#"{{"admin":{{"enforce_origin":false,"listen":"{ADMIN_API_HOST}","origins":["{ADMIN_API_HOST}"]}}}}"#
+    )
 }
 
 /// JSON shapes accepted by `validate_json_shape`.
@@ -1016,6 +1028,23 @@ services:
         // When gateway priorities tie, Docker picks the network name
         // that sorts first.
         assert!(ADMIN_NETWORK < INGRESS_NETWORK);
+    }
+
+    /// The bootstrap is part of the spec hash of the proxy. It came from
+    /// `serde_json::Value` Display, so its key order depended on the
+    /// `preserve_order` feature of `serde_json`.
+    #[test]
+    fn bootstrap_cmd_is_pinned() {
+        let proxy = synthesized_proxy_service(&ProxyConfig::default());
+        assert_eq!(
+            proxy.run.cmd,
+            [concat!(
+                r#"echo '{"admin":{"enforce_origin":false,"#,
+                r#""listen":"yoink-proxy-admin-api:2019","#,
+                r#""origins":["yoink-proxy-admin-api:2019"]}}'"#,
+                " | exec caddy run --config /dev/stdin --resume",
+            )]
+        );
     }
 
     #[test]
