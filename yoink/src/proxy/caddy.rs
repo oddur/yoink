@@ -1374,7 +1374,7 @@ services:
 
     #[test]
     fn config_extra_user_keys_win_on_conflict() {
-        // User explicitly overrides yoink's default admin block.
+        // User explicitly overrides a value yoink renders.
         let cfg = parse(
             r#"
 deploy: { networks: [n] }
@@ -1382,7 +1382,7 @@ hosts: [{ address: h1, user: deploy }]
 proxy:
   email: ops@example.com
   config_extra: |
-    {"admin": {"listen": "127.0.0.1:9999"}}
+    {"apps": {"http": {"servers": {"main": {"listen": [":8443"]}}}}}
 services:
   - name: api
     image: img
@@ -1392,7 +1392,10 @@ services:
 "#,
         );
         let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
-        assert_eq!(json["admin"]["listen"].as_str(), Some("127.0.0.1:9999"));
+        assert_eq!(
+            json["apps"]["http"]["servers"]["main"]["listen"],
+            serde_json::json!([":8443"])
+        );
     }
 
     /// The admin API used to listen on `0.0.0.0:2019` with the origin

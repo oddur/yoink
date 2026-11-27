@@ -91,7 +91,7 @@ The entries run as a pipeline, so their order matters. Cheap filters (the CrowdS
 
 yoink does not model the global config values of Caddy as typed fields. Examples are the server-level `trusted_proxies` and `client_ip_headers`, and the top-level `storage` for shared ACME state across hosts. Top-level app blocks for plugins such as `cache-handler` and `coraza` are also in this group.
 
-`proxy.config_extra:` takes raw JSON for these values, and yoink deep-merges it into the generated config. Your value wins on every leaf conflict. Two paths are the exception: yoink rejects a write to the routes or to the TLS connection policies. A write there removes routes or disables mTLS.
+`proxy.config_extra:` takes raw JSON for these values, and yoink deep-merges it into the generated config. Your value wins on every leaf conflict. Three paths are the exception: yoink rejects a write to the routes, to the TLS connection policies, or to the `admin` block. A write there removes routes, disables mTLS, or moves the admin API.
 
 `config_extra:` injects raw config. `global_handlers:` is the typed slot for handlers. The merge rules are in the [`config_extra:` block](/docs/reference/proxy#proxyconfig_extra-block-global-caddy-config-escape-hatch) of the reference.
 

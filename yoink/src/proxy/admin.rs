@@ -55,8 +55,8 @@ pub enum AdminError {
 /// Push `config` to the proxy on `host` with `docker exec` into the
 /// running proxy container, then verify the route count.
 ///
-/// The admin address comes from `admin.listen` of `config`, so a
-/// `proxy.config_extra` override of it still works. A proxy that an
+/// The admin address is always [`ADMIN_LISTEN`]: config load rejects
+/// an `admin` key in `proxy.config_extra`. A proxy that an
 /// older yoink started listens on `0.0.0.0:2019`, which includes the
 /// container loopback, so the first push to it also works. That push
 /// carries the loopback-only admin block and moves the proxy onto it.
@@ -66,10 +66,6 @@ pub async fn push_config(
     config: &Value,
 ) -> Result<(), AdminError> {
     let container = running_proxy(host, ops).await?;
-    let admin = config
-        .pointer("/admin/listen")
-        .and_then(Value::as_str)
-        .unwrap_or(ADMIN_LISTEN);
     let docker_err = |source| AdminError::Docker {
         host: host.address.clone(),
         source,
@@ -86,7 +82,7 @@ pub async fn push_config(
                 "--config".into(),
                 "/dev/stdin".into(),
                 "--address".into(),
-                admin.into(),
+                ADMIN_LISTEN.into(),
             ],
             body,
         )
@@ -110,7 +106,7 @@ pub async fn push_config(
     // domains. Verifying upfront beats discovering it from a Cloudflare
     // 521 alert.
     let expected = route_count(config);
-    let actual = read_route_count(host, ops, &container, admin).await?;
+    let actual = read_route_count(host, ops, &container).await?;
     if expected != actual {
         return Err(AdminError::LoadVerifyMismatch { expected, actual });
     }
@@ -155,11 +151,10 @@ async fn read_route_count(
     host: &Host,
     ops: &dyn DockerOps,
     container: &str,
-    admin: &str,
 ) -> Result<usize, AdminError> {
     // BusyBox `wget` ships in the `caddy:2` image (the docker
     // HEALTHCHECK uses it too).
-    let url = format!("http://{admin}/config/apps/http/servers/main/routes/");
+    let url = format!("http://{ADMIN_LISTEN}/config/apps/http/servers/main/routes/");
     let out = ops
         .exec_oneshot(
             host,

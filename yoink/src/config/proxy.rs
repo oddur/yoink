@@ -474,7 +474,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
 /// JSON shapes accepted by `validate_json_shape`.
 #[derive(Clone, Copy)]
 enum JsonShape {
-    /// Top-level Caddy config block (`apps`, `storage`, `admin`, ...).
+    /// Top-level Caddy config block (`apps`, `storage`, ...).
     ObjectOnly,
     /// A single handler / route, OR a list of either.
     ObjectOrArray,
@@ -504,7 +504,7 @@ fn validate_json_shape(
     Err(ConfigError::Invalid(match shape {
         JsonShape::ObjectOnly => format!(
             "{label} must be a JSON object (top-level Caddy config keys like \
-             `apps`, `storage`, `admin`)"
+             `apps`, `storage`)"
         ),
         JsonShape::ObjectOrArray => {
             format!("{label} must be a JSON object (handler) or array of handlers/routes")
@@ -516,13 +516,23 @@ fn validate_json_shape(
 /// would silently disappear if a user wrote them into `proxy.config_extra:`.
 /// `deep_merge` replaces arrays wholesale (Caddy config doesn't have a
 /// concept of array merging), so a top-level write to either of these
-/// paths would clobber yoink's output. The two routes-shaped slots are
+/// paths would clobber yoink's output. `admin` is reserved whole (see
+/// below). The two routes-shaped slots are
 /// the dangerous ones — `routes` would wipe every service yoink rendered,
 /// and `tls_connection_policies` would silently disable mTLS configured
 /// via `proxy.tls.client_auth:` (a security regression). Other routes-
 /// shaped paths inside the rendered config (e.g. `apps.tls.automation.policies`)
 /// are also yoink-managed but the realistic operator footguns are these two.
 const RESERVED_CONFIG_EXTRA_PATHS: &[(&[&str], &str)] = &[
+    // The admin API must stay on `ADMIN_LISTEN`: the bootstrap, the
+    // deploy healthcheck, `caddy reload` and the route read-back all
+    // use that address. Another `listen` or `origins` breaks the next
+    // deploy, and a wildcard address lets other containers rewrite
+    // the proxy config.
+    (
+        &["admin"],
+        "the Caddy admin API stays on 127.0.0.1:2019 inside the proxy container",
+    ),
     (
         &["apps", "http", "servers", "main", "routes"],
         "set this via `proxy.global_handlers:` / `caddy_extra_json:` instead",
@@ -861,6 +871,34 @@ services:
         let msg = format!("{err}");
         assert!(msg.contains("tls_connection_policies"), "got: {msg}");
         assert!(msg.contains("proxy.tls.client_auth"), "got: {msg}");
+    }
+
+    /// An `admin.listen` or `admin.origins` override used to pass, and
+    /// broke the next deploy: the bootstrap and the healthcheck use
+    /// `127.0.0.1:2019`, and the route read-back built a URL from the
+    /// override.
+    #[test]
+    fn config_extra_rejects_admin_overrides() {
+        for extra in [
+            r#"{"admin":{"listen":"127.0.0.1:9999"}}"#,
+            r#"{"admin":{"origins":["example.com"]}}"#,
+            r#"{"admin":{"listen":"unix//run/caddy.sock"}}"#,
+        ] {
+            let mut cfg = config_with_one_service(
+                Some(DomainSpec::Single("api.example.com".into())),
+                Some(8080),
+            );
+            cfg.proxy = Some(ProxyConfig {
+                email: Some("ops@example.com".into()),
+                config_extra: Some(extra.into()),
+                ..ProxyConfig::default()
+            });
+            let err = cfg.inject_implicit_proxy().unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("proxy.config_extra"), "got: {msg}");
+            assert!(msg.contains("`admin`"), "got: {msg}");
+            assert!(msg.contains("127.0.0.1:2019"), "got: {msg}");
+        }
     }
 
     #[test]

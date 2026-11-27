@@ -87,11 +87,12 @@ Merge rules:
 - yoink parses the string as JSON when it loads the config. The top level must be an object.
 - The merge is recursive on objects. If the two sides have an object at the same key, yoink merges their children. If not, your value wins.
 - The keys of yoink at paths that do not overlap stay. For example, `apps.http.servers.main.trusted_proxies` does not overwrite the generated `routes` array.
-- Your value wins on every leaf conflict. For example, your own `admin.listen` value overrides the yoink default `127.0.0.1:2019`. yoink pushes the config to the address in `admin.listen` from inside the proxy container. Use an address that the container itself can reach. An address on a Docker network lets other containers on that network change the proxy config.
-- **Two paths are reserved for yoink.** A write to either path fails when yoink loads the config. The error names the typed field to use.
+- Your value wins on every leaf conflict.
+- **Three paths are reserved for yoink.** A write to one of these paths fails when yoink loads the config. The error tells you what to do.
 
 | Reserved path | Effect of a write | Use |
 |---|---|---|
+| `admin` | moves the admin API away from `127.0.0.1:2019`, and the next deploy fails | none. The admin API always listens on `127.0.0.1:2019` inside the proxy container. |
 | `apps.http.servers.main.routes` | removes every per-service route | `proxy.global_handlers:` or `caddy_extra_json:` |
 | `apps.http.servers.main.tls_connection_policies` | disables the mTLS from `proxy.tls.client_auth:` | `proxy.tls.client_auth:` |
 
