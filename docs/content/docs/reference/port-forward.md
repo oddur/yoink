@@ -31,7 +31,7 @@ With `--scheme=auto` (default), container ports 80, 3000, 5000, 5050, 8000, 8080
 | `--mode=sidecar` | Always starts a sidecar. Bypasses docker-proxy and reaches the container directly. |
 | `--mode=published` | Published path only. Stops with an error when no `publish:` entry matches. |
 
-The published path bridges to the host port that `docker-proxy` already listens on. The sidecar path starts an `alpine/socat` container on the first docker network of the service. The sidecar publishes a random port on `127.0.0.1` of the host.
+The published path bridges to the host port that `docker-proxy` already listens on. The sidecar path starts an `alpine/socat` container on the first docker network of the service that is not `yoink-admin`. Only the proxy can join `yoink-admin`. The sidecar publishes a random port on `127.0.0.1` of the host.
 
 ## Replica flags
 
@@ -59,7 +59,7 @@ A `publish:` entry for each replica, with different host ports, gives determinis
 | ``service "x" has no `publish:` block and `--mode published` was forced`` | Remove the flag (auto mode falls back to a sidecar), or pass `--mode sidecar` explicitly. |
 | `service "x" has no published container port N (available: …)` | `--mode published` with a port that no `publish:` entry has. Use a port from the list, or remove the flag. |
 | `service "x" publishes N on more than one host port` | Two `publish:` entries have the same container port. Remove one entry, or pass `--mode sidecar`. |
-| ``service "x" declares no `networks:` `` | Sidecar mode needs a docker network to join. Add a `networks:` entry to the service or to `deploy.networks:`. |
+| ``service "x" declares no `networks:` `` | Sidecar mode needs a docker network to join, other than `yoink-admin`. Add a `networks:` entry to the service or to `deploy.networks:`. |
 | ``service "x" has no `publish:` and no `run.port:` `` | With no port argument, yoink uses `run.port`. Set `run.port`, or pass the container port explicitly. |
 | `service "x" runs on N hosts; pin one with --host:` | Pass `--host <ADDRESS>`. |
 | `ssh probe to <host>: ssh probe failed: …` | This is the same probe that `yoink up` uses. Correct the tailnet membership, the SSH key, or the host-key acceptance. |

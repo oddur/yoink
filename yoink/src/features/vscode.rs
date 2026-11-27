@@ -68,7 +68,8 @@ pub enum VscodeError {
     #[error("no service named {0:?} in this config")]
     ServiceNotFound(String),
     #[error(
-        "service {service:?} declares no `networks:` — `yoink vscode` needs a docker network to join \
+        "service {service:?} declares no `networks:` (other than the reserved `yoink-admin`) — \
+         `yoink vscode` needs a docker network to join \
          (so code-server can resolve service DNS in its terminal). Add a `networks:` entry to the \
          service or `deploy.networks:`."
     )]
@@ -119,6 +120,7 @@ pub enum VscodeError {
 /// `service-r0-vN`) plus the docker network the sidecar should join so
 /// code-server's terminal can resolve sister-service DNS. `networks`
 /// is the effective network list of `service` (`Config::networks_for`).
+/// The sidecar never joins [`crate::config::ADMIN_NETWORK`].
 pub async fn resolve_target(
     ops: &dyn DockerOps,
     host: &Host,
@@ -147,10 +149,10 @@ pub async fn resolve_target(
     // (its `networks:` or the `deploy.networks` default) over scraping
     // the live container, so a service that's been re-attached to extra
     // networks behind yoink's back doesn't surprise us.
-    let network = networks
-        .first()
-        .cloned()
-        .or_else(|| target.networks.first().cloned())
+    // Never join the reserved admin network (the first network of
+    // `yoink-proxy`).
+    let network = pf::sidecar_network(networks)
+        .or_else(|| pf::sidecar_network(&target.networks))
         .ok_or_else(|| VscodeError::NoNetwork {
             service: service.name.clone(),
         })?;
@@ -492,5 +494,44 @@ mod tests {
             .unwrap();
         assert_eq!(container, "api-r0");
         assert_eq!(network, "app");
+    }
+
+    /// The first network of `yoink-proxy` is the reserved admin network.
+    /// The code-server sidecar joins the next network.
+    #[tokio::test]
+    async fn resolve_target_skips_the_admin_network() {
+        use crate::config::{ADMIN_NETWORK, INGRESS_NETWORK, PROXY_SERVICE_NAME};
+        let cfg = crate::config::Config::parse_str("hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n").unwrap();
+        let proxy = cfg.service(PROXY_SERVICE_NAME).unwrap();
+        let host = cfg.fleet().remove(0);
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![running(PROXY_SERVICE_NAME, &[ADMIN_NETWORK])]));
+        let networks = cfg.networks_for(proxy);
+        assert_eq!(networks.first().map(String::as_str), Some(ADMIN_NETWORK));
+        let (_, network) = resolve_target(&ops, &host, proxy, &networks).await.unwrap();
+        assert_eq!(network, INGRESS_NETWORK);
+
+        // The live-container fallback skips the admin network too.
+        ops.push_list_containers(Ok(vec![running(PROXY_SERVICE_NAME, &[ADMIN_NETWORK])]));
+        let err = resolve_target(&ops, &host, proxy, &[]).await.unwrap_err();
+        assert!(matches!(err, VscodeError::NoNetwork { .. }), "got {err:?}");
+    }
+
+    fn running(service: &str, networks: &[&str]) -> crate::docker_ops::ContainerInfo {
+        crate::docker_ops::ContainerInfo {
+            host: "h1".into(),
+            name: format!("{service}-r0"),
+            image: String::new(),
+            state: "running".into(),
+            status_text: String::new(),
+            created_unix: None,
+            yoink_service: Some(service.into()),
+            yoink_version: None,
+            yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: networks.iter().map(ToString::to_string).collect(),
+            other_labels: std::collections::BTreeMap::new(),
+        }
     }
 }

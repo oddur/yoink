@@ -30,7 +30,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::base::host::Host;
-use crate::config::{Config, ServiceConfig};
+use crate::config::{ADMIN_NETWORK, Config, ServiceConfig};
 use crate::docker_ops::DockerOps;
 
 /// How long we'll wait for the SSH tunnel's local listener to come
@@ -183,7 +183,7 @@ pub enum PfError {
     #[error("invalid publish spec {spec:?}: {reason}")]
     InvalidPublishSpec { spec: String, reason: String },
     #[error(
-        "service {service:?} declares no `networks:` — sidecar mode needs at least one docker network to join. Add a `networks:` entry to the service or its `deploy.networks:` default, or pin one published container port and use `--mode published`."
+        "service {service:?} declares no `networks:` (other than the reserved `yoink-admin`) — sidecar mode needs at least one docker network to join. Add a `networks:` entry to the service or its `deploy.networks:` default, or pin one published container port and use `--mode published`."
     )]
     SidecarNoNetwork { service: String },
     #[error(transparent)]
@@ -332,11 +332,20 @@ pub enum ResolvedTarget {
     Sidecar(SidecarHandle),
 }
 
+/// The network a sidecar joins: the first of `networks` that is not
+/// [`ADMIN_NETWORK`]. Only the proxy may join the admin network, and
+/// it is the first network of `yoink-proxy`.
+#[must_use]
+pub fn sidecar_network(networks: &[String]) -> Option<String> {
+    networks.iter().find(|n| *n != ADMIN_NETWORK).cloned()
+}
+
 /// Decide which path to take for `(service, container_port)` and
 /// drive whichever side spawns/inspects need running. Returns the
 /// resolved endpoint (published) or sidecar handle (when we had to
 /// spin one up). `networks` is the effective network list of
-/// `service` (`Config::networks_for`); the sidecar joins the first.
+/// `service` (`Config::networks_for`); the sidecar joins the first
+/// one that is not [`ADMIN_NETWORK`].
 pub async fn resolve_target(
     ops: Arc<dyn DockerOps>,
     host: &Host,
@@ -369,12 +378,9 @@ pub async fn resolve_target(
     // 2. Sidecar path. Pick a network the target shares; bind a
     //    socat container into it and let docker-proxy publish a
     //    random host port back at us.
-    let network = networks
-        .first()
-        .cloned()
-        .ok_or_else(|| PfError::SidecarNoNetwork {
-            service: service.name.clone(),
-        })?;
+    let network = sidecar_network(networks).ok_or_else(|| PfError::SidecarNoNetwork {
+        service: service.name.clone(),
+    })?;
     let handle = spawn_sidecar(ops, host.clone(), &service.name, container_port, &network).await?;
     Ok(ResolvedTarget::Sidecar(handle))
 }
@@ -934,6 +940,40 @@ services:
         // Past the network pick: the sidecar image pull is the next step.
         assert!(
             matches!(result, Err(PfError::Sidecar(SidecarError::Pull { .. }))),
+            "got {:?}",
+            result.err()
+        );
+    }
+
+    /// The first network of `yoink-proxy` is the reserved admin network.
+    /// The sidecar must not join it: it joins the next network.
+    #[test]
+    fn sidecar_network_skips_the_admin_network() {
+        let cfg = crate::config::Config::parse_str("hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n").unwrap();
+        let proxy = cfg.service(crate::config::PROXY_SERVICE_NAME).unwrap();
+        let networks = cfg.networks_for(proxy);
+        assert_eq!(
+            networks.first().map(String::as_str),
+            Some(crate::config::ADMIN_NETWORK)
+        );
+        assert_eq!(
+            sidecar_network(&networks).as_deref(),
+            Some(crate::config::INGRESS_NETWORK)
+        );
+    }
+
+    /// A service whose only network is the admin network has no
+    /// network for the sidecar.
+    #[tokio::test]
+    async fn sidecar_refuses_only_the_admin_network() {
+        let cfg = crate::config::Config::parse_str("hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    image: img\n    tag: v1\n    run: { port: 8080 }\n").unwrap();
+        let svc = cfg.service("api").unwrap();
+        let host = cfg.fleet().remove(0);
+        let ops = Arc::new(crate::docker_ops::FakeDockerOps::new());
+        let networks = vec![crate::config::ADMIN_NETWORK.to_string()];
+        let result = resolve_target(ops, &host, svc, &networks, 8080, Mode::Sidecar).await;
+        assert!(
+            matches!(result, Err(PfError::SidecarNoNetwork { .. })),
             "got {:?}",
             result.err()
         );
