@@ -3327,6 +3327,7 @@ impl App {
         let host_for_task = host.clone();
         let service_name_for_task = service_name.clone();
         let service_for_task = service.clone();
+        let networks_for_task = self.config.networks_for(&service);
         let ops = self.ops.clone();
         let tx = self.update_tx.clone();
         let toast_prefix = format!("→ {service_name} :{container_port}");
@@ -3348,6 +3349,7 @@ impl App {
                 ops.clone(),
                 &host_for_task,
                 &service_for_task,
+                &networks_for_task,
                 container_port,
                 crate::features::pf::Mode::Auto,
             )
@@ -3431,6 +3433,7 @@ impl App {
 
         let host_for_task = host.clone();
         let service_for_task = service.clone();
+        let networks_for_task = self.config.networks_for(&service);
         let service_name_for_task = service_name.clone();
         let ops = self.ops.clone();
         let tx = self.update_tx.clone();
@@ -3453,6 +3456,7 @@ impl App {
                 ops.as_ref(),
                 &host_for_task,
                 &service_for_task,
+                &networks_for_task,
             )
             .await
             {

@@ -335,11 +335,13 @@ pub enum ResolvedTarget {
 /// Decide which path to take for `(service, container_port)` and
 /// drive whichever side spawns/inspects need running. Returns the
 /// resolved endpoint (published) or sidecar handle (when we had to
-/// spin one up).
+/// spin one up). `networks` is the effective network list of
+/// `service` (`Config::networks_for`); the sidecar joins the first.
 pub async fn resolve_target(
     ops: Arc<dyn DockerOps>,
     host: &Host,
     service: &ServiceConfig,
+    networks: &[String],
     container_port: u16,
     mode: Mode,
 ) -> Result<ResolvedTarget, PfError> {
@@ -367,10 +369,9 @@ pub async fn resolve_target(
     // 2. Sidecar path. Pick a network the target shares; bind a
     //    socat container into it and let docker-proxy publish a
     //    random host port back at us.
-    let network = service
-        .networks
-        .as_ref()
-        .and_then(|v| v.first().cloned())
+    let network = networks
+        .first()
+        .cloned()
         .ok_or_else(|| PfError::SidecarNoNetwork {
             service: service.name.clone(),
         })?;
@@ -912,6 +913,29 @@ services:
         assert_eq!(
             forward_url(54326, 80, SchemeOverride::Tcp),
             "localhost:54326"
+        );
+    }
+
+    /// A service without `networks:` joins the `deploy.networks` default.
+    /// The sidecar path read the raw field and refused such a service
+    /// with "declares no `networks:`".
+    #[tokio::test]
+    async fn sidecar_uses_the_deploy_networks_default() {
+        let cfg = crate::config::Config::parse_str("hosts:\n  - { address: h1, user: root }\ndeploy:\n  networks: [app]\nservices:\n  - name: api\n    image: img\n    tag: v1\n    run: { port: 8080 }\n").unwrap();
+        let svc = cfg.service("api").unwrap();
+        assert!(svc.networks.is_none());
+        let host = cfg.fleet().remove(0);
+        let ops = Arc::new(crate::docker_ops::FakeDockerOps::new());
+        ops.push_pull_image(Err(crate::docker_ops::DockerError::Invalid(
+            "stop here".into(),
+        )));
+        let networks = cfg.networks_for(svc);
+        let result = resolve_target(ops, &host, svc, &networks, 8080, Mode::Sidecar).await;
+        // Past the network pick: the sidecar image pull is the next step.
+        assert!(
+            matches!(result, Err(PfError::Sidecar(SidecarError::Pull { .. }))),
+            "got {:?}",
+            result.err()
         );
     }
 }
