@@ -22,6 +22,16 @@ pub enum TarballError {
         status: String,
         stderr: String,
     },
+    /// `docker save` failed and the load on the host failed with it
+    /// (it got a short or empty tar). The save stderr names the cause.
+    #[error("`docker save` for {image:?} exited with status {status}{stderr}\nthe load on the host failed too: {load}", stderr = if .stderr.is_empty() { String::new() } else { format!(":\n{}", .stderr) })]
+    SaveAndLoadFailed {
+        image: String,
+        status: String,
+        stderr: String,
+        #[source]
+        load: DockerError,
+    },
     #[error(transparent)]
     Docker(#[from] DockerError),
     #[error("failed to spawn `{program}`: {source}")]
@@ -52,9 +62,21 @@ pub async fn save_and_load_to_host(
     host: &Host,
     on_progress: impl FnMut(u64) + Send + 'static,
 ) -> Result<u64, TarballError> {
-    let mut child = Command::new("docker")
-        .arg("save")
-        .arg(image_ref)
+    let mut save = Command::new("docker");
+    save.arg("save").arg(image_ref);
+    save_and_load_with(save, image_ref, ops, host, on_progress).await
+}
+
+/// [`save_and_load_to_host`] with the `docker save` command as a
+/// parameter, so tests can run a stand-in.
+async fn save_and_load_with(
+    mut save: Command,
+    image_ref: &str,
+    ops: &dyn DockerOps,
+    host: &Host,
+    on_progress: impl FnMut(u64) + Send + 'static,
+) -> Result<u64, TarballError> {
+    let mut child = save
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -93,7 +115,10 @@ pub async fn save_and_load_to_host(
         }
     });
     let body: ImageTarStream = Box::pin(stream);
-    ops.load_image(host, body).await?;
+    // Wait for `docker save` also when the load fails: a failed save
+    // makes the load fail on a short tar, and only the save stderr
+    // says why (e.g. "No such image").
+    let load_result = ops.load_image(host, body).await;
 
     let status = child.wait().await.map_err(|source| TarballError::Spawn {
         program: "docker".into(),
@@ -101,11 +126,56 @@ pub async fn save_and_load_to_host(
     })?;
     let stderr_text = stderr_task.await.unwrap_or_default();
     if !status.success() {
-        return Err(TarballError::DockerSaveFailed {
-            image: image_ref.to_string(),
-            status: status.to_string(),
-            stderr: stderr_text.trim().to_string(),
+        let image = image_ref.to_string();
+        let status = status.to_string();
+        let stderr = stderr_text.trim().to_string();
+        return Err(match load_result {
+            Ok(()) => TarballError::DockerSaveFailed {
+                image,
+                status,
+                stderr,
+            },
+            Err(load) => TarballError::SaveAndLoadFailed {
+                image,
+                status,
+                stderr,
+                load,
+            },
         });
     }
+    load_result?;
     Ok(total.load(Ordering::Relaxed))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::docker_ops::FakeDockerOps;
+
+    /// Regression: when `docker save` failed, the load error returned
+    /// first and the save stderr was lost. The user saw only a generic
+    /// load error.
+    #[tokio::test]
+    async fn failed_save_surfaces_its_stderr_when_the_load_fails() {
+        let mut save = Command::new("sh");
+        save.arg("-c")
+            .arg("echo 'Error response from daemon: reference does not exist' >&2; exit 1");
+
+        // No scripted load result: the fake load fails, as a real
+        // daemon does on an empty tar.
+        let ops = FakeDockerOps::new();
+        let host = Host::local();
+        let err = save_and_load_with(save, "app:v1", &ops, &host, |_| ())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, TarballError::SaveAndLoadFailed { .. }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("reference does not exist"),
+            "{err}"
+        );
+    }
 }
