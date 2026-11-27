@@ -31,13 +31,15 @@ use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
+use yoink::base::bundle::SecretsBundle;
+use yoink::base::git;
+use yoink::base::host::Host;
 use yoink::config::Config;
 use yoink::deploy;
-use yoink::docker_ops::{DockerOps, Host, RealDockerOps};
-use yoink::git;
-use yoink::output;
-use yoink::secrets::{self, SecretsBundle};
-use yoink::status::StatusReport;
+use yoink::docker_ops::{DockerOps, RealDockerOps};
+use yoink::features::output;
+use yoink::features::status::StatusReport;
+use yoink::secrets;
 use yoink::tui::{self, Mode};
 
 #[derive(Parser)]
@@ -745,7 +747,7 @@ enum Command {
     },
 }
 
-/// CLI value enum mirror of `yoink::pf::SchemeOverride`. Lives in
+/// CLI value enum mirror of `yoink::features::pf::SchemeOverride`. Lives in
 /// main.rs so it can carry clap's `ValueEnum` derive without
 /// pulling clap into the lib crate; converted via `From` on the
 /// way into `cmd_pf`.
@@ -759,7 +761,7 @@ enum PfScheme {
     None,
 }
 
-impl From<PfScheme> for yoink::pf::SchemeOverride {
+impl From<PfScheme> for yoink::features::pf::SchemeOverride {
     fn from(s: PfScheme) -> Self {
         match s {
             PfScheme::Auto => Self::Auto,
@@ -785,7 +787,7 @@ enum PfMode {
     Sidecar,
 }
 
-impl From<PfMode> for yoink::pf::Mode {
+impl From<PfMode> for yoink::features::pf::Mode {
     fn from(m: PfMode) -> Self {
         match m {
             PfMode::Auto => Self::Auto,
@@ -1231,11 +1233,11 @@ fn page_output(content: &str) {
 
 /// TTY-gated interactive confirmation for destructive operations
 /// (clig.dev: severe changes require non-trivial confirmation).
-/// Thin wrapper around [`yoink::prompt::confirm`] in `Destructive`
+/// Thin wrapper around [`yoink::base::prompt::confirm`] in `Destructive`
 /// mode — kept for the `bail!`-on-reject ergonomic so callers can
 /// `confirm_destructive(...)?` without a separate match.
 fn confirm_destructive(prompt: &str) -> Result<()> {
-    use yoink::prompt::{ConfirmKind, confirm};
+    use yoink::base::prompt::{ConfirmKind, confirm};
     if !confirm(prompt, ConfirmKind::Destructive, false)? {
         anyhow::bail!("aborted");
     }
@@ -1365,7 +1367,8 @@ async fn run(cli: Cli) -> Result<()> {
     // With prompts off the read fails at once, and yoink says that the
     // keychain does not work over SSH. A read that needs no question
     // still works.
-    let _no_keychain_prompts = yoink::keychain::in_ssh_session().then(yoink::keychain::no_prompts);
+    let _no_keychain_prompts =
+        yoink::base::keychain::in_ssh_session().then(yoink::base::keychain::no_prompts);
 
     if let Some(result) = run_bootstrap(&cli.command, &cli.config) {
         return result;
@@ -1413,7 +1416,7 @@ async fn run(cli: Cli) -> Result<()> {
         HostAddresses::BestEffort => resolve_sealed_host_addresses(&mut config, true).await?,
         HostAddresses::Quiet => {
             // If prompts cannot be turned off, stay away from the keychain.
-            let quiet = yoink::keychain::no_prompts();
+            let quiet = yoink::base::keychain::no_prompts();
             if quiet.active() {
                 resolve_sealed_host_addresses(&mut config, true).await?;
             }
@@ -1429,10 +1432,10 @@ async fn run(cli: Cli) -> Result<()> {
             refresh,
             var,
         } => {
-            let outcome = yoink::add::cmd_add(
+            let outcome = yoink::features::add::cmd_add(
                 &config,
                 &cli.config,
-                yoink::add::AddOpts {
+                yoink::features::add::AddOpts {
                     r#ref,
                     from_path,
                     yes,
@@ -1583,10 +1586,10 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let ops: std::sync::Arc<dyn DockerOps> =
                 std::sync::Arc::new(build_real_ops(&config, None).await?);
-            yoink::vscode::cmd_vscode(
+            yoink::features::vscode::cmd_vscode(
                 &config,
                 &service,
-                yoink::vscode::VscodeOptions {
+                yoink::features::vscode::VscodeOptions {
                     host_filter: host,
                     replica,
                     open: !no_open,
@@ -1643,8 +1646,7 @@ async fn cmd_preflight(config: &Config, wait: Option<Duration>) -> Result<()> {
     config.require_hosts()?;
     let ops = build_real_ops(config, None).await?;
     let mut had_error = false;
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
+    for host in config.fleet() {
         match probe_host_with_wait(&ops, &host, wait).await {
             Ok(v) => eprintln!(
                 "✓ {}: docker {} (api {}) on {}/{}",
@@ -1815,8 +1817,7 @@ const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[allow(clippy::too_many_lines)] // single linear up-once flow; splitting fragments the build → push → reconcile sequence
 async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Result<()> {
-    use yoink::docker_ops::Host;
-    use yoink::lock::HostLock;
+    use yoink::deploy::lock::HostLock;
     let &UpOptions {
         services,
         tag_args,
@@ -1854,7 +1855,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         let sha = git::current_short_sha(&cwd)
             .context("--here: resolve git short SHA from current directory")?;
         let names: Vec<&str> = if services.is_empty() {
-            config.services.iter().map(|s| s.name.as_str()).collect()
+            config.service_names().collect()
         } else {
             services.iter().map(String::as_str).collect()
         };
@@ -1922,16 +1923,16 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             );
         }
         for svc in buildable {
-            if yoink::build::has_tag(svc, &tag_overrides) {
-                let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
-                yoink::build::build_service(config, svc, &tag, false, false)
+            if yoink::features::build::has_tag(svc, &tag_overrides) {
+                let tag = yoink::features::build::resolve_service_tag(svc, &tag_overrides)?;
+                yoink::features::build::build_service(config, svc, &tag, false, false)
                     .await
                     .with_context(|| format!("build {}", svc.name))?;
             } else {
                 // No tag in config and no --tag override: derive the tag from
                 // the built image's content digest so yoink can detect changes
                 // automatically without a nonce or explicit tag management.
-                let tag = yoink::build::build_and_capture_tag(config, svc, false)
+                let tag = yoink::features::build::build_and_capture_tag(config, svc, false)
                     .await
                     .with_context(|| format!("build {}", svc.name))?;
                 tag_overrides.insert(svc.name.clone(), tag);
@@ -1956,10 +1957,10 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     //      `build:` block, so there is nothing to pull). Always skips
     //      `build:` services internally — they're never in any
     //      registry by definition.
-    let has_buildable = config.services.iter().any(|s| s.build.is_some());
+    let has_buildable = config.any_service_builds_locally();
     let needs_pull = config.any_service_requires_pull();
     if has_buildable || no_registry {
-        yoink::build::load_images_to_hosts(
+        yoink::features::build::load_images_to_hosts(
             ops.as_ref(),
             config,
             &tag_overrides,
@@ -1973,9 +1974,8 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // Per-host advisory locks. Sentinel container holds the lock; a
     // tokio heartbeat task touches it every few seconds. If yoink
     // dies, heartbeats stop, sentinel self-exits within ~30s, and
-    // the next deploy reaps it as an orphan. See `lock.rs`.
-    let acquire_futs = config.hosts.iter().map(|host_cfg| {
-        let host = Host::from(host_cfg);
+    // the next deploy reaps it as an orphan. See `deploy/lock.rs`.
+    let acquire_futs = config.fleet().into_iter().map(|host| {
         let ops = ops.clone();
         async move {
             let lock = HostLock::acquire(&*ops, host.clone())
@@ -2001,16 +2001,15 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // per-host events (lock acquire/release, container ops). Read-time
     // dedup on `event_id` keeps the merged view safe even if a future
     // change starts double-writing.
-    let host_audit = std::sync::Arc::new(yoink::audit::HostAuditSink::new());
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
+    let host_audit = std::sync::Arc::new(yoink::features::audit::HostAuditSink::new());
+    for host in config.fleet() {
         let keyfile = ops.ssh_keyfile(&host);
         host_audit.register(host, keyfile).await;
     }
-    let audit_sink: std::sync::Arc<dyn yoink::audit::AuditSink> = host_audit.clone();
-    let operator_sink: std::sync::Arc<dyn yoink::audit::AuditSink> =
-        std::sync::Arc::new(yoink::audit::OperatorAuditSink::new());
-    let run_ctx = yoink::audit::RunContext::new("up");
+    let audit_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink> = host_audit.clone();
+    let operator_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink> =
+        std::sync::Arc::new(yoink::features::audit::OperatorAuditSink::new());
+    let run_ctx = yoink::features::audit::RunContext::new("up");
     let selected_service_names: Vec<String> = config
         .selected_services(services_filter)
         .map(|s| s.name.clone())
@@ -2018,28 +2017,28 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // RunStarted is a fleet-wide fact — one operator-side line per
     // run, not per host. LockAcquired is per-host (the lock is on the
     // host's docker daemon) so it stays on each host's log.
-    yoink::audit::emit_operator(
+    yoink::features::audit::emit_operator(
         &operator_sink,
         &run_ctx,
         "",
-        yoink::audit::AuditEventKind::RunStarted {
+        yoink::features::audit::AuditEventKind::RunStarted {
             command: "up".into(),
             services: selected_service_names.clone(),
         },
     )
     .await;
-    let webhook_http = yoink::webhooks::http_client();
+    let webhook_http = yoink::features::webhooks::http_client();
     let operator_host = run_ctx
         .actor
         .split_once('@')
         .map_or(run_ctx.actor.as_str(), |(_, h)| h)
         .to_string();
-    let started_ctx = yoink::webhooks::Context::run_started(
+    let started_ctx = yoink::features::webhooks::Context::run_started(
         &run_ctx,
         &operator_host,
         selected_service_names.clone(),
     );
-    yoink::webhooks::dispatch_all(
+    yoink::features::webhooks::dispatch_all(
         &config.webhooks,
         &started_ctx,
         bundle.as_ref(),
@@ -2048,13 +2047,12 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         &run_ctx,
     )
     .await;
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
-        yoink::audit::emit(
+    for host in config.fleet() {
+        yoink::features::audit::emit(
             &audit_sink,
             &run_ctx,
             &host.address,
-            yoink::audit::AuditEventKind::LockAcquired,
+            yoink::features::audit::AuditEventKind::LockAcquired,
         )
         .await;
     }
@@ -2063,13 +2061,13 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // sink: the closure pushes to an unbounded mpsc; a drain task
     // owns the sink and awaits each event in order.
     let (audit_tx, mut audit_rx) =
-        tokio::sync::mpsc::unbounded_channel::<yoink::audit::AuditEvent>();
+        tokio::sync::mpsc::unbounded_channel::<yoink::features::audit::AuditEvent>();
     let drain_sink = audit_sink.clone();
     let drain_operator_sink = operator_sink.clone();
     let drain_task = tokio::spawn(async move {
         while let Some(ev) = audit_rx.recv().await {
             // Hook events have no host and go to the operator log.
-            yoink::audit::sink_for(&ev, &drain_sink, &drain_operator_sink)
+            yoink::features::audit::sink_for(&ev, &drain_sink, &drain_operator_sink)
                 .record(ev)
                 .await;
         }
@@ -2089,10 +2087,12 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     let run_ctx_for_closure = run_ctx.clone();
     let mut sink = move |service: Option<&str>, event: deploy::DeployEvent| {
         eprintln!("{}", output::format_deploy_event(service, &event));
-        if let Some((host, kind)) = yoink::audit::map_deploy_event(service, &event, &|svc| {
-            tag_lookup.get(svc).cloned().unwrap_or_default()
-        }) {
-            let ev = yoink::audit::build_deploy_event(&run_ctx_for_closure, host, kind);
+        if let Some((host, kind)) =
+            yoink::features::audit::map_deploy_event(service, &event, &|svc| {
+                tag_lookup.get(svc).cloned().unwrap_or_default()
+            })
+        {
+            let ev = yoink::features::audit::build_deploy_event(&run_ctx_for_closure, host, kind);
             let _ = audit_tx.send(ev);
         }
     };
@@ -2159,35 +2159,34 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         .as_ref()
         .err()
         .map(std::string::ToString::to_string);
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
-        yoink::audit::emit(
+    for host in config.fleet() {
+        yoink::features::audit::emit(
             &audit_sink,
             &run_ctx,
             &host.address,
-            yoink::audit::AuditEventKind::LockReleased,
+            yoink::features::audit::AuditEventKind::LockReleased,
         )
         .await;
     }
-    yoink::audit::emit_operator(
+    yoink::features::audit::emit_operator(
         &operator_sink,
         &run_ctx,
         "",
-        yoink::audit::AuditEventKind::RunFinished {
+        yoink::features::audit::AuditEventKind::RunFinished {
             command: "up".into(),
             ok,
             error: err_msg.clone(),
         },
     )
     .await;
-    let finished_ctx = yoink::webhooks::Context::run_finished(
+    let finished_ctx = yoink::features::webhooks::Context::run_finished(
         &run_ctx,
         &operator_host,
         selected_service_names.clone(),
         ok,
         err_msg.clone(),
     );
-    yoink::webhooks::dispatch_all(
+    yoink::features::webhooks::dispatch_all(
         &config.webhooks,
         &finished_ctx,
         bundle.as_ref(),
@@ -2278,7 +2277,7 @@ fn check_git_fallback<'a>(
     };
     let Some(svc) = selected.into_iter().find(|svc| {
         let tagged_by_build = build_tags_untagged && svc.build.is_some();
-        !yoink::build::has_tag(svc, tag_overrides) && !tagged_by_build
+        !yoink::features::build::has_tag(svc, tag_overrides) && !tagged_by_build
     }) else {
         return Ok(());
     };
@@ -2432,8 +2431,8 @@ async fn cmd_build(config: &Config, build: BuildOptions<'_>) -> Result<()> {
             false,
             false,
         )?;
-        let tag = yoink::build::resolve_service_tag(svc, &tag_overrides)?;
-        yoink::build::build_service(config, svc, &tag, no_cache, push)
+        let tag = yoink::features::build::resolve_service_tag(svc, &tag_overrides)?;
+        yoink::features::build::build_service(config, svc, &tag, no_cache, push)
             .await
             .with_context(|| format!("build {}", svc.name))?;
         built_any = true;
@@ -2471,12 +2470,11 @@ async fn cmd_rollback(
     dry_run: bool,
 ) -> Result<()> {
     use std::collections::BTreeMap;
-    use yoink::docker_ops::Host;
 
     // Validate --service filter if given.
     if let Some(name) = service_filter {
         anyhow::ensure!(
-            config.services.iter().any(|s| s.name == name),
+            config.service(name).is_some(),
             "service {name:?} is not declared in the loaded config"
         );
     }
@@ -2484,7 +2482,7 @@ async fn cmd_rollback(
     // Validate --host filter if given.
     if let Some(addr) = host_filter {
         anyhow::ensure!(
-            config.hosts.iter().any(|h| h.address == addr),
+            config.host(addr).is_some(),
             "host {addr:?} is not declared in the loaded config"
         );
     }
@@ -2499,14 +2497,9 @@ async fn cmd_rollback(
     // Result: service_name -> Vec<(host_address, prev_tag)>
     let mut rollback_plan: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
 
-    let hosts_to_scan: Vec<&yoink::config::HostConfig> = config
-        .hosts
-        .iter()
-        .filter(|h| host_filter.is_none_or(|addr| h.address == addr))
-        .collect();
+    let hosts_to_scan = config.fleet_matching(host_filter);
 
-    for host_cfg in &hosts_to_scan {
-        let host = Host::from(*host_cfg);
+    for host in hosts_to_scan {
         // list_containers_by_label uses all(true) internally — returns both
         // running and stopped/exited containers.
         let all = ops
@@ -2698,7 +2691,7 @@ fn extract_image_tag(image: &str) -> &str {
     }
 }
 async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
-    use yoink::prune::{self, PruneReason};
+    use yoink::features::prune::{self, PruneReason};
     let ops = build_real_ops(config, None).await?;
     let report = prune::run(&ops, config, dry_run).await.context("prune")?;
     let items = if dry_run {
@@ -2759,7 +2752,7 @@ fn env_flag_truthy(name: &str) -> bool {
 /// upstream, detached HEAD, etc. Does not fetch — reflects the
 /// operator's most recent `git fetch`.
 fn check_config_freshness(path: &std::path::Path, require_latest: bool) -> Result<()> {
-    let Some(lag) = yoink::git::commits_behind_upstream_for_path(path) else {
+    let Some(lag) = yoink::base::git::commits_behind_upstream_for_path(path) else {
         return Ok(());
     };
     let plural = if lag.commits_behind == 1 { "" } else { "s" };
@@ -2899,7 +2892,7 @@ async fn build_real_ops(config: &Config, bundle: Option<&SecretsBundle>) -> Resu
     // Fast path: no host needs a managed key. Skip bundle access
     // entirely so commands that don't otherwise touch secrets pay
     // nothing.
-    if config.hosts.iter().all(|h| h.ssh_key_secret.is_none()) {
+    if config.host_ssh_keys().next().is_none() {
         return Ok(RealDockerOps::new());
     }
     let owned_bundle;
@@ -2909,7 +2902,7 @@ async fn build_real_ops(config: &Config, bundle: Option<&SecretsBundle>) -> Resu
         owned_bundle = load_secrets_bundle(config).await?;
         owned_bundle.as_ref()
     };
-    let km = yoink::ssh_keys::prepare(config, bundle).context("prepare per-host ssh keys")?;
+    let km = yoink::ssh::keys::prepare(config, bundle).context("prepare per-host ssh keys")?;
     Ok(RealDockerOps::with_key_manager(km.map(std::sync::Arc::new)))
 }
 
@@ -2922,30 +2915,24 @@ async fn build_real_ops(config: &Config, bundle: Option<&SecretsBundle>) -> Resu
 /// and the replica-aware shell/logs paths (auto-pick / multiplex).
 /// Per-host listings run in parallel — for a fleet of N hosts this is
 /// one round-trip instead of N. Same fan-out shape used elsewhere in
-/// the CLI (deploy.rs, prune, prefetch).
+/// the CLI (deploy, prune, prefetch).
 async fn list_running_replicas(
     ops: &dyn DockerOps,
     config: &Config,
     service: &str,
     host_filter: Option<&str>,
-) -> Result<Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>> {
-    use yoink::docker_ops::Host;
+) -> Result<Vec<(yoink::base::host::Host, yoink::docker_ops::ContainerInfo)>> {
     let label = format!("yoink.service={service}");
-    let futs = config
-        .hosts
-        .iter()
-        .filter(|h| host_filter.is_none_or(|f| f == h.address))
-        .map(|host_cfg| {
-            let host = Host::from(host_cfg);
-            let label = &label;
-            async move {
-                let containers = ops
-                    .list_containers_by_label(&host, label)
-                    .await
-                    .with_context(|| format!("list containers on {}", host.address))?;
-                anyhow::Ok((host, containers))
-            }
-        });
+    let futs = config.fleet_matching(host_filter).into_iter().map(|host| {
+        let label = &label;
+        async move {
+            let containers = ops
+                .list_containers_by_label(&host, label)
+                .await
+                .with_context(|| format!("list containers on {}", host.address))?;
+            anyhow::Ok((host, containers))
+        }
+    });
     let per_host = futures_util::future::try_join_all(futs).await?;
     let mut candidates = Vec::new();
     for (host, containers) in per_host {
@@ -2966,7 +2953,7 @@ async fn resolve_running_container(
     config: &Config,
     service: &str,
     host_filter: Option<&str>,
-) -> Result<(yoink::docker_ops::Host, String)> {
+) -> Result<(yoink::base::host::Host, String)> {
     let candidates = list_running_replicas(ops, config, service, host_filter).await?;
     match candidates.len() {
         0 => Err(no_replicas_err(service, host_filter)),
@@ -3003,8 +2990,8 @@ fn no_replicas_err(service: &str, host_filter: Option<&str>) -> anyhow::Error {
 /// no `healthcheck_path:` (where `health_hint()` is always `None`) so
 /// `yoink shell <svc>` still works on them.
 fn pick_healthy_replica(
-    candidates: Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>,
-) -> Option<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)> {
+    candidates: Vec<(yoink::base::host::Host, yoink::docker_ops::ContainerInfo)>,
+) -> Option<(yoink::base::host::Host, yoink::docker_ops::ContainerInfo)> {
     if let Some(idx) = candidates
         .iter()
         .position(|(_, c)| c.health_hint() == Some(yoink::docker_ops::HealthStatus::Healthy))
@@ -3062,7 +3049,7 @@ async fn cmd_logs(
 /// (preserved so shell pipelines piping `yoink logs` into `grep` keep
 /// working unchanged for the single-replica case).
 fn replica_prefix(
-    host: &yoink::docker_ops::Host,
+    host: &yoink::base::host::Host,
     info: &yoink::docker_ops::ContainerInfo,
     multi: bool,
 ) -> String {
@@ -3078,7 +3065,7 @@ fn replica_prefix(
 /// channel once every per-replica task exits.
 async fn cmd_logs_follow(
     ops: std::sync::Arc<dyn DockerOps>,
-    candidates: Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>,
+    candidates: Vec<(yoink::base::host::Host, yoink::docker_ops::ContainerInfo)>,
     tail: u32,
 ) -> Result<()> {
     let multi = candidates.len() > 1;
@@ -3128,7 +3115,7 @@ async fn cmd_logs_follow(
 /// inserted before each `\n`-delimited segment.
 async fn cmd_logs_tail(
     ops: &dyn DockerOps,
-    candidates: Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>,
+    candidates: Vec<(yoink::base::host::Host, yoink::docker_ops::ContainerInfo)>,
     tail: u32,
 ) -> Result<()> {
     let multi = candidates.len() > 1;
@@ -3195,12 +3182,12 @@ async fn cmd_pf(
     host_filter: Option<&str>,
     replica: usize,
     open_browser: bool,
-    scheme_override: yoink::pf::SchemeOverride,
+    scheme_override: yoink::features::pf::SchemeOverride,
     json: bool,
-    mode: yoink::pf::Mode,
+    mode: yoink::features::pf::Mode,
 ) -> Result<()> {
-    use yoink::pf;
-    use yoink::transport::tunnel::SshTunnel;
+    use yoink::features::pf;
+    use yoink::ssh::tunnel::SshTunnel;
 
     let service = pf::resolve_service(config, service_name)?;
 
@@ -3226,18 +3213,18 @@ async fn cmd_pf(
 
     // Pick the host: respect --host if given; otherwise the first
     // host the service applies to. Reject if zero applicable hosts.
-    let applicable: Vec<_> = service
-        .applicable_hosts(&config.hosts)
+    let applicable: Vec<_> = config
+        .fleet_for(service)
         .into_iter()
         .filter(|h| host_filter.is_none_or(|f| f == h.address))
         .collect();
-    let host_cfg = match applicable.as_slice() {
+    let host = match applicable.as_slice() {
         [] => anyhow::bail!(
             "service {service_name:?} has no applicable host{}",
             host_filter.map_or(String::new(), |f| format!(" matching --host={f}")),
         ),
-        [single] => *single,
-        many if host_filter.is_some() => many[0],
+        [single] => single.clone(),
+        many if host_filter.is_some() => many[0].clone(),
         many => anyhow::bail!(
             "service {service_name:?} runs on {} hosts; pin one with --host:\n{}",
             many.len(),
@@ -3255,11 +3242,10 @@ async fn cmd_pf(
         );
     }
 
-    let host = yoink::docker_ops::Host::from(host_cfg);
     let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
         std::sync::Arc::new(build_real_ops(config, None).await?);
     let keyfile = ops.ssh_keyfile(&host);
-    yoink::ssh_probe::probe(&host, keyfile.as_deref().and_then(|p| p.to_str()))
+    yoink::ssh::probe::probe(&host, keyfile.as_deref().and_then(|p| p.to_str()))
         .await
         .map_err(|e| anyhow::anyhow!("ssh probe to {}: {e}", host.address))?;
 
@@ -3587,7 +3573,7 @@ impl From<TransportMode> for yoink::transport::Transport {
     }
 }
 
-impl From<DryRunFormat> for yoink::diff::Format {
+impl From<DryRunFormat> for yoink::features::diff::Format {
     fn from(f: DryRunFormat) -> Self {
         match f {
             DryRunFormat::Text => Self::Text,
@@ -3602,12 +3588,13 @@ async fn run_dry_run(
     config: &Config,
     tag_overrides: &std::collections::BTreeMap<String, String>,
     services_filter: Option<&[String]>,
-    secrets: Option<&yoink::secrets::SecretsBundle>,
+    secrets: Option<&yoink::base::bundle::SecretsBundle>,
     format: DryRunFormat,
 ) -> Result<()> {
-    let report = yoink::diff::compute(ops, config, tag_overrides, services_filter, secrets)
-        .await
-        .context("compute dry-run diff")?;
+    let report =
+        yoink::features::diff::compute(ops, config, tag_overrides, services_filter, secrets)
+            .await
+            .context("compute dry-run diff")?;
     print!("{}", report.render(format.into()));
     Ok(())
 }
@@ -3656,9 +3643,7 @@ async fn cmd_pull(
     host_filter: Option<&str>,
 ) -> Result<()> {
     let svc_cfg = config
-        .services
-        .iter()
-        .find(|s| s.name == service)
+        .service(service)
         .with_context(|| format!("service {service:?} not in config"))?;
     let tag = tag_override
         .map(str::to_string)
@@ -3671,28 +3656,23 @@ async fn cmd_pull(
     let credentials = deploy::registry_credentials(config, bundle.as_ref(), &svc_cfg.image);
     let ops = build_real_ops(config, bundle.as_ref()).await?;
     // Fan out across hosts so a slow daemon doesn't block the others.
-    let pulls = config
-        .hosts
-        .iter()
-        .filter(|h| host_filter.is_none_or(|f| f == h.address))
-        .map(|host_cfg| {
-            let host = Host::from(host_cfg);
-            let image = svc_cfg.image.clone();
-            let tag = tag.clone();
-            let credentials = credentials.clone();
-            let ops = &ops;
-            async move {
-                info_eprintln!(
-                    "→ {}: pulling {}",
-                    host.address,
-                    yoink::docker::image_reference(&image, &tag),
-                );
-                ops.pull_image(&host, &image, &tag, credentials)
-                    .await
-                    .with_context(|| format!("pull on {}", host.address))
-                    .map(|()| host.address)
-            }
-        });
+    let pulls = config.fleet_matching(host_filter).into_iter().map(|host| {
+        let image = svc_cfg.image.clone();
+        let tag = tag.clone();
+        let credentials = credentials.clone();
+        let ops = &ops;
+        async move {
+            info_eprintln!(
+                "→ {}: pulling {}",
+                host.address,
+                yoink::base::image::image_reference(&image, &tag),
+            );
+            ops.pull_image(&host, &image, &tag, credentials)
+                .await
+                .with_context(|| format!("pull on {}", host.address))
+                .map(|()| host.address)
+        }
+    });
     let results = futures_util::future::join_all(pulls).await;
     let mut had_err = false;
     for r in results {
@@ -3720,8 +3700,7 @@ async fn cmd_history(
     let label = format!("yoink.service={service}");
     // Fan out across hosts. Each call returns running + exited
     // containers labeled with this service.
-    let probes = config.hosts.iter().map(|host_cfg| {
-        let host = Host::from(host_cfg);
+    let probes = config.fleet().into_iter().map(|host| {
         let label = label.clone();
         let ops = &ops;
         async move {
@@ -3841,15 +3820,18 @@ async fn cmd_audit_log(
     limit: usize,
     format: TableFormat,
 ) -> Result<()> {
-    use yoink::audit::{FetchOptions, event_name, event_service, event_summary, fetch_events};
-    use yoink::docker_ops::{DockerOps as _, Host};
+    use yoink::base::host::Host;
+    use yoink::docker_ops::DockerOps as _;
+    use yoink::features::audit::{
+        FetchOptions, event_name, event_service, event_summary, fetch_events,
+    };
 
     if let Some(o) = origin_filter
         && !matches!(o, "operator" | "host")
     {
         anyhow::bail!("--origin must be 'operator' or 'host', got {o:?}");
     }
-    let hosts: Vec<Host> = config.hosts.iter().map(Host::from).collect();
+    let hosts: Vec<Host> = config.fleet();
     if hosts.is_empty() && origin_filter == Some("host") {
         anyhow::bail!("no hosts match the filter (or no hosts configured)");
     }
@@ -3955,19 +3937,15 @@ async fn cmd_audit_gc(
     host_filter: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    use yoink::docker_ops::{DockerOps as _, Host};
+    use yoink::base::host::Host;
+    use yoink::docker_ops::DockerOps as _;
     let secs = parse_since(keep)?;
     let cutoff_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
         .saturating_sub(secs);
 
-    let hosts: Vec<Host> = config
-        .hosts
-        .iter()
-        .filter(|h| host_filter.is_none_or(|f| h.address == f))
-        .map(Host::from)
-        .collect();
+    let hosts: Vec<Host> = config.fleet_matching(host_filter);
     if hosts.is_empty() {
         anyhow::bail!("no hosts match the filter (or no hosts configured)");
     }
@@ -4002,12 +3980,12 @@ async fn cmd_audit_gc(
 }
 
 async fn audit_gc_one(
-    host: &yoink::docker_ops::Host,
+    host: &yoink::base::host::Host,
     key_path: Option<&std::path::Path>,
     cutoff_unix: u64,
     dry_run: bool,
 ) -> Result<usize> {
-    use yoink::audit::{HOST_AUDIT_DIR_SH, LEGACY_HOST_AUDIT_DIR, run_audit_shell};
+    use yoink::features::audit::{HOST_AUDIT_DIR_SH, LEGACY_HOST_AUDIT_DIR, run_audit_shell};
     // POSIX-portable enough for the fleet we target. `-printf '%T@ %p'`
     // gives `<float-mtime> <path>` per line. Both the current and the
     // legacy directory are covered, so the path is the full one.
@@ -4068,7 +4046,7 @@ struct TopRow {
 }
 
 async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<()> {
-    use yoink::output::{format_bytes, format_relative_time};
+    use yoink::features::output::{format_bytes, format_relative_time};
     let ops = build_real_ops(config, None).await?;
     let report = StatusReport::collect(&ops, config)
         .await
@@ -4083,11 +4061,7 @@ async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<(
         }
     }
     let stat_futs = targets.iter().map(|(host_addr, name)| {
-        let host = config
-            .hosts
-            .iter()
-            .find(|h| h.address == *host_addr)
-            .map(yoink::docker_ops::Host::from);
+        let host = config.host(host_addr);
         let ops = &ops;
         async move {
             let h = host?;
@@ -4174,18 +4148,13 @@ async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<(
 
 async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> {
     let ops = build_real_ops(config, None).await?;
-    let probes = config
-        .hosts
-        .iter()
-        .filter(|h| host_filter.is_none_or(|f| f == h.address))
-        .map(|h| {
-            let host = Host::from(h);
-            let ops = &ops;
-            async move {
-                let nets = ops.list_networks(&host).await?;
-                anyhow::Ok(nets)
-            }
-        });
+    let probes = config.fleet_matching(host_filter).into_iter().map(|host| {
+        let ops = &ops;
+        async move {
+            let nets = ops.list_networks(&host).await?;
+            anyhow::Ok(nets)
+        }
+    });
     let mut all = Vec::new();
     for r in futures_util::future::join_all(probes).await {
         all.extend(r?);
@@ -4209,18 +4178,13 @@ async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> 
 
 async fn cmd_volumes(config: &Config, host_filter: Option<&str>) -> Result<()> {
     let ops = build_real_ops(config, None).await?;
-    let probes = config
-        .hosts
-        .iter()
-        .filter(|h| host_filter.is_none_or(|f| f == h.address))
-        .map(|h| {
-            let host = Host::from(h);
-            let ops = &ops;
-            async move {
-                let vols = ops.list_volumes(&host).await?;
-                anyhow::Ok(vols)
-            }
-        });
+    let probes = config.fleet_matching(host_filter).into_iter().map(|host| {
+        let ops = &ops;
+        async move {
+            let vols = ops.list_volumes(&host).await?;
+            anyhow::Ok(vols)
+        }
+    });
     let mut all = Vec::new();
     for r in futures_util::future::join_all(probes).await {
         all.extend(r?);
@@ -4292,8 +4256,8 @@ fn redact_value(value: &str) -> String {
 async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
     use serde_json::json;
     use yoink::deploy;
+    use yoink::deploy::lock::LOCK_NAME;
     use yoink::docker;
-    use yoink::lock::LOCK_NAME;
 
     // Best-effort secrets load — drift hashes are accurate when it
     // succeeds, marked "?" otherwise. Failure is logged via tracing
@@ -4306,8 +4270,7 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
     let mut hosts_json = Vec::new();
     let mut issues: Vec<String> = Vec::new();
 
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
+    for host in config.fleet() {
         let address = host.address.clone();
         let mut host_obj = json!({
             "address": address,
@@ -4401,7 +4364,7 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
             // for. Tag fallback: config's tag if set, else the
             // container's own yoink_version.
             let drift = c.yoink_service.as_deref().and_then(|name| {
-                let svc = config.services.iter().find(|s| s.name == name)?;
+                let svc = config.service(name)?;
                 let tag = svc.tag.clone().or_else(|| c.yoink_version.clone())?;
                 let desired =
                     deploy::build_desired_spec(config, svc, &tag, secrets.as_ref()).ok()?;
@@ -4499,13 +4462,13 @@ async fn cmd_dump(config: &Config, log_tail: u32) -> Result<()> {
         },
         "config": {
             "deploy": {
-                "networks": config.deploy.networks,
+                "networks": config.networks(),
             },
-            "hosts": config.hosts.iter().map(|h| {
+            "hosts": config.fleet().iter().map(|h| {
                 json!({"address": h.address, "user": h.user})
             }).collect::<Vec<_>>(),
             "services": config.services.iter().map(|s| {
-                let networks = s.networks.clone().unwrap_or_else(|| config.deploy.networks.clone());
+                let networks = config.networks_for(s);
                 json!({
                     "name": s.name,
                     "image": s.image,
@@ -4546,15 +4509,15 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
     // unknown YAML keys. If we got this far the config is well-formed.
     println!(
         "✓ config OK — {} services across {} hosts",
-        config.services.len(),
-        config.hosts.len()
+        config.service_count(),
+        config.host_count()
     );
     // Caddy schema validation: render the proxy config and run it
     // through `caddy validate` in an ephemeral container. Catches
     // schema errors (invalid `caddy_extra_json`, bad TLS config,
     // unknown handler module) BEFORE deploy time. Best-effort —
     // skips silently if docker isn't on the operator's machine.
-    if yoink::proxy::proxy_enabled(config) {
+    if config.proxy_enabled() {
         validate_proxy_render(config).await?;
     }
     if check_hosts {
@@ -4574,7 +4537,7 @@ fn is_keychain_error(err: &anyhow::Error) -> bool {
 }
 
 async fn cmd_doctor(config: &Config, json: bool) -> Result<()> {
-    use yoink::doctor::{Severity, run_doctor, tally};
+    use yoink::features::doctor::{Severity, run_doctor, tally};
 
     // A sealed ssh key needs the identity. If the keychain will not hand
     // it out, doctor must still run and say so: the secrets check
@@ -4651,7 +4614,7 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
     // — the rendered config still ran through `proxy::caddy::render`
     // above (catches schema errors), and Caddy refuses bad configs at
     // `/load` time on the host anyway.
-    if config.proxy.as_ref().is_some_and(|p| p.xcaddy.is_some()) {
+    if config.xcaddy().is_some() {
         eprintln!(
             "  (skipping Caddy schema check — proxy.xcaddy is set; the proxy image only \
              exists on hosts. Caddy will reject any bad config at /load time.)"
@@ -4659,10 +4622,7 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    let image = config.proxy.as_ref().map_or_else(
-        || yoink::config::CADDY_DEFAULT_IMAGE.to_string(),
-        yoink::config::ProxyConfig::resolved_image,
-    );
+    let image = config.proxy_image();
     let mut child = tokio::process::Command::new("docker")
         // JSON is Caddy's native config format — no `--adapter` flag.
         // (`--adapter caddyfile` would convert from Caddyfile syntax;
@@ -4720,23 +4680,19 @@ async fn validate_proxy_render(config: &Config) -> Result<()> {
 }
 
 fn cmd_proxy_dockerfile(config: &Config) -> Result<()> {
-    let xcaddy = config
-        .proxy
-        .as_ref()
-        .and_then(|p| p.xcaddy.as_ref())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "proxy.xcaddy is not set — there's no Dockerfile to render. Add a \
+    let xcaddy = config.xcaddy().ok_or_else(|| {
+        anyhow::anyhow!(
+            "proxy.xcaddy is not set — there's no Dockerfile to render. Add a \
                  `proxy.xcaddy.plugins:` block first."
-            )
-        })?;
+        )
+    })?;
     let dockerfile = yoink::proxy::xcaddy::render_dockerfile(xcaddy);
     print!("{dockerfile}");
     Ok(())
 }
 
 async fn cmd_proxy_render(config: &Config) -> Result<()> {
-    if !yoink::proxy::proxy_enabled(config) {
+    if !config.proxy_enabled() {
         anyhow::bail!(
             "proxy is not enabled — no service has `domain:` and `proxy.enabled` is unset"
         );
@@ -4757,14 +4713,13 @@ async fn cmd_proxy_render(config: &Config) -> Result<()> {
 }
 
 async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
-    use yoink::lock::LOCK_NAME;
+    use yoink::deploy::lock::LOCK_NAME;
     let ops = build_real_ops(config, None).await?;
     match action {
         LockAction::Status => {
             // Fan out across hosts — one slow daemon shouldn't make
             // the others wait. Per-host errors surface as Err inline.
-            let probes = config.hosts.iter().map(|host_cfg| {
-                let host = Host::from(host_cfg);
+            let probes = config.fleet().into_iter().map(|host| {
                 let ops = &ops;
                 async move {
                     let containers = ops.list_running_containers(&host).await?;
@@ -4792,13 +4747,7 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
                 );
                 anyhow::bail!("aborted");
             }
-            for host_cfg in &config.hosts {
-                if let Some(filter) = &host
-                    && filter != &host_cfg.address
-                {
-                    continue;
-                }
-                let h = Host::from(host_cfg);
+            for h in config.fleet_matching(host.as_deref()) {
                 match ops.force_remove_container(&h, LOCK_NAME).await {
                     Ok(()) => eprintln!("{}: released", h.address),
                     Err(e) => eprintln!("{}: {e:#}", h.address),
@@ -4811,9 +4760,7 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
 
 async fn cmd_diff(config: &Config, service: &str, tag_override: Option<&str>) -> Result<()> {
     let svc_cfg = config
-        .services
-        .iter()
-        .find(|s| s.name == service)
+        .service(service)
         .with_context(|| format!("service {service:?} not in config"))?;
     let target_tag = tag_override
         .map(str::to_string)
@@ -4852,7 +4799,7 @@ async fn cmd_diff(config: &Config, service: &str, tag_override: Option<&str>) ->
     }
     println!(
         "\nspec: {} (env, ports, mounts compared at deploy time via spec hash)",
-        yoink::docker::image_reference(&svc_cfg.image, &target_tag),
+        yoink::base::image::image_reference(&svc_cfg.image, &target_tag),
     );
     Ok(())
 }
@@ -4876,14 +4823,14 @@ fn cmd_complete(config: &Config, what: CompleteKind) {
             }
         }
         CompleteKind::Hosts => {
-            for host in &config.hosts {
+            for host in config.fleet() {
                 println!("{}", host.address);
             }
         }
         CompleteKind::Configs => {
             // Bootstrap should have caught this; render anyway in
             // case someone calls through `run()` directly.
-            yoink::completion::print_yoink_configs();
+            yoink::base::completion::print_yoink_configs();
         }
     }
 }
@@ -4951,7 +4898,7 @@ fn run_bootstrap(command: &Command, config_path: &Path) -> Option<Result<()>> {
             // Configs completion *cannot* depend on a config already
             // existing — the whole point is to find one to use. Run
             // before the load step in `run()`.
-            yoink::completion::print_yoink_configs();
+            yoink::base::completion::print_yoink_configs();
             Some(Ok(()))
         }
         Command::Secrets {
@@ -4981,18 +4928,20 @@ fn run_bootstrap(command: &Command, config_path: &Path) -> Option<Result<()>> {
             no_secrets,
             create_ssh_key,
             proxy_email,
-        } => Some(yoink::init::cmd_init(yoink::init::InitOpts {
-            host: host.clone(),
-            force: *force,
-            interactive: *interactive,
-            service: service.clone(),
-            port: *port,
-            no_port: *no_port,
-            image: image.clone(),
-            no_secrets: *no_secrets,
-            create_ssh_key: create_ssh_key.clone(),
-            proxy_email: proxy_email.clone(),
-        })),
+        } => Some(yoink::features::init::cmd_init(
+            yoink::features::init::InitOpts {
+                host: host.clone(),
+                force: *force,
+                interactive: *interactive,
+                service: service.clone(),
+                port: *port,
+                no_port: *no_port,
+                image: image.clone(),
+                no_secrets: *no_secrets,
+                create_ssh_key: create_ssh_key.clone(),
+                proxy_email: proxy_email.clone(),
+            },
+        )),
         _ => None,
     }
 }
@@ -5055,7 +5004,7 @@ fn split_hosts_add_address(
     let Some(address) = address else {
         return Ok((None, port));
     };
-    let (address, inline) = yoink::config::split_address_port(address)
+    let (address, inline) = yoink::base::host::split_address_port(address)
         .map_err(|e| anyhow::anyhow!("--address: {e}"))?;
     match (port, inline) {
         (Some(flag), Some(inline)) if flag != inline => Err(anyhow::anyhow!(
@@ -5277,8 +5226,8 @@ fn cmd_secrets_ssh_key_generate(
     comment: Option<&str>,
 ) -> Result<()> {
     use yoink::sealed;
-    let (file_override, recipients) = expect_age_block(config)?;
-    let target = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+    let recipients = expect_age_block(config)?;
+    let target = config.sealed_path()?;
     let pub_openssh = sealed::ssh_keygen_into_bundle(&target, recipients, seal_as, comment)?;
     eprintln!(
         "✓ sealed new ed25519 SSH private key as {seal_as:?} into {}",
@@ -5292,8 +5241,8 @@ fn cmd_secrets_ssh_key_public(config: &Config, name: &str) -> Result<()> {
     use ssh_key::PrivateKey;
     use yoink::sealed;
 
-    let (file_override, recipients) = expect_age_block(config)?;
-    let target = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+    let recipients = expect_age_block(config)?;
+    let target = config.sealed_path()?;
     if !target.exists() {
         return Err(anyhow::anyhow!(
             "no sealed bundle at {}; nothing to derive {name:?} from",
@@ -5353,8 +5302,8 @@ fn age_recipients(config: &Config) -> &[String] {
 }
 
 /// The credential store, or an error on a platform without one.
-fn require_keychain() -> Result<&'static dyn yoink::keychain::IdentityStore> {
-    let store = yoink::keychain::system_store();
+fn require_keychain() -> Result<&'static dyn yoink::base::keychain::IdentityStore> {
+    let store = yoink::base::keychain::system_store();
     if !store.supported() {
         anyhow::bail!("`--keychain` is supported on macOS only");
     }
@@ -5385,11 +5334,11 @@ fn cmd_secrets_key_generate_keychain(config_path: &Path) -> Result<()> {
     store.set(
         &public,
         secret.as_str(),
-        &yoink::keychain::label_for(&project_name(config_path)),
+        &yoink::base::keychain::label_for(&project_name(config_path)),
     )?;
     eprintln!(
         "stored identity in the keychain (service {})",
-        yoink::keychain::SERVICE
+        yoink::base::keychain::SERVICE
     );
     eprintln!("public recipient: {public}");
     eprintln!();
@@ -5447,7 +5396,7 @@ fn cmd_secrets_key_import(
     yes: bool,
 ) -> Result<()> {
     use std::io::Read as _;
-    use yoink::prompt::{ConfirmKind, confirm};
+    use yoink::base::prompt::{ConfirmKind, confirm};
     use yoink::sealed;
 
     let store = require_keychain()?;
@@ -5492,7 +5441,7 @@ fn cmd_secrets_key_import(
     store.set(
         &public,
         secret.as_str(),
-        &yoink::keychain::label_for(&project_name(config_path)),
+        &yoink::base::keychain::label_for(&project_name(config_path)),
     )?;
     // Read back before anything is deleted.
     // The store has no cache, so this is a real read of the item.
@@ -5582,7 +5531,7 @@ fn cmd_secrets_key_export(config: &Config, out: Option<&Path>, force: bool) -> R
         if let Some(reason) = lookup.unavailable {
             // Export reads the keychain only, so the general advice
             // (set YOINK_AGE_KEY, generate a key) does not apply.
-            let fix = if yoink::keychain::in_ssh_session() {
+            let fix = if yoink::base::keychain::in_ssh_session() {
                 "This looks like an SSH session, where macOS cannot ask for permission. \
                  Run this command on the Mac itself"
             } else {
@@ -5643,7 +5592,7 @@ fn cmd_secrets_key_list_all(config: Option<&Config>) -> Result<()> {
             ""
         }
     };
-    let store = yoink::keychain::system_store();
+    let store = yoink::base::keychain::system_store();
     let items = store.list()?;
     let files = sealed::file_identities()?;
     if items.is_empty() && files.is_empty() {
@@ -5747,7 +5696,7 @@ fn collect_key_rows(recipients: &[String]) -> Result<Vec<KeyRow>> {
     // an environment variable already supplies the identity. Whether an
     // item really holds its identity shows in the star and in the
     // message below, which come from the real resolution.
-    let stored: Vec<String> = match yoink::keychain::system_store().list() {
+    let stored: Vec<String> = match yoink::base::keychain::system_store().list() {
         Ok(items) => items.into_iter().map(|i| i.recipient).collect(),
         Err(e) => {
             rows.push(unreadable("keychain".into(), &e.to_string()));
@@ -5801,9 +5750,9 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
     // on that file would be wrong, so then no row gets one.
     // True when prompts are already off for the whole run (an SSH
     // session). A real command then gets the same answer as this list.
-    let run_is_quiet = yoink::keychain::prompts_off();
+    let run_is_quiet = yoink::base::keychain::prompts_off();
     let (resolved, unread) = {
-        let quiet = yoink::keychain::no_prompts();
+        let quiet = yoink::base::keychain::no_prompts();
         if quiet.active() {
             // The reason, when any item could not be read. Also when
             // another recipient's item was readable: a real command asks
@@ -5860,7 +5809,7 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
         Err(sealed::SealedError::KeychainUnavailable { reason }) => {
             eprintln!("no star: the keychain item was not read ({reason}).");
             if run_is_quiet {
-                eprintln!("{}", yoink::keychain::advice());
+                eprintln!("{}", yoink::base::keychain::advice());
             } else {
                 eprintln!(
                     "A command that uses the key, for example `yoink secrets show`, \
@@ -5874,7 +5823,7 @@ fn cmd_secrets_key_list(config: &Config) -> Result<()> {
 }
 
 fn cmd_secrets_key_remove(recipient: &str, yes: bool) -> Result<()> {
-    use yoink::prompt::{ConfirmKind, confirm};
+    use yoink::base::prompt::{ConfirmKind, confirm};
     let store = require_keychain()?;
     if !confirm(
         &format!(
@@ -5973,8 +5922,8 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
     use std::collections::BTreeMap;
     use yoink::sealed;
 
-    let (file_override, recipients) = expect_age_block(config)?;
-    let path = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+    let recipients = expect_age_block(config)?;
+    let path = config.sealed_path()?;
 
     // Decrypt the current bundle (or start with an empty template).
     let (original_bundle, plaintext) = if path.exists() {
@@ -6073,13 +6022,10 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
              not into build logs), set YOINK_ALLOW_REVEAL_IN_CI=1"
         ));
     }
-    let SecretsConfig::Age {
-        file, recipients, ..
-    } = expect_secrets_provider_age(config)?
-    else {
+    let SecretsConfig::Age { recipients, .. } = expect_secrets_provider_age(config)? else {
         unreachable!()
     };
-    let path = sealed::resolve_sealed_path(config, file.as_deref())?;
+    let path = config.sealed_path()?;
     let bytes =
         std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
     let identity = sealed::load_identity(recipients)?;
@@ -6108,7 +6054,6 @@ fn cmd_secrets_env(config: &Config, no_export: bool, profile_name: Option<&str>)
         ));
     }
     let SecretsConfig::Age {
-        file,
         recipients,
         profiles,
         ..
@@ -6130,7 +6075,7 @@ fn cmd_secrets_env(config: &Config, no_export: bool, profile_name: Option<&str>)
         })?),
         None => None,
     };
-    let path = sealed::resolve_sealed_path(config, file.as_deref())?;
+    let path = config.sealed_path()?;
     let bytes =
         std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
     let identity = sealed::load_identity(recipients)?;
@@ -6234,7 +6179,7 @@ fn cmd_secrets_seal(
     yes: bool,
 ) -> Result<()> {
     use yoink::sealed;
-    let (file_override, recipients) = expect_age_block(config)?;
+    let recipients = expect_age_block(config)?;
     // Cap input at 10 MiB regardless of source — protects against
     // a wrong-file paste (a 5GB image) just as much as an unbounded
     // stdin stream. Real secrets bundles are kilobytes.
@@ -6278,7 +6223,7 @@ fn cmd_secrets_seal(
 
     let target = match out {
         Some(p) => p,
-        None => sealed::resolve_sealed_path(config, file_override.as_deref())?,
+        None => config.sealed_path()?,
     };
 
     // Load existing bundle (if any). On the first seal — when
@@ -6416,8 +6361,8 @@ fn parse_as_pairs(
 fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     use yoink::sealed;
 
-    let (file_override, current_recipients) = expect_age_block(config)?;
-    let path = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+    let current_recipients = expect_age_block(config)?;
+    let path = config.sealed_path()?;
     if !path.exists() {
         return Err(anyhow::anyhow!(
             "{} doesn't exist — nothing to rotate. `yoink secrets edit` to create it first",
@@ -6486,12 +6431,9 @@ fn expect_secrets_provider_age(config: &Config) -> Result<&yoink::config::Secret
     }
 }
 
-fn expect_age_block(config: &Config) -> Result<(Option<String>, &Vec<String>)> {
+fn expect_age_block(config: &Config) -> Result<&Vec<String>> {
     use yoink::config::SecretsConfig;
-    let SecretsConfig::Age {
-        file, recipients, ..
-    } = expect_secrets_provider_age(config)?
-    else {
+    let SecretsConfig::Age { recipients, .. } = expect_secrets_provider_age(config)? else {
         unreachable!()
     };
     if recipients.is_empty() {
@@ -6499,7 +6441,7 @@ fn expect_age_block(config: &Config) -> Result<(Option<String>, &Vec<String>)> {
             "no `secrets.recipients:` configured — add at least one age public key (`age1...`) to yoink.yaml"
         ));
     }
-    Ok((file.clone(), recipients))
+    Ok(recipients)
 }
 
 /// Open `initial` content in `$EDITOR` (falling back to `$VISUAL`,
@@ -6825,7 +6767,7 @@ services:
         assert_eq!(failure, None);
         check_git_fallback(&services, &out, failure.as_ref(), false, true).unwrap();
         let api = services.iter().find(|s| s.name == "api").unwrap();
-        let err = yoink::build::resolve_service_tag(api, &out)
+        let err = yoink::features::build::resolve_service_tag(api, &out)
             .unwrap_err()
             .to_string();
         assert_eq!(

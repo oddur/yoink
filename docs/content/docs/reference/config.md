@@ -4,7 +4,7 @@ description: The complete yoink.yaml schema with every field, its type, and its 
 weight: 5
 ---
 
-The canonical source of the `yoink.yaml` schema is [`yoink/src/config.rs`](https://github.com/oddur/yoink/blob/main/yoink/src/config.rs).
+The canonical source of the `yoink.yaml` schema is [`yoink/src/config/`](https://github.com/oddur/yoink/tree/main/yoink/src/config).
 
 ## Top level
 

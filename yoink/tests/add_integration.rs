@@ -10,10 +10,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use yoink::add::manifest::TemplateManifest;
-use yoink::add::render;
-use yoink::add::wizard;
 use yoink::config::{Config, ConfigFragment};
+use yoink::features::add::manifest::TemplateManifest;
+use yoink::features::add::render;
+use yoink::features::add::wizard;
 
 fn templates_dir() -> PathBuf {
     // Tests run with cwd = workspace root by default. Resolve from

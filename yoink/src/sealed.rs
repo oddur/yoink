@@ -10,7 +10,7 @@
 //!   1. `YOINK_AGE_KEY` env var — raw `AGE-SECRET-KEY-1...`
 //!   2. `YOINK_AGE_KEY_FILE` env var — path to a key file
 //!   3. The OS credential store (the macOS login keychain): one item
-//!      per recipient in `secrets.recipients:`. See [`crate::keychain`].
+//!      per recipient in `secrets.recipients:`. See [`crate::base::keychain`].
 //!   4. Scan `~/.config/yoink/keys/*.key` for an identity whose public
 //!      half matches one of the config's `secrets.recipients:`
 //!   5. Legacy `~/.config/yoink/age.key` (the pre-multi-identity default;
@@ -34,8 +34,6 @@ use age::{
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::config::Config;
-
 pub const AGE_KEY_ENV: &str = "YOINK_AGE_KEY";
 pub const AGE_KEY_FILE_ENV: &str = "YOINK_AGE_KEY_FILE";
 pub const DEFAULT_SEALED_FILENAME: &str = "secrets.age";
@@ -57,11 +55,11 @@ pub enum SealedError {
     #[error("parse age identity: {0}")]
     IdentityParse(String),
     #[error(transparent)]
-    Keychain(#[from] crate::keychain::StoreError),
+    Keychain(#[from] crate::base::keychain::StoreError),
     #[error(
         "the keychain could not be read ({reason}), and no key file holds an identity for \
          this config's recipients. {}",
-        crate::keychain::advice()
+        crate::base::keychain::advice()
     )]
     KeychainUnavailable { reason: String },
     #[error("parse age recipient {raw:?}: {reason}")]
@@ -111,7 +109,8 @@ pub enum SealedError {
 }
 
 /// Resolve where the sealed file lives. Honors `secrets.file:` when
-/// set, falls back to `<config_dir>/secrets.age`.
+/// set, falls back to `<config_dir>/secrets.age`. `config_dir` is the
+/// directory `yoink.yaml` was loaded from; `None` means `.`.
 ///
 /// Rejects `secrets.file:` values that contain `..` components or are
 /// absolute paths pointing outside the config directory — the value
@@ -119,13 +118,10 @@ pub enum SealedError {
 /// `file: ../../../etc/passwd` should never become a sealed-file
 /// pointer (`yoink secrets edit` would happily overwrite it).
 pub fn resolve_sealed_path(
-    config: &Config,
+    config_dir: Option<&Path>,
     file_override: Option<&str>,
 ) -> Result<PathBuf, SealedError> {
-    let base = config
-        .config_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base = config_dir.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let raw = file_override.unwrap_or(DEFAULT_SEALED_FILENAME);
     let candidate = Path::new(raw);
     if candidate.is_absolute() {
@@ -258,13 +254,13 @@ pub fn resolve_identity(recipients: &[String]) -> Result<ResolvedIdentity, Seale
 pub fn keychain_lookup(recipients: &[String]) -> KeychainAnswer {
     // An SSH session where prompts could not be turned off: a read
     // could wait on a dialog nobody sees. Stay away from the keychain.
-    if crate::keychain::in_ssh_session() && !crate::keychain::prompts_off() {
+    if crate::base::keychain::in_ssh_session() && !crate::base::keychain::prompts_off() {
         return Ok(KeychainLookup {
             unavailable: Some("keychain prompts could not be turned off".into()),
             ..KeychainLookup::default()
         });
     }
-    let store = crate::keychain::system_store();
+    let store = crate::base::keychain::system_store();
     keychain_identity_by(
         |recipient| KEYCHAIN_MEMO.get(recipient, || store.get(recipient)),
         recipients,
@@ -282,10 +278,10 @@ pub fn forget_keychain_failures() -> bool {
 
 /// What the keychain said about a list of recipients: a lookup, or a
 /// refusal.
-pub type KeychainAnswer = Result<KeychainLookup, crate::keychain::StoreError>;
+pub type KeychainAnswer = Result<KeychainLookup, crate::base::keychain::StoreError>;
 
 /// What the keychain said about one recipient.
-type KeychainItem = Result<Option<Zeroizing<String>>, crate::keychain::StoreError>;
+type KeychainItem = Result<Option<Zeroizing<String>>, crate::base::keychain::StoreError>;
 
 static KEYCHAIN_MEMO: KeychainMemo = KeychainMemo::new();
 
@@ -426,7 +422,7 @@ pub struct KeychainLookup {
 ///   refusal is not bypassed through a copy of the key on disk.
 /// - An item that does not hold the identity of its recipient: skipped.
 pub fn keychain_identity(
-    store: &dyn crate::keychain::IdentityStore,
+    store: &dyn crate::base::keychain::IdentityStore,
     recipients: &[String],
 ) -> KeychainAnswer {
     keychain_identity_by(|recipient| store.get(recipient), recipients)
@@ -438,7 +434,7 @@ fn keychain_identity_by(
     get: impl Fn(&str) -> KeychainItem,
     recipients: &[String],
 ) -> KeychainAnswer {
-    use crate::keychain::StoreError;
+    use crate::base::keychain::StoreError;
     let mut lookup = KeychainLookup::default();
     for recipient in recipients {
         match get(recipient) {
@@ -1042,7 +1038,7 @@ mod tests {
         resolve_identity_with(
             env_key,
             env_file,
-            &crate::keychain::NoStore,
+            &crate::base::keychain::NoStore,
             keys_dir,
             legacy_path,
             recipients,
@@ -1056,7 +1052,7 @@ mod tests {
     fn resolve_identity_with(
         env_key: Option<String>,
         env_file: Option<String>,
-        store: &dyn crate::keychain::IdentityStore,
+        store: &dyn crate::base::keychain::IdentityStore,
         keys_dir: &Path,
         legacy_path: &Path,
         recipients: &[String],
@@ -1425,7 +1421,7 @@ BAZ=plain
 
     // -- credential store ----------------------------------------------
 
-    use crate::keychain::{IdentityStore as _, StoreError, fake::FakeStore};
+    use crate::base::keychain::{IdentityStore as _, StoreError, fake::FakeStore};
 
     /// A temp keys dir with one key file, plus a legacy path that does
     /// not exist. Returns `(tmp, keys_dir, legacy, public_of_the_file)`.
@@ -1577,7 +1573,7 @@ BAZ=plain
     /// hide a readable item of the next recipient.
     #[test]
     fn keychain_lookup_continues_past_an_unavailable_item() {
-        use crate::keychain::IdentityStore;
+        use crate::base::keychain::IdentityStore;
         use zeroize::Zeroizing;
         struct OneLocked(FakeStore);
         impl IdentityStore for OneLocked {

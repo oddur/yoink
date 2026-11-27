@@ -5,7 +5,7 @@
 //!
 //! - [`Transport::Tarball`] — `docker save | docker load` over the
 //!   existing bollard ssh transport. Whole image every time. No host
-//!   dependencies. Lives in [`crate::build::save_and_load_to_host`].
+//!   dependencies. Lives in [`tarball`].
 //! - [`Transport::Unregistry`] — spin up an ephemeral
 //!   `ghcr.io/psviderski/unregistry` sidecar on the host, tunnel a
 //!   local port to it, `docker push` over the registry protocol so
@@ -17,7 +17,7 @@
 //! errors out instead.
 
 pub mod oci_push;
-pub mod tunnel;
+pub mod tarball;
 pub mod unregistry;
 
 /// Transport selection for the `--no-registry` image-delivery step.

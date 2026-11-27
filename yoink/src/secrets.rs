@@ -15,7 +15,6 @@
 //!     yoink growing first-party integrations for each.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -25,6 +24,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use zeroize::Zeroizing;
 
+use crate::base::bundle::SecretsBundle;
 use crate::config::{Config, SecretsConfig, SecretsFormat};
 use crate::sealed;
 
@@ -162,50 +162,6 @@ pub enum SecretsError {
     Sealed(#[from] sealed::SealedError),
 }
 
-/// In-memory map of resolved secret keys → values. Built once at the
-/// start of a reconcile. Each service then picks the keys it needs.
-/// Values are wrapped in `Zeroizing<String>` so they are wiped from
-/// memory when the bundle is dropped.
-#[derive(Clone, Default)]
-pub struct SecretsBundle {
-    values: BTreeMap<String, Zeroizing<String>>,
-}
-
-impl SecretsBundle {
-    #[must_use]
-    pub fn new(values: BTreeMap<String, Zeroizing<String>>) -> Self {
-        Self { values }
-    }
-
-    #[must_use]
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.values.get(key).map(|v| v.as_str())
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.values.keys().map(String::as_str)
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-}
-
-impl fmt::Debug for SecretsBundle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SecretsBundle")
-            .field("len", &self.values.len())
-            .field("keys", &self.values.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
 /// Load whatever the operator configured. `Ok(None)` when no
 /// `[secrets]` block is declared (services that don't need secrets).
 ///
@@ -221,10 +177,8 @@ pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, Secre
     };
     let any_secrets_referenced = config_references_secrets(config);
     let bundle = match cfg {
-        SecretsConfig::Age {
-            file, recipients, ..
-        } => {
-            let path = sealed::resolve_sealed_path(config, file.as_deref())?;
+        SecretsConfig::Age { recipients, .. } => {
+            let path = config.sealed_path()?;
             load_age_bundle(&path, recipients, any_secrets_referenced)?
         }
         SecretsConfig::Command { command, format } => {
@@ -247,11 +201,7 @@ fn config_references_secrets(config: &Config) -> bool {
     {
         return true;
     }
-    if config
-        .hosts
-        .iter()
-        .any(|h| h.address_secret.is_some() || h.ssh_key_secret.is_some())
-    {
+    if config.any_host_address_sealed() || config.host_ssh_keys().next().is_some() {
         return true;
     }
     config

@@ -1,32 +1,26 @@
-pub mod add;
-pub mod audit;
-pub mod bollard_ssh;
-pub mod build;
-pub mod completion;
+//! yoink as a library, in layers. A module uses only modules on its
+//! own layer or below:
+//!
+//! - `tui`: the terminal UI (the `yoink` binary holds the commands).
+//! - `features`: what the commands do besides deploying: status,
+//!   diff, doctor, build, audit, port-forwards, templates.
+//! - `deploy`: reconcile services onto hosts.
+//! - `proxy`, `transport`: Caddy on the hosts, and shipping images.
+//! - `docker_ops`, `docker`, `ssh`: the Docker API, container specs,
+//!   and reaching a host.
+//! - `config`, `secrets`: `yoink.yaml` and its secrets provider.
+//! - `sealed`, `base`: the sealed file, and the leaves every layer
+//!   shares.
+
+pub mod base;
 pub mod config;
 pub mod deploy;
-pub mod diff;
 pub mod docker;
 pub mod docker_ops;
-pub mod doctor;
-pub mod files;
-pub mod git;
-pub mod healthcheck;
-pub mod init;
-pub mod keychain;
-pub mod lock;
-pub mod network;
-pub mod output;
-pub mod pf;
-pub mod prompt;
+pub mod features;
 pub mod proxy;
-pub mod prune;
 pub mod sealed;
 pub mod secrets;
-pub mod ssh_keys;
-pub mod ssh_probe;
-pub mod status;
+pub mod ssh;
 pub mod transport;
 pub mod tui;
-pub mod vscode;
-pub mod webhooks;

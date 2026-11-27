@@ -33,7 +33,7 @@ pub fn config_source(config_path: &Path) -> Option<String> {
     );
     if status
         .as_deref()
-        .is_some_and(crate::git::is_dirty_from_status)
+        .is_some_and(crate::base::git::is_dirty_from_status)
     {
         Some(format!("{name}(*)"))
     } else {

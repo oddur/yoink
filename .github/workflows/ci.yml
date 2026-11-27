@@ -51,7 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  # The keychain backend (`yoink/src/keychain.rs`, `mod macos`) compiles
+  # The keychain backend (`yoink/src/base/keychain.rs`, `mod macos`) compiles
   # only on macOS. Without this job a break in it shows first in the
   # release build, after the tag.
   macos:

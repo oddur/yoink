@@ -21,9 +21,10 @@ use thiserror::Error;
 use tracing::warn;
 
 use super::oci_push::{self, OciPushError};
-use super::tunnel::{SshTunnel, TunnelError};
-use crate::docker_ops::{DockerError, DockerOps, Host, parse_published_port, rand_hex};
-use crate::ssh_probe;
+use crate::base::host::Host;
+use crate::docker_ops::{DockerError, DockerOps, parse_published_port, rand_hex};
+use crate::ssh::probe;
+use crate::ssh::tunnel::{SshTunnel, TunnelError};
 
 /// Image used for the ephemeral on-host registry sidecar.
 ///
@@ -144,7 +145,7 @@ pub async fn push(
     // Pre-flight ssh so we surface classified errors (Tailscale auth,
     // permission denied, …) instead of the tunnel's generic "didn't
     // become reachable" timeout. Same probe `yoink preflight` uses.
-    ssh_probe::probe(host, keyfile.as_deref().and_then(|p| p.to_str()))
+    probe::probe(host, keyfile.as_deref().and_then(|p| p.to_str()))
         .await
         .map_err(UnregistryError::SshProbe)?;
     let tunnel = SshTunnel::open(host, host_port, READY_TIMEOUT, keyfile.as_deref()).await?;

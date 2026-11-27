@@ -1,25 +1,12 @@
-//! TUI mode. See `app` for the event loop and per-pane modules for
-//! rendering.
+//! TUI mode. `screens` holds the event loop (`app`) and one module
+//! per pane; the modules here are the helpers the screens share.
 
-mod app;
-mod audit;
 mod chrome;
-mod container_detail;
-mod dashboard;
-mod doctor;
-mod drift;
 mod editor;
-mod history;
-mod host_detail;
-mod hosts;
-mod logs;
 mod pf;
 mod progress;
-mod resources;
-mod secrets;
-mod services;
-mod shell;
+mod screens;
 mod ui;
 mod vscode;
 
-pub use app::{Mode, run};
+pub use screens::app::{Mode, run};
