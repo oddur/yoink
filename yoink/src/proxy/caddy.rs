@@ -129,16 +129,14 @@ where
     }
 
     let mut config = json!({
-        // Same admin block as the synthesized proxy's bootstrap. Caddy
-        // /load REPLACES the active config — if we omit the admin
-        // block, Caddy reverts admin from `0.0.0.0:2019` to the
-        // default `localhost:2019`, which breaks docker's port
-        // forwarding (the docker-proxy on the host sends to the
-        // container's eth0:2019, not lo). Subsequent /load calls
-        // would then time out trying to reach the admin endpoint.
+        // Same admin block as the synthesized proxy's bootstrap: the
+        // admin API listens on the container loopback only, so no
+        // other container can reach it. Caddy /load REPLACES the
+        // active config, so the block goes into every push. This also
+        // moves a proxy that an older yoink started with a wildcard
+        // admin address onto loopback at its next push.
         "admin": {
-            "listen": "0.0.0.0:2019",
-            "enforce_origin": false,
+            "listen": crate::config::ADMIN_LISTEN,
         },
         "apps": {
             "http": {
@@ -1395,5 +1393,31 @@ services:
         );
         let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
         assert_eq!(json["admin"]["listen"].as_str(), Some("127.0.0.1:9999"));
+    }
+
+    /// The admin API used to listen on `0.0.0.0:2019` with the origin
+    /// check off, so any container on `yoink-ingress` could rewrite the
+    /// proxy config. Every push now keeps it on the container loopback
+    /// with Caddy's default origin check.
+    #[test]
+    fn admin_api_listens_on_container_loopback_only() {
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        assert_eq!(
+            json["admin"],
+            serde_json::json!({ "listen": "127.0.0.1:2019" })
+        );
     }
 }

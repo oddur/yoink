@@ -1,50 +1,27 @@
 //! Push rendered Caddy JSON to the proxy's admin API.
 //!
-//! Caddy's admin API listens on `:2019` *inside* the container and is
-//! published on the host's loopback at an ephemeral port (chosen by
-//! docker via `127.0.0.1:0:2019`). The yoink CLI:
+//! Caddy's admin API listens on `127.0.0.1:2019` *inside* the proxy
+//! container ([`ADMIN_LISTEN`]). It is not published, and it does not
+//! listen on any docker network, so no other container can reach it.
+//! The admin API has no authentication, so this matters: a container
+//! that reaches it can rewrite every route of the proxy. The yoink CLI:
 //!
-//! 1. Looks up the proxy container, reads the host-side admin port
-//!    from its inspect output.
-//! 2. SSH-tunnels from `operator-localhost:<rand>` to
-//!    `host-localhost:<published>`.
-//! 3. `POST`s the JSON to `http://127.0.0.1:<rand>/load`.
-//! 4. Drops the tunnel.
+//! 1. Looks up the running proxy container.
+//! 2. Runs `caddy reload --config /dev/stdin` in it with `docker exec`
+//!    and sends the JSON on stdin. The config carries certificate
+//!    keys, so it never goes on a command line.
+//! 3. Reads the route count back with `wget` in the same container.
 //!
-//! Why loopback-published instead of using the container's docker IP
-//! directly: docker doesn't route user-defined-network container IPs
-//! from the host, so an SSH-tunnel `-L … :<container_ip>:2019` gets
-//! "connection refused". Loopback publishing is the established
-//! pattern (same shape as the unregistry transport).
-
-use std::time::{Duration, Instant};
+//! `docker exec` goes through the docker API connection that yoink
+//! already has, so this needs no SSH tunnel and no published port.
 
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::base::host::Host;
-use crate::docker_ops::{DockerError, DockerOps, parse_published_port};
-use crate::ssh::tunnel::{SshTunnel, TunnelError};
+use crate::docker_ops::{DockerError, DockerOps};
 
-use crate::config::{ADMIN_PORT, PROXY_SERVICE_NAME};
-
-/// How long the SSH tunnel + Caddy admin readiness probe each get
-/// before giving up. 20s comfortably covers a cold proxy boot on a
-/// laggy host without making transient ssh blips look like real outages.
-const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(20);
-/// HTTP timeout for the actual admin-API push. The push uploads the
-/// rendered Caddy JSON; 60s is plenty for any realistic config.
-const ADMIN_API_TIMEOUT: Duration = Duration::from_secs(60);
-/// HTTP timeout for the readiness probe loop. Short — we expect a
-/// fast no-content response or fast failure.
-const ADMIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Backoff between readiness probes while the proxy is coming up.
-const ADMIN_POLL_INTERVAL: Duration = Duration::from_millis(150);
-/// Pause before retrying a failed `/load` push. Short enough to be
-/// invisible to operators on the happy retry path, long enough that
-/// we don't dial a fresh ssh tunnel into the same NAT/sshd state
-/// that just dropped the previous one.
-const RETRY_BACKOFF: Duration = Duration::from_millis(200);
+use crate::config::{ADMIN_LISTEN, PROXY_SERVICE_NAME};
 
 #[derive(Debug, Error)]
 pub enum AdminError {
@@ -56,25 +33,13 @@ pub enum AdminError {
     },
     #[error("proxy container {PROXY_SERVICE_NAME:?} not running on {host}")]
     ProxyNotRunning { host: String },
-    #[error(
-        "proxy container on {host} has no published admin port — yoink expected \
-         it on `127.0.0.1:0:{ADMIN_PORT}` but inspect returned: {ports:?}"
-    )]
-    NoPublishedAdminPort { host: String, ports: Vec<String> },
-    #[error("ssh tunnel to proxy admin: {0}")]
-    Tunnel(#[from] TunnelError),
-    #[error("proxy admin endpoint did not respond within {timeout:?}")]
-    NotReady { timeout: Duration },
-    #[error("HTTP error talking to proxy admin: {source}")]
-    Http {
-        #[source]
-        source: reqwest::Error,
-    },
-    #[error("proxy admin rejected /load with status {status}: {body}")]
-    LoadRejected {
-        status: reqwest::StatusCode,
-        body: String,
-    },
+    /// `caddy reload` exited non-zero. `detail` is its output, which
+    /// carries the admin API's answer (e.g. a Caddy parser error).
+    #[error("proxy admin rejected /load: {detail}")]
+    LoadRejected { detail: String },
+    /// The route-count read-back after a successful `/load` failed.
+    #[error("read back proxy routes: {detail}")]
+    ReadBackFailed { detail: String },
     /// `/load` returned 200 but reading `/config/...routes/` back yielded
     /// a different route count. Caught early so a silent under-load
     /// doesn't end up serving 521 for routes the operator believes are
@@ -87,64 +52,72 @@ pub enum AdminError {
     LoadVerifyMismatch { expected: usize, actual: usize },
 }
 
-/// Push `config` to the proxy on `host`. Looks up the proxy
-/// container's host-side admin port, opens an SSH tunnel to host
-/// loopback at that port, POSTs to `/load`, drops the tunnel.
+/// Push `config` to the proxy on `host` with `docker exec` into the
+/// running proxy container, then verify the route count.
 ///
-/// Retries once on transport-class failures (tunnel didn't come up,
-/// readiness probe timed out, or `reqwest` errored mid-request) —
-/// each ssh tunnel is short-lived and CI environments occasionally
-/// see one drop between the readiness probe and the actual `/load`,
-/// surfacing as `error sending request`. Real Caddy errors propagate
-/// immediately without a retry.
+/// The admin address comes from `admin.listen` of `config`, so a
+/// `proxy.config_extra` override of it still works. A proxy that an
+/// older yoink started listens on `0.0.0.0:2019`, which includes the
+/// container loopback, so the first push to it also works. That push
+/// carries the loopback-only admin block and moves the proxy onto it.
 pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
     config: &Value,
 ) -> Result<(), AdminError> {
-    // The discovery phase (label lookup + inspect + port parse +
-    // keyfile) is invariant across retries on transport-class
-    // failures, so we run it once and only re-tunnel-and-load on
-    // retry. `AdminError::Docker` deliberately stays out of the
-    // transient set: bollard's `with_retry` already covers the
-    // ssh-pool flakiness for those calls (see `RealDockerOps`),
-    // adding another retry layer here would compound the wait on
-    // genuinely down hosts.
-    let target = discover_admin_target(host, ops).await?;
-    match tunnel_and_load(host, &target, config).await {
-        Ok(()) => Ok(()),
-        Err(e) if is_transient(&e) => {
-            tracing::debug!(
-                host = %host.address,
-                error = %e,
-                "transient proxy admin push error; reopening tunnel and retrying once",
-            );
-            tokio::time::sleep(RETRY_BACKOFF).await;
-            tunnel_and_load(host, &target, config).await
-        }
-        Err(e) => Err(e),
+    let container = running_proxy(host, ops).await?;
+    let admin = config
+        .pointer("/admin/listen")
+        .and_then(Value::as_str)
+        .unwrap_or(ADMIN_LISTEN);
+    let docker_err = |source| AdminError::Docker {
+        host: host.address.clone(),
+        source,
+    };
+
+    let body = serde_json::to_vec(config).expect("serde_json::Value always serializes");
+    let load = ops
+        .exec_with_stdin(
+            host,
+            &container,
+            vec![
+                "caddy".into(),
+                "reload".into(),
+                "--config".into(),
+                "/dev/stdin".into(),
+                "--address".into(),
+                admin.into(),
+            ],
+            body,
+        )
+        .await
+        .map_err(docker_err)?;
+    if load.exit_code != 0 {
+        // Caddy parser errors can echo a slice of the submitted JSON,
+        // which carries inline cert+key PEMs from
+        // `tls.certificates.load_pem`. Strip them before the error
+        // lands in stderr / tracing / TUI toasts.
+        return Err(AdminError::LoadRejected {
+            detail: redact_pem_blocks(exec_output(&load).trim()),
+        });
     }
+
+    // Belt-and-braces: read the route count back from the daemon and
+    // compare. `/load` is synchronous, so a success already implies the
+    // config is live — but a future Caddy version that silently
+    // drops routes (or any third-party admin-API shim) would otherwise
+    // leave us claiming success while the proxy serves 5xx for those
+    // domains. Verifying upfront beats discovering it from a Cloudflare
+    // 521 alert.
+    let expected = route_count(config);
+    let actual = read_route_count(host, ops, &container, admin).await?;
+    if expected != actual {
+        return Err(AdminError::LoadVerifyMismatch { expected, actual });
+    }
+    Ok(())
 }
 
-fn is_transient(e: &AdminError) -> bool {
-    matches!(
-        e,
-        AdminError::Tunnel(_) | AdminError::NotReady { .. } | AdminError::Http { .. }
-    )
-}
-
-/// Resolved admin endpoint for one push attempt: the host-side TCP
-/// port docker published Caddy's `:2019` to, plus the ssh keyfile
-/// the tunnel should authenticate with.
-struct AdminTarget {
-    host_port: u16,
-    keyfile: Option<std::path::PathBuf>,
-}
-
-async fn discover_admin_target(
-    host: &Host,
-    ops: &dyn DockerOps,
-) -> Result<AdminTarget, AdminError> {
+async fn running_proxy(host: &Host, ops: &dyn DockerOps) -> Result<String, AdminError> {
     let label = format!("yoink.service={PROXY_SERVICE_NAME}");
     let containers = ops
         .list_containers_by_label(host, &label)
@@ -153,83 +126,22 @@ async fn discover_admin_target(
             host: host.address.clone(),
             source,
         })?;
-    let running = containers
+    containers
         .into_iter()
         .find(crate::docker_ops::ContainerInfo::is_running)
+        .map(|c| c.name)
         .ok_or_else(|| AdminError::ProxyNotRunning {
             host: host.address.clone(),
-        })?;
-
-    let detail = ops
-        .inspect_container(host, &running.name)
-        .await
-        .map_err(|source| AdminError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
-    let host_port = parse_published_port(&detail.ports, ADMIN_PORT).ok_or_else(|| {
-        AdminError::NoPublishedAdminPort {
-            host: host.address.clone(),
-            ports: detail.ports.clone(),
-        }
-    })?;
-
-    Ok(AdminTarget {
-        host_port,
-        keyfile: ops.ssh_keyfile(host),
-    })
+        })
 }
 
-async fn tunnel_and_load(
-    host: &Host,
-    target: &AdminTarget,
-    config: &Value,
-) -> Result<(), AdminError> {
-    let tunnel = SshTunnel::open(
-        host,
-        target.host_port,
-        TUNNEL_READY_TIMEOUT,
-        target.keyfile.as_deref(),
-    )
-    .await?;
-
-    wait_until_ready(tunnel.local_port(), TUNNEL_READY_TIMEOUT).await?;
-
-    let url = format!("http://127.0.0.1:{}/load", tunnel.local_port());
-    let client = reqwest::Client::builder()
-        .timeout(ADMIN_API_TIMEOUT)
-        .build()
-        .expect("reqwest client builder");
-    let resp = client
-        .post(&url)
-        .json(config)
-        .send()
-        .await
-        .map_err(|source| AdminError::Http { source })?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        // Caddy parser errors can echo a slice of the submitted JSON,
-        // which carries inline cert+key PEMs from
-        // `tls.certificates.load_pem`. Strip them before the error
-        // lands in stderr / tracing / TUI toasts.
-        let body = redact_pem_blocks(&resp.text().await.unwrap_or_default());
-        return Err(AdminError::LoadRejected { status, body });
+/// stderr of an exec, or stdout when stderr is empty.
+fn exec_output(r: &crate::docker_ops::OneShotResult) -> &str {
+    if r.stderr.trim().is_empty() {
+        &r.stdout
+    } else {
+        &r.stderr
     }
-
-    // Belt-and-braces: read the route count back from the daemon and
-    // compare. `/load` is synchronous, so a 200 already implies the
-    // config is live — but a future Caddy version that silently
-    // drops routes (or any third-party admin-API shim) would otherwise
-    // leave us claiming success while the proxy serves 5xx for those
-    // domains. Verifying upfront beats discovering it from a Cloudflare
-    // 521 alert.
-    let expected = route_count(config);
-    let actual = read_route_count(&client, tunnel.local_port()).await?;
-    drop(tunnel);
-    if expected != actual {
-        return Err(AdminError::LoadVerifyMismatch { expected, actual });
-    }
-    Ok(())
 }
 
 fn route_count(config: &Value) -> usize {
@@ -239,23 +151,42 @@ fn route_count(config: &Value) -> usize {
         .map_or(0, Vec::len)
 }
 
-async fn read_route_count(client: &reqwest::Client, local_port: u16) -> Result<usize, AdminError> {
-    let url = format!("http://127.0.0.1:{local_port}/config/apps/http/servers/main/routes/");
-    let resp = client
-        .get(&url)
-        .send()
+async fn read_route_count(
+    host: &Host,
+    ops: &dyn DockerOps,
+    container: &str,
+    admin: &str,
+) -> Result<usize, AdminError> {
+    // BusyBox `wget` ships in the `caddy:2` image (the docker
+    // HEALTHCHECK uses it too).
+    let url = format!("http://{admin}/config/apps/http/servers/main/routes/");
+    let out = ops
+        .exec_oneshot(
+            host,
+            container,
+            vec!["wget".into(), "-q".into(), "-O".into(), "-".into(), url],
+        )
         .await
-        .map_err(|source| AdminError::Http { source })?;
-    // 404 = no routes object at that pointer (e.g. a config with no
-    // routed services). Treat as zero rather than an error so the
-    // verify step doesn't trip on legitimate empty configs.
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(0);
+        .map_err(|source| AdminError::Docker {
+            host: host.address.clone(),
+            source,
+        })?;
+    if out.exit_code != 0 {
+        // 404 = no routes object at that pointer (e.g. a config with no
+        // routed services). Treat as zero rather than an error so the
+        // verify step doesn't trip on legitimate empty configs.
+        let detail = exec_output(&out).trim();
+        if detail.contains("404") {
+            return Ok(0);
+        }
+        return Err(AdminError::ReadBackFailed {
+            detail: redact_pem_blocks(detail),
+        });
     }
-    let routes: Value = resp
-        .json()
-        .await
-        .map_err(|source| AdminError::Http { source })?;
+    let routes: Value =
+        serde_json::from_str(out.stdout.trim()).map_err(|e| AdminError::ReadBackFailed {
+            detail: format!("parse routes JSON: {e}"),
+        })?;
     Ok(routes.as_array().map_or(0, Vec::len))
 }
 
@@ -287,24 +218,6 @@ fn redact_pem_blocks(body: &str) -> String {
     }
 }
 
-async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), AdminError> {
-    let url = format!("http://127.0.0.1:{local_port}/config/");
-    let client = reqwest::Client::builder()
-        .timeout(ADMIN_PROBE_TIMEOUT)
-        .build()
-        .expect("reqwest client builder");
-    let deadline = Instant::now() + timeout;
-    loop {
-        if client.get(&url).send().await.is_ok() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(AdminError::NotReady { timeout });
-        }
-        tokio::time::sleep(ADMIN_POLL_INTERVAL).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +243,118 @@ mod tests {
     fn redact_passthrough_when_no_pem() {
         let body = r#"{"error":"unknown directive 'foo'"}"#;
         assert_eq!(redact_pem_blocks(body), body);
+    }
+
+    fn proxy_container() -> crate::docker_ops::ContainerInfo {
+        crate::docker_ops::ContainerInfo {
+            host: "h1".into(),
+            name: "yoink-proxy-abc".into(),
+            image: String::new(),
+            state: "running".into(),
+            status_text: String::new(),
+            created_unix: None,
+            yoink_service: Some(PROXY_SERVICE_NAME.into()),
+            yoink_version: None,
+            yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn host() -> Host {
+        Host {
+            user: "root".into(),
+            address: "h1".into(),
+            port: None,
+        }
+    }
+
+    fn exit(code: i64, stdout: &str, stderr: &str) -> crate::docker_ops::OneShotResult {
+        crate::docker_ops::OneShotResult {
+            exit_code: code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// The push used to go through a published host port and an SSH
+    /// tunnel, which needed the admin API on `0.0.0.0:2019`. It now runs
+    /// `caddy reload` in the proxy container and sends the config on
+    /// stdin, so the admin API can stay on the container loopback.
+    #[tokio::test]
+    async fn push_runs_caddy_reload_in_the_proxy_container() {
+        use crate::docker_ops::{FakeDockerOps, RecordedCall};
+        let config = serde_json::json!({
+            "admin": { "listen": ADMIN_LISTEN },
+            "apps": { "http": { "servers": { "main": { "routes": [{}, {}] } } } },
+        });
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(0, "", "")));
+        ops.push_exec_oneshot(Ok(exit(0, "[{},{}]\n", "")));
+        push_config(&host(), &ops, &config).await.unwrap();
+
+        let calls = ops.calls();
+        let (container, cmd, stdin) = calls
+            .iter()
+            .find_map(|c| match c {
+                RecordedCall::ExecWithStdin(_, container, cmd, stdin) => {
+                    Some((container, cmd, stdin))
+                }
+                _ => None,
+            })
+            .expect("caddy reload exec");
+        assert_eq!(container, "yoink-proxy-abc");
+        assert_eq!(
+            cmd,
+            &[
+                "caddy",
+                "reload",
+                "--config",
+                "/dev/stdin",
+                "--address",
+                "127.0.0.1:2019"
+            ]
+        );
+        assert_eq!(serde_json::from_slice::<Value>(stdin).unwrap(), config);
+        assert!(calls.iter().any(|c| matches!(
+            c,
+            RecordedCall::ExecOneshot(_, _, cmd)
+                if cmd.last().map(String::as_str)
+                    == Some("http://127.0.0.1:2019/config/apps/http/servers/main/routes/")
+        )));
+    }
+
+    #[tokio::test]
+    async fn push_reports_a_rejected_load_without_pem() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(
+            1,
+            "",
+            "Error: caddy responded with error: HTTP 400: -----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY----- bad",
+        )));
+        let err = push_config(&host(), &ops, &config).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, AdminError::LoadRejected { .. }), "got {msg}");
+        assert!(msg.contains("HTTP 400"), "got {msg}");
+        assert!(!msg.contains("MIIabc"), "got {msg}");
+    }
+
+    #[tokio::test]
+    async fn push_treats_a_404_route_read_back_as_zero_routes() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(0, "", "")));
+        ops.push_exec_oneshot(Ok(exit(
+            1,
+            "",
+            "wget: server returned error: HTTP/1.1 404 Not Found",
+        )));
+        push_config(&host(), &ops, &config).await.unwrap();
     }
 }

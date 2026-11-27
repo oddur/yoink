@@ -20,14 +20,17 @@ pub const PROXY_SERVICE_NAME: &str = "yoink-proxy";
 /// name. Every service with `domain:` joins it automatically.
 pub const INGRESS_NETWORK: &str = "yoink-ingress";
 
-/// Docker network the proxy publishes its admin API on. Only the
-/// proxy itself joins this network — the yoink CLI reaches the
-/// admin API by inspecting the proxy container's IP on this network
-/// and opening an SSH-tunnelled forward to it.
+/// Docker network that only the proxy joins. The admin API does not
+/// listen on it: see [`ADMIN_LISTEN`].
 pub const ADMIN_NETWORK: &str = "yoink-proxy-admin";
 
 /// Container port the Caddy admin API listens on (Caddy default).
 pub const ADMIN_PORT: u16 = 2019;
+
+/// Listen address of the Caddy admin API: the loopback interface of
+/// the proxy container, so no other container can reach it. yoink
+/// reaches it with `docker exec` into the proxy container.
+pub const ADMIN_LISTEN: &str = "127.0.0.1:2019";
 
 impl Config {
     /// True when the proxy should be enabled for this config — either
@@ -391,25 +394,21 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         hsts: false, // proxy itself doesn't serve TLS; this field is irrelevant
         run: ServiceRun {
             // Healthcheck probes Caddy's admin endpoint (`/config/`)
-            // on the container's :2019 from inside the proxy's first
-            // network. Eliminates the race where yoink-proxy is
+            // on :2019 with `docker exec` inside the proxy container
+            // (the admin API listens on loopback only). Eliminates the
+            // race where yoink-proxy is
             // "started" per docker but Caddy's HTTP server hasn't
             // bound yet — without this gate, the first /load can
             // arrive before admin is up.
             port: Some(ADMIN_PORT),
             healthcheck_path: Some("/config/".to_string()),
-            // Caddy serves :80 + :443 on the host. Admin API on :2019
-            // is published on 127.0.0.1 with an ephemeral host port
-            // (`:0:2019`) so it's reachable from the host (and only
-            // from the host) — docker doesn't route user-defined-
-            // network container IPs from the host. yoink looks up
-            // the actual host port via `inspect_container` and
-            // SSH-tunnels to it for one `/load` call.
+            // Caddy serves :80 + :443 on the host. The admin API on
+            // :2019 is not published: it listens on the loopback of
+            // the container, and yoink reaches it with `docker exec`.
             //
             // `proxy.bind:` (when set) prepends the bind address to
             // :80/:443 so the proxy is reachable only on that
-            // interface (e.g. tailnet IP). Admin port stays on
-            // 127.0.0.1 regardless.
+            // interface (e.g. tailnet IP).
             //
             // The :80/:443 publishes also implicitly force stop-first
             // deploy (port bindings are exclusive at the kernel
@@ -421,21 +420,17 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
                     .as_deref()
                     .map(|ip| format!("{ip}:"))
                     .unwrap_or_default();
-                vec![
-                    format!("{prefix}80:80"),
-                    format!("{prefix}443:443"),
-                    "127.0.0.1:0:2019".to_string(),
-                ]
+                vec![format!("{prefix}80:80"), format!("{prefix}443:443")]
             },
             // Override the official caddy:2 image's entrypoint to
             // start with a minimal bootstrap config: admin bound to
-            // 0.0.0.0:2019 (so the admin endpoint is reachable from
-            // the docker bridge — the default `localhost:2019` would
-            // refuse our SSH-tunneled `/load`), `enforce_origin: false`
-            // + a known origin (`yoink-admin`) so we can route past
-            // Caddy's host-header check by setting Host: yoink-admin
-            // on every admin request. The actual routes are pushed
-            // via `/load` immediately after the container is healthy.
+            // the container loopback (`ADMIN_LISTEN`). A wildcard
+            // address would let every container on `yoink-ingress`
+            // rewrite the proxy config, because the admin API has no
+            // authentication. Caddy's default origin check accepts
+            // the loopback Host headers that `caddy reload` and
+            // `wget` send. The actual routes are pushed via `/load`
+            // immediately after the container is healthy.
             //
             // `--resume` makes Caddy fall back to its autosaved
             // runtime config (`/config/caddy/autosave.json` on the
@@ -447,15 +442,10 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // `yoink up`. On a fresh proxy (no autosave yet) the
             // bootstrap takes effect as before.
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
-            cmd: vec![
-                concat!(
-                    "echo '{\"admin\":{\"listen\":\"0.0.0.0:2019\",",
-                    "\"enforce_origin\":false,",
-                    "\"origins\":[\"yoink-admin\"]}}'",
-                    " | exec caddy run --config /dev/stdin --resume",
-                )
-                .to_string(),
-            ],
+            cmd: vec![format!(
+                "echo '{{\"admin\":{{\"listen\":\"{ADMIN_LISTEN}\"}}}}' \
+                 | exec caddy run --config /dev/stdin --resume"
+            )],
             // Yoink's `cap_drop: [ALL]` default would block Caddy
             // from binding :80/:443 (privileged ports). Re-add the
             // one cap that lets it; everything else stays dropped.
@@ -720,6 +710,31 @@ services:
                 .any(|n| n == INGRESS_NETWORK)
         );
         assert!(api.depends_on.iter().any(|d| d == PROXY_SERVICE_NAME));
+    }
+
+    /// The proxy published the admin port and bootstrapped Caddy with
+    /// `0.0.0.0:2019` and the origin check off. Any container on
+    /// `yoink-ingress` could then rewrite the proxy config. The admin
+    /// API now listens on the container loopback and is not published.
+    #[test]
+    fn proxy_admin_api_is_loopback_only_and_unpublished() {
+        let mut cfg = config_with_one_service(
+            Some(DomainSpec::Single("api.example.com".into())),
+            Some(8080),
+        );
+        cfg.proxy = Some(ProxyConfig {
+            email: Some("ops@example.com".into()),
+            ..ProxyConfig::default()
+        });
+        cfg.inject_implicit_proxy().expect("inject ok");
+        let proxy = cfg.service(PROXY_SERVICE_NAME).expect("proxy synthesized");
+        assert_eq!(proxy.run.publish, ["80:80", "443:443"]);
+        assert_eq!(
+            proxy.run.cmd,
+            [
+                r#"echo '{"admin":{"listen":"127.0.0.1:2019"}}' | exec caddy run --config /dev/stdin --resume"#
+            ]
+        );
     }
 
     #[test]

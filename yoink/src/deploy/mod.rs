@@ -1905,7 +1905,20 @@ async fn wait_until_healthy(
     // pick the service's first effective network.
     let effective = config.networks_for(service);
     let probe_network = effective.first().map_or("bridge", String::as_str);
+    let is_proxy = matches!(service.kind, Some(crate::config::ServiceKind::Proxy));
     let result = match service.run.healthcheck_path.as_deref() {
+        // The Caddy admin API listens on the loopback of the proxy
+        // container only, so no network probe reaches it. Probe it
+        // from inside the container instead.
+        Some(path) if is_proxy => {
+            let cmd = [
+                "wget".to_string(),
+                "--spider".to_string(),
+                "--quiet".to_string(),
+                format!("http://127.0.0.1:{port}{path}"),
+            ];
+            healthcheck::poll_exec(ops, host, new_name, &cmd, service.run.healthcheck_timeout).await
+        }
         Some(path) => {
             healthcheck::poll(
                 ops,
@@ -4599,5 +4612,48 @@ services:
         .await
         .unwrap();
         assert!(reports.is_empty());
+    }
+
+    /// The deploy gate for the proxy probed `<proxy>:2019` from a curl
+    /// container on `yoink-ingress`. That only worked because the admin
+    /// API listened on every interface, which let any routed service
+    /// reach it. The admin API is now loopback-only, so the gate runs
+    /// `wget` in the proxy container instead.
+    #[tokio::test]
+    async fn proxy_healthcheck_runs_inside_the_proxy_container() {
+        let cfg = config_proxied_service();
+        let proxy = cfg.service(crate::config::PROXY_SERVICE_NAME).unwrap();
+        let ops = FakeDockerOps::new();
+        ops.push_exec_oneshot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+        let host = Host {
+            user: "deploy".into(),
+            address: "host-a".into(),
+            port: None,
+        };
+        let mut on_event = |_e: DeployEvent| {};
+        wait_until_healthy(&ops, &host, &cfg, proxy, "yoink-proxy-new", &mut on_event)
+            .await
+            .unwrap();
+        let calls = ops.calls();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::ExecOneshot(_, name, cmd)
+                    if name == "yoink-proxy-new"
+                        && cmd.last().map(String::as_str)
+                            == Some("http://127.0.0.1:2019/config/")
+            )),
+            "got {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::Healthcheck(..))),
+            "got {calls:?}"
+        );
     }
 }

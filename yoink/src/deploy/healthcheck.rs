@@ -116,6 +116,43 @@ pub async fn poll_tcp(
     .await
 }
 
+/// Poll `cmd` run with `docker exec` inside `container` until it exits
+/// 0 or `budget` elapses. Used for the proxy: its admin API listens on
+/// the container loopback, so a probe container on a docker network
+/// cannot reach it. A non-zero exit or an exec error counts as
+/// not-yet. A request the daemon rejects with a 4xx (for example, the
+/// container is not running) ends the poll at once.
+pub async fn poll_exec(
+    ops: &dyn DockerOps,
+    host: &Host,
+    container: &str,
+    cmd: &[String],
+    budget: Duration,
+) -> Result<u32, HealthcheckError> {
+    poll_until(budget, |attempt| async move {
+        match ops.exec_oneshot(host, container, cmd.to_vec()).await {
+            Ok(r) if r.exit_code == 0 => {
+                debug!(host = %host.address, container, attempt, "exec probe ok");
+                Ok(AttemptOutcome::Healthy)
+            }
+            Ok(r) => {
+                debug!(host = %host.address, container, attempt, exit = r.exit_code, "exec probe failed");
+                Ok(AttemptOutcome::ProbeFailed(DockerError::Invalid(format!(
+                    "exec probe exited {}: {}",
+                    r.exit_code,
+                    r.stderr.trim()
+                ))))
+            }
+            Err(e) if e.is_daemon_rejection() => Err(e),
+            Err(e) => {
+                debug!(host = %host.address, container, attempt, error = %e, "exec probe errored");
+                Ok(AttemptOutcome::ProbeFailed(e))
+            }
+        }
+    })
+    .await
+}
+
 /// Poll the new container's HTTP healthcheck endpoint until 200 or
 /// `budget` elapses. Returns the number of attempts on success.
 ///

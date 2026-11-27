@@ -53,6 +53,7 @@ struct FakeState {
     healthcheck: VecDeque<Result<u16, DockerError>>,
     healthcheck_tcp: VecDeque<Result<(), DockerError>>,
     exec_oneshot: VecDeque<Result<OneShotResult, DockerError>>,
+    exec_with_stdin: VecDeque<Result<OneShotResult, DockerError>>,
     fetch_logs: VecDeque<Result<Vec<String>, DockerError>>,
     one_shot: VecDeque<Result<OneShotResult, DockerError>>,
     event_streams: VecDeque<Vec<DockerEvent>>,
@@ -79,6 +80,7 @@ pub enum RecordedCall {
     Healthcheck(Host, String, String, u16, String),
     HealthcheckTcp(Host, String, String, u16),
     ExecOneshot(Host, String, Vec<String>),
+    ExecWithStdin(Host, String, Vec<String>, Vec<u8>),
     FetchRecentLogs(Host, String, u32),
     OpenLogStream(Host, String),
     RunOneShot(Host, String),
@@ -150,6 +152,9 @@ impl FakeDockerOps {
     }
     pub fn push_exec_oneshot(&self, v: Result<OneShotResult, DockerError>) {
         self.lock().exec_oneshot.push_back(v);
+    }
+    pub fn push_exec_with_stdin(&self, v: Result<OneShotResult, DockerError>) {
+        self.lock().exec_with_stdin.push_back(v);
     }
     pub fn push_fetch_logs(&self, v: Result<Vec<String>, DockerError>) {
         self.lock().fetch_logs.push_back(v);
@@ -412,6 +417,22 @@ impl DockerOps for FakeDockerOps {
             cmd,
         ));
         pop(&mut s.exec_oneshot, "exec_oneshot")
+    }
+    async fn exec_with_stdin(
+        &self,
+        host: &Host,
+        container: &str,
+        cmd: Vec<String>,
+        stdin: Vec<u8>,
+    ) -> Result<OneShotResult, DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::ExecWithStdin(
+            host.clone(),
+            container.into(),
+            cmd,
+            stdin,
+        ));
+        pop(&mut s.exec_with_stdin, "exec_with_stdin")
     }
     async fn exec_interactive(
         &self,

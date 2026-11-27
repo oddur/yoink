@@ -763,6 +763,18 @@ pub trait DockerOps: Send + Sync {
         cmd: Vec<String>,
     ) -> Result<OneShotResult, DockerError>;
 
+    /// [`Self::exec_oneshot`] that also writes `stdin` to the process
+    /// and then closes its stdin, so the process reads to EOF. The
+    /// proxy admin client sends the Caddy config this way: the config
+    /// carries certificate keys, so it must not go on the command line.
+    async fn exec_with_stdin(
+        &self,
+        host: &Host,
+        container: &str,
+        cmd: Vec<String>,
+        stdin: Vec<u8>,
+    ) -> Result<OneShotResult, DockerError>;
+
     /// Start an interactive (PTY-mode) docker exec. The returned
     /// `ExecSession` lets the caller stream raw terminal bytes both ways:
     /// the embedded TUI shell drives `vt100::Parser` from `output` and

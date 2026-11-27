@@ -289,6 +289,89 @@ impl RealDockerOps {
             }
         }
     }
+
+    /// Run `cmd` in `container` and collect its stdout, stderr and exit
+    /// code. With `stdin`, write it to the process and then shut the
+    /// write side, which closes the stdin of the process.
+    async fn exec_collect(
+        &self,
+        host: &Host,
+        container: &str,
+        cmd: Vec<String>,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<OneShotResult, DockerError> {
+        let docker = self.client_for(host).await?;
+        let exec = docker
+            .create_exec(
+                container,
+                bollard::exec::CreateExecOptions {
+                    cmd: Some(cmd),
+                    attach_stdin: Some(stdin.is_some()),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|s| Self::err(host, s))?;
+
+        // Non-detached: bollard returns a stream of frame-tagged log
+        // chunks that we drain into stdout/stderr buffers. The lock
+        // heartbeat callers ignore the output; `yoink exec` prints it.
+        let exec_results = docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|s| Self::err(host, s))?;
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let bollard::exec::StartExecResults::Attached {
+            mut output,
+            mut input,
+        } = exec_results
+        {
+            if let Some(bytes) = stdin {
+                use tokio::io::AsyncWriteExt as _;
+                input
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|e| DockerError::Invalid(format!("write exec stdin: {e}")))?;
+                input
+                    .shutdown()
+                    .await
+                    .map_err(|e| DockerError::Invalid(format!("close exec stdin: {e}")))?;
+            }
+            while let Some(item) = output.next().await {
+                match item {
+                    Ok(
+                        bollard::container::LogOutput::StdOut { message }
+                        | bollard::container::LogOutput::Console { message },
+                    ) => stdout.push_str(&String::from_utf8_lossy(&message)),
+                    Ok(bollard::container::LogOutput::StdErr { message }) => {
+                        stderr.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    Ok(bollard::container::LogOutput::StdIn { .. }) => {}
+                    Err(e) => return Err(Self::err(host, e)),
+                }
+            }
+        }
+
+        let inspect = docker
+            .inspect_exec(&exec.id)
+            .await
+            .map_err(|s| Self::err(host, s))?;
+        Ok(OneShotResult {
+            exit_code: inspect.exit_code.unwrap_or(0),
+            stdout,
+            stderr,
+        })
+    }
 }
 
 #[async_trait]
@@ -974,61 +1057,17 @@ impl DockerOps for RealDockerOps {
         container: &str,
         cmd: Vec<String>,
     ) -> Result<OneShotResult, DockerError> {
-        let docker = self.client_for(host).await?;
-        let exec = docker
-            .create_exec(
-                container,
-                bollard::exec::CreateExecOptions {
-                    cmd: Some(cmd),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        self.exec_collect(host, container, cmd, None).await
+    }
 
-        // Non-detached: bollard returns a stream of frame-tagged log
-        // chunks that we drain into stdout/stderr buffers. The lock
-        // heartbeat callers ignore the output; `yoink exec` prints it.
-        let exec_results = docker
-            .start_exec(
-                &exec.id,
-                Some(bollard::exec::StartExecOptions {
-                    detach: false,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|s| Self::err(host, s))?;
-
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let bollard::exec::StartExecResults::Attached { mut output, .. } = exec_results {
-            while let Some(item) = output.next().await {
-                match item {
-                    Ok(
-                        bollard::container::LogOutput::StdOut { message }
-                        | bollard::container::LogOutput::Console { message },
-                    ) => stdout.push_str(&String::from_utf8_lossy(&message)),
-                    Ok(bollard::container::LogOutput::StdErr { message }) => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(bollard::container::LogOutput::StdIn { .. }) => {}
-                    Err(e) => return Err(Self::err(host, e)),
-                }
-            }
-        }
-
-        let inspect = docker
-            .inspect_exec(&exec.id)
-            .await
-            .map_err(|s| Self::err(host, s))?;
-        Ok(OneShotResult {
-            exit_code: inspect.exit_code.unwrap_or(0),
-            stdout,
-            stderr,
-        })
+    async fn exec_with_stdin(
+        &self,
+        host: &Host,
+        container: &str,
+        cmd: Vec<String>,
+        stdin: Vec<u8>,
+    ) -> Result<OneShotResult, DockerError> {
+        self.exec_collect(host, container, cmd, Some(stdin)).await
     }
 
     async fn exec_interactive(
