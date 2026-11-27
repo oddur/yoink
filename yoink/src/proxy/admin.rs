@@ -82,9 +82,14 @@ impl AdminError {
 /// The rendered config is small, so a reload that takes longer hangs.
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Pause before the second push. Long enough for a Caddy that is
-/// still starting to bind the admin port.
-const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+/// Before the second push, wait up to this long for the admin API to
+/// answer. A Caddy that is still starting, or that restarts, can take
+/// some seconds to bind the admin port.
+const ADMIN_READY_BUDGET: Duration = Duration::from_secs(20);
+
+/// Pause between two readiness probes. Each probe is a new curl
+/// container, so it takes some time of its own.
+const ADMIN_READY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Push `config` to the proxy on `host` with `docker exec` into the
 /// running proxy container, then verify the route count.
@@ -96,8 +101,10 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// carries the loopback-only admin block and moves the proxy onto it.
 ///
 /// A transient failure (see `AdminError::is_transient`) gets one more
-/// push. That is safe even when the first reload ran: `caddy reload`
-/// with the same config is idempotent. A Caddy error does not retry.
+/// push. Before that push, yoink waits until the admin API answers
+/// (see [`wait_for_admin`]). The second push is safe even when the
+/// first reload ran: `caddy reload` with the same config is
+/// idempotent. A Caddy error does not retry.
 pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
@@ -111,10 +118,47 @@ pub async fn push_config(
                 error = %e,
                 "transient proxy admin push error; retrying once",
             );
-            tokio::time::sleep(RETRY_BACKOFF).await;
+            wait_for_admin(host, ops, &container).await;
             push_once(host, ops, &container, config).await
         }
         other => other,
+    }
+}
+
+/// Probe `GET /config/` with a curl container in the network namespace
+/// of the proxy until the admin API sends any HTTP answer, or until
+/// [`ADMIN_READY_BUDGET`] ends. A probe that fails, also with a docker
+/// error, is "not ready yet". This function does not return an error:
+/// when the budget ends, the second push runs and reports the result.
+async fn wait_for_admin(host: &Host, ops: &dyn DockerOps, container: &str) {
+    let deadline = tokio::time::Instant::now() + ADMIN_READY_BUDGET;
+    loop {
+        let probe = ops.curl_in_netns(
+            host,
+            container,
+            vec![
+                "-sS".into(),
+                "--max-time".into(),
+                "2".into(),
+                "-o".into(),
+                "/dev/null".into(),
+                format!("http://{ADMIN_LISTEN}/config/"),
+            ],
+        );
+        match tokio::time::timeout_at(deadline, probe).await {
+            Ok(Ok(out)) if out.exit_code == 0 => return,
+            Ok(Ok(out)) => {
+                tracing::debug!(host = %host.address, exit = out.exit_code, "proxy admin API not ready");
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(host = %host.address, error = %e, "proxy admin readiness probe failed");
+            }
+            Err(_) => return,
+        }
+        if tokio::time::Instant::now() + ADMIN_READY_INTERVAL >= deadline {
+            return;
+        }
+        tokio::time::sleep(ADMIN_READY_INTERVAL).await;
     }
 }
 
@@ -483,6 +527,7 @@ mod tests {
         ops.push_list_containers(Ok(vec![proxy_container()]));
         ops.push_exec_with_stdin(Ok(exit(1, "", REFUSED)));
         ops.push_exec_with_stdin(Ok(exit(0, "", "")));
+        ops.push_curl_in_netns(Ok(exit(0, "", ""))); // admin ready
         ops.push_curl_in_netns(Ok(exit(0, "{}\n404", "")));
         push_config(&host(), &ops, &config).await.unwrap();
         let reloads = ops
@@ -499,6 +544,7 @@ mod tests {
         let ops = crate::docker_ops::FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![proxy_container()]));
         ops.push_exec_with_stdin(Ok(exit(1, "", REFUSED)));
+        ops.push_curl_in_netns(Ok(exit(0, "", ""))); // admin ready
         ops.push_exec_with_stdin(Ok(exit(1, "", REFUSED)));
         let err = push_config(&host(), &ops, &config).await.unwrap_err();
         assert!(
@@ -519,8 +565,85 @@ mod tests {
             },
         }));
         ops.push_exec_with_stdin(Ok(exit(0, "", "")));
+        ops.push_curl_in_netns(Ok(exit(0, "", ""))); // admin ready
         ops.push_curl_in_netns(Ok(exit(0, "{}\n404", "")));
         push_config(&host(), &ops, &config).await.unwrap();
+    }
+
+    /// The retry waited a fixed 500 ms, which is too short for a Caddy
+    /// that is still starting. Now it probes `/config/` until the admin
+    /// API answers.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_waits_until_the_admin_api_answers() {
+        use crate::docker_ops::RecordedCall;
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(1, "", REFUSED)));
+        ops.push_exec_with_stdin(Ok(exit(0, "", "")));
+        let refused = "curl: (7) Failed to connect to 127.0.0.1 port 2019";
+        ops.push_curl_in_netns(Ok(exit(7, "", refused)));
+        ops.push_curl_in_netns(Err(DockerError::Invalid("409 conflict".into())));
+        ops.push_curl_in_netns(Ok(exit(7, "", refused)));
+        ops.push_curl_in_netns(Ok(exit(0, "", ""))); // admin ready
+        ops.push_curl_in_netns(Ok(exit(0, "{}\n404", "")));
+        let started = tokio::time::Instant::now();
+        push_config(&host(), &ops, &config).await.unwrap();
+        assert_eq!(started.elapsed(), ADMIN_READY_INTERVAL * 3);
+
+        let calls = ops.calls();
+        let probes: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::CurlInNetns(_, _, args) => args.last().cloned(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(probes.len(), 5, "got {probes:?}");
+        assert!(
+            probes[..4]
+                .iter()
+                .all(|u| u == "http://127.0.0.1:2019/config/")
+        );
+        // The second push runs after the admin API answers, not before.
+        let second_reload = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::ExecWithStdin(..)))
+            .unwrap();
+        let ready_probe = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, RecordedCall::CurlInNetns(..)))
+            .nth(3)
+            .unwrap()
+            .0;
+        assert!(ready_probe < second_reload);
+    }
+
+    /// When the admin API does not answer within the budget, the second
+    /// push still runs and reports the result.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_runs_when_the_admin_api_stays_down() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(1, "", REFUSED)));
+        ops.push_exec_with_stdin(Ok(exit(1, "", REFUSED)));
+        for _ in 0..100 {
+            ops.push_curl_in_netns(Ok(exit(7, "", "curl: (7) Failed to connect")));
+        }
+        let started = tokio::time::Instant::now();
+        let err = push_config(&host(), &ops, &config).await.unwrap_err();
+        assert!(
+            matches!(err, AdminError::AdminUnreachable { .. }),
+            "got {err}"
+        );
+        assert!(
+            started.elapsed() <= ADMIN_READY_BUDGET,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() + ADMIN_READY_INTERVAL >= ADMIN_READY_BUDGET);
     }
 
     /// Any failed request is a transport error, not only a refused
