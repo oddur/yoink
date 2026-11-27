@@ -944,10 +944,17 @@ fn check_tls_cert_secrets(
             "TLS cert-mode check skipped (no services use `tls: cert`)",
         )];
     }
-    // If the bundle isn't loaded, `check_secret_references` will have
-    // already surfaced that — don't double-report.
+    // `check_secret_references` reports a missing bundle only for
+    // services with `secrets:`, so report it here for the TLS certs.
     let Some(bundle) = bundle else {
-        return Vec::new();
+        return vec![
+            Finding::error(
+                "secrets",
+                "the TLS certs (`proxy.tls` or a `tls: cert` service) need the secrets bundle, \
+                 but no bundle is configured / loadable",
+            )
+            .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)"),
+        ];
     };
 
     let mut out = Vec::new();
@@ -1325,6 +1332,38 @@ services:
             findings[0].title
         );
         assert!(findings[0].fix.as_deref().unwrap().contains("add `rw`"));
+    }
+
+    /// Regression: with `proxy.tls` set and no bundle, doctor reported
+    /// nothing, and no other check did when no service lists
+    /// `secrets:`. `yoink up` then fails at Caddy render.
+    #[test]
+    fn tls_certs_without_a_bundle_are_an_error() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let findings = check_tls_cert_secrets(&config, None);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.title.contains("bundle")),
+            "{:?}",
+            titles(&findings)
+        );
     }
 
     fn titles(findings: &[Finding]) -> Vec<(Severity, &str)> {
