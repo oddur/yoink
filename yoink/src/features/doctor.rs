@@ -702,6 +702,16 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
             "sealed file check skipped (not using `provider: age`)",
         )];
     };
+    // Every secrets load resolves this path first, so an escaping
+    // `secrets.file:` breaks `yoink up` whatever the services reference.
+    let path = match config.sealed_path() {
+        Ok(path) => path,
+        Err(e) => {
+            return vec![Finding::error("secrets", e.to_string()).with_fix(
+                "set `secrets.file:` to a relative path inside the directory of yoink.yaml",
+            )];
+        }
+    };
     if recipients.is_empty() {
         return vec![Finding::pass(
             "secrets",
@@ -718,9 +728,6 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
             "sealed file check skipped (no services reference secrets)",
         )];
     }
-    let Ok(path) = config.sealed_path() else {
-        return Vec::new();
-    };
     if path.exists() {
         return vec![Finding::pass(
             "secrets",
@@ -1084,6 +1091,36 @@ fn check_secret_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: doctor said nothing when `secrets.file:` points
+    /// outside the config directory. Load accepts it, and every
+    /// secrets command fails later with `PathEscape`.
+    #[test]
+    fn secrets_file_outside_config_dir_is_an_error() {
+        let config = Config::parse_str(
+            r#"
+hosts: [{ address: h1, user: deploy }]
+secrets:
+  provider: age
+  file: ../elsewhere/sealed.age
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
+services:
+  - name: api
+    image: img
+    tag: t
+    run: { port: 8080 }
+"#,
+        )
+        .expect("load accepts the path today");
+        let findings = check_sealed_file_exists(&config);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(
+            findings[0].title.contains("escapes"),
+            "{:?}",
+            titles(&findings)
+        );
+    }
 
     /// Regression: the hint named `proxy.tls.cert` / `proxy.tls.key`.
     /// The fields are `cert_secret` / `key_secret`, and the wrong names
