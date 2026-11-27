@@ -177,7 +177,7 @@ impl DashboardState {
     #[cfg(test)]
     pub async fn refresh(&mut self, ops: &dyn DockerOps, config: &Config) {
         let data = fetch(ops, config).await;
-        self.apply(data);
+        self.apply(data, config);
     }
 
     /// Apply background-fetched results. `loaded` flips
@@ -185,13 +185,24 @@ impl DashboardState {
     /// ssh probe failed, etc.), the existing render path uses
     /// `last_error` to surface the failure instead of looping on
     /// `(loading…)`. Last-known good `report`/`stats` are kept on
-    /// error to ride out transient blips.
-    pub fn apply(&mut self, data: DashboardRefresh) {
+    /// error to ride out transient blips. On a partial failure the
+    /// hosts that did not answer keep their last-known rows too.
+    pub fn apply(&mut self, data: DashboardRefresh, config: &Config) {
         self.last_error = data.error;
         self.loaded = true;
-        if let Some(report) = data.report {
+        if let Some(mut report) = data.report {
+            if let Some(previous) = &self.report {
+                report.keep_failed_hosts_from(previous, config);
+            }
             self.report = Some(report);
         }
+    }
+
+    /// The last report, with the last-known rows of hosts that did not
+    /// answer. `None` until a refresh succeeds.
+    #[must_use]
+    pub fn report(&self) -> Option<&StatusReport> {
+        self.report.as_ref()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -555,5 +566,47 @@ services:
             .as_deref()
             .expect("unreachable host is reported");
         assert!(err.contains("host-b"), "{err}");
+    }
+
+    /// Regression: on a partial failure the new report replaced the
+    /// last-known one, so a one-tick ssh blip made the rows of the
+    /// failed host vanish. Its rows stay and the footer shows the error.
+    #[tokio::test]
+    async fn partial_failure_keeps_the_rows_of_the_failed_host() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: deploy }
+  - { address: host-b, user: deploy }
+services:
+  - name: app-a
+    image: x
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![running_container()]));
+        ops.push_list_containers(Ok(vec![running_container()]));
+        let mut state = DashboardState::new();
+        state.refresh(&ops, &cfg).await;
+
+        ops.push_list_containers(Err(crate::docker_ops::DockerError::SshProbe {
+            host: "host-a".into(),
+            detail: "connection refused".into(),
+        }));
+        ops.push_list_containers(Ok(vec![]));
+        state.refresh(&ops, &cfg).await;
+
+        let report = state.report().expect("report is kept");
+        let hosts: Vec<(&str, usize)> = report
+            .hosts
+            .iter()
+            .map(|h| (h.host.as_str(), h.containers.len()))
+            .collect();
+        assert_eq!(hosts, vec![("host-a", 1), ("host-b", 0)]);
+        let err = state.last_error.as_deref().expect("the error shows");
+        assert!(err.contains("host-a"), "{err}");
     }
 }

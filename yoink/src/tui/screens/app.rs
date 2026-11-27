@@ -3095,15 +3095,17 @@ impl App {
                     self.show_error_modal_once("connection error", err);
                 }
                 // Services & ServiceDetail share the same StatusReport
-                // as Dashboard. Clone it into both before handing the
-                // original off to dashboard's apply (which moves it).
-                let report_clone = data.report.clone();
+                // as Dashboard. Dashboard's apply keeps the last-known
+                // rows of a host that did not answer, so the two get
+                // its merged report. No new report: all keep the old.
+                let fresh = data.report.is_some();
+                self.dashboard.apply(data, &self.config);
+                let report = fresh.then(|| self.dashboard.report().cloned()).flatten();
                 let service_names: Vec<String> =
                     self.config.service_names().map(str::to_string).collect();
-                self.services.apply(report_clone.clone(), service_names);
+                self.services.apply(report.clone(), service_names);
                 self.service_detail
-                    .apply(report_clone.map(Arc::new), &self.config);
-                self.dashboard.apply(data);
+                    .apply(report.map(Arc::new), &self.config);
                 self.dashboard_in_flight = false;
             }
             Update::ServiceHistory {

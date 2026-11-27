@@ -65,6 +65,26 @@ impl StatusReport {
         Ok(report)
     }
 
+    /// Keep the rows of a host that did not answer this time: each
+    /// host in `failed` gets its `HostStatus` from `previous`, the last
+    /// report that had it. A one-tick ssh blip then does not hide the
+    /// host's containers. `failed` stays as is, so the error still
+    /// shows. Hosts stay in the order of `config.fleet()`.
+    pub fn keep_failed_hosts_from(&mut self, previous: &Self, config: &Config) {
+        let carried = previous.hosts.iter().filter(|prev| {
+            self.failed.iter().any(|f| f.host == prev.host)
+                && !self.hosts.iter().any(|h| h.host == prev.host)
+        });
+        let carried: Vec<HostStatus> = carried.cloned().collect();
+        if carried.is_empty() {
+            return;
+        }
+        self.hosts.extend(carried);
+        let fleet: Vec<String> = config.fleet().into_iter().map(|h| h.address).collect();
+        self.hosts
+            .sort_by_key(|h| fleet.iter().position(|addr| *addr == h.host));
+    }
+
     /// All containers for one named service across every host.
     pub async fn collect_for_service(
         ops: &dyn DockerOps,
