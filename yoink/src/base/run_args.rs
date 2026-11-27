@@ -72,6 +72,11 @@ pub enum BuildError {
     #[error("invalid memory value {0:?}: expected like \"512m\", \"512Mi\", or \"1Gi\"")]
     Memory(String),
     #[error(
+        "invalid memory value {0:?}: the smallest limit Docker accepts is 6 MiB (\"6m\"); \
+         use \"0\" for no limit"
+    )]
+    MemoryBelowMinimum(String),
+    #[error(
         "invalid cpus value {0:?}: expected an absolute core count like \"2\", \"1.5\", or \"500m\""
     )]
     Cpus(String),
@@ -127,7 +132,7 @@ pub fn parse_memory(s: &str) -> Result<i64, BuildError> {
         .map_err(|_| BuildError::Memory(s.to_string()))?;
     let bytes = n.saturating_mul(mult);
     if bytes < 0 || (bytes > 0 && bytes < DOCKER_MIN_MEMORY) {
-        return Err(BuildError::Memory(s.to_string()));
+        return Err(BuildError::MemoryBelowMinimum(s.to_string()));
     }
     Ok(bytes)
 }
@@ -429,12 +434,28 @@ mod tests {
     /// means no limit in Docker and stays valid.
     #[test]
     fn parse_memory_rejects_what_docker_rejects() {
-        assert!(parse_memory("-512m").is_err());
-        assert!(parse_memory("-1").is_err());
-        assert!(parse_memory("1024").is_err());
-        assert!(parse_memory("5m").is_err());
+        for value in ["-512m", "-1", "1024", "5m"] {
+            assert!(
+                matches!(parse_memory(value), Err(BuildError::MemoryBelowMinimum(_))),
+                "{value}"
+            );
+        }
         assert_eq!(parse_memory("0").unwrap(), 0);
         assert_eq!(parse_memory("6m").unwrap(), 6 * 1024 * 1024);
+    }
+
+    /// Regression: a value below 6 MiB failed with the format error
+    /// ("expected like 512m"), although its format was fine. The error
+    /// now names the minimum and says that `0` means no limit.
+    #[test]
+    fn parse_memory_below_the_minimum_names_the_minimum() {
+        let msg = parse_memory("4m").unwrap_err().to_string();
+        assert_eq!(
+            msg,
+            "invalid memory value \"4m\": the smallest limit Docker accepts is 6 MiB (\"6m\"); \
+             use \"0\" for no limit"
+        );
+        assert!(matches!(parse_memory("12x"), Err(BuildError::Memory(_))));
     }
 
     #[test]

@@ -287,7 +287,7 @@ The defaults are a hardened profile. Each service can override them.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `memory` | string | unset | Memory limit (`"512Mi"`, `"1Gi"`). |
+| `memory` | string | unset | Memory limit (`"512Mi"`, `"1Gi"`). The minimum is 6 MiB (`"6m"`), because Docker rejects a smaller limit. `"0"` means no limit. Validation rejects a negative value. |
 | `cpus` | string | unset | CPU limit in cores of CPU time (`"1.5"` = 1.5 cores). |
 | `pids_limit` | integer | `1024` | Limit against fork bombs. |
 | `cap_drop` | list of string | `["ALL"]` | Linux capabilities that the container loses. |
