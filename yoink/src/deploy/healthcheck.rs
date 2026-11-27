@@ -130,7 +130,9 @@ pub async fn poll_tcp(
 /// docker network cannot reach it. The probe brings its own curl, so
 /// the proxy image needs no HTTP client. A non-200 or a probe error
 /// counts as not-yet. A request the daemon rejects with a 4xx (for
-/// example, the container is not running) ends the poll at once.
+/// example, the container does not exist) ends the poll at once. A
+/// 409 is the exception: the daemon sends it while the container
+/// restarts, so it counts as not-yet.
 pub async fn poll_in_netns(
     ops: &dyn DockerOps,
     host: &Host,
@@ -168,7 +170,7 @@ pub async fn poll_in_netns(
                     ))))
                 }
             },
-            Err(e) if e.is_daemon_rejection() => Err(e),
+            Err(e) if e.is_daemon_rejection() && !e.is_conflict() => Err(e),
             Err(e) => {
                 debug!(host = %host.address, container, attempt, error = %e, "netns probe errored");
                 Ok(AttemptOutcome::ProbeFailed(e))
@@ -426,6 +428,48 @@ mod tests {
             }
             HealthcheckError::TimedOut { .. } => panic!("expected docker error, got {err:?}"),
         }
+    }
+
+    /// A 409 from the daemon (the proxy restarts, so the probe cannot
+    /// join its network namespace) ended the poll at once.
+    #[tokio::test(start_paused = true)]
+    async fn netns_probe_retries_a_409_while_the_container_restarts() {
+        let ops = FakeDockerOps::new();
+        ops.push_curl_in_netns(Err(daemon_error(
+            409,
+            "cannot join network namespace of container: Container abc is restarting",
+        )));
+        ops.push_curl_in_netns(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 0,
+            stdout: "200".into(),
+            stderr: String::new(),
+        }));
+        let attempts = poll_in_netns(
+            &ops,
+            &host(),
+            "yoink-proxy-abc",
+            "http://127.0.0.1:2019/config/",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn netns_probe_fails_at_once_on_other_daemon_rejections() {
+        let ops = FakeDockerOps::new();
+        ops.push_curl_in_netns(Err(daemon_error(404, "No such container: yoink-proxy-abc")));
+        let err = poll_in_netns(
+            &ops,
+            &host(),
+            "yoink-proxy-abc",
+            "http://127.0.0.1:2019/config/",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, HealthcheckError::Docker(_)), "got {err:?}");
     }
 
     #[tokio::test(start_paused = true)]

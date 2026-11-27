@@ -77,6 +77,23 @@ impl DockerError {
             } if (400..500).contains(status_code)
         )
     }
+
+    /// True for an HTTP 409 Conflict from the daemon. For example, a
+    /// probe cannot join the network namespace of a container that
+    /// restarts at that moment.
+    #[must_use]
+    pub fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Bollard {
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409,
+                    ..
+                },
+                ..
+            }
+        )
+    }
 }
 
 /// Outcome of [`DockerOps::remove_stopped_container`].
