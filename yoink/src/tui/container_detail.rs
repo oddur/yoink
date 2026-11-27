@@ -157,6 +157,27 @@ impl StatsHistory {
         self.cpu_pct.is_empty()
     }
 
+    /// CPU % samples, oldest first, as `(elapsed secs, value)`.
+    fn cpu_series(&self) -> Vec<(f64, f64)> {
+        self.cpu_pct.iter().copied().collect()
+    }
+
+    /// Memory samples, oldest first: percent of the cap, or MB when
+    /// uncapped.
+    fn mem_series(&self) -> Vec<(f64, f64)> {
+        self.mem_pct.iter().copied().collect()
+    }
+
+    /// Per-second receive rates, from the cumulative byte counter.
+    fn net_rx_rates(&self) -> Vec<(f64, f64)> {
+        Self::rate_series(&self.net_rx)
+    }
+
+    /// Per-second transmit rates, from the cumulative byte counter.
+    fn net_tx_rates(&self) -> Vec<(f64, f64)> {
+        Self::rate_series(&self.net_tx)
+    }
+
     fn x_window(&self) -> (f64, f64) {
         let now = self.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
         let lo = (now - HISTORY_WINDOW_SECS).max(0.0);
@@ -242,8 +263,19 @@ impl ContainerDetailState {
     /// Last-known inspect for the focused container, if loaded.
     /// Used by `App::drift_focus` to resolve the service name from
     /// the running container's `yoink.service` label.
-    pub fn inspect(&self) -> Option<&ContainerDetail> {
-        self.inspect.as_ref()
+    /// A label of the inspected container, once inspect has loaded.
+    #[must_use]
+    pub fn inspected_label(&self, key: &str) -> Option<&str> {
+        self.inspect.as_ref()?.labels.get(key).map(String::as_str)
+    }
+
+    /// True when this pane shows `container` on `host`. A refresh for
+    /// another container is stale.
+    #[must_use]
+    pub fn is_showing(&self, host: &Host, container: &str) -> bool {
+        self.target
+            .as_ref()
+            .is_some_and(|(h, c)| h == host && c == container)
     }
 
     pub fn target(&self) -> Option<&(Host, String)> {
@@ -367,8 +399,8 @@ impl ContainerDetailState {
         };
 
         let (xmin, xmax) = history.x_window();
-        let cpu_data: Vec<(f64, f64)> = history.cpu_pct.iter().copied().collect();
-        let mem_data: Vec<(f64, f64)> = history.mem_pct.iter().copied().collect();
+        let cpu_data = history.cpu_series();
+        let mem_data = history.mem_series();
 
         // ── Panel 1: CPU% over time ───────────────────────────────────
         let cpu_now = cpu_data.last().map(|(_, v)| *v);
@@ -474,8 +506,8 @@ impl ContainerDetailState {
         // mirrored below. Outgoing-on-top reads naturally as "this
         // container is pushing X out to the world", and the two series
         // can no longer overlap.
-        let rx_rates_pos = StatsHistory::rate_series(&history.net_rx);
-        let tx_rates = StatsHistory::rate_series(&history.net_tx);
+        let rx_rates_pos = history.net_rx_rates();
+        let tx_rates = history.net_tx_rates();
         // Mirror rx below the zero line by negating each y value. The
         // rendered line still tracks the same magnitude — just on the
         // negative side of the axis.

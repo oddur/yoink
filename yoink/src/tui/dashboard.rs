@@ -59,9 +59,19 @@ impl DashboardState {
         self.show_exited = !self.show_exited;
     }
 
+    /// The `yoink.service` label of the container named `container`,
+    /// on any host of the last report.
     #[must_use]
-    pub fn report_ref(&self) -> Option<&StatusReport> {
-        self.report.as_ref()
+    pub fn service_of(&self, container: &str) -> Option<String> {
+        self.report
+            .as_ref()
+            .and_then(|r| {
+                r.hosts
+                    .iter()
+                    .flat_map(|h| h.containers.iter())
+                    .find(|c| c.name == container)
+            })
+            .and_then(|c| c.yoink_service.clone())
     }
 
     /// Selectable rows in the same order `build_rows` would render

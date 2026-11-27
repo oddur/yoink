@@ -160,6 +160,20 @@ impl HostDetailState {
         self.host.as_ref()
     }
 
+    /// The host on screen and the container under the cursor. Every
+    /// container action of this pane acts on this pair.
+    #[must_use]
+    pub fn selected_target(&self) -> Option<(Host, String)> {
+        Some((self.host.clone()?, self.selected_container()?))
+    }
+
+    /// True when this pane shows `host`. A refresh for another host
+    /// is stale.
+    #[must_use]
+    pub fn is_showing(&self, host: &Host) -> bool {
+        self.host.as_ref() == Some(host)
+    }
+
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn render(
         &mut self,

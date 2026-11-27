@@ -743,31 +743,10 @@ async fn run_loop(
                             // races with shutdown). Synchronous
                             // SshTunnel children get killed by
                             // their own Drop on App teardown.
-                            app.forwards.close_all_async().await;
-                            app.vscode.close_all_async().await;
+                            app.close_sessions().await;
                             return Ok(());
                         }
-                        if let Some(target) = app.take_pending_editor() {
-                            // Run the editor synchronously — the operator
-                            // is *editing*; nothing else should fire while
-                            // the alt-screen is torn down.
-                            restore_terminal(terminal, mouse)
-                                .context("restore terminal for $EDITOR")?;
-                            let status = super::editor::run_editor(&target);
-                            *terminal = setup_terminal(mouse)
-                                .context("re-setup terminal after $EDITOR")?;
-                            terminal.clear().context("clear terminal after $EDITOR")?;
-                            match status {
-                                Ok(s) if !s.success() => app.push_toast(format!(
-                                    "✗ editor exited with status {s}"
-                                )),
-                                Err(e) => app.push_toast(format!("✗ editor failed: {e}")),
-                                _ => {}
-                            }
-                            // Pick up edits immediately rather than
-                            // waiting for the next reload tick.
-                            app.maybe_reload_config();
-                        }
+                        app.run_pending_editor(terminal, mouse)?;
                     }
                     Some(Ok(Event::Mouse(m))) => app.on_mouse(m),
                     Some(Ok(_)) => {}
@@ -801,22 +780,8 @@ async fn run_loop(
             _ = throbber_tick.tick() => {
                 app.tick_throbber();
             }
-            Some(update) = app.update_rx.recv() => {
-                app.apply_update(update);
-            }
-            Some(line) = app.log_rx.recv() => {
-                app.logs.push_rendered(line);
-            }
-            Some(bytes) = app.shell_bytes_rx.recv() => {
-                if let Some(shell) = app.shell.as_mut() {
-                    shell.process_bytes(&bytes);
-                }
-            }
-            Some((origin_view, res, banner)) = app.shell_session_rx.recv() => {
-                app.apply_shell_session(&origin_view, res, &banner);
-            }
-            Some(update) = app.job_rx.recv() => {
-                app.apply_job_update(update);
+            Some(message) = app.next_inbound() => {
+                app.handle_inbound(message);
             }
             _ = shell_spin_tick.tick() => {
                 // Tick exists purely to wake the loop so the spinner
@@ -826,6 +791,16 @@ async fn run_loop(
             }
         }
     }
+}
+
+/// One message from a background task to the run loop.
+#[allow(clippy::large_enum_variant)] // one lives on the stack per loop turn; boxing `Update` buys nothing
+enum Inbound {
+    Update(Update),
+    LogLine(RenderedLine),
+    ShellBytes(Vec<u8>),
+    ShellSession(View, SessionResult, String),
+    Job(JobUpdate),
 }
 
 #[allow(clippy::struct_excessive_bools)] // Independent in-flight flags + capability flag.
@@ -1057,8 +1032,73 @@ impl App {
     /// Drained by `run_loop` after each key event. When `Some`, the
     /// outer loop suspends the TUI, runs `$EDITOR` on the target,
     /// and re-enters the alt-screen + raw mode.
-    pub fn take_pending_editor(&mut self) -> Option<super::editor::EditorTarget> {
-        self.pending_editor.take()
+    /// Run `$EDITOR` when a key asked for it. The editor runs
+    /// synchronously — the operator is *editing*; nothing else should
+    /// fire while the alt-screen is torn down.
+    fn run_pending_editor(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        mouse: bool,
+    ) -> Result<()> {
+        let Some(target) = self.pending_editor.take() else {
+            return Ok(());
+        };
+        restore_terminal(terminal, mouse).context("restore terminal for $EDITOR")?;
+        let status = super::editor::run_editor(&target);
+        *terminal = setup_terminal(mouse).context("re-setup terminal after $EDITOR")?;
+        terminal.clear().context("clear terminal after $EDITOR")?;
+        match status {
+            Ok(s) if !s.success() => self.push_toast(format!("✗ editor exited with status {s}")),
+            Err(e) => self.push_toast(format!("✗ editor failed: {e}")),
+            _ => {}
+        }
+        // Pick up edits immediately rather than
+        // waiting for the next reload tick.
+        self.maybe_reload_config();
+        Ok(())
+    }
+
+    /// Quit. Drain port-forwards explicitly so each sidecar's docker
+    /// remove completes before the runtime tears down (the
+    /// spawn-from-Drop fallback races with shutdown). Synchronous
+    /// `SshTunnel` children get killed by their own Drop on App
+    /// teardown.
+    async fn close_sessions(&mut self) {
+        self.forwards.close_all_async().await;
+        self.vscode.close_all_async().await;
+    }
+
+    /// The next message from a background task. Channels are polled
+    /// in a fixed order, so a busy one cannot starve the ones before
+    /// it. `None` once every channel is closed.
+    async fn next_inbound(&mut self) -> Option<Inbound> {
+        tokio::select! {
+            biased;
+            Some(update) = self.update_rx.recv() => Some(Inbound::Update(update)),
+            Some(line) = self.log_rx.recv() => Some(Inbound::LogLine(line)),
+            Some(bytes) = self.shell_bytes_rx.recv() => Some(Inbound::ShellBytes(bytes)),
+            Some((origin_view, res, banner)) = self.shell_session_rx.recv() => {
+                Some(Inbound::ShellSession(origin_view, res, banner))
+            }
+            Some(update) = self.job_rx.recv() => Some(Inbound::Job(update)),
+            else => None,
+        }
+    }
+
+    fn handle_inbound(&mut self, message: Inbound) {
+        match message {
+            Inbound::Update(update) => self.apply_update(update),
+            Inbound::LogLine(line) => self.logs.push_rendered(line),
+            Inbound::ShellBytes(bytes) => {
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.process_bytes(&bytes);
+                }
+            }
+            Inbound::ShellSession(origin_view, res, banner) => {
+                self.apply_shell_session(&origin_view, res, &banner);
+            }
+            Inbound::Job(update) => self.apply_job_update(update),
+        }
     }
 
     /// Advance the loading-spinner glyph one frame.
@@ -1121,13 +1161,10 @@ impl App {
                 let row = self.service_detail.selected_row()?;
                 Some((row.host, svc.clone()))
             }
-            View::ContainerDetail { host, .. } => {
-                let labels = &self.container_detail.inspect()?.labels;
-                labels
-                    .get("yoink.service")
-                    .cloned()
-                    .map(|s| (host.clone(), s))
-            }
+            View::ContainerDetail { host, .. } => self
+                .container_detail
+                .inspected_label("yoink.service")
+                .map(|s| (host.clone(), s.to_string())),
             _ => None,
         }
     }
@@ -1162,13 +1199,14 @@ impl App {
             View::HostDetail(_) => self.host_detail.selected_service(),
             View::ServiceDetail(svc) => Some(svc.clone()),
             View::Services => self.services.selected_service(),
-            View::ContainerDetail { .. } => {
-                let labels = &self.container_detail.inspect()?.labels;
-                labels
-                    .get("yoink.service")
-                    .or_else(|| labels.get("yoink.pf.target_service"))
-                    .cloned()
-            }
+            View::ContainerDetail { .. } => self
+                .container_detail
+                .inspected_label("yoink.service")
+                .or_else(|| {
+                    self.container_detail
+                        .inspected_label("yoink.pf.target_service")
+                })
+                .map(str::to_string),
             _ => None,
         }
     }
@@ -2085,19 +2123,13 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => self.host_detail.select_prev(),
                 KeyCode::Down | KeyCode::Char('j') => self.host_detail.select_next(),
                 KeyCode::Enter => {
-                    if let (Some(host), Some(container)) = (
-                        self.host_detail.host().cloned(),
-                        self.host_detail.selected_container(),
-                    ) {
+                    if let Some((host, container)) = self.host_detail.selected_target() {
                         self.transition(View::ContainerLogs { host, container })
                             .await;
                     }
                 }
                 KeyCode::Char('!') => {
-                    if let (Some(host), Some(container)) = (
-                        self.host_detail.host().cloned(),
-                        self.host_detail.selected_container(),
-                    ) {
+                    if let Some((host, container)) = self.host_detail.selected_target() {
                         self.transition(View::ContainerShell {
                             host,
                             container,
@@ -2107,10 +2139,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('B') => {
-                    if let (Some(host), Some(container)) = (
-                        self.host_detail.host().cloned(),
-                        self.host_detail.selected_container(),
-                    ) {
+                    if let Some((host, container)) = self.host_detail.selected_target() {
                         self.transition(View::ContainerShell {
                             host,
                             container,
@@ -2120,35 +2149,23 @@ impl App {
                     }
                 }
                 KeyCode::Char('i') => {
-                    if let (Some(host), Some(container)) = (
-                        self.host_detail.host().cloned(),
-                        self.host_detail.selected_container(),
-                    ) {
+                    if let Some((host, container)) = self.host_detail.selected_target() {
                         self.transition(View::ContainerDetail { host, container })
                             .await;
                     }
                 }
                 KeyCode::Char('K') => {
-                    if let (Some(host), Some(container)) = (
-                        self.host_detail.host().cloned(),
-                        self.host_detail.selected_container(),
-                    ) {
+                    if let Some((host, container)) = self.host_detail.selected_target() {
                         self.kill_target = Some((host, container));
                     }
                 }
                 KeyCode::Char('S') => {
-                    if let (Some(host), Some(container)) = (
-                        self.host_detail.host().cloned(),
-                        self.host_detail.selected_container(),
-                    ) {
+                    if let Some((host, container)) = self.host_detail.selected_target() {
                         self.spawn_lifecycle(host, container, LifecycleOp::Start);
                     }
                 }
                 KeyCode::Char('X') => {
-                    if let (Some(host), Some(container)) = (
-                        self.host_detail.host().cloned(),
-                        self.host_detail.selected_container(),
-                    ) {
+                    if let Some((host, container)) = self.host_detail.selected_target() {
                         self.spawn_lifecycle(host, container, LifecycleOp::Stop);
                     }
                 }
@@ -2157,10 +2174,7 @@ impl App {
                 // `S`/`X`/`K`/`T` family is consistent across
                 // container-action surfaces.
                 KeyCode::Char('T') => {
-                    if let (Some(host), Some(container)) = (
-                        self.host_detail.host().cloned(),
-                        self.host_detail.selected_container(),
-                    ) {
+                    if let Some((host, container)) = self.host_detail.selected_target() {
                         self.spawn_lifecycle(host, container, LifecycleOp::Restart);
                     }
                 }
@@ -2193,17 +2207,10 @@ impl App {
                     self.kill_target = Some((host.clone(), container.clone()));
                 }
                 KeyCode::Char('U') => {
-                    let svc = self.container_detail.target().and_then(|(_, name)| {
-                        self.dashboard
-                            .report_ref()
-                            .and_then(|r| {
-                                r.hosts
-                                    .iter()
-                                    .flat_map(|h| h.containers.iter())
-                                    .find(|c| &c.name == name)
-                            })
-                            .and_then(|c| c.yoink_service.clone())
-                    });
+                    let svc = self
+                        .container_detail
+                        .target()
+                        .and_then(|(_, name)| self.dashboard.service_of(name));
                     if let Some(name) = svc {
                         self.open_reconcile_modal(&name);
                     }
@@ -3062,7 +3069,7 @@ impl App {
             Update::HostDetail { host, data } => {
                 // Drop stale results from a prior host the user has since
                 // navigated away from.
-                if self.host_detail.host() == Some(&host) {
+                if self.host_detail.is_showing(&host) {
                     self.host_detail.apply(data);
                 }
                 self.host_detail_in_flight = false;
@@ -3072,9 +3079,7 @@ impl App {
                 container,
                 data,
             } => {
-                if self.container_detail.target().map(|(h, c)| (h, c.as_str()))
-                    == Some((&host, container.as_str()))
-                {
+                if self.container_detail.is_showing(&host, &container) {
                     self.container_detail.apply(*data);
                 }
                 self.container_detail_in_flight = false;
@@ -3129,9 +3134,7 @@ impl App {
                 result,
             } => match result {
                 Ok(table) => {
-                    if self.container_detail.target().map(|(h, c)| (h, c.as_str()))
-                        == Some((&host, container.as_str()))
-                    {
+                    if self.container_detail.is_showing(&host, &container) {
                         self.container_detail.set_top(table);
                     }
                 }
