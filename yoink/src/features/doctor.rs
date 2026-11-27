@@ -912,11 +912,15 @@ fn check_tls_cert_secrets(
 ) -> Vec<Finding> {
     let proxy_default_cert = config.proxy_tls().map(|t| t.cert_secret.clone());
     let proxy_default_key = config.proxy_tls().map(|t| t.key_secret.clone());
+    // The Caddy renderer resolves the `proxy.tls` secrets whenever the
+    // proxy runs, whatever `tls:` mode the services use.
+    let global_tls = config.proxy_tls().filter(|_| config.proxy_enabled());
 
-    let needs_bundle = config
-        .services
-        .iter()
-        .any(|s| matches!(s.tls, TlsMode::Cert));
+    let needs_bundle = global_tls.is_some()
+        || config
+            .services
+            .iter()
+            .any(|s| matches!(s.tls, TlsMode::Cert));
     if !needs_bundle {
         return vec![Finding::pass(
             "config",
@@ -930,8 +934,38 @@ fn check_tls_cert_secrets(
     };
 
     let mut out = Vec::new();
+    if let Some(tls) = global_tls {
+        let mut refs = vec![
+            ("cert_secret", tls.cert_secret.as_str()),
+            ("key_secret", tls.key_secret.as_str()),
+        ];
+        if let Some(ca) = &tls.client_auth {
+            refs.push((
+                "client_auth.trust_pool_secret",
+                ca.trust_pool_secret.as_str(),
+            ));
+        }
+        for (field, key) in refs {
+            if bundle.get(key).is_none() {
+                out.push(
+                    Finding::error(
+                        "secrets",
+                        format!(
+                            "`proxy.tls.{field}` references `{key}`, which is not in the bundle"
+                        ),
+                    )
+                    .with_fix(format!("add `{key}=<pem-bytes>` via `yoink secrets edit`")),
+                );
+            }
+        }
+    }
     for svc in &config.services {
         if !matches!(svc.tls, TlsMode::Cert) {
+            continue;
+        }
+        // A service that inherits the `proxy.tls` cert is covered by
+        // the check above.
+        if global_tls.is_some() && svc.tls_cert_secret.is_none() && svc.tls_key_secret.is_none() {
             continue;
         }
         let cert_key = svc
@@ -1050,6 +1084,46 @@ fn check_secret_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: with only `tls: auto` services, doctor skipped the
+    /// `proxy.tls` secrets. The Caddy renderer still needs them, so
+    /// `yoink up` failed on a secret that doctor never checked.
+    #[test]
+    fn missing_proxy_tls_secret_is_an_error_with_tls_auto_services() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+secrets: { provider: age, recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy] }
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            "CF_CERT".to_string(),
+            zeroize::Zeroizing::new("cert".to_string()),
+        );
+        let bundle = crate::base::bundle::SecretsBundle::new(values);
+        let findings = check_tls_cert_secrets(&config, Some(&bundle));
+        let errors: Vec<&str> = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Error)
+            .map(|f| f.title.as_str())
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("proxy.tls.key_secret"), "{errors:?}");
+        assert!(errors[0].contains("CF_KEY"), "{errors:?}");
+    }
 
     /// Regression: doctor only warned about a missing `proxy.email:`
     /// while `yoink up` fails at Caddy render for a `tls: auto`
