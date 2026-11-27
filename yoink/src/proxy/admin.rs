@@ -17,6 +17,8 @@
 //! `docker exec` goes through the docker API connection that yoink
 //! already has, so this needs no SSH tunnel and no published port.
 
+use std::time::Duration;
+
 use serde_json::Value;
 use thiserror::Error;
 
@@ -39,6 +41,11 @@ pub enum AdminError {
     /// carries the admin API's answer (e.g. a Caddy parser error).
     #[error("proxy admin rejected /load: {detail}")]
     LoadRejected { detail: String },
+    /// `caddy reload` could not connect to the admin API (for example,
+    /// Caddy is still starting). Caddy did not see the config, so this
+    /// is not a config error.
+    #[error("proxy admin API not reachable: {detail}")]
+    AdminUnreachable { detail: String },
     /// The route-count read-back after a successful `/load` failed.
     #[error("read back proxy routes: {detail}")]
     ReadBackFailed { detail: String },
@@ -54,6 +61,22 @@ pub enum AdminError {
     LoadVerifyMismatch { expected: usize, actual: usize },
 }
 
+impl AdminError {
+    /// True for a failure that a second push can fix: the admin API
+    /// did not accept connections, or the docker transport failed.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::AdminUnreachable { .. } => true,
+            Self::Docker { source, .. } => source.is_transport(),
+            _ => false,
+        }
+    }
+}
+
+/// Pause before the second push. Long enough for a Caddy that is
+/// still starting to bind the admin port.
+const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
 /// Push `config` to the proxy on `host` with `docker exec` into the
 /// running proxy container, then verify the route count.
 ///
@@ -62,12 +85,36 @@ pub enum AdminError {
 /// older yoink started listens on `0.0.0.0:2019`, which includes the
 /// container loopback, so the first push to it also works. That push
 /// carries the loopback-only admin block and moves the proxy onto it.
+///
+/// A transient failure ([`AdminError::is_transient`]) gets one more
+/// push. That is safe even when the first reload ran: `caddy reload`
+/// with the same config is idempotent. A Caddy error does not retry.
 pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
     config: &Value,
 ) -> Result<(), AdminError> {
     let container = running_proxy(host, ops).await?;
+    match push_once(host, ops, &container, config).await {
+        Err(e) if e.is_transient() => {
+            tracing::debug!(
+                host = %host.address,
+                error = %e,
+                "transient proxy admin push error; retrying once",
+            );
+            tokio::time::sleep(RETRY_BACKOFF).await;
+            push_once(host, ops, &container, config).await
+        }
+        other => other,
+    }
+}
+
+async fn push_once(
+    host: &Host,
+    ops: &dyn DockerOps,
+    container: &str,
+    config: &Value,
+) -> Result<(), AdminError> {
     let docker_err = |source| AdminError::Docker {
         host: host.address.clone(),
         source,
@@ -77,7 +124,7 @@ pub async fn push_config(
     let load = ops
         .exec_with_stdin(
             host,
-            &container,
+            container,
             vec![
                 "caddy".into(),
                 "reload".into(),
@@ -95,9 +142,11 @@ pub async fn push_config(
         // which carries inline cert+key PEMs from
         // `tls.certificates.load_pem`. Strip them before the error
         // lands in stderr / tracing / TUI toasts.
-        return Err(AdminError::LoadRejected {
-            detail: redact_pem_blocks(exec_output(&load).trim()),
-        });
+        let detail = redact_pem_blocks(exec_output(&load).trim());
+        if detail.to_ascii_lowercase().contains("connection refused") {
+            return Err(AdminError::AdminUnreachable { detail });
+        }
+        return Err(AdminError::LoadRejected { detail });
     }
 
     // Belt-and-braces: read the route count back from the daemon and
@@ -108,7 +157,7 @@ pub async fn push_config(
     // domains. Verifying upfront beats discovering it from a Cloudflare
     // 521 alert.
     let expected = route_count(config);
-    let actual = read_route_count(host, ops, &container).await?;
+    let actual = read_route_count(host, ops, container).await?;
     if expected != actual {
         return Err(AdminError::LoadVerifyMismatch { expected, actual });
     }
@@ -370,6 +419,69 @@ mod tests {
         ops.push_exec_with_stdin(Ok(exit(0, "", "")));
         ops.push_curl_in_netns(Ok(exit(0, "{\"error\":\"unknown path\"}\n404", "")));
         push_config(&host(), &ops, &config).await.unwrap();
+    }
+
+    const REFUSED: &str = "Error: sending configuration to instance: performing request: \
+        Post \"http://127.0.0.1:2019/load\": dial tcp 127.0.0.1:2019: connect: connection refused";
+
+    /// The old HTTP push retried once on a transport error. The exec
+    /// push did not, and it reported a Caddy that was not listening yet
+    /// as a rejected config.
+    #[tokio::test]
+    async fn push_retries_once_when_the_admin_api_refuses_the_connection() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(1, "", REFUSED)));
+        ops.push_exec_with_stdin(Ok(exit(0, "", "")));
+        ops.push_curl_in_netns(Ok(exit(0, "{}\n404", "")));
+        push_config(&host(), &ops, &config).await.unwrap();
+        let reloads = ops
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, crate::docker_ops::RecordedCall::ExecWithStdin(..)))
+            .count();
+        assert_eq!(reloads, 2);
+    }
+
+    #[tokio::test]
+    async fn push_reports_a_refused_connection_as_unreachable_not_rejected() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(1, "", REFUSED)));
+        ops.push_exec_with_stdin(Ok(exit(1, "", REFUSED)));
+        let err = push_config(&host(), &ops, &config).await.unwrap_err();
+        assert!(
+            matches!(err, AdminError::AdminUnreachable { .. }),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_retries_once_on_a_docker_transport_error() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Err(DockerError::Bollard {
+            host: "h1".into(),
+            source: bollard::errors::Error::IOError {
+                err: std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            },
+        }));
+        ops.push_exec_with_stdin(Ok(exit(0, "", "")));
+        ops.push_curl_in_netns(Ok(exit(0, "{}\n404", "")));
+        push_config(&host(), &ops, &config).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_does_not_retry_a_rejected_config() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(1, "", "Error: HTTP 400: unknown module")));
+        let err = push_config(&host(), &ops, &config).await.unwrap_err();
+        assert!(matches!(err, AdminError::LoadRejected { .. }), "got {err}");
     }
 
     #[tokio::test]

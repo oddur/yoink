@@ -47,6 +47,21 @@ pub enum DockerError {
 }
 
 impl DockerError {
+    /// True when the request failed in the transport (a stale pooled
+    /// connection, a dropped ssh session, an I/O error), not in the
+    /// daemon. The request can have run, so only an idempotent
+    /// operation can retry on it.
+    #[must_use]
+    pub fn is_transport(&self) -> bool {
+        match self {
+            Self::Bollard { source, .. } => {
+                real::is_stale_transport(source)
+                    || matches!(source, bollard::errors::Error::IOError { .. })
+            }
+            _ => false,
+        }
+    }
+
     /// True when the daemon answered the request and rejected it
     /// with a 4xx (no such network, no such image, bad request). The
     /// request reached the daemon, so this is not a transport blip.

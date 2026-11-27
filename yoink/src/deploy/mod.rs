@@ -1323,32 +1323,38 @@ async fn push_caddy_config(
     crate::proxy::admin::push_config(host, ops, &json)
         .await
         .map_err(|source| {
-            // When Caddy bounces /load, point the operator at the
-            // services that have a `caddy_extra_json:` block —
-            // those are the most likely sources of schema errors.
-            // Unattributed users would otherwise stare at a Caddy
-            // backtrace with no clue which service caused it.
-            let extras: Vec<&str> = config
-                .services
-                .iter()
-                .filter(|s| s.caddy_extra_json.is_some())
-                .map(|s| s.name.as_str())
-                .collect();
-            let hint = if extras.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\nhint: services with caddy_extra_json: {} — \
-                     run `yoink proxy-render` to inspect the rendered config",
-                    extras.join(", "),
-                )
-            };
+            let hint = push_error_hint(config, &source);
             DeployError::Custom {
                 host: host.address.clone(),
                 detail: format!("push Caddy config: {source}{hint}"),
             }
         })?;
     Ok(())
+}
+
+/// When Caddy bounces /load, point the operator at the services that
+/// have a `caddy_extra_json:` block — those are the most likely
+/// sources of schema errors. Unattributed users would otherwise stare
+/// at a Caddy backtrace with no clue which service caused it. Other
+/// failures (an unreachable admin API, a docker error) get no hint.
+fn push_error_hint(config: &Config, error: &crate::proxy::admin::AdminError) -> String {
+    if !matches!(error, crate::proxy::admin::AdminError::LoadRejected { .. }) {
+        return String::new();
+    }
+    let extras: Vec<&str> = config
+        .services
+        .iter()
+        .filter(|s| s.caddy_extra_json.is_some())
+        .map(|s| s.name.as_str())
+        .collect();
+    if extras.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nhint: services with caddy_extra_json: {} — \
+         run `yoink proxy-render` to inspect the rendered config",
+        extras.join(", "),
+    )
 }
 
 /// Build a `RunSpec` for the given service+tag. Used both to compute the
@@ -4609,6 +4615,24 @@ services:
         .await
         .unwrap();
         assert!(reports.is_empty());
+    }
+
+    /// An unreachable admin API is not a config error, so the push
+    /// error no longer points at the `caddy_extra_json:` services.
+    #[test]
+    fn push_error_hint_names_caddy_extra_json_only_for_a_rejected_load() {
+        use crate::proxy::admin::AdminError;
+        let mut cfg = config_proxied_service();
+        cfg.services[0].caddy_extra_json = Some("{}".into());
+        let name = cfg.services[0].name.clone();
+        let rejected = AdminError::LoadRejected {
+            detail: "HTTP 400".into(),
+        };
+        assert!(push_error_hint(&cfg, &rejected).contains(&name));
+        let unreachable = AdminError::AdminUnreachable {
+            detail: "connection refused".into(),
+        };
+        assert_eq!(push_error_hint(&cfg, &unreachable), "");
     }
 
     /// The deploy gate for the proxy probed `<proxy>:2019` from a curl

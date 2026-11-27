@@ -57,7 +57,7 @@ struct CachedClient {
 /// connection, link reset, ssh stdio session closed) rather than a
 /// real Docker API error. Used by `with_retry` to decide whether
 /// retrying with a freshly-dialed `Docker` is appropriate.
-fn is_stale_transport(e: &bollard::errors::Error) -> bool {
+pub(super) fn is_stale_transport(e: &bollard::errors::Error) -> bool {
     matches!(
         e,
         bollard::errors::Error::HyperLegacyError { .. }
@@ -300,20 +300,32 @@ impl RealDockerOps {
         cmd: Vec<String>,
         stdin: Option<Vec<u8>>,
     ) -> Result<OneShotResult, DockerError> {
+        // `create_exec` and `inspect_exec` go through `with_retry`: they
+        // run nothing, so a retry on a stale pooled connection is safe.
+        // `start_exec` runs the command and is not retried here, because
+        // not every command is idempotent. A caller with an idempotent
+        // command (the proxy push) retries the whole call.
+        let attach_stdin = stdin.is_some();
+        let exec = self
+            .with_retry(host, |docker| {
+                let cmd = cmd.clone();
+                async move {
+                    docker
+                        .create_exec(
+                            container,
+                            bollard::exec::CreateExecOptions {
+                                cmd: Some(cmd),
+                                attach_stdin: Some(attach_stdin),
+                                attach_stdout: Some(true),
+                                attach_stderr: Some(true),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                }
+            })
+            .await?;
         let docker = self.client_for(host).await?;
-        let exec = docker
-            .create_exec(
-                container,
-                bollard::exec::CreateExecOptions {
-                    cmd: Some(cmd),
-                    attach_stdin: Some(stdin.is_some()),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|s| Self::err(host, s))?;
 
         // Non-detached: bollard returns a stream of frame-tagged log
         // chunks that we drain into stdout/stderr buffers. The lock
@@ -362,10 +374,13 @@ impl RealDockerOps {
             }
         }
 
-        let inspect = docker
-            .inspect_exec(&exec.id)
-            .await
-            .map_err(|s| Self::err(host, s))?;
+        let exec_id = exec.id.as_str();
+        let inspect = self
+            .with_retry(
+                host,
+                |docker| async move { docker.inspect_exec(exec_id).await },
+            )
+            .await?;
         Ok(OneShotResult {
             exit_code: inspect.exit_code.unwrap_or(0),
             stdout,
