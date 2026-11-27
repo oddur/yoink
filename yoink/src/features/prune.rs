@@ -92,8 +92,11 @@ fn classify(c: &ContainerInfo, known: &BTreeSet<String>) -> Option<PruneReason> 
     let svc = c.yoink_service.as_deref();
     match svc {
         Some(name) if !known.contains(name) => Some(PruneReason::ServiceNotInConfig),
-        Some(_) if !c.is_running() => Some(PruneReason::StaleExited),
-        // Running container of a known service: keep.
+        // Only a container that has finished is stale. A paused,
+        // restarting or just-created container of a declared service
+        // is still in use.
+        Some(_) if matches!(c.state.as_str(), "exited" | "dead") => Some(PruneReason::StaleExited),
+        // Any other container of a known service: keep.
         // Container with no `yoink.service` label but managed=true:
         // shouldn't happen (every yoink-created container gets the
         // label) — leave it alone rather than blow it away on a
@@ -162,6 +165,29 @@ mod tests {
         assert!(names.contains(&"yoink-old-ccc"));
         assert!(!names.contains(&"api-aaa"));
         assert!(!names.contains(&"web-ddd"));
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_paused_restarting_and_created_containers() {
+        let ops = FakeDockerOps::new();
+        let with_state = |name: &str, state: &str| ContainerInfo {
+            state: state.into(),
+            ..container(name, "api", false)
+        };
+        ops.push_list_containers(Ok(vec![
+            with_state("api-paused", "paused"),
+            with_state("api-restarting", "restarting"),
+            with_state("api-created", "created"),
+            with_state("api-dead", "dead"),
+            with_state("api-exited", "exited"),
+        ]));
+        let report = run(&ops, &cfg(&["api"]), true).await.unwrap();
+        let names: Vec<&str> = report
+            .planned
+            .iter()
+            .map(|p| p.container.as_str())
+            .collect();
+        assert_eq!(names, ["api-dead", "api-exited"]);
     }
 
     #[tokio::test]
