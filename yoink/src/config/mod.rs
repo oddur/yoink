@@ -2378,9 +2378,15 @@ impl Config {
                         .transpose()
                         .err(),
                 ),
+                // The synthesized `_proxy` gets its publish list from
+                // `proxy.bind:`. Do not fail every command on it.
                 (
                     "run.publish",
-                    run_args::parse_port_bindings(&service.run.publish).err(),
+                    if matches!(service.kind, Some(ServiceKind::Proxy)) {
+                        None
+                    } else {
+                        run_args::parse_port_bindings(&service.run.publish).err()
+                    },
                 ),
             ];
             if let Some((field, e)) = checks.into_iter().find_map(|(f, e)| e.map(|e| (f, e))) {
@@ -3709,6 +3715,33 @@ services:
         // A later-declared or earlier-declared known service is fine.
         Config::parse_str(&config("migrations")).unwrap();
         Config::parse_str(&config("api")).unwrap();
+    }
+
+    /// Regression: the `run.publish` check also ran on the synthesized
+    /// `_proxy`. A `proxy.bind:` that the publish parser rejects (an
+    /// IPv6 address) broke config load for every command.
+    #[test]
+    fn proxy_bind_is_not_checked_as_a_publish_at_load() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: host-a, user: u }
+proxy: { bind: "::1", email: ops@example.com }
+services:
+  - name: api
+    image: i
+    tag: v1
+    domain: api.example.com
+    run: { port: 3000 }
+"#,
+        )
+        .unwrap();
+        let proxy = cfg
+            .services
+            .iter()
+            .find(|s| matches!(s.kind, Some(ServiceKind::Proxy)))
+            .expect("the proxy is synthesized");
+        assert!(proxy.run.publish.iter().any(|p| p.starts_with("::1:")));
     }
 
     /// Regression: `run.options.memory`, `run.options.cpus` and
