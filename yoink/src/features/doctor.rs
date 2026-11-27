@@ -1026,10 +1026,12 @@ fn services_reference_secrets(config: &Config) -> bool {
 
 // ---------- the bundle loads when a check needs it ----------
 
-/// One error when the services or the TLS certs need the secrets
-/// bundle and there is none. `loaded` is true when the bundle loaded.
-/// `load_error` is the error of the load. The fix differs for a config
-/// without a `secrets:` block and for a bundle that did not load.
+/// One error when the bundle is needed and there is none. `loaded` is
+/// true when the bundle loaded. `load_error` is the error of the load.
+/// With a `secrets:` block, `yoink up` loads the bundle first, so a
+/// failed load is an error whatever references the secrets. Without
+/// the block the load gives no bundle and no error, so it is an error
+/// only when the services or the TLS certs need the bundle.
 fn check_bundle_loaded(config: &Config, loaded: bool, load_error: Option<&str>) -> Vec<Finding> {
     if loaded {
         return Vec::new();
@@ -1041,23 +1043,25 @@ fn check_bundle_loaded(config: &Config, loaded: bool, load_error: Option<&str>) 
     if tls_needs_bundle(config) {
         needs.push("the TLS certs (`proxy.tls` or a `tls: cert` service)");
     }
-    if needs.is_empty() {
-        return Vec::new();
-    }
     let what = needs.join(" and ");
     let finding = if config.secrets.is_none() {
+        if needs.is_empty() {
+            return Vec::new();
+        }
         Finding::error(
             "secrets",
             format!("{what} need the secrets bundle, but yoink.yaml has no `secrets:` block"),
         )
         .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)")
     } else {
-        Finding::error(
-            "secrets",
-            format!("{what} need the secrets bundle, but the bundle did not load"),
-        )
-        .with_detail(load_error.unwrap_or("unknown error").to_string())
-        .with_fix("fix the load error in the detail, then run `yoink doctor` again")
+        let title = if needs.is_empty() {
+            "`yoink up` loads the secrets bundle first, but the bundle did not load".to_string()
+        } else {
+            format!("{what} need the secrets bundle, but the bundle did not load")
+        };
+        Finding::error("secrets", title)
+            .with_detail(load_error.unwrap_or("unknown error").to_string())
+            .with_fix("fix the load error in the detail, then run `yoink doctor` again")
     };
     vec![finding]
 }
@@ -1510,6 +1514,54 @@ services:
         );
 
         assert!(check_bundle_loaded(&block, true, None).is_empty());
+    }
+
+    /// Regression: with a `secrets:` block and secrets referenced only
+    /// by a pre-deploy hook, doctor dropped the load error. `yoink up`
+    /// loads the bundle first and failed where doctor passed.
+    #[test]
+    fn a_failed_load_is_an_error_when_no_service_needs_the_bundle() {
+        let config = Config::parse_str(
+            r#"
+hosts: [{ address: h1, user: deploy }]
+secrets:
+  provider: age
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
+hooks:
+  pre_deploy:
+    - name: migrate
+      cmd: [./migrate]
+      secrets: [DB_URL]
+services:
+  - name: api
+    image: img
+    tag: t
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        assert!(!services_reference_secrets(&config));
+        assert!(!tls_needs_bundle(&config));
+        let findings = check_bundle_loaded(&config, false, Some("decrypt failed"));
+        assert_eq!(findings.len(), 1, "{:?}", titles(&findings));
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(findings[0].title.contains("did not load"));
+        assert_eq!(findings[0].detail.as_deref(), Some("decrypt failed"));
+
+        // Without a `secrets:` block the load gives no bundle and no
+        // error, and `yoink up` does not fail on it.
+        let no_block = Config::parse_str(
+            r#"
+hosts: [{ address: h1, user: deploy }]
+services:
+  - name: api
+    image: img
+    tag: t
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        assert!(check_bundle_loaded(&no_block, false, None).is_empty());
     }
 
     fn titles(findings: &[Finding]) -> Vec<(Severity, &str)> {
