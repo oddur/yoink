@@ -1977,7 +1977,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // the next deploy reaps it as an orphan. See `deploy/lock.rs`.
     // Each lock starts its heartbeat as soon as it is acquired. The
     // first failure prints at once, while the other attempts finish
-    // and get released.
+    // and get released. Each later failure prints as it arrives.
     let report_first_failure = |host: &yoink::base::host::Host,
                                 e: &yoink::deploy::lock::LockError| {
         eprintln!(

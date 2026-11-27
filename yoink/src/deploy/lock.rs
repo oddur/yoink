@@ -240,7 +240,10 @@ impl HostLock {
 /// immediate retry does not find a lock still held. The error carries
 /// the host that failed first. `on_failure` gets that first failure at
 /// once when other attempts are still running, so the caller can show
-/// it while it waits.
+/// it while it waits. `on_failure` also gets every later failure,
+/// because the returned error names only the first one. A first
+/// failure that is also the last attempt goes only into the returned
+/// error, so the caller does not show it twice.
 pub async fn acquire_all(
     ops: &Arc<dyn DockerOps>,
     hosts: Vec<Host>,
@@ -276,7 +279,7 @@ pub async fn acquire_all(
                 releases.extend(locks.drain(..).map(release));
                 first_error = Some((host, e));
             }
-            Err(_) => {}
+            Err(e) => on_failure(&host, &e),
         }
     }
     match first_error {
@@ -460,12 +463,16 @@ mod tests {
 
         let dyn_ops: Arc<dyn DockerOps> = ops.clone();
 
-        let (failed, _) = acquire_all(&dyn_ops, vec![host(), other.clone()], |_, _| {})
-            .await
-            .err()
-            .expect("second host fails");
+        let mut reported = 0;
+        let (failed, _) = acquire_all(&dyn_ops, vec![host(), other.clone()], |_, _| {
+            reported += 1;
+        })
+        .await
+        .err()
+        .expect("second host fails");
 
         assert_eq!(failed, other);
+        assert_eq!(reported, 0, "the returned error is the only report");
         assert_eq!(
             removals(&ops),
             vec![RecordedCall::ForceRemoveContainer(host(), "abc123".into())]
@@ -623,6 +630,29 @@ mod tests {
                 RecordedCall::ForceRemoveContainer(slow_host(), "slow-id".into()),
             ]
         );
+    }
+
+    /// Regression: when two hosts failed to lock, only the first
+    /// failure was shown. Each failure now reaches `on_failure`, and
+    /// the returned error is still the first one.
+    #[tokio::test(start_paused = true)]
+    async fn acquire_all_reports_every_failure() {
+        let ops = Arc::new(FakeDockerOps::new());
+        ops.delay_pulls_on(&slow_host().address, Duration::from_secs(60));
+        ops.push_pull_image(Err(daemon_error(500)));
+        ops.push_pull_image(Err(daemon_error(500)));
+        let dyn_ops: Arc<dyn DockerOps> = ops.clone();
+
+        let mut reported = Vec::new();
+        let (failed, _) = acquire_all(&dyn_ops, vec![host(), slow_host()], |h, _| {
+            reported.push(h.clone());
+        })
+        .await
+        .err()
+        .expect("both hosts fail");
+
+        assert_eq!(failed, host());
+        assert_eq!(reported, vec![host(), slow_host()]);
     }
 
     /// The release-on-failure path stops the heartbeat of each lock it
