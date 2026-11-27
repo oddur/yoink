@@ -3722,6 +3722,7 @@ async fn cmd_pull(
     let svc_cfg = config
         .service(service)
         .with_context(|| format!("service {service:?} not in config"))?;
+    let hosts = config.require_fleet_matching(host_filter)?;
     let tag = tag_override
         .map(str::to_string)
         .or_else(|| svc_cfg.tag.clone())
@@ -3733,7 +3734,7 @@ async fn cmd_pull(
     let credentials = deploy::registry_credentials(config, bundle.as_ref(), &svc_cfg.image);
     let ops = build_real_ops(config, bundle.as_ref()).await?;
     // Fan out across hosts so a slow daemon doesn't block the others.
-    let pulls = config.fleet_matching(host_filter).into_iter().map(|host| {
+    let pulls = hosts.into_iter().map(|host| {
         let image = svc_cfg.image.clone();
         let tag = tag.clone();
         let credentials = credentials.clone();
@@ -4224,8 +4225,9 @@ async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<(
 }
 
 async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> {
+    let hosts = config.require_fleet_matching(host_filter)?;
     let ops = build_real_ops(config, None).await?;
-    let probes = config.fleet_matching(host_filter).into_iter().map(|host| {
+    let probes = hosts.into_iter().map(|host| {
         let ops = &ops;
         async move {
             let nets = ops.list_networks(&host).await?;
@@ -4254,8 +4256,9 @@ async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> 
 }
 
 async fn cmd_volumes(config: &Config, host_filter: Option<&str>) -> Result<()> {
+    let hosts = config.require_fleet_matching(host_filter)?;
     let ops = build_real_ops(config, None).await?;
-    let probes = config.fleet_matching(host_filter).into_iter().map(|host| {
+    let probes = hosts.into_iter().map(|host| {
         let ops = &ops;
         async move {
             let vols = ops.list_volumes(&host).await?;
@@ -4817,6 +4820,7 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
             }
         }
         LockAction::Release { host, yes } => {
+            let hosts = config.require_fleet_matching(host.as_deref())?;
             if !yes {
                 eprintln!(
                     "force-releasing the deploy lock while another operator is deploying \
@@ -4824,7 +4828,7 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
                 );
                 anyhow::bail!("aborted");
             }
-            for h in config.fleet_matching(host.as_deref()) {
+            for h in hosts {
                 match ops.force_remove_container(&h, LOCK_NAME).await {
                     Ok(()) => eprintln!("{}: released", h.address),
                     Err(e) => eprintln!("{}: {e:#}", h.address),

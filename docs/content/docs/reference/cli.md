@@ -37,7 +37,7 @@ yoink reads these environment variables:
 
 ## Subcommand reference
 
-`<SERVICE>` is a service name from the config. `--host <ADDRESS>` takes a host address from the config.
+`<SERVICE>` is a service name from the config. `--host <ADDRESS>` takes a host address from the config. `yoink pull`, `yoink networks`, `yoink volumes`, and `yoink lock release` stop with an error for an address that is not in the config. The error lists the known hosts.
 
 ### Setup
 

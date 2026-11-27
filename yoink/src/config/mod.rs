@@ -1669,6 +1669,23 @@ impl Config {
             .collect()
     }
 
+    /// [`Self::fleet_matching`] for a `--host` filter, but an `address`
+    /// that names no host is an error. The error lists the known hosts,
+    /// so a typo does not turn the command into a silent no-op.
+    pub fn require_fleet_matching(&self, address: Option<&str>) -> Result<Vec<Host>, ConfigError> {
+        let hosts = self.fleet_matching(address);
+        if let Some(address) = address
+            && hosts.is_empty()
+        {
+            let known: Vec<&str> = self.hosts.iter().map(|h| h.address.as_str()).collect();
+            return Err(ConfigError::Invalid(format!(
+                "unknown host {address:?}; known: {}",
+                known.join(", ")
+            )));
+        }
+        Ok(hosts)
+    }
+
     /// `(address, ssh_key_secret)` for every host that names a sealed
     /// ssh key, in config order.
     pub fn host_ssh_keys(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -3179,6 +3196,24 @@ secrets:
         let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("duplicate"), "got: {err}");
+    }
+
+    /// A mistyped `--host` gave an empty host list, so `yoink pull`,
+    /// `networks`, `volumes` and `lock release` did nothing and exited 0.
+    #[test]
+    fn require_fleet_matching_rejects_an_unknown_host() {
+        let cfg = Config::parse_str(
+            "hosts:\n  - { address: web-1, user: root }\n  - { address: web-2, user: root }\nservices: []\n",
+        )
+        .unwrap();
+        let err = cfg.require_fleet_matching(Some("web-3")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown host \"web-3\""), "got: {msg}");
+        assert!(msg.contains("known: web-1, web-2"), "got: {msg}");
+        let one = cfg.require_fleet_matching(Some("web-2")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].address, "web-2");
+        assert_eq!(cfg.require_fleet_matching(None).unwrap().len(), 2);
     }
 
     #[test]
