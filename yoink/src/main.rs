@@ -1748,6 +1748,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
     config.require_hosts()?;
     config.require_services()?;
     let dry_run = up.dry_run || up.plan;
+    warn_binds_without_mode(config);
 
     do_up_once(config, &up, dry_run).await?;
     if !up.watch {
@@ -2755,6 +2756,19 @@ fn env_flag_truthy(name: &str) -> bool {
         .ok()
         .map(|v| v.trim().to_ascii_lowercase())
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// One stderr line for each bind that sets options but no mode: yoink
+/// mounts it read-only, and the spec hash does not see that change.
+/// Stderr only, so `--dry-run` JSON and markdown on stdout stay clean.
+fn warn_binds_without_mode(config: &Config) {
+    for (service, bind) in config.binds_without_mode() {
+        eprintln!(
+            "\x1b[33mwarning:\x1b[0m {} — {}",
+            yoink::config::implicit_ro_bind_warning(service, bind),
+            yoink::config::IMPLICIT_RO_BIND_FIX,
+        );
+    }
 }
 
 /// Best-effort: warn (or hard-fail under `--require-latest-config`)

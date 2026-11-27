@@ -1691,6 +1691,23 @@ impl Config {
         self.services.iter().map(|s| s.name.as_str())
     }
 
+    /// The `run.binds` entries that set options but no mode, as
+    /// `(service, bind)`. yoink mounts them read-only, so each one gets
+    /// a warning (see [`implicit_ro_bind_warning`]).
+    #[must_use]
+    pub fn binds_without_mode(&self) -> Vec<(&str, &str)> {
+        self.services
+            .iter()
+            .flat_map(|svc| {
+                svc.run
+                    .binds
+                    .iter()
+                    .filter(|b| crate::base::run_args::bind_has_options_without_mode(b))
+                    .map(|b| (svc.name.as_str(), b.as_str()))
+            })
+            .collect()
+    }
+
     /// The services the proxy routes (those with `domain:`), in topo
     /// order.
     #[must_use]
@@ -2708,6 +2725,18 @@ impl ServiceConfig {
             None => all.iter().collect(),
         }
     }
+}
+
+/// The fix for a bind from [`Config::binds_without_mode`].
+pub const IMPLICIT_RO_BIND_FIX: &str =
+    "add `rw` to keep it writable, or `ro` to make the default explicit";
+
+/// The warning for a bind from [`Config::binds_without_mode`].
+#[must_use]
+pub fn implicit_ro_bind_warning(service: &str, bind: &str) -> String {
+    format!(
+        "service {service:?}: bind {bind:?} sets options but no mode, so yoink mounts it read-only"
+    )
 }
 
 /// The `include:` glob `pattern` as a pattern under `base`. An absolute

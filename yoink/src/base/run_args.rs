@@ -216,17 +216,36 @@ pub fn harden_tmpfs_options(opts: &str) -> String {
 pub fn default_bind_to_ro(bind: &str) -> String {
     // A bind has the shape "src:dst" or "src:dst:mode[,opt,opt]".
     // Docker accepts the comma-separated options in any order.
-    let mut parts = bind.splitn(3, ':');
-    let (Some(src), Some(dst)) = (parts.next(), parts.next()) else {
-        return format!("{bind}:ro");
-    };
-    match parts.next() {
-        None => format!("{bind}:ro"),
-        Some(opts) if opts.is_empty() || opts.split(',').any(|o| o == "ro" || o == "rw") => {
-            bind.to_string()
-        }
-        Some(opts) => format!("{src}:{dst}:ro,{opts}"),
+    if let Some((src_dst, opts)) = split_options_without_mode(bind) {
+        return format!("{src_dst}:ro,{opts}");
     }
+    if bind.matches(':').count() >= 2 {
+        bind.to_string()
+    } else {
+        format!("{bind}:ro")
+    }
+}
+
+/// True when the third field of `bind` sets options (e.g. an `SELinux`
+/// label `:Z`) but neither `ro` nor `rw`. yoink mounts such a bind
+/// read-only (see [`default_bind_to_ro`]), and an operator who meant
+/// it writable has to add `rw`.
+#[must_use]
+pub fn bind_has_options_without_mode(bind: &str) -> bool {
+    split_options_without_mode(bind).is_some()
+}
+
+/// `("src:dst", "opts")` for a bind whose non-empty third field has no
+/// `ro` or `rw` token.
+fn split_options_without_mode(bind: &str) -> Option<(&str, &str)> {
+    let mut parts = bind.splitn(3, ':');
+    let src = parts.next()?;
+    let dst = parts.next()?;
+    let opts = parts.next()?;
+    if opts.is_empty() || opts.split(',').any(|o| o == "ro" || o == "rw") {
+        return None;
+    }
+    Some((&bind[..src.len() + 1 + dst.len()], opts))
 }
 
 /// Parse docker-cli `--publish` strings into a port-bindings map keyed
@@ -378,6 +397,16 @@ mod tests {
         assert_eq!(default_bind_to_ro("/h:/c:z,rshared"), "/h:/c:ro,z,rshared");
         assert_eq!(default_bind_to_ro("/h:/c:Z,ro"), "/h:/c:Z,ro");
         assert_eq!(default_bind_to_ro("/h:/c:ro"), "/h:/c:ro");
+    }
+
+    #[test]
+    fn bind_has_options_without_mode_only_for_options_without_ro_or_rw() {
+        assert!(bind_has_options_without_mode("/h:/c:Z"));
+        assert!(bind_has_options_without_mode("/h:/c:z,rshared"));
+        assert!(!bind_has_options_without_mode("/h:/c"));
+        assert!(!bind_has_options_without_mode("/h:/c:"));
+        assert!(!bind_has_options_without_mode("/h:/c:ro"));
+        assert!(!bind_has_options_without_mode("/h:/c:rw,Z"));
     }
 
     #[test]

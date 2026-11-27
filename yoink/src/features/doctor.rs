@@ -154,6 +154,7 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
     findings.extend(check_registry_consistency(config));
     findings.extend(check_dockerfile_paths(config));
     findings.extend(check_proxied_services(config));
+    findings.extend(check_binds_without_mode(config));
     findings.extend(check_tls_cert_secrets(config, bundle_ref));
     findings.extend(check_secret_references(config, bundle_ref));
     findings.extend(check_hosts_from_versions(&host_versions));
@@ -435,6 +436,25 @@ fn check_registry_consistency(config: &Config) -> Vec<Finding> {
                  use it (e.g. `image: {}/your-app`)",
                 reg.server
             ))
+        })
+        .collect()
+}
+
+// ---------- config: bind modes ----------
+
+/// A bind with options but no `ro`/`rw` mounts read-only. Before, it
+/// mounted read-write, and the spec hash does not see the change, so
+/// the flip lands at a later redeploy. Warn so operators add `rw` first.
+fn check_binds_without_mode(config: &Config) -> Vec<Finding> {
+    config
+        .binds_without_mode()
+        .into_iter()
+        .map(|(service, bind)| {
+            Finding::warn(
+                "config",
+                crate::config::implicit_ro_bind_warning(service, bind),
+            )
+            .with_fix(crate::config::IMPLICIT_RO_BIND_FIX)
         })
         .collect()
 }
@@ -1271,6 +1291,40 @@ services:
             "{:?}",
             titles(&findings)
         );
+    }
+
+    /// Regression: `src:dst:Z` now mounts read-only. The spec hash does
+    /// not see that, so doctor warns for each such bind.
+    #[test]
+    fn bind_with_options_but_no_mode_is_a_warning() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+services:
+  - name: db
+    image: img
+    tag: t
+    run:
+      port: 5432
+      binds: ["/srv/db:/var/lib/db:Z", "/etc/db:/etc/db:ro,Z", "/srv/x:/x:rw"]
+"#,
+        )
+        .unwrap();
+        let findings = check_binds_without_mode(&config);
+        assert_eq!(findings.len(), 1, "{:?}", titles(&findings));
+        assert_eq!(findings[0].severity, Severity::Warn);
+        assert!(
+            findings[0].title.contains("\"db\""),
+            "{}",
+            findings[0].title
+        );
+        assert!(
+            findings[0].title.contains("/srv/db:/var/lib/db:Z"),
+            "{}",
+            findings[0].title
+        );
+        assert!(findings[0].fix.as_deref().unwrap().contains("add `rw`"));
     }
 
     fn titles(findings: &[Finding]) -> Vec<(Severity, &str)> {
