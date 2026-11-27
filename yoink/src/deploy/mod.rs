@@ -323,7 +323,10 @@ pub async fn reconcile(
     .await
 }
 
-#[allow(clippy::too_many_lines)] // single linear reconcile-with-options flow; same rationale as `reconcile`
+/// Reconcile `config` on its fleet. If a Caddy push of the run sent
+/// the earlier admin block to a proxy, the run emits one
+/// [`DeployEvent::ProxyAdminUpgradePending`] before it returns, also
+/// when the run fails.
 pub async fn reconcile_with_options(
     ops: &dyn DockerOps,
     config: &Config,
@@ -331,6 +334,76 @@ pub async fn reconcile_with_options(
     services_filter: Option<&[String]>,
     secrets: Option<&SecretsBundle>,
     options: ReconcileOptions,
+    on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
+) -> Result<Vec<ServiceDeployReport>, DeployError> {
+    let legacy = LegacyAdminHosts::default();
+    let result = reconcile_run(
+        ops,
+        config,
+        tag_overrides,
+        services_filter,
+        secrets,
+        options,
+        &legacy,
+        &mut *on_event,
+    )
+    .await;
+    // On success and on error: the old proxy stays in place either way.
+    emit_admin_notice(legacy, on_event);
+    result
+}
+
+/// Emit the admin upgrade warning for the hosts in `legacy`, if any.
+fn emit_admin_notice(
+    legacy: LegacyAdminHosts,
+    on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
+) {
+    if let Some(event) = legacy.into_notice() {
+        on_event(None, event);
+    }
+}
+
+/// The hosts whose proxy got the earlier admin block from a Caddy push
+/// in this run, see [`AdminListen::Legacy`]. Every push of the run
+/// records here: finalize, cleanup and the final push.
+#[derive(Debug, Default)]
+pub struct LegacyAdminHosts(std::sync::Mutex<Vec<String>>);
+
+impl LegacyAdminHosts {
+    /// The last push to `host` decides. A deploy of the proxy in the
+    /// same run can replace an old proxy with a new one.
+    fn record(&self, host: &str, listen: AdminListen) {
+        let mut hosts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hosts.retain(|h| h != host);
+        if listen == AdminListen::Legacy {
+            hosts.push(host.to_string());
+        }
+    }
+
+    /// The one warning for all recorded hosts. `None` when every proxy
+    /// has the admin API alias.
+    fn into_notice(self) -> Option<DeployEvent> {
+        let hosts = self
+            .0
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!hosts.is_empty()).then_some(DeployEvent::ProxyAdminUpgradePending { hosts })
+    }
+}
+
+#[allow(clippy::too_many_lines)] // single linear reconcile flow; same rationale as `reconcile`
+#[allow(clippy::too_many_arguments)] // the arguments of `reconcile_with_options`, plus `legacy`
+async fn reconcile_run(
+    ops: &dyn DockerOps,
+    config: &Config,
+    tag_overrides: &BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
+    secrets: Option<&SecretsBundle>,
+    options: ReconcileOptions,
+    legacy: &LegacyAdminHosts,
     on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
 ) -> Result<Vec<ServiceDeployReport>, DeployError> {
     // Ensure every declared network exists on every host, once. Top-
@@ -506,6 +579,7 @@ pub async fn reconcile_with_options(
                             &tag,
                             secrets_ref,
                             hosts,
+                            legacy,
                             &mut local_sink,
                         )
                         .await;
@@ -519,6 +593,7 @@ pub async fn reconcile_with_options(
                         overrides_ref,
                         secrets_ref,
                         options.force,
+                        legacy,
                         &mut local_sink,
                     )
                     .await
@@ -545,28 +620,12 @@ pub async fn reconcile_with_options(
             .iter()
             .find(|s| matches!(s.kind, Some(crate::config::ServiceKind::Proxy)))
     {
-        let mut legacy = Vec::new();
         for host in config.fleet_for(proxy_svc) {
-            if push_caddy_config(ops, &host, config, secrets, None).await? == AdminListen::Legacy {
-                legacy.push(host.address.clone());
-            }
-        }
-        if let Some(event) = admin_upgrade_notice(legacy) {
-            let on_event = sink
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            on_event(None, event);
+            push_caddy_config(ops, &host, config, secrets, None, legacy).await?;
         }
     }
 
     Ok(reports)
-}
-
-/// The one warning of a reconcile that left a proxy of an earlier
-/// yoink version in place, for the hosts in `legacy`. `None` when every
-/// proxy has the admin API alias.
-fn admin_upgrade_notice(legacy: Vec<String>) -> Option<DeployEvent> {
-    (!legacy.is_empty()).then_some(DeployEvent::ProxyAdminUpgradePending { hosts: legacy })
 }
 
 /// What one host runs for a service, measured against the desired
@@ -699,6 +758,7 @@ fn service_already_at_spec(
 /// A stop failure is an error here, unlike in the deploy path. The
 /// stop is the whole job of this route, and an extra that stays up
 /// would be picked up again by the final Caddy push in `reconcile`.
+#[allow(clippy::too_many_arguments)] // the per-service context of `deploy_service`, plus the hosts at spec
 async fn cleanup_extra_containers(
     ops: &dyn DockerOps,
     config: &Config,
@@ -706,6 +766,7 @@ async fn cleanup_extra_containers(
     tag: &str,
     secrets: Option<&SecretsBundle>,
     hosts: Vec<HostAtSpec>,
+    legacy: &LegacyAdminHosts,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<ServiceDeployReport, DeployError> {
     let push_caddy = triggers_caddy_load(config, service);
@@ -745,6 +806,7 @@ async fn cleanup_extra_containers(
                     config,
                     secrets,
                     Some((service.name.as_str(), &keep)),
+                    legacy,
                 )
                 .await?;
             }
@@ -799,6 +861,7 @@ pub async fn deploy_service(
     tag_overrides: &BTreeMap<String, String>,
     secrets: Option<&SecretsBundle>,
     force: bool,
+    legacy: &LegacyAdminHosts,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<ServiceDeployReport, DeployError> {
     let hosts = config.fleet_for(service);
@@ -863,7 +926,7 @@ pub async fn deploy_service(
     let mut host_results = Vec::with_capacity(prepared.len());
     let mut pending = prepared.into_iter();
     while let Some(prep) = pending.next() {
-        match finalize_one_host(ops, config, service, prep, secrets, on_event).await {
+        match finalize_one_host(ops, config, service, prep, secrets, legacy, on_event).await {
             Ok(result) => host_results.push(result),
             Err(e) => {
                 // `finalize_one_host` unwinds its own host. The hosts
@@ -1102,6 +1165,7 @@ async fn finalize_one_host(
     service: &ServiceConfig,
     prep: HostPrep,
     secrets: Option<&SecretsBundle>,
+    legacy: &LegacyAdminHosts,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<HostDeployResult, DeployError> {
     let HostPrep {
@@ -1136,6 +1200,7 @@ async fn finalize_one_host(
                 config,
                 secrets,
                 Some((service.name.as_str(), &expected_names)),
+                legacy,
             )
             .await?;
         }
@@ -1216,6 +1281,7 @@ async fn finalize_one_host(
             config,
             secrets,
             Some((service.name.as_str(), &expected_names)),
+            legacy,
         )
         .await
     {
@@ -1299,8 +1365,8 @@ async fn build_upstream_names(
 
 /// Render the Caddy config for `host`'s view of `config` and POST it
 /// to the proxy's admin API. Errors abort the deploy — old config
-/// stays active because Caddy's `/load` is atomic. Returns the admin
-/// block that the running proxy got, see [`AdminListen`].
+/// stays active because Caddy's `/load` is atomic. A proxy that got
+/// the earlier admin block goes into `legacy`, see [`AdminListen`].
 ///
 /// `in_flight_upstreams` carries `(service_name, expected_names)` for
 /// the service the caller is currently reconciling. For that service,
@@ -1327,7 +1393,8 @@ async fn push_caddy_config(
     config: &Config,
     secrets: Option<&SecretsBundle>,
     in_flight_upstreams: Option<(&str, &std::collections::BTreeSet<String>)>,
-) -> Result<AdminListen, DeployError> {
+    legacy: &LegacyAdminHosts,
+) -> Result<(), DeployError> {
     // Expand any `caddy_extra_caddyfile:` snippets to JSON. Mutates a
     // local clone so the caller's view of config stays unchanged.
     let mut config = config.clone();
@@ -1351,7 +1418,7 @@ async fn push_caddy_config(
         host: host.address.clone(),
         detail: format!("render Caddy config: {source}"),
     })?;
-    crate::proxy::admin::push_config(host, ops, &json)
+    let listen = crate::proxy::admin::push_config(host, ops, &json)
         .await
         .map_err(|source| {
             // When Caddy bounces /load, point the operator at the
@@ -1378,7 +1445,9 @@ async fn push_caddy_config(
                 host: host.address.clone(),
                 detail: format!("push Caddy config: {source}{hint}"),
             }
-        })
+        })?;
+    legacy.record(&host.address, listen);
+    Ok(())
 }
 
 /// Build a `RunSpec` for the given service+tag. Used both to compute the
@@ -2387,16 +2456,48 @@ services:
         );
     }
 
-    /// The final push of a run collects the hosts whose proxy got the
-    /// earlier admin block, and the run warns once for all of them.
+    /// Every Caddy push of a run records a proxy that got the earlier
+    /// admin block, and the run warns once for all of them.
     #[test]
-    fn admin_upgrade_notice_is_one_event_for_all_legacy_hosts() {
-        assert_eq!(admin_upgrade_notice(Vec::new()), None);
+    fn legacy_admin_hosts_give_one_event_for_all_hosts() {
+        assert_eq!(LegacyAdminHosts::default().into_notice(), None);
+        let legacy = LegacyAdminHosts::default();
+        legacy.record("h1", AdminListen::Legacy);
+        legacy.record("h2", AdminListen::Legacy);
+        legacy.record("h3", AdminListen::Alias);
+        legacy.record("h2", AdminListen::Legacy);
+        // The proxy on h4 was replaced later in the run.
+        legacy.record("h4", AdminListen::Legacy);
+        legacy.record("h4", AdminListen::Alias);
         assert_eq!(
-            admin_upgrade_notice(vec!["h1".into(), "h2".into()]),
+            legacy.into_notice(),
             Some(DeployEvent::ProxyAdminUpgradePending {
                 hosts: vec!["h1".into(), "h2".into()],
             })
+        );
+    }
+
+    /// The warning came only from the final push loop. A scoped run
+    /// that pushed to an old proxy and then failed (a later service,
+    /// a later host, the final push) did not warn. Now every push
+    /// records the host, and `reconcile_with_options` emits the
+    /// warning after `reconcile_run` returns, also on error.
+    #[test]
+    fn recorded_legacy_proxy_is_emitted_as_a_top_level_event() {
+        let legacy = LegacyAdminHosts::default();
+        legacy.record("h1", AdminListen::Legacy);
+        let mut events: TaggedEvents = Vec::new();
+        let mut sink =
+            |svc: Option<&str>, e: DeployEvent| events.push((svc.map(str::to_string), e));
+        emit_admin_notice(legacy, &mut sink);
+        assert_eq!(
+            events,
+            vec![(
+                None,
+                DeployEvent::ProxyAdminUpgradePending {
+                    hosts: vec!["h1".into()],
+                }
+            )]
         );
     }
 
@@ -2722,6 +2823,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -2764,6 +2866,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -2834,6 +2937,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -2921,6 +3025,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3133,6 +3238,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3165,6 +3271,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3218,6 +3325,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3341,6 +3449,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3888,6 +3997,7 @@ services:
             overrides,
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4173,6 +4283,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4251,6 +4362,7 @@ services:
             &BTreeMap::new(),
             None,
             true,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4309,6 +4421,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4377,6 +4490,7 @@ services:
             &BTreeMap::new(),
             Some(&bundle),
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4444,6 +4558,7 @@ services:
             &BTreeMap::new(),
             Some(&bundle),
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4646,7 +4761,16 @@ services:
             stop_first: false,
         };
         let mut sink = |_e: DeployEvent| {};
-        let result = finalize_one_host(&ops, &cfg, service, prep, None, &mut sink).await;
+        let result = finalize_one_host(
+            &ops,
+            &cfg,
+            service,
+            prep,
+            None,
+            &LegacyAdminHosts::default(),
+            &mut sink,
+        )
+        .await;
 
         assert!(result.is_err(), "the failed Caddy push must abort");
         let calls = ops.calls();
@@ -4686,9 +4810,17 @@ services:
         };
         let mut events: Vec<DeployEvent> = Vec::new();
         let mut sink = |e: DeployEvent| events.push(e);
-        let result = finalize_one_host(&ops, &cfg, service, prep, None, &mut sink)
-            .await
-            .unwrap();
+        let result = finalize_one_host(
+            &ops,
+            &cfg,
+            service,
+            prep,
+            None,
+            &LegacyAdminHosts::default(),
+            &mut sink,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.stopped_old, vec!["app-a-OLDHASH".to_string()]);
         assert!(
