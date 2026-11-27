@@ -1989,11 +1989,7 @@ impl Config {
         // identical configs on different boxes).
         let mut matched: Vec<std::path::PathBuf> = Vec::new();
         for pattern in &self.include {
-            let abs_pat = if Path::new(pattern).is_absolute() {
-                pattern.clone()
-            } else {
-                base.join(pattern).display().to_string()
-            };
+            let abs_pat = glob_under(&base, pattern);
             let entries = glob::glob(&abs_pat).map_err(|source| ConfigError::GlobPattern {
                 pattern: pattern.clone(),
                 source,
@@ -2714,6 +2710,18 @@ impl ServiceConfig {
     }
 }
 
+/// The `include:` glob `pattern` as a pattern under `base`. An absolute
+/// pattern stays as written. For a relative one, the glob characters in
+/// `base` are escaped, so a config directory such as `proj[1]` matches
+/// itself literally. The user's pattern is not escaped.
+fn glob_under(base: &Path, pattern: &str) -> String {
+    if Path::new(pattern).is_absolute() {
+        return pattern.to_string();
+    }
+    let escaped_base = std::path::PathBuf::from(glob::Pattern::escape(&base.to_string_lossy()));
+    escaped_base.join(pattern).to_string_lossy().into_owned()
+}
+
 fn dest_matched_by_existing_globs(base: &Path, dest: &Path, globs: &[String]) -> bool {
     let abs_dest = if dest.is_absolute() {
         dest.to_path_buf()
@@ -2721,11 +2729,7 @@ fn dest_matched_by_existing_globs(base: &Path, dest: &Path, globs: &[String]) ->
         base.join(dest)
     };
     globs.iter().any(|pattern| {
-        let pat_path = if Path::new(pattern).is_absolute() {
-            pattern.clone()
-        } else {
-            base.join(pattern).to_string_lossy().into_owned()
-        };
+        let pat_path = glob_under(base, pattern);
         match glob::Pattern::new(&pat_path) {
             Ok(p) => p.matches_path(&abs_dest),
             Err(_) => false,
@@ -2942,6 +2946,40 @@ hooks:
         assert_eq!(cfg.deploy.networks, vec!["kamal".to_string()]);
         assert_eq!(cfg.hooks.pre_deploy.len(), 1);
         assert_eq!(cfg.hooks.pre_deploy[0].name, "migrate");
+    }
+
+    /// Regression: glob characters in the config directory were not
+    /// escaped, so a project in `proj[1]` silently skipped its include
+    /// fragments, and `include_covers` missed them too.
+    #[test]
+    fn include_glob_works_in_a_directory_with_glob_characters() {
+        let dir = write_temp_tree(&[
+            (
+                "proj[1]/yoink.yaml",
+                r#"
+hosts:
+  - { address: h1, user: root }
+include:
+  - services/*.yaml
+"#,
+            ),
+            (
+                "proj[1]/services/api.yaml",
+                r#"
+services:
+  - name: api
+    image: img/api
+    tag: v1
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+            ),
+        ]);
+        let project = dir.join("proj[1]");
+        let cfg = Config::load_from_path(&project.join("yoink.yaml")).unwrap();
+        let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["api"]);
+        assert!(cfg.include_covers(&project.join("services/web.yaml")));
+        assert!(cfg.include_covers(Path::new("services/web.yaml")));
     }
 
     #[test]
