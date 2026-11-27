@@ -1702,23 +1702,6 @@ impl Config {
         self.services.iter().map(|s| s.name.as_str())
     }
 
-    /// The `run.binds` entries that set options but no mode, as
-    /// `(service, bind)`. yoink mounts them read-only, so each one gets
-    /// a warning (see [`implicit_ro_bind_warning`]).
-    #[must_use]
-    pub fn binds_without_mode(&self) -> Vec<(&str, &str)> {
-        self.services
-            .iter()
-            .flat_map(|svc| {
-                svc.run
-                    .binds
-                    .iter()
-                    .filter(|b| run_args::bind_has_options_without_mode(b))
-                    .map(|b| (svc.name.as_str(), b.as_str()))
-            })
-            .collect()
-    }
-
     /// The services the proxy routes (those with `domain:`), in topo
     /// order.
     #[must_use]
@@ -2410,6 +2393,18 @@ impl Config {
                     )));
                 }
             }
+            // A bind whose third field holds no `ro`/`rw` is ambiguous:
+            // Docker mounts it read-write, and yoink mounts every other
+            // bind read-only. Make the operator choose.
+            for bind in &service.run.binds {
+                if let Some(opts) = run_args::bind_mode_missing(bind) {
+                    return Err(ConfigError::Invalid(bind_without_mode_error(
+                        &service.name,
+                        bind,
+                        opts,
+                    )));
+                }
+            }
             // A `files:` mount is always read-only. `:rw` used to load
             // and then mount read-only without a word; reject it here
             // so `yoink validate` catches it before a deploy does.
@@ -2740,16 +2735,20 @@ impl ServiceConfig {
     }
 }
 
-/// The fix for a bind from [`Config::binds_without_mode`].
-pub const IMPLICIT_RO_BIND_FIX: &str =
-    "add `rw` to keep it writable, or `ro` to make the default explicit";
-
-/// The warning for a bind from [`Config::binds_without_mode`].
-#[must_use]
-pub fn implicit_ro_bind_warning(service: &str, bind: &str) -> String {
-    format!(
-        "service {service:?}: bind {bind:?} sets options but no mode, so yoink mounts it read-only"
-    )
+/// The load error for a `run.binds` entry whose third field `opts`
+/// holds neither `ro` nor `rw`.
+fn bind_without_mode_error(service: &str, bind: &str, opts: &str) -> String {
+    if opts.is_empty() {
+        format!(
+            "service {service:?}.run.binds: bind {bind:?} ends in an empty mode field, and \
+             Docker mounts it read-write; add `ro` or `rw` after the last `:`"
+        )
+    } else {
+        format!(
+            "service {service:?}.run.binds: bind {bind:?} sets options but no mode; \
+             add `ro` or `rw` (e.g. `ro,{opts}` or `rw,{opts}`)"
+        )
+    }
 }
 
 /// The `include:` glob `pattern` as a pattern under `base`. An absolute
@@ -3587,6 +3586,70 @@ services:
 "#;
         let err = Config::parse_str(s).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(m) if m.contains("port required")));
+    }
+
+    fn config_with_bind(bind: &str) -> String {
+        format!(
+            r#"
+hosts:
+  - {{ address: h, user: u }}
+services:
+  - name: db
+    image: i
+    tag: v1
+    run:
+      binds:
+        - "{bind}"
+"#
+        )
+    }
+
+    /// Regression: a bind with options but no mode (`:Z`) loaded and
+    /// was mounted read-only, while Docker reads it as read-write. It
+    /// is now a load error that names the service and the bind.
+    #[test]
+    fn rejects_a_bind_with_options_but_no_mode() {
+        for (bind, opts) in [
+            ("/srv/pg:/data:Z", "Z"),
+            ("/srv/pg:/data:z", "z"),
+            ("/srv/pg:/data:rshared", "rshared"),
+            ("/srv/pg:/data:nocopy", "nocopy"),
+            ("/srv/pg:/data:Z,rshared", "Z,rshared"),
+        ] {
+            let err = Config::parse_str(&config_with_bind(bind)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "invalid config: service \"db\".run.binds: bind \"{bind}\" sets options but \
+                     no mode; add `ro` or `rw` (e.g. `ro,{opts}` or `rw,{opts}`)"
+                )
+            );
+        }
+    }
+
+    /// An empty third field (`${VAR:-}` expanded to nothing) is read
+    /// as read-write by Docker. It is a load error too.
+    #[test]
+    fn rejects_a_bind_with_an_empty_mode_field() {
+        let err = parse_via_temp(&config_with_bind("/etc/app:/etc/app:")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid config: service \"db\".run.binds: bind \"/etc/app:/etc/app:\" ends in an \
+             empty mode field, and Docker mounts it read-write; add `ro` or `rw` after the last `:`"
+        );
+    }
+
+    #[test]
+    fn accepts_binds_with_a_mode_or_no_third_field() {
+        for bind in [
+            "/srv/pg:/data",
+            "/srv/pg:/data:ro",
+            "/srv/pg:/data:rw",
+            "/srv/pg:/data:ro,Z",
+            "/srv/pg:/data:Z,rw",
+        ] {
+            Config::parse_str(&config_with_bind(bind)).unwrap();
+        }
     }
 
     fn config_with_files_entry(entry: &str) -> String {

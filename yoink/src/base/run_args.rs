@@ -206,46 +206,45 @@ pub fn harden_tmpfs_options(opts: &str) -> String {
 
 /// Append `:ro` to a bind-mount string unless it already specifies a
 /// mode (`ro` or `rw` as a token of the third colon-delimited field,
-/// e.g. `:rw,Z`). Other options alone (an `SELinux` label like `:Z`,
-/// propagation, `nocopy`) do not choose a mode, so `ro` is added in
-/// front of them: `src:dst:Z` becomes `src:dst:ro,Z`. Operator opts in
-/// to writable bind mounts with explicit `:rw`. Removes the "I
-/// bind-mounted a config dir and the app started scribbling on /etc on
-/// the host" footgun.
+/// e.g. `:rw,Z`). Operator opts in to writable bind mounts with
+/// explicit `:rw`. Removes the "I bind-mounted a config dir and the
+/// app started scribbling on /etc on the host" footgun.
+///
+/// Config load rejects a `run.binds` entry whose third field has no
+/// mode (see [`bind_mode_missing`]). A `files:` entry can still reach
+/// here with options and no mode (`local:/etc/app.conf:Z`), because a
+/// `files:` mount is always read-only. For that case `ro` is added in
+/// front of the options: `src:dst:Z` becomes `src:dst:ro,Z`.
 #[must_use]
 pub fn default_bind_to_ro(bind: &str) -> String {
     // A bind has the shape "src:dst" or "src:dst:mode[,opt,opt]".
     // Docker accepts the comma-separated options in any order.
-    if let Some((src_dst, opts)) = split_options_without_mode(bind) {
-        return format!("{src_dst}:ro,{opts}");
-    }
-    if bind.matches(':').count() >= 2 {
-        bind.to_string()
-    } else {
-        format!("{bind}:ro")
+    match bind_mode_missing(bind) {
+        Some(opts) if !opts.is_empty() => {
+            let src_dst = &bind[..bind.len() - opts.len() - 1];
+            format!("{src_dst}:ro,{opts}")
+        }
+        Some(_) => bind.to_string(),
+        None if bind.matches(':').count() >= 2 => bind.to_string(),
+        None => format!("{bind}:ro"),
     }
 }
 
-/// True when the third field of `bind` sets options (e.g. an `SELinux`
-/// label `:Z`) but neither `ro` nor `rw`. yoink mounts such a bind
-/// read-only (see [`default_bind_to_ro`]), and an operator who meant
-/// it writable has to add `rw`.
+/// The third field of `bind` when it is present but holds neither
+/// `ro` nor `rw`: options only (an `SELinux` label like `Z`,
+/// propagation, `nocopy`), or nothing at all (`src:dst:`). Docker
+/// mounts such a bind read-write, so config load rejects it.
+/// `None` for `src:dst` and for a third field with a mode.
 #[must_use]
-pub fn bind_has_options_without_mode(bind: &str) -> bool {
-    split_options_without_mode(bind).is_some()
-}
-
-/// `("src:dst", "opts")` for a bind whose non-empty third field has no
-/// `ro` or `rw` token.
-fn split_options_without_mode(bind: &str) -> Option<(&str, &str)> {
+pub fn bind_mode_missing(bind: &str) -> Option<&str> {
     let mut parts = bind.splitn(3, ':');
-    let src = parts.next()?;
-    let dst = parts.next()?;
+    parts.next()?;
+    parts.next()?;
     let opts = parts.next()?;
-    if opts.is_empty() || opts.split(',').any(|o| o == "ro" || o == "rw") {
+    if opts.split(',').any(|o| o == "ro" || o == "rw") {
         return None;
     }
-    Some((&bind[..src.len() + 1 + dst.len()], opts))
+    Some(opts)
 }
 
 /// Parse docker-cli `--publish` strings into a port-bindings map keyed
@@ -400,13 +399,13 @@ mod tests {
     }
 
     #[test]
-    fn bind_has_options_without_mode_only_for_options_without_ro_or_rw() {
-        assert!(bind_has_options_without_mode("/h:/c:Z"));
-        assert!(bind_has_options_without_mode("/h:/c:z,rshared"));
-        assert!(!bind_has_options_without_mode("/h:/c"));
-        assert!(!bind_has_options_without_mode("/h:/c:"));
-        assert!(!bind_has_options_without_mode("/h:/c:ro"));
-        assert!(!bind_has_options_without_mode("/h:/c:rw,Z"));
+    fn bind_mode_missing_for_options_or_an_empty_field_without_ro_or_rw() {
+        assert_eq!(bind_mode_missing("/h:/c:Z"), Some("Z"));
+        assert_eq!(bind_mode_missing("/h:/c:z,rshared"), Some("z,rshared"));
+        assert_eq!(bind_mode_missing("/h:/c:"), Some(""));
+        assert_eq!(bind_mode_missing("/h:/c"), None);
+        assert_eq!(bind_mode_missing("/h:/c:ro"), None);
+        assert_eq!(bind_mode_missing("/h:/c:rw,Z"), None);
     }
 
     #[test]
