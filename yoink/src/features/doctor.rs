@@ -686,12 +686,12 @@ async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
 // ---------- sealed.age existence ----------
 
 fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
-    let Some(SecretsConfig::Age { recipients, .. }) = &config.secrets else {
+    if !matches!(config.secrets, Some(SecretsConfig::Age { .. })) {
         return vec![Finding::pass(
             "secrets",
             "sealed file check skipped (not using `provider: age`)",
         )];
-    };
+    }
     // Every secrets load resolves this path first, so an escaping
     // `secrets.file:` breaks `yoink up` whatever the services reference.
     let path = match config.sealed_path() {
@@ -702,22 +702,10 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
             )];
         }
     };
-    if recipients.is_empty() {
-        return vec![Finding::pass(
-            "secrets",
-            "sealed file check skipped (no `secrets.recipients:`)",
-        )];
-    }
-    let any_refs = config
-        .services
-        .iter()
-        .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty());
-    if !any_refs {
-        return vec![Finding::pass(
-            "secrets",
-            "sealed file check skipped (no services reference secrets)",
-        )];
-    }
+    // `load_bundle` reads the file for every `provider: age` config,
+    // before it looks at the recipients or at what the services
+    // reference. A missing file fails `yoink up`, also in a new
+    // project that has no secrets yet.
     if path.exists() {
         return vec![Finding::pass(
             "secrets",
@@ -728,11 +716,14 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
         Finding::error(
             "secrets",
             format!(
-                "{} doesn't exist but services reference secrets",
+                "{} does not exist, and `yoink up` reads it for every `provider: age` config",
                 path.display()
             ),
         )
-        .with_fix("run `yoink secrets edit` to create the bundle, then commit the file"),
+        .with_fix(
+            "run `yoink secrets edit` to create the bundle, then commit the file \
+             (or remove the `secrets:` block if the project has no secrets)",
+        ),
     ]
 }
 
@@ -1116,6 +1107,50 @@ services:
             "{:?}",
             titles(&findings)
         );
+    }
+
+    /// Regression: with `provider: age`, a missing sealed file and no
+    /// service that references secrets, doctor said "skipped".
+    /// `load_bundle` reads the file for every age config, so `yoink up`
+    /// failed. Doctor now reports the missing file as an error.
+    #[tokio::test]
+    async fn missing_sealed_file_is_an_error_for_every_age_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("yoink.yaml");
+        std::fs::write(
+            &path,
+            r#"
+hosts: [{ address: h1, user: deploy }]
+secrets:
+  provider: age
+  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]
+services:
+  - name: api
+    image: img
+    tag: t
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let config = Config::load_from_path(&path).unwrap();
+        let findings = check_sealed_file_exists(&config);
+        assert_eq!(findings.len(), 1, "{:?}", titles(&findings));
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(
+            findings[0].title.contains("does not exist"),
+            "{:?}",
+            titles(&findings)
+        );
+        // The same config fails the load that `yoink up` runs first.
+        // The read fails before any identity is loaded.
+        assert!(matches!(
+            crate::secrets::load_bundle(&config).await,
+            Err(crate::secrets::SecretsError::SealedRead { .. })
+        ));
+
+        std::fs::write(config.sealed_path().unwrap(), b"").unwrap();
+        let findings = check_sealed_file_exists(&config);
+        assert_eq!(findings[0].severity, Severity::Pass);
     }
 
     /// Regression: the hint named `proxy.tls.cert` / `proxy.tls.key`.
