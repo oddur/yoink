@@ -713,9 +713,8 @@ fn default_hsts() -> bool {
 /// Discriminator for special-purpose services. Most services are
 /// regular app workloads (`None`); the only variant today is `Proxy`
 /// for the implicit `_proxy` service yoink synthesizes when any
-/// service declares `domain:`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// service declares `domain:`. Only yoink sets it; it is not a YAML key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceKind {
     Proxy,
 }
@@ -799,8 +798,10 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub description: Option<String>,
     /// Special-purpose service marker. Set automatically on the
-    /// implicit `_proxy` service; users do not write this.
-    #[serde(default)]
+    /// implicit `_proxy` service. It is not a YAML key: a user service
+    /// with `kind: proxy` would skip the `yoink-admin` network check
+    /// and get the admin API alias. `deny_unknown_fields` refuses it.
+    #[serde(skip_deserializing)]
     pub kind: Option<ServiceKind>,
     /// Local-build instructions. When set, `yoink build [<service>]`
     /// runs `docker build` against this context, tagging the result

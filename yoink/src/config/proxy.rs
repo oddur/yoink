@@ -816,6 +816,22 @@ services:
         }
     }
 
+    /// `kind: proxy` in the YAML made a user service look like the
+    /// proxy. It then skipped `reject_admin_network` and got the admin
+    /// alias. Only yoink sets `kind`, so the YAML key is refused.
+    #[test]
+    fn kind_is_not_a_yaml_key() {
+        let yaml = "hosts: [{ address: h, user: u }]\nproxy: { email: o@example.com }\n\
+                    services:\n  - name: api\n    image: a\n    tag: v1\n    \
+                    domain: api.example.com\n    run: { port: 8080 }\n  - name: worker\n    \
+                    image: w\n    tag: v1\n    kind: proxy\n    networks: [yoink-admin]\n    \
+                    run: {}\n";
+        let msg = Config::parse_str(yaml)
+            .expect_err("kind: proxy")
+            .to_string();
+        assert!(msg.contains("unknown field `kind`"), "got: {msg}");
+    }
+
     #[test]
     fn domain_synthesizes_proxy_and_networks() {
         let mut cfg = config_with_one_service(

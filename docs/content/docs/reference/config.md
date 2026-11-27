@@ -239,7 +239,6 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `env` | map of string | `{}` | Plain env vars. **Do not put secrets here.** |
 | `labels` | map of string | `{}` | Extra docker labels. |
 | `description` | string | unset | yoink writes it to the container as `org.opencontainers.image.description`. The TUI shows it. |
-| `kind` | enum | unset | Internal marker for services that yoink synthesizes (the proxy). You do not set this field. |
 | `pre_deploy` | list of [Hook](#hook) | `[]` | One-shot hooks that run before yoink starts the new containers of this service. See [Hooks](#hooks). |
 | `domain` | string \| list of string | unset | One or more hostnames that the bundled proxy routes to this service. The field enables the proxy. Requires `run.port`. See the [proxy guide](/docs/explanation/proxy). |
 | `path_prefix` | string | unset | Matches this path glob in addition to `domain:`, so that many services can share a hostname. yoink puts routes with a path constraint before the catch-all routes. |
