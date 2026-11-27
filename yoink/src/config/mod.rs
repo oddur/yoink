@@ -33,6 +33,10 @@ pub enum ConfigError {
     Parse(#[from] yaml_serde::Error),
     #[error("invalid config: {0}")]
     Invalid(String),
+    /// A `--host` value names no declared host. Not a config error:
+    /// the config is fine, the flag is wrong.
+    #[error("unknown --host {address:?}; {}", known_hosts_hint(.known))]
+    UnknownHost { address: String, known: Vec<String> },
     #[error("invalid include glob {pattern:?}: {source}")]
     GlobPattern {
         pattern: String,
@@ -51,6 +55,14 @@ pub enum ConfigError {
         "malformed env var reference near {context:?} — expected `${{NAME}}` with NAME = [A-Za-z_][A-Za-z0-9_]*"
     )]
     EnvVarSyntax { context: String },
+}
+
+fn known_hosts_hint(known: &[String]) -> String {
+    if known.is_empty() {
+        "no hosts declared".to_string()
+    } else {
+        format!("known: {}", known.join(", "))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1672,6 +1684,22 @@ impl Config {
             .collect()
     }
 
+    /// [`Self::fleet_matching`] for a `--host` filter, but an `address`
+    /// that names no host is an error. The error lists the known hosts,
+    /// so a typo does not turn the command into a silent no-op.
+    pub fn require_fleet_matching(&self, address: Option<&str>) -> Result<Vec<Host>, ConfigError> {
+        let hosts = self.fleet_matching(address);
+        if let Some(address) = address
+            && hosts.is_empty()
+        {
+            return Err(ConfigError::UnknownHost {
+                address: address.to_string(),
+                known: self.hosts.iter().map(|h| h.address.clone()).collect(),
+            });
+        }
+        Ok(hosts)
+    }
+
     /// `(address, ssh_key_secret)` for every host that names a sealed
     /// ssh key, in config order.
     pub fn host_ssh_keys(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -3182,6 +3210,36 @@ secrets:
         let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("duplicate"), "got: {err}");
+    }
+
+    /// A mistyped `--host` gave an empty host list, so `yoink pull`,
+    /// `networks`, `volumes` and `lock release` did nothing and exited 0.
+    #[test]
+    fn require_fleet_matching_rejects_an_unknown_host() {
+        let cfg = Config::parse_str(
+            "hosts:\n  - { address: web-1, user: root }\n  - { address: web-2, user: root }\nservices: []\n",
+        )
+        .unwrap();
+        let err = cfg.require_fleet_matching(Some("web-3")).unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(msg, "unknown --host \"web-3\"; known: web-1, web-2");
+        let one = cfg.require_fleet_matching(Some("web-2")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].address, "web-2");
+        assert_eq!(cfg.require_fleet_matching(None).unwrap().len(), 2);
+    }
+
+    /// The error said "invalid config: …" for a wrong flag, and gave an
+    /// empty "known:" list when the config declares no hosts.
+    #[test]
+    fn require_fleet_matching_names_the_flag_and_handles_no_hosts() {
+        let cfg = Config::parse_str("hosts: []\nservices: []\n").unwrap();
+        let err = cfg.require_fleet_matching(Some("web-1")).unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownHost { .. }), "got: {err}");
+        assert_eq!(
+            err.to_string(),
+            "unknown --host \"web-1\"; no hosts declared"
+        );
     }
 
     #[test]
