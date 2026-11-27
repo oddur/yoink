@@ -4095,7 +4095,14 @@ async fn reconcile_one(
     // Acquire one lock per configured host. Per-host parallel like
     // cmd_up; on any failure release whatever we already grabbed and
     // bail.
-    let mut locks = match crate::deploy::lock::acquire_all(&*ops, config.fleet()).await {
+    let mut locks = match crate::deploy::lock::acquire_all(&*ops, config.fleet(), |host, e| {
+        send_event(format!(
+            "could not acquire the deploy lock on {}: {e}. Releasing the locks on the other hosts.",
+            host.address
+        ));
+    })
+    .await
+    {
         Ok(ls) => ls,
         Err((_, e)) => {
             send_done(Err(format!("acquire deploy lock: {e}")));
@@ -4156,7 +4163,14 @@ async fn reconcile_all(
         return;
     }
 
-    let mut locks = match crate::deploy::lock::acquire_all(&*ops, config.fleet()).await {
+    let mut locks = match crate::deploy::lock::acquire_all(&*ops, config.fleet(), |host, e| {
+        send_event(format!(
+            "could not acquire the deploy lock on {}: {e}. Releasing the locks on the other hosts.",
+            host.address
+        ));
+    })
+    .await
+    {
         Ok(ls) => ls,
         Err((_, e)) => {
             send_done(Err(format!("acquire deploy lock: {e}")));
