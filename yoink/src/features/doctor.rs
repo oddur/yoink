@@ -141,7 +141,10 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
         bundle_fut,
         dns_fut,
     );
-    let bundle = bundle_result.ok().flatten();
+    let (bundle, bundle_error) = match bundle_result {
+        Ok(bundle) => (bundle, None),
+        Err(e) => (None, Some(e.to_string())),
+    };
     let bundle_ref = bundle.as_ref();
 
     // Every other check is sync (config walk + cached lookups).
@@ -154,6 +157,11 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
     findings.extend(check_registry_consistency(config));
     findings.extend(check_dockerfile_paths(config));
     findings.extend(check_proxied_services(config));
+    findings.extend(check_bundle_loaded(
+        config,
+        bundle.is_some(),
+        bundle_error.as_deref(),
+    ));
     findings.extend(check_tls_cert_secrets(config, bundle_ref));
     findings.extend(check_secret_references(config, bundle_ref));
     findings.extend(check_hosts_from_versions(&host_versions));
@@ -900,27 +908,17 @@ fn check_tls_cert_secrets(
 ) -> Vec<Finding> {
     let proxy_default_cert = config.proxy_tls().map(|t| t.cert_secret.clone());
     let proxy_default_key = config.proxy_tls().map(|t| t.key_secret.clone());
-    // The Caddy renderer resolves the `proxy.tls` secrets whenever the
-    // proxy runs, whatever `tls:` mode the services use.
-    let global_tls = config.proxy_tls().filter(|_| config.proxy_enabled());
+    let global_tls = global_proxy_tls(config);
 
-    let needs_bundle = global_tls.is_some()
-        || config
-            .services
-            .iter()
-            .any(|s| matches!(s.tls, TlsMode::Cert));
-    if !needs_bundle {
+    if !tls_needs_bundle(config) {
         return vec![Finding::pass(
             "config",
             "TLS cert-mode check skipped (no services use `tls: cert`)",
         )];
     }
-    // `check_secret_references` reports a missing bundle only for
-    // services with `secrets:`, so report it here for the TLS certs.
+    // `check_bundle_loaded` reports a missing bundle.
     let Some(bundle) = bundle else {
-        return vec![missing_bundle(
-            "the TLS certs (`proxy.tls` or a `tls: cert` service) need the secrets bundle",
-        )];
+        return Vec::new();
     };
 
     let mut out = Vec::new();
@@ -1003,34 +1001,82 @@ fn check_tls_cert_secrets(
     out
 }
 
-// ---------- env_from_secrets / secrets references match the bundle ----------
-
-/// The error for a check that needs the secrets bundle when there is
-/// none. `what` names what needs it.
-fn missing_bundle(what: &str) -> Finding {
-    Finding::error(
-        "secrets",
-        format!("{what} but no bundle is configured / loadable"),
-    )
-    .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)")
+/// The `proxy.tls` block when the proxy runs. The Caddy renderer
+/// resolves its secrets then, whatever `tls:` mode the services use.
+fn global_proxy_tls(config: &Config) -> Option<&crate::config::ProxyTls> {
+    config.proxy_tls().filter(|_| config.proxy_enabled())
 }
+
+/// True when the TLS certs need the secrets bundle: the proxy runs
+/// with `proxy.tls`, or a service uses `tls: cert`.
+fn tls_needs_bundle(config: &Config) -> bool {
+    global_proxy_tls(config).is_some()
+        || config
+            .services
+            .iter()
+            .any(|s| matches!(s.tls, TlsMode::Cert))
+}
+
+fn services_reference_secrets(config: &Config) -> bool {
+    config
+        .services
+        .iter()
+        .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty())
+}
+
+// ---------- the bundle loads when a check needs it ----------
+
+/// One error when the services or the TLS certs need the secrets
+/// bundle and there is none. `loaded` is true when the bundle loaded.
+/// `load_error` is the error of the load. The fix differs for a config
+/// without a `secrets:` block and for a bundle that did not load.
+fn check_bundle_loaded(config: &Config, loaded: bool, load_error: Option<&str>) -> Vec<Finding> {
+    if loaded {
+        return Vec::new();
+    }
+    let mut needs = Vec::new();
+    if services_reference_secrets(config) {
+        needs.push("services that reference secrets");
+    }
+    if tls_needs_bundle(config) {
+        needs.push("the TLS certs (`proxy.tls` or a `tls: cert` service)");
+    }
+    if needs.is_empty() {
+        return Vec::new();
+    }
+    let what = needs.join(" and ");
+    let finding = if config.secrets.is_none() {
+        Finding::error(
+            "secrets",
+            format!("{what} need the secrets bundle, but yoink.yaml has no `secrets:` block"),
+        )
+        .with_fix("set `secrets:` in yoink.yaml (`yoink secrets key generate` to start)")
+    } else {
+        Finding::error(
+            "secrets",
+            format!("{what} need the secrets bundle, but the bundle did not load"),
+        )
+        .with_detail(load_error.unwrap_or("unknown error").to_string())
+        .with_fix("fix the load error in the detail, then run `yoink doctor` again")
+    };
+    vec![finding]
+}
+
+// ---------- env_from_secrets / secrets references match the bundle ----------
 
 fn check_secret_references(
     config: &Config,
     bundle: Option<&crate::base::bundle::SecretsBundle>,
 ) -> Vec<Finding> {
-    let any_refs = config
-        .services
-        .iter()
-        .any(|s| !s.secrets.is_empty() || !s.env_from_secrets.is_empty());
-    if !any_refs {
+    if !services_reference_secrets(config) {
         return vec![Finding::pass(
             "secrets",
             "secret-reference check skipped (no services reference secrets)",
         )];
     }
+    // `check_bundle_loaded` reports a missing bundle.
     let Some(bundle) = bundle else {
-        return vec![missing_bundle("services reference secrets")];
+        return Vec::new();
     };
 
     let mut out = Vec::new();
@@ -1381,7 +1427,7 @@ services:
 "#,
         )
         .unwrap();
-        let findings = check_tls_cert_secrets(&config, None);
+        let findings = check_bundle_loaded(&config, false, None);
         assert!(
             findings
                 .iter()
@@ -1389,6 +1435,81 @@ services:
             "{:?}",
             titles(&findings)
         );
+    }
+
+    /// Regression: with services that reference secrets and TLS certs
+    /// that need the bundle, a missing bundle was reported twice. The
+    /// fix said to set `secrets:` even when the block was set and only
+    /// the load failed.
+    #[test]
+    fn a_missing_bundle_is_reported_once_with_a_fix_for_its_cause() {
+        let yaml = |secrets: &str| {
+            format!(
+                r#"
+deploy: {{ networks: [n] }}
+hosts: [{{ address: h1, user: deploy }}]
+{secrets}
+proxy:
+  tls:
+    cert_secret: CF_CERT
+    key_secret: CF_KEY
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    secrets: [DB_URL]
+    run: {{ port: 8080 }}
+"#
+            )
+        };
+        let missing = |config: &Config, error: Option<&str>| {
+            let mut findings = check_bundle_loaded(config, false, error);
+            findings.extend(check_tls_cert_secrets(config, None));
+            findings.extend(check_secret_references(config, None));
+            findings
+                .into_iter()
+                .filter(|f| f.severity == Severity::Error)
+                .collect::<Vec<_>>()
+        };
+
+        let no_block = Config::parse_str(&yaml("")).unwrap();
+        let findings = missing(&no_block, None);
+        assert_eq!(findings.len(), 1, "{:?}", titles(&findings));
+        assert!(
+            findings[0]
+                .title
+                .contains("services that reference secrets and the TLS certs")
+        );
+        assert!(findings[0].title.contains("no `secrets:` block"));
+        assert!(
+            findings[0]
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("set `secrets:`")
+        );
+
+        let block = Config::parse_str(&yaml(
+            "secrets:\n  provider: age\n  recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]",
+        ))
+        .unwrap();
+        let findings = missing(&block, Some("read sealed file: not found"));
+        assert_eq!(findings.len(), 1, "{:?}", titles(&findings));
+        assert!(findings[0].title.contains("did not load"));
+        assert_eq!(
+            findings[0].detail.as_deref(),
+            Some("read sealed file: not found")
+        );
+        assert!(
+            !findings[0]
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("set `secrets:`")
+        );
+
+        assert!(check_bundle_loaded(&block, true, None).is_empty());
     }
 
     fn titles(findings: &[Finding]) -> Vec<(Severity, &str)> {
