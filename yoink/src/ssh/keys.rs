@@ -75,7 +75,7 @@ pub fn host_shell_command(
     cmd
 }
 
-/// Walk the hosts' `ssh_key_secret:` entries, decrypt every named `ssh_key_secret` from the
+/// Walk the hosts, decrypt every named `ssh_key_secret` from the
 /// bundle into a 0600 tempfile, and return a manager. The manager
 /// holds the tempfiles alive for the duration of the deploy.
 ///

@@ -2915,7 +2915,7 @@ async fn build_real_ops(config: &Config, bundle: Option<&SecretsBundle>) -> Resu
 /// and the replica-aware shell/logs paths (auto-pick / multiplex).
 /// Per-host listings run in parallel — for a fleet of N hosts this is
 /// one round-trip instead of N. Same fan-out shape used elsewhere in
-/// the CLI (deploy.rs, prune, prefetch).
+/// the CLI (deploy, prune, prefetch).
 async fn list_running_replicas(
     ops: &dyn DockerOps,
     config: &Config,

@@ -1736,6 +1736,10 @@ impl Config {
     /// Where the sealed secrets file lives: `secrets.file:` (age
     /// provider) or `secrets.age`, under the config's directory.
     /// Errors when `secrets.file:` escapes that directory.
+    ///
+    /// Only meaningful for the age provider: with `provider: command`
+    /// or no `secrets:` block it still returns the default
+    /// `secrets.age` path. Callers check the provider first.
     pub fn sealed_path(&self) -> Result<std::path::PathBuf, crate::sealed::SealedError> {
         let file = match &self.secrets {
             Some(SecretsConfig::Age { file, .. }) => file.as_deref(),
