@@ -4794,9 +4794,9 @@ async fn cmd_proxy_render(config: &Config) -> Result<()> {
 
 async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
     use yoink::deploy::lock::LOCK_NAME;
-    let ops = build_real_ops(config, None).await?;
     match action {
         LockAction::Status => {
+            let ops = build_real_ops(config, None).await?;
             // Fan out across hosts — one slow daemon shouldn't make
             // the others wait. Per-host errors surface as Err inline.
             let probes = config.fleet().into_iter().map(|host| {
@@ -4828,6 +4828,9 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
                 );
                 anyhow::bail!("aborted");
             }
+            // After the checks: with a managed ssh key, building the
+            // client loads the secrets bundle.
+            let ops = build_real_ops(config, None).await?;
             for h in hosts {
                 match ops.force_remove_container(&h, LOCK_NAME).await {
                     Ok(()) => eprintln!("{}: released", h.address),
@@ -6721,6 +6724,40 @@ mod tests {
                 .unwrap()
                 .contains("recipients")
         );
+    }
+
+    /// `lock release --host x` built the Docker client before it
+    /// checked the host. With a host that has `ssh_key_secret:`, that
+    /// loads the secrets bundle first, so a mistyped host got a secrets
+    /// error (or a keychain prompt) instead of the unknown-host error.
+    /// The sealed file here does not exist, so a bundle load fails.
+    #[tokio::test]
+    async fn lock_release_checks_the_host_before_it_builds_the_client() {
+        let cfg = yoink::config::Config::parse_str(
+            "hosts:\n  - { address: web-1, user: root, ssh_key_secret: DEPLOY_KEY }\n\
+             secrets:\n  provider: age\n  file: lock-test-does-not-exist.age\n  \
+             recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]\n\
+             services: []\n",
+        )
+        .unwrap();
+        let release = |yes| super::LockAction::Release {
+            host: Some("web-9".into()),
+            yes,
+        };
+        for yes in [true, false] {
+            let msg = format!(
+                "{:#}",
+                super::cmd_lock(&cfg, release(yes)).await.unwrap_err()
+            );
+            assert!(msg.contains("unknown --host \"web-9\""), "got: {msg}");
+        }
+        // Without --yes, the command stops before it builds the client.
+        let release = super::LockAction::Release {
+            host: Some("web-1".into()),
+            yes: false,
+        };
+        let msg = format!("{:#}", super::cmd_lock(&cfg, release).await.unwrap_err());
+        assert_eq!(msg, "aborted");
     }
 
     fn tag_test_services() -> Vec<yoink::config::ServiceConfig> {
