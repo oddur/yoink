@@ -41,9 +41,10 @@ pub enum AdminError {
     /// carries the admin API's answer (e.g. a Caddy parser error).
     #[error("proxy admin rejected /load: {detail}")]
     LoadRejected { detail: String },
-    /// `caddy reload` could not connect to the admin API (for example,
-    /// Caddy is still starting). Caddy did not see the config, so this
-    /// is not a config error.
+    /// The `/load` request of `caddy reload` failed before Caddy sent
+    /// an answer: refused, reset, EOF or timeout (for example, Caddy is
+    /// still starting). Caddy did not answer, so this is not a config
+    /// error.
     #[error("proxy admin API not reachable: {detail}")]
     AdminUnreachable { detail: String },
     /// `caddy reload` did not finish within `timeout`. Not retried: a
@@ -154,10 +155,7 @@ async fn push_once(
         // `tls.certificates.load_pem`. Strip them before the error
         // lands in stderr / tracing / TUI toasts.
         let detail = redact_pem_blocks(exec_output(&load).trim());
-        if detail.to_ascii_lowercase().contains("connection refused") {
-            return Err(AdminError::AdminUnreachable { detail });
-        }
-        return Err(AdminError::LoadRejected { detail });
+        return Err(classify_reload_failure(detail));
     }
 
     // Belt-and-braces: read the route count back from the daemon and
@@ -191,6 +189,31 @@ async fn running_proxy(host: &Host, ops: &dyn DockerOps) -> Result<String, Admin
         .ok_or_else(|| AdminError::ProxyNotRunning {
             host: host.address.clone(),
         })
+}
+
+/// The prefix that `caddy reload` puts before an error of the `/load`
+/// request. After it comes `performing request: <Go error>` when the
+/// HTTP request failed, or
+/// `caddy responded with error: HTTP <code>: <body>` when Caddy
+/// answered with an error status.
+const RELOAD_SEND_PREFIX: &str = "sending configuration to instance: ";
+const REQUEST_FAILED: &str = "performing request: ";
+
+/// Sort a failed `caddy reload` by its output. Only a failed HTTP
+/// request (refused, reset, EOF, timeout) is `AdminUnreachable`: Caddy
+/// did not answer. An HTTP error status from Caddy is `LoadRejected`,
+/// also when its body mentions a connection error. Look only at the
+/// text right after the first [`RELOAD_SEND_PREFIX`], so the body of an
+/// answer cannot change the class.
+fn classify_reload_failure(detail: String) -> AdminError {
+    let request_failed = detail
+        .find(RELOAD_SEND_PREFIX)
+        .is_some_and(|at| detail[at + RELOAD_SEND_PREFIX.len()..].starts_with(REQUEST_FAILED));
+    if request_failed {
+        AdminError::AdminUnreachable { detail }
+    } else {
+        AdminError::LoadRejected { detail }
+    }
 }
 
 /// stderr of an exec, or stdout when stderr is empty.
@@ -498,6 +521,54 @@ mod tests {
         ops.push_exec_with_stdin(Ok(exit(0, "", "")));
         ops.push_curl_in_netns(Ok(exit(0, "{}\n404", "")));
         push_config(&host(), &ops, &config).await.unwrap();
+    }
+
+    /// Any failed request is a transport error, not only a refused
+    /// connection: a reset or an EOF while Caddy restarts also retries.
+    #[test]
+    fn a_failed_request_is_unreachable() {
+        for tail in [
+            "dial tcp 127.0.0.1:2019: connect: connection refused",
+            "read tcp 127.0.0.1:50000->127.0.0.1:2019: read: connection reset by peer",
+            "EOF",
+            "dial tcp 127.0.0.1:2019: i/o timeout",
+        ] {
+            let detail = format!(
+                "{{\"level\":\"info\",\"msg\":\"using config from file\"}}\n\
+                 Error: sending configuration to instance: performing request: \
+                 Post \"http://127.0.0.1:2019/load\": {tail}"
+            );
+            let err = classify_reload_failure(detail);
+            assert!(
+                matches!(err, AdminError::AdminUnreachable { .. }),
+                "got {err}"
+            );
+        }
+    }
+
+    /// The old check found "connection refused" anywhere in the output,
+    /// so an HTTP error from Caddy with those words in its body was a
+    /// transport error, and yoink pushed the config a second time.
+    #[tokio::test]
+    async fn an_http_error_from_caddy_is_rejected_even_if_it_mentions_a_refused_connection() {
+        let config = serde_json::json!({ "admin": { "listen": ADMIN_LISTEN } });
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container()]));
+        ops.push_exec_with_stdin(Ok(exit(
+            1,
+            "",
+            "Error: sending configuration to instance: caddy responded with error: \
+             HTTP 400: {\"error\":\"loading new config: performing request: \
+             dial tcp 10.0.0.5:443: connect: connection refused\"}",
+        )));
+        let err = push_config(&host(), &ops, &config).await.unwrap_err();
+        assert!(matches!(err, AdminError::LoadRejected { .. }), "got {err}");
+        let reloads = ops
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, crate::docker_ops::RecordedCall::ExecWithStdin(..)))
+            .count();
+        assert_eq!(reloads, 1);
     }
 
     #[tokio::test]
