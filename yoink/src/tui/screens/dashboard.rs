@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ratatui::Frame;
-use ratatui::layout::Constraint;
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
@@ -219,6 +219,19 @@ impl DashboardState {
         throbber: &throbber_widgets_tui::ThrobberState,
     ) {
         let layout = pane_layout(area);
+        // With a report, a fetch error means some hosts did not answer.
+        // It gets its own line above the footer, so the filter prompt
+        // and the active filter stay visible.
+        let (table_area, failed_area) = match (&self.report, &self.last_error) {
+            (Some(_), Some(_)) => {
+                let split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0), Constraint::Length(1)])
+                    .split(layout[1]);
+                (split[0], Some(split[1]))
+            }
+            _ => (layout[1], None),
+        };
 
         let services = config.service_names().collect::<Vec<_>>().join(", ");
         let header = Paragraph::new(format!(
@@ -260,7 +273,7 @@ impl DashboardState {
             .row_highlight_style(crate::tui::ui::table_highlight_style())
             .highlight_symbol(crate::tui::ui::TABLE_HIGHLIGHT_SYMBOL)
             .block(Block::default().borders(Borders::ALL).title("status"));
-        frame.render_stateful_widget(table, layout[1], &mut self.table);
+        frame.render_stateful_widget(table, table_area, &mut self.table);
 
         let exited_indicator = if self.show_exited {
             "[exited: on]"
@@ -268,7 +281,11 @@ impl DashboardState {
             "[exited: off]"
         };
         let help = format!("q quit · r refresh · e {exited_indicator} · ? help");
-        if let Some(err) = &self.last_error {
+        if let (Some(err), Some(failed_area)) = (&self.last_error, failed_area) {
+            let failed = Paragraph::new(format!("unreachable: {err}"))
+                .style(Style::default().fg(Color::Red));
+            frame.render_widget(failed, failed_area);
+        } else if let Some(err) = &self.last_error {
             let footer = Paragraph::new(format!("error: {err}  ·  {help}"))
                 .style(Style::default().fg(Color::Red));
             frame.render_widget(footer, layout[2]);
@@ -571,6 +588,71 @@ services:
             .as_deref()
             .expect("unreachable host is reported");
         assert!(err.contains("host-b"), "{err}");
+    }
+
+    fn render_to_text(state: &mut DashboardState, cfg: &Config) -> String {
+        let backend = ratatui::backend::TestBackend::new(200, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let forwards = crate::tui::pf::PortForwardState::default();
+        let vscode = crate::tui::vscode::VscodeSessionState::default();
+        let throbber = throbber_widgets_tui::ThrobberState::default();
+        terminal
+            .draw(|frame| {
+                state.render(
+                    frame,
+                    frame.area(),
+                    cfg,
+                    None,
+                    &HashMap::new(),
+                    &forwards,
+                    &vscode,
+                    &throbber,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        buffer
+            .content
+            .chunks(width)
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Regression: while one host was down, the footer showed only the
+    /// error. The `/` prompt and the active filter were hidden. The
+    /// unreachable hosts now get their own line above the footer.
+    #[tokio::test]
+    async fn a_down_host_does_not_hide_the_filter_footer() {
+        let cfg = config_two_hosts();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![running_container()]));
+        ops.push_list_containers(Err(crate::docker_ops::DockerError::SshProbe {
+            host: "host-b".into(),
+            detail: "connection refused".into(),
+        }));
+        let mut state = DashboardState::new();
+        state.refresh(&ops, &cfg).await;
+        assert!(state.last_error.is_some());
+
+        let text = render_to_text(&mut state, &cfg);
+        assert!(text.contains("/ filter"), "{text}");
+        assert!(text.contains("unreachable:"), "{text}");
+        assert!(text.contains("host-b"), "{text}");
+
+        state.filter.begin_input();
+        state.filter.push_char('a');
+        let text = render_to_text(&mut state, &cfg);
+        assert!(text.contains("/a_"), "{text}");
+        state.filter.apply();
+        let text = render_to_text(&mut state, &cfg);
+        assert!(text.contains("filter: a"), "{text}");
+        assert!(text.contains("host-b"), "{text}");
     }
 
     /// Regression: on a partial failure the new report replaced the
