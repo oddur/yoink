@@ -12,6 +12,17 @@ use crate::docker_ops::{ContainerInfo, DockerError, DockerOps};
 pub enum StatusError {
     #[error("docker error: {0}")]
     Docker(#[from] DockerError),
+    /// No host answered. Names each host with its error.
+    #[error("{}", join_failures(.0))]
+    AllHostsFailed(Vec<HostFailure>),
+}
+
+fn join_failures(failed: &[HostFailure]) -> String {
+    failed
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -50,23 +61,17 @@ impl StatusReport {
     /// host answered.
     pub async fn collect(ops: &dyn DockerOps, config: &Config) -> Result<Self, StatusError> {
         let mut report = Self::default();
-        let mut first_error = None;
         for (host, result) in Self::query(ops, config, "yoink.managed=true").await {
             match result {
                 Ok(containers) => report.hosts.push(HostStatus { host, containers }),
-                Err(e) => {
-                    report.failed.push(HostFailure {
-                        host,
-                        error: e.to_string(),
-                    });
-                    first_error.get_or_insert(e);
-                }
+                Err(e) => report.failed.push(HostFailure {
+                    host,
+                    error: e.to_string(),
+                }),
             }
         }
-        if report.hosts.is_empty()
-            && let Some(e) = first_error
-        {
-            return Err(e.into());
+        if report.hosts.is_empty() && !report.failed.is_empty() {
+            return Err(StatusError::AllHostsFailed(report.failed));
         }
         Ok(report)
     }
@@ -235,7 +240,12 @@ services:
             }));
         }
         let cfg = config_with_two_hosts();
-        assert!(StatusReport::collect(&ops, &cfg).await.is_err());
+        let err = StatusReport::collect(&ops, &cfg).await.unwrap_err();
+        // Regression: only the first host was named, and the dashboard
+        // showed "unreachable: host-a" above the rows of both hosts.
+        let text = err.to_string();
+        assert!(text.starts_with("host-a: "), "{text}");
+        assert!(text.contains(" · host-b: "), "{text}");
     }
 
     #[tokio::test]
