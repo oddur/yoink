@@ -452,7 +452,20 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
     }
 
     let email = config.proxy_email();
-    if email.is_none() {
+    if email.is_none() && config.proxy_uses_acme() {
+        // `yoink up` fails at Caddy render in this case, so this is
+        // an error, not a warning.
+        out.push(
+            Finding::error(
+                "config",
+                "a service uses `tls: auto` (Let's Encrypt) but `proxy.email:` is unset; \
+                 `yoink up` fails",
+            )
+            .with_fix(
+                "set `proxy: { email: <your real email> }` (or set `proxy.tls` for an inline cert)",
+            ),
+        );
+    } else if email.is_none() {
         out.push(
             Finding::warn(
                 "config",
@@ -1037,6 +1050,38 @@ fn check_secret_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: doctor only warned about a missing `proxy.email:`
+    /// while `yoink up` fails at Caddy render for a `tls: auto`
+    /// service. Doctor must report an error.
+    #[test]
+    fn missing_proxy_email_with_tls_auto_is_an_error() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let findings = check_proxied_services(&config);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.title.contains("proxy.email")),
+            "{:?}",
+            titles(&findings)
+        );
+        assert!(
+            crate::proxy::caddy::render(&config, |_| vec![], None).is_err(),
+            "up fails at render for the same config"
+        );
+    }
 
     fn titles(findings: &[Finding]) -> Vec<(Severity, &str)> {
         findings

@@ -152,8 +152,7 @@ where
     // ACME is only for services that genuinely want it AND aren't
     // covered by a proxy-level inline cert. Proxy-level cert disables
     // ACME entirely (we never want both running on the same domains).
-    let any_acme = proxy_tls.is_none() && proxied.iter().any(|s| matches!(s.tls, TlsMode::Auto));
-    if any_acme {
+    if cfg.proxy_uses_acme() {
         let email = cfg.proxy_email().ok_or_else(|| {
             anyhow!(
                 "at least one service uses `tls: auto` (Let's Encrypt) but `proxy.email:` \
