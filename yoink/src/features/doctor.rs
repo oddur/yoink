@@ -990,7 +990,7 @@ fn check_tls_cert_secrets(
                         .with_fix(format!(
                             "set `{label}: <SECRET_NAME>` on the service \
                              (or `proxy.tls.{}` to inherit)",
-                            label.trim_start_matches("tls_").trim_end_matches("_secret")
+                            label.trim_start_matches("tls_")
                         )),
                     );
                 }
@@ -1084,6 +1084,35 @@ fn check_secret_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the hint named `proxy.tls.cert` / `proxy.tls.key`.
+    /// The fields are `cert_secret` / `key_secret`, and the wrong names
+    /// break config parsing (`deny_unknown_fields`).
+    #[test]
+    fn tls_cert_hint_names_the_real_proxy_tls_fields() {
+        // No `domain:`, so the proxy is off and load does not reject it.
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+services:
+  - name: api
+    image: img
+    tag: t
+    tls: cert
+    run: { port: 8080 }
+"#,
+        )
+        .unwrap();
+        let bundle = crate::base::bundle::SecretsBundle::new(std::collections::BTreeMap::new());
+        let fixes: Vec<String> = check_tls_cert_secrets(&config, Some(&bundle))
+            .into_iter()
+            .filter_map(|f| f.fix)
+            .collect();
+        assert_eq!(fixes.len(), 2, "{fixes:?}");
+        assert!(fixes[0].contains("`proxy.tls.cert_secret`"), "{fixes:?}");
+        assert!(fixes[1].contains("`proxy.tls.key_secret`"), "{fixes:?}");
+    }
 
     /// Regression: with only `tls: auto` services, doctor skipped the
     /// `proxy.tls` secrets. The Caddy renderer still needs them, so
