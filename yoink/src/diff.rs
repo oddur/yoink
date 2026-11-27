@@ -218,18 +218,15 @@ pub async fn compute(
     // for an N-host fleet this is one round-trip instead of N. Same
     // fan-out shape `deploy::reconcile` and the prune path use.
     let snapshot: BTreeMap<String, Vec<ContainerInfo>> = {
-        let futs = config.hosts.iter().map(|host_cfg| {
-            let host = Host::from(host_cfg);
-            async move {
-                let containers = ops
-                    .list_containers_by_label(&host, "yoink.managed=true")
-                    .await
-                    .map_err(|source| DiffError::Docker {
-                        host: host.address.clone(),
-                        source,
-                    })?;
-                Ok::<_, DiffError>((host.address, containers))
-            }
+        let futs = config.fleet().into_iter().map(|host| async move {
+            let containers = ops
+                .list_containers_by_label(&host, "yoink.managed=true")
+                .await
+                .map_err(|source| DiffError::Docker {
+                    host: host.address.clone(),
+                    source,
+                })?;
+            Ok::<_, DiffError>((host.address, containers))
         });
         futures_util::future::try_join_all(futs)
             .await?
@@ -239,7 +236,7 @@ pub async fn compute(
 
     let selected: BTreeSet<&str> = match services_filter {
         Some(f) => f.iter().map(String::as_str).collect(),
-        None => config.services.iter().map(|s| s.name.as_str()).collect(),
+        None => config.service_names().collect(),
     };
 
     let mut services = Vec::new();
@@ -262,8 +259,8 @@ pub async fn compute(
         let desired_hash = docker::compute_spec_hash(&desired_spec);
         let desired_image = image::image_reference(&svc.image, &tag);
 
-        for host_cfg in svc.applicable_hosts(&config.hosts) {
-            let host = host_cfg.address.clone();
+        for target in config.fleet_for(svc) {
+            let host = target.address.clone();
             let containers = snapshot.get(&host).map_or(&[][..], Vec::as_slice);
 
             // Same classification the reconcile skip uses
@@ -304,7 +301,7 @@ pub async fn compute(
                         owned.insert((host.clone(), c.name.clone()));
                         let fields = inspect_field_diff(
                             ops,
-                            &Host::from(host_cfg),
+                            &target,
                             &c.name,
                             svc,
                             &tag,

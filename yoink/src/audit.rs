@@ -440,6 +440,18 @@ impl HostAuditSink {
             .insert(host.address.clone(), (host, keyfile));
     }
 
+    /// Queue one serialized event line for `host_addr`.
+    async fn buffer_line(&self, host_addr: &str, line: String) {
+        let mut bufs = self.buffers.lock().await;
+        bufs.entry(host_addr.to_string()).or_default().push(line);
+    }
+
+    /// The addresses that have a buffer slot (pending lines or not).
+    async fn buffered_hosts(&self) -> Vec<String> {
+        let bufs = self.buffers.lock().await;
+        bufs.keys().cloned().collect()
+    }
+
     /// Drain one host's buffer to disk via a single SSH invocation.
     /// Failure is logged to stderr; lines are dropped (deploy must not
     /// block on audit).
@@ -495,21 +507,14 @@ impl AuditSink for HostAuditSink {
             }
         };
         let is_forensic = event.kind.is_forensic();
-        {
-            let mut bufs = self.buffers.lock().await;
-            bufs.entry(host_addr.clone()).or_default().push(line);
-        }
+        self.buffer_line(&host_addr, line).await;
         if is_forensic {
             self.flush_host(&host_addr).await;
         }
     }
 
     async fn flush(&self) {
-        let addrs: Vec<String> = {
-            let bufs = self.buffers.lock().await;
-            bufs.keys().cloned().collect()
-        };
-        for addr in addrs {
+        for addr in self.buffered_hosts().await {
             self.flush_host(&addr).await;
         }
     }

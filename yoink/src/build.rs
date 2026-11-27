@@ -304,7 +304,7 @@ pub async fn load_images_to_hosts(
     transport: Transport,
     only_buildable: bool,
 ) -> anyhow::Result<()> {
-    let mut by_image: BTreeMap<String, Vec<&crate::config::HostConfig>> = BTreeMap::new();
+    let mut by_image: BTreeMap<String, Vec<Host>> = BTreeMap::new();
     for svc in config.selected_services(services_filter) {
         if only_buildable && svc.build.is_none() {
             continue;
@@ -312,9 +312,9 @@ pub async fn load_images_to_hosts(
         let tag = resolve_service_tag(svc, tag_overrides)?;
         let image_ref = image::image_reference(&svc.image, &tag);
         let entry = by_image.entry(image_ref).or_default();
-        for host_cfg in svc.applicable_hosts(&config.hosts) {
-            if !entry.iter().any(|h| h.address == host_cfg.address) {
-                entry.push(host_cfg);
+        for host in config.fleet_for(svc) {
+            if !entry.iter().any(|h| h.address == host.address) {
+                entry.push(host);
             }
         }
     }
@@ -327,18 +327,18 @@ pub async fn load_images_to_hosts(
     // create them. Errors here are logged-and-ignored — sweeping is a
     // hygiene step, not a correctness gate.
     if !matches!(transport, Transport::Tarball) {
-        let unique_hosts: BTreeMap<String, &crate::config::HostConfig> = by_image
+        let unique_hosts: BTreeMap<String, &Host> = by_image
             .values()
             .flatten()
-            .map(|h| (h.address.clone(), *h))
+            .map(|h| (h.address.clone(), h))
             .collect();
-        for host_cfg in unique_hosts.values() {
-            sweep_leaked_sidecars(ops, &Host::from(*host_cfg)).await;
+        for host in unique_hosts.values() {
+            sweep_leaked_sidecars(ops, host).await;
         }
     }
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
-    for (image_ref, host_cfgs) in &by_image {
+    for (image_ref, hosts) in &by_image {
         // Hide the progress draw target on non-TTY (CI logs); the
         // steady-tick wakeups still happen but indicatif batches them
         // off-screen so it doesn't pollute the captured output.
@@ -352,8 +352,8 @@ pub async fn load_images_to_hosts(
         )
         .expect("static progress template parses");
 
-        let loads = host_cfgs.iter().map(|host_cfg| {
-            let host = Host::from(*host_cfg);
+        let loads = hosts.iter().map(|host| {
+            let host = host.clone();
             let bar = multi.add(ProgressBar::new_spinner().with_style(style.clone()));
             bar.set_prefix(format!("{} → {}", short_image(image_ref), host.address));
             if interactive {

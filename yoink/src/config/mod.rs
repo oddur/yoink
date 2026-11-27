@@ -960,7 +960,7 @@ impl ServiceConfig {
     /// The networks this service will actually attach to — its
     /// declared list when set, else every network in `deploy.networks`.
     #[must_use]
-    pub fn effective_networks(&self, deploy: &DeployDefaults) -> Vec<String> {
+    fn effective_networks(&self, deploy: &DeployDefaults) -> Vec<String> {
         self.networks
             .clone()
             .unwrap_or_else(|| deploy.networks.clone())
@@ -1608,6 +1608,140 @@ impl Config {
                 },
                 Host::from,
             )
+    }
+
+    /// Every configured host, as the target Docker and ssh calls take,
+    /// in config order.
+    #[must_use]
+    pub fn fleet(&self) -> Vec<Host> {
+        self.hosts.iter().map(Host::from).collect()
+    }
+
+    /// The hosts `service` runs on: its `hosts:` subset of the fleet,
+    /// or the whole fleet when it names none. In config order.
+    #[must_use]
+    pub fn fleet_for(&self, service: &ServiceConfig) -> Vec<Host> {
+        service
+            .applicable_hosts(&self.hosts)
+            .into_iter()
+            .map(Host::from)
+            .collect()
+    }
+
+    /// How many hosts the config declares.
+    #[must_use]
+    pub fn host_count(&self) -> usize {
+        self.hosts.len()
+    }
+
+    /// The declared host with this `address:`.
+    #[must_use]
+    pub fn host(&self, address: &str) -> Option<Host> {
+        self.hosts
+            .iter()
+            .find(|h| h.address == address)
+            .map(Host::from)
+    }
+
+    /// The hosts whose `address:` is `address`, or every host when
+    /// `address` is `None`. Drives the `--host` filter of commands.
+    #[must_use]
+    pub fn fleet_matching(&self, address: Option<&str>) -> Vec<Host> {
+        self.hosts
+            .iter()
+            .filter(|h| address.is_none_or(|a| a == h.address))
+            .map(Host::from)
+            .collect()
+    }
+
+    /// `(address, ssh_key_secret)` for every host that names a sealed
+    /// ssh key, in config order.
+    pub fn host_ssh_keys(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.hosts.iter().filter_map(|h| {
+            h.ssh_key_secret
+                .as_deref()
+                .map(|secret| (h.address.as_str(), secret))
+        })
+    }
+
+    /// True when the declared hosts differ from `other`'s, in any
+    /// field. A reload that changes them needs fresh connections.
+    #[must_use]
+    pub fn hosts_differ(&self, other: &Config) -> bool {
+        self.hosts != other.hosts
+    }
+
+    /// The service named `name`.
+    #[must_use]
+    pub fn service(&self, name: &str) -> Option<&ServiceConfig> {
+        self.services.iter().find(|s| s.name == name)
+    }
+
+    /// How many services the config declares, the implicit proxy
+    /// included.
+    #[must_use]
+    pub fn service_count(&self) -> usize {
+        self.services.len()
+    }
+
+    /// Every service name, in topo order.
+    pub fn service_names(&self) -> impl Iterator<Item = &str> {
+        self.services.iter().map(|s| s.name.as_str())
+    }
+
+    /// The services the proxy routes (those with `domain:`), in topo
+    /// order.
+    #[must_use]
+    pub fn proxied_services(&self) -> Vec<&ServiceConfig> {
+        self.services.iter().filter(|s| s.is_proxied()).collect()
+    }
+
+    /// True when at least one service has a `build:` block, so its
+    /// image is built on the operator's machine.
+    #[must_use]
+    pub fn any_service_builds_locally(&self) -> bool {
+        self.services.iter().any(|s| s.build.is_some())
+    }
+
+    /// The Docker networks the deploy declares (`deploy.networks`).
+    #[must_use]
+    pub fn networks(&self) -> &[String] {
+        &self.deploy.networks
+    }
+
+    /// The networks `service` attaches to: its own `networks:` when
+    /// set, else every declared network.
+    #[must_use]
+    pub fn networks_for(&self, service: &ServiceConfig) -> Vec<String> {
+        service.effective_networks(&self.deploy)
+    }
+
+    /// True when `glob` is already an entry of `include:`.
+    #[must_use]
+    pub fn includes_glob(&self, glob: &str) -> bool {
+        self.include.iter().any(|existing| existing == glob)
+    }
+
+    /// True when an `include:` glob matches `path`. Relative globs and
+    /// a relative `path` are both taken from the config's directory.
+    #[must_use]
+    pub fn include_covers(&self, path: &Path) -> bool {
+        let base = self
+            .config_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        dest_matched_by_existing_globs(&base, path, &self.include)
+    }
+
+    /// Where the sealed secrets file lives: `secrets.file:` (age
+    /// provider) or `secrets.age`, under the config's directory.
+    /// Errors when `secrets.file:` escapes that directory.
+    pub fn sealed_path(&self) -> Result<std::path::PathBuf, crate::sealed::SealedError> {
+        let file = match &self.secrets {
+            Some(SecretsConfig::Age { file, .. }) => file.as_deref(),
+            _ => None,
+        };
+        crate::sealed::resolve_sealed_path(self.config_dir.as_deref(), file)
     }
 
     /// `true` when at least one host declares `address_secret:`.
@@ -2530,7 +2664,7 @@ impl ServiceConfig {
     /// The set of hosts this service should run on, intersected against
     /// the global [[hosts]] list.
     #[must_use]
-    pub fn applicable_hosts<'a>(&'a self, all: &'a [HostConfig]) -> Vec<&'a HostConfig> {
+    fn applicable_hosts<'a>(&'a self, all: &'a [HostConfig]) -> Vec<&'a HostConfig> {
         match &self.hosts {
             Some(subset) => all
                 .iter()
@@ -2539,6 +2673,25 @@ impl ServiceConfig {
             None => all.iter().collect(),
         }
     }
+}
+
+fn dest_matched_by_existing_globs(base: &Path, dest: &Path, globs: &[String]) -> bool {
+    let abs_dest = if dest.is_absolute() {
+        dest.to_path_buf()
+    } else {
+        base.join(dest)
+    };
+    globs.iter().any(|pattern| {
+        let pat_path = if Path::new(pattern).is_absolute() {
+            pattern.clone()
+        } else {
+            base.join(pattern).to_string_lossy().into_owned()
+        };
+        match glob::Pattern::new(&pat_path) {
+            Ok(p) => p.matches_path(&abs_dest),
+            Err(_) => false,
+        }
+    })
 }
 
 fn validate_service_name(name: &str) -> Result<(), ConfigError> {

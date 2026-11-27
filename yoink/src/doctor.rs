@@ -127,8 +127,7 @@ pub async fn run_doctor(config: &Config, ops: Arc<dyn DockerOps>) -> Vec<Finding
     //   - DNS lookups for `domain:` services (independent of the
     //     above; concurrent with the version probes).
     let local_host = Host::local();
-    let host_version_futs = config.hosts.iter().map(|h| {
-        let host = Host::from(h);
+    let host_version_futs = config.fleet().into_iter().map(|host| {
         let ops = ops.clone();
         async move { (host.clone(), ops.version(&host).await) }
     });
@@ -444,11 +443,7 @@ fn check_registry_consistency(config: &Config) -> Vec<Finding> {
 
 fn check_proxied_services(config: &Config) -> Vec<Finding> {
     let mut out = Vec::new();
-    let proxied: Vec<&ServiceConfig> = config
-        .services
-        .iter()
-        .filter(|s| s.domain.is_some())
-        .collect();
+    let proxied: Vec<&ServiceConfig> = config.proxied_services();
     if proxied.is_empty() {
         return vec![Finding::pass(
             "config",
@@ -456,7 +451,7 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
         )];
     }
 
-    let email = config.proxy.as_ref().and_then(|p| p.email.as_deref());
+    let email = config.proxy_email();
     if email.is_none() {
         out.push(
             Finding::warn(
@@ -558,7 +553,7 @@ fn check_arch_alignment_from_versions(
         Result<crate::docker_ops::DockerVersion, crate::docker_ops::DockerError>,
     )],
 ) -> Vec<Finding> {
-    let any_local_build = config.services.iter().any(|s| s.build.is_some());
+    let any_local_build = config.any_service_builds_locally();
     if !any_local_build {
         return vec![Finding::pass(
             "build",
@@ -688,10 +683,7 @@ async fn check_dns_for_domains(config: &Config) -> Vec<Finding> {
 // ---------- sealed.age existence ----------
 
 fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
-    let Some(SecretsConfig::Age {
-        file, recipients, ..
-    }) = &config.secrets
-    else {
+    let Some(SecretsConfig::Age { recipients, .. }) = &config.secrets else {
         return vec![Finding::pass(
             "secrets",
             "sealed file check skipped (not using `provider: age`)",
@@ -713,8 +705,7 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
             "sealed file check skipped (no services reference secrets)",
         )];
     }
-    let Ok(path) = sealed::resolve_sealed_path(config.config_dir.as_deref(), file.as_deref())
-    else {
+    let Ok(path) = config.sealed_path() else {
         return Vec::new();
     };
     if path.exists() {
@@ -906,16 +897,8 @@ fn check_tls_cert_secrets(
     config: &Config,
     bundle: Option<&crate::bundle::SecretsBundle>,
 ) -> Vec<Finding> {
-    let proxy_default_cert = config
-        .proxy
-        .as_ref()
-        .and_then(|p| p.tls.as_ref())
-        .map(|t| t.cert_secret.clone());
-    let proxy_default_key = config
-        .proxy
-        .as_ref()
-        .and_then(|p| p.tls.as_ref())
-        .map(|t| t.key_secret.clone());
+    let proxy_default_cert = config.proxy_tls().map(|t| t.cert_secret.clone());
+    let proxy_default_key = config.proxy_tls().map(|t| t.key_secret.clone());
 
     let needs_bundle = config
         .services

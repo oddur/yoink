@@ -1106,13 +1106,7 @@ impl App {
     /// `yoink.service` label. `None` when the current view has no
     /// notion of a focused row (Logs / Resources / Secrets).
     fn drift_focus(&self) -> Option<(Host, String)> {
-        let host_for = |addr: &str| -> Option<Host> {
-            self.config
-                .hosts
-                .iter()
-                .find(|h| h.address == addr)
-                .map(Host::from)
-        };
+        let host_for = |addr: &str| -> Option<Host> { self.config.host(addr) };
         match &self.view {
             View::Dashboard => {
                 let row = self.dashboard.selected()?;
@@ -1222,7 +1216,7 @@ impl App {
         if new_config == *self.config {
             return;
         }
-        let hosts_changed = new_config.hosts != self.config.hosts;
+        let hosts_changed = new_config.hosts_differ(&self.config);
         self.config = Arc::new(new_config);
         if hosts_changed {
             self.stop_event_subscriptions();
@@ -1231,14 +1225,9 @@ impl App {
             self.start_stats_history_pollers();
             // Drop event rings for hosts no longer in the config so a
             // re-added address doesn't inherit stale events.
-            let active: std::collections::HashSet<&str> = self
-                .config
-                .hosts
-                .iter()
-                .map(|h| h.address.as_str())
-                .collect();
-            self.host_events
-                .retain(|addr, _| active.contains(addr.as_str()));
+            let active: std::collections::HashSet<String> =
+                self.config.fleet().into_iter().map(|h| h.address).collect();
+            self.host_events.retain(|addr, _| active.contains(addr));
             self.schedule_hosts_refresh();
         }
         self.schedule_dashboard_refresh();
@@ -1308,7 +1297,7 @@ impl App {
         if self.job_progress.is_some() {
             return;
         }
-        let Some(svc) = self.config.services.iter().find(|s| s.name == service) else {
+        let Some(svc) = self.config.service(service) else {
             return;
         };
         let tag = svc.tag.clone().or_else(|| {
@@ -1512,8 +1501,7 @@ impl App {
     /// events stream and forwards each event into `update_tx`. Cheap —
     /// one connection per host, multiplexed across all panes.
     fn start_event_subscriptions(&mut self) {
-        for host_cfg in &self.config.hosts {
-            let host = Host::from(host_cfg);
+        for host in self.config.fleet() {
             let ops = self.ops.clone();
             let tx = self.update_tx.clone();
             let task = tokio::spawn(async move {
@@ -1569,8 +1557,7 @@ impl App {
     /// `stop_stats_history_pollers` first (we do that on `hosts:`
     /// config-reload before respawning, and on Drop).
     fn start_stats_history_pollers(&mut self) {
-        for host_cfg in &self.config.hosts {
-            let host = Host::from(host_cfg);
+        for host in self.config.fleet() {
             let ops = self.ops.clone();
             let tx = self.update_tx.clone();
             let task = tokio::spawn(async move {
@@ -2719,7 +2706,7 @@ impl App {
         }
         self.history_in_flight = true;
         let ops = self.ops.clone();
-        let hosts: Vec<Host> = self.config.hosts.iter().map(Host::from).collect();
+        let hosts: Vec<Host> = self.config.fleet();
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
             let label = format!("yoink.service={service}");
@@ -2771,7 +2758,7 @@ impl App {
             return;
         }
         self.audit_in_flight = true;
-        let hosts: Vec<Host> = self.config.hosts.iter().map(Host::from).collect();
+        let hosts: Vec<Host> = self.config.fleet();
         let tx = self.update_tx.clone();
         // Pre-resolve sealed `ssh_key_secret` keypair paths per host
         // so the fetch closure stays `Send + Sync`. The TUI's `ops`
@@ -2879,7 +2866,7 @@ impl App {
         }
         self.hosts_in_flight = true;
         let ops = self.ops.clone();
-        let hosts = self.config.hosts.clone();
+        let hosts = self.config.fleet();
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
             let rows = hosts::fetch_rows_owned(ops, hosts).await;
@@ -3019,7 +3006,7 @@ impl App {
     /// fanned out across every host.
     fn spawn_resource_prune(&self, kind: ResourceTab, dangling_only: bool) {
         let ops = self.ops.clone();
-        let hosts: Vec<Host> = self.config.hosts.iter().map(Host::from).collect();
+        let hosts: Vec<Host> = self.config.fleet();
         let tx = self.update_tx.clone();
         tokio::spawn(async move {
             let mut summaries: Vec<String> = Vec::new();
@@ -3104,12 +3091,8 @@ impl App {
                 // as Dashboard. Clone it into both before handing the
                 // original off to dashboard's apply (which moves it).
                 let report_clone = data.report.clone();
-                let service_names: Vec<String> = self
-                    .config
-                    .services
-                    .iter()
-                    .map(|s| s.name.clone())
-                    .collect();
+                let service_names: Vec<String> =
+                    self.config.service_names().map(str::to_string).collect();
                 self.services.apply(report_clone.clone(), service_names);
                 self.service_detail
                     .apply(report_clone.map(Arc::new), &self.config);
@@ -3259,7 +3242,7 @@ impl App {
             // For services with no `tag:` in config, fall back to the
             // running replica's tag so the diff isolates the env/label
             // change instead of erroring on a missing tag.
-            if let Some(svc) = config.services.iter().find(|s| s.name == service)
+            if let Some(svc) = config.service(&service)
                 && svc.tag.is_none()
                 && let Ok(containers) = ops
                     .list_containers_by_label(&host, &format!("yoink.service={service}"))
@@ -3307,13 +3290,7 @@ impl App {
         service_name: String,
         target_container: Option<String>,
     ) {
-        let Some(service) = self
-            .config
-            .services
-            .iter()
-            .find(|s| s.name == service_name)
-            .cloned()
-        else {
+        let Some(service) = self.config.service(&service_name).cloned() else {
             self.push_toast(format!("✗ no service named {service_name}"));
             return;
         };
@@ -3438,13 +3415,7 @@ impl App {
             self.push_toast(format!("◊ already up: {}", existing.url));
             return;
         }
-        let Some(service) = self
-            .config
-            .services
-            .iter()
-            .find(|s| s.name == service_name)
-            .cloned()
-        else {
+        let Some(service) = self.config.service(&service_name).cloned() else {
             self.push_toast(format!("✗ no service named {service_name}"));
             return;
         };
@@ -3692,8 +3663,8 @@ impl App {
             || {
                 format!(
                     "{} hosts · {} services",
-                    self.config.hosts.len(),
-                    self.config.services.len()
+                    self.config.host_count(),
+                    self.config.service_count()
                 )
             },
             |(_, msg)| format!("● {msg}"),
@@ -3850,7 +3821,7 @@ impl App {
         if let Some((service, tag)) = &self.reconcile_target {
             let svc_line = format!("service:  {service}");
             let tag_line = format!("tag:      {tag}");
-            let host_count = format!("hosts:    {}", self.config.hosts.len());
+            let host_count = format!("hosts:    {}", self.config.host_count());
             let lines = vec![
                 "About to run `yoink up` for one service.",
                 "",
@@ -3869,8 +3840,8 @@ impl App {
             super::ui::render_modal(frame, "reconcile service?", &lines);
         }
         if self.reconcile_all_target {
-            let svc_count = format!("services: {}", self.config.services.len());
-            let host_count = format!("hosts:    {}", self.config.hosts.len());
+            let svc_count = format!("services: {}", self.config.service_count());
+            let host_count = format!("hosts:    {}", self.config.host_count());
             let lines = vec![
                 "About to run `yoink up` for every service.",
                 "",
@@ -3914,7 +3885,7 @@ impl App {
             super::ui::render_modal(frame, &title, &lines);
         }
         if let Some((kind, dangling_only)) = &self.resource_prune_target {
-            let host_count = format!("hosts:  {}", self.config.hosts.len());
+            let host_count = format!("hosts:  {}", self.config.host_count());
             let title = match kind {
                 ResourceTab::Images => {
                     if *dangling_only {
@@ -3950,7 +3921,7 @@ impl App {
             super::ui::render_modal(frame, title, &lines);
         }
         if self.prune_target {
-            let host_count = format!("hosts:    {}", self.config.hosts.len());
+            let host_count = format!("hosts:    {}", self.config.host_count());
             let lines = vec![
                 "About to run `yoink prune`.",
                 "",
@@ -4111,7 +4082,7 @@ async fn reconcile_one(
         let _ = tx.send(JobUpdate::Done(result));
     };
 
-    if config.hosts.is_empty() {
+    if config.host_count() == 0 {
         send_done(Err("no hosts configured".into()));
         return;
     }
@@ -4119,8 +4090,7 @@ async fn reconcile_one(
     // Acquire one lock per configured host. Per-host parallel like
     // cmd_up; on any failure release whatever we already grabbed and
     // bail.
-    let acquire_futs = config.hosts.iter().map(|host_cfg| {
-        let host = Host::from(host_cfg);
+    let acquire_futs = config.fleet().into_iter().map(|host| {
         let ops = ops.clone();
         async move { HostLock::acquire(&*ops, host.clone()).await }
     });
@@ -4182,13 +4152,12 @@ async fn reconcile_all(
         let _ = tx.send(JobUpdate::Done(result));
     };
 
-    if config.hosts.is_empty() {
+    if config.host_count() == 0 {
         send_done(Err("no hosts configured".into()));
         return;
     }
 
-    let acquire_futs = config.hosts.iter().map(|host_cfg| {
-        let host = Host::from(host_cfg);
+    let acquire_futs = config.fleet().into_iter().map(|host| {
         let ops = ops.clone();
         async move { HostLock::acquire(&*ops, host.clone()).await }
     });
@@ -4278,12 +4247,12 @@ async fn prune_all(config: Config, ops: Arc<dyn DockerOps>, tx: UnboundedSender<
         let _ = tx.send(JobUpdate::Done(result));
     };
 
-    if config.hosts.is_empty() {
+    if config.host_count() == 0 {
         send_done(Err("no hosts to prune".into()));
         return;
     }
 
-    send_event(format!("scanning {} host(s)…", config.hosts.len()));
+    send_event(format!("scanning {} host(s)…", config.host_count()));
     match prune::run(&*ops, &config, false).await {
         Ok(report) => {
             if report.removed.is_empty() {

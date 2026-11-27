@@ -316,13 +316,11 @@ pub async fn cmd_vscode(
     use crate::transport::tunnel::SshTunnel;
 
     let service = config
-        .services
-        .iter()
-        .find(|s| s.name == service_name)
+        .service(service_name)
         .ok_or_else(|| VscodeError::ServiceNotFound(service_name.to_string()))?;
 
-    let applicable: Vec<_> = service
-        .applicable_hosts(&config.hosts)
+    let applicable: Vec<_> = config
+        .fleet_for(service)
         .into_iter()
         .filter(|h| {
             options
@@ -331,7 +329,7 @@ pub async fn cmd_vscode(
                 .is_none_or(|f| f == h.address)
         })
         .collect();
-    let host_cfg = match applicable.as_slice() {
+    let host = match applicable.as_slice() {
         [] => {
             return Err(VscodeError::NoApplicableHost {
                 service: service_name.to_string(),
@@ -342,8 +340,8 @@ pub async fn cmd_vscode(
             }
             .into());
         }
-        [single] => *single,
-        many if options.host_filter.is_some() => many[0],
+        [single] => single.clone(),
+        many if options.host_filter.is_some() => many[0].clone(),
         many => {
             let listing = many
                 .iter()
@@ -359,7 +357,7 @@ pub async fn cmd_vscode(
         }
     };
 
-    if host_cfg.address == "local" {
+    if host.address == "local" {
         return Err(VscodeError::LocalHost {
             service: service_name.to_string(),
         }
@@ -374,8 +372,6 @@ pub async fn cmd_vscode(
         }
         .into());
     }
-
-    let host = Host::from(host_cfg);
 
     let keyfile = ops.ssh_keyfile(&host);
     crate::ssh_probe::probe(&host, keyfile.as_deref().and_then(|p| p.to_str()))

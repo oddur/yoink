@@ -324,8 +324,8 @@ pub async fn reconcile_with_options(
     // level event: no service context.
     {
         let mut none_sink = |e: DeployEvent| on_event(None, e);
-        for host_cfg in &config.hosts {
-            ensure_host_networks(ops, host_cfg, &config.deploy.networks, &mut none_sink).await?;
+        for host in config.fleet() {
+            ensure_host_networks(ops, &host, config.networks(), &mut none_sink).await?;
         }
     }
 
@@ -353,8 +353,7 @@ pub async fn reconcile_with_options(
     // discover-it's-a-noop dance.
     let mut snapshot: std::collections::HashMap<String, Vec<ContainerInfo>> =
         std::collections::HashMap::new();
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
+    for host in config.fleet() {
         let containers = ops
             .list_containers_by_label(&host, "yoink.managed=true")
             .await
@@ -377,7 +376,7 @@ pub async fn reconcile_with_options(
         .collect();
     let selected_names: std::collections::HashSet<String> = match services_filter {
         Some(filter) => filter.iter().cloned().collect(),
-        None => config.services.iter().map(|s| s.name.clone()).collect(),
+        None => config.service_names().map(str::to_string).collect(),
     };
     let mut remaining: Vec<&ServiceConfig> = config
         .services
@@ -533,8 +532,7 @@ pub async fn reconcile_with_options(
             .iter()
             .find(|s| matches!(s.kind, Some(crate::config::ServiceKind::Proxy)))
     {
-        for host_cfg in proxy_svc.applicable_hosts(&config.hosts) {
-            let host = Host::from(host_cfg);
+        for host in config.fleet_for(proxy_svc) {
             push_caddy_config(ops, &host, config, secrets, None).await?;
         }
     }
@@ -638,8 +636,8 @@ fn service_already_at_spec(
     desired_hash: &str,
 ) -> SpecStatus {
     let mut hosts = Vec::new();
-    for host_cfg in service.applicable_hosts(&config.hosts) {
-        let Some(containers) = snapshot.get(&host_cfg.address) else {
+    for host in config.fleet_for(service) {
+        let Some(containers) = snapshot.get(&host.address) else {
             return SpecStatus::NotAtSpec;
         };
         let state = host_spec_state(containers, service, desired_hash);
@@ -647,7 +645,7 @@ fn service_already_at_spec(
             return SpecStatus::NotAtSpec;
         }
         hosts.push(HostAtSpec {
-            host: Host::from(host_cfg),
+            host,
             expected: state.expected,
             extras: state.extras,
         });
@@ -774,7 +772,7 @@ pub async fn deploy_service(
     force: bool,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<ServiceDeployReport, DeployError> {
-    let hosts = service.applicable_hosts(&config.hosts);
+    let hosts = config.fleet_for(service);
 
     // ── Phase 1: PREPARE ──────────────────────────────────────────
     // For every host: ensure network, pull image, upload files,
@@ -782,11 +780,9 @@ pub async fn deploy_service(
     // every host has a fully-configured container that's just one
     // `docker start` away from running.
     let mut prepared: Vec<HostPrep> = Vec::with_capacity(hosts.len());
-    for host_cfg in &hosts {
-        let prep = prepare_one_host(
-            ops, config, service, tag, secrets, host_cfg, force, on_event,
-        )
-        .await?;
+    for host in &hosts {
+        let prep =
+            prepare_one_host(ops, config, service, tag, secrets, host, force, on_event).await?;
         prepared.push(prep);
     }
 
@@ -871,11 +867,11 @@ async fn prepare_one_host(
     service: &ServiceConfig,
     tag: &str,
     secrets: Option<&SecretsBundle>,
-    host_cfg: &crate::config::HostConfig,
+    host: &Host,
     force: bool,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<HostPrep, DeployError> {
-    let host = Host::from(host_cfg);
+    let host = host.clone();
     on_event(DeployEvent::Started {
         service: service.name.clone(),
         tag: tag.to_string(),
@@ -1031,7 +1027,7 @@ async fn start_new_replicas(
         // service_already_at_spec only checks name/hash/running, so a
         // half-networked container would otherwise short-circuit and
         // persist forever.
-        let effective = service.effective_networks(&config.deploy);
+        let effective = config.networks_for(service);
         let mut aliases = vec![replica.name.clone()];
         aliases.extend(service.run.options.network_aliases.iter().cloned());
         attach_extra_networks(ops, host, &replica.name, &effective, &aliases).await?;
@@ -1295,7 +1291,7 @@ async fn push_caddy_config(
         })?;
     let config = &config;
 
-    let routed: Vec<&ServiceConfig> = config.services.iter().filter(|s| s.is_proxied()).collect();
+    let routed: Vec<&ServiceConfig> = config.proxied_services();
     let upstream_names = build_upstream_names(ops, host, &routed, in_flight_upstreams).await?;
 
     let json = crate::proxy::caddy::render(
@@ -1388,7 +1384,7 @@ fn build_run_spec(
     RunSpec {
         image: service.image.clone(),
         tag: tag.to_string(),
-        networks: service.effective_networks(&config.deploy),
+        networks: config.networks_for(service),
         container_name,
         labels: build_labels(service, tag, spec_hash),
         env: build_env(service, secrets),
@@ -1565,14 +1561,13 @@ async fn pull_image(
 /// already-exists / created status.
 pub async fn ensure_host_networks(
     ops: &dyn DockerOps,
-    host_cfg: &crate::config::HostConfig,
+    host: &Host,
     networks: &[String],
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<(), DeployError> {
-    let host = Host::from(host_cfg);
     for net in networks {
         let created =
-            network::ensure(ops, &host, net)
+            network::ensure(ops, host, net)
                 .await
                 .map_err(|source| DeployError::Docker {
                     host: host.address.clone(),
@@ -1633,15 +1628,10 @@ pub async fn prefetch_images(
         >,
     > = Vec::new();
 
-    if let Some(proxy_cfg) = config.proxy.as_ref()
-        && let Some(xcaddy_cfg) = proxy_cfg.xcaddy.as_ref()
-        && let Some(svc) = config
-            .services
-            .iter()
-            .find(|s| s.name == crate::config::PROXY_SERVICE_NAME)
+    if let Some(xcaddy_cfg) = config.xcaddy()
+        && let Some(svc) = config.service(crate::config::PROXY_SERVICE_NAME)
     {
-        for host_cfg in svc.applicable_hosts(&config.hosts) {
-            let host = Host::from(host_cfg);
+        for host in config.fleet_for(svc) {
             let ops = ops.clone();
             let xcaddy_cfg = xcaddy_cfg.clone();
             build_futs.push(Box::pin(async move {
@@ -1679,9 +1669,7 @@ pub async fn prefetch_images(
         // Likewise the xcaddy-built proxy image only exists locally on
         // each host; pulling it from a registry would 404. The build
         // fan-out above has already produced the image.
-        if service.name == crate::config::PROXY_SERVICE_NAME
-            && config.proxy.as_ref().is_some_and(|p| p.xcaddy.is_some())
-        {
+        if service.name == crate::config::PROXY_SERVICE_NAME && config.xcaddy().is_some() {
             continue;
         }
         let tag = match tag_overrides.get(&service.name).cloned() {
@@ -1694,8 +1682,7 @@ pub async fn prefetch_images(
             },
         };
         let credentials = registry_credentials(config, secrets, &service.image);
-        for host_cfg in service.applicable_hosts(&config.hosts) {
-            let host = Host::from(host_cfg);
+        for host in config.fleet_for(service) {
             let ops = ops.clone();
             let on_event = on_event.clone();
             let creds = credentials.clone();
@@ -1899,7 +1886,7 @@ async fn wait_until_healthy(
     // non-HTTP services like redis or TLS-only edges like caddy).
     // The probe must share at least one network with the target;
     // pick the service's first effective network.
-    let effective = service.effective_networks(&config.deploy);
+    let effective = config.networks_for(service);
     let probe_network = effective.first().map_or("bridge", String::as_str);
     let result = match service.run.healthcheck_path.as_deref() {
         Some(path) => {
@@ -2060,11 +2047,14 @@ async fn run_hook(
     if hook.is_subprocess() {
         return run_subprocess_hook(config, hook, secrets).await;
     }
-    let host_cfg = config.hosts.first().ok_or_else(|| DeployError::Hook {
-        name: hook.name.clone(),
-        message: "no hosts configured".into(),
-    })?;
-    let host = Host::from(host_cfg);
+    let host = config
+        .fleet()
+        .into_iter()
+        .next()
+        .ok_or_else(|| DeployError::Hook {
+            name: hook.name.clone(),
+            message: "no hosts configured".into(),
+        })?;
 
     let image = hook
         .image
@@ -2082,11 +2072,7 @@ async fn run_hook(
     // services on it (e.g. a migration hook hitting the database).
     // Operators with stricter isolation needs can put their hooks
     // on a dedicated network and put it first in deploy.networks.
-    let hook_network = config
-        .deploy
-        .networks
-        .first()
-        .map_or("bridge", String::as_str);
+    let hook_network = config.networks().first().map_or("bridge", String::as_str);
     let body = docker::build_hook_container(
         image,
         tag,

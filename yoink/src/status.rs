@@ -7,7 +7,6 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::docker_ops::{ContainerInfo, DockerError, DockerOps};
-use crate::host::Host;
 
 #[derive(Debug, Error)]
 pub enum StatusError {
@@ -51,15 +50,12 @@ impl StatusReport {
         config: &Config,
         label: &str,
     ) -> Result<Self, StatusError> {
-        let per_host = config.hosts.iter().map(|host_cfg| {
-            let host = Host::from(host_cfg);
-            async move {
-                let containers = ops.list_containers_by_label(&host, label).await?;
-                Ok::<_, DockerError>(HostStatus {
-                    host: host.address,
-                    containers,
-                })
-            }
+        let per_host = config.fleet().into_iter().map(|host| async move {
+            let containers = ops.list_containers_by_label(&host, label).await?;
+            Ok::<_, DockerError>(HostStatus {
+                host: host.address,
+                containers,
+            })
         });
         let hosts = try_join_all(per_host).await?;
         Ok(Self { hosts })

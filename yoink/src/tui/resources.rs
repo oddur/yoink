@@ -584,18 +584,14 @@ impl ResourcesState {
 }
 
 fn host_for_address(config: &Config, address: &str) -> Option<Host> {
-    config
-        .hosts
-        .iter()
-        .find(|h| h.address == address)
-        .map(Host::from)
+    config.host(address)
 }
 
 /// Background-friendly fetch — fans out per-host across all three
 /// resource families in parallel. Errors per host land in the result
 /// vec as `Err(String)` so the pane can render partial successes.
 pub async fn fetch_owned(ops: Arc<dyn DockerOps>, config: Arc<Config>) -> ResourcesRefresh {
-    let hosts: Vec<Host> = config.hosts.iter().map(Host::from).collect();
+    let hosts: Vec<Host> = config.fleet();
 
     // Three concurrent fan-outs, one per resource family.
     let images_fut = {

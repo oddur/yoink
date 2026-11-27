@@ -75,7 +75,7 @@ pub fn host_shell_command(
     cmd
 }
 
-/// Walk `config.hosts`, decrypt every named `ssh_key_secret` from the
+/// Walk the hosts' `ssh_key_secret:` entries, decrypt every named `ssh_key_secret` from the
 /// bundle into a 0600 tempfile, and return a manager. The manager
 /// holds the tempfiles alive for the duration of the deploy.
 ///
@@ -83,24 +83,19 @@ pub fn host_shell_command(
 /// path; the operator's existing ssh auth keeps working.
 pub fn prepare(config: &Config, bundle: Option<&SecretsBundle>) -> Result<Option<KeyManager>> {
     let mut by_address: BTreeMap<String, NamedTempFile> = BTreeMap::new();
-    for host in &config.hosts {
-        let Some(secret_name) = host.ssh_key_secret.as_deref() else {
-            continue;
-        };
+    for (address, secret_name) in config.host_ssh_keys() {
         let bundle = bundle.ok_or_else(|| {
             anyhow::anyhow!(
-                "host `{}` declares ssh_key_secret={secret_name:?} but no [secrets] block is configured",
-                host.address,
+                "host `{address}` declares ssh_key_secret={secret_name:?} but no [secrets] block is configured",
             )
         })?;
         let key_pem = bundle.get(secret_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "host `{}` declares ssh_key_secret={secret_name:?} but the secrets bundle has no such key",
-                host.address,
+                "host `{address}` declares ssh_key_secret={secret_name:?} but the secrets bundle has no such key",
             )
         })?;
         let tempfile = write_keyfile(secret_name, key_pem)?;
-        by_address.insert(host.address.clone(), tempfile);
+        by_address.insert(address.to_string(), tempfile);
     }
     if by_address.is_empty() {
         return Ok(None);

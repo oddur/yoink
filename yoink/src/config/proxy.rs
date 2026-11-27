@@ -6,7 +6,10 @@
 
 mod plugins;
 
-use super::{Config, ConfigError, ProxyConfig, ServiceConfig, ServiceKind, ServiceRun, TlsMode};
+use super::{
+    Config, ConfigError, ProxyConfig, ProxyTls, ServiceConfig, ServiceKind, ServiceRun, TlsMode,
+    XcaddyConfig,
+};
 
 /// The internal service name yoink uses for the implicit reverse
 /// proxy. Users may not declare a service with this name when they
@@ -40,6 +43,54 @@ impl Config {
         self.services.iter().any(|s| s.domain.is_some())
     }
 
+    /// The managed Caddy build (`proxy.xcaddy:`), when configured.
+    #[must_use]
+    pub fn xcaddy(&self) -> Option<&XcaddyConfig> {
+        self.proxy.as_ref().and_then(|p| p.xcaddy.as_ref())
+    }
+
+    /// The ACME registration email (`proxy.email:`), when set.
+    #[must_use]
+    pub fn proxy_email(&self) -> Option<&str> {
+        self.proxy.as_ref().and_then(|p| p.email.as_deref())
+    }
+
+    /// The proxy-level TLS block (`proxy.tls:`), when set.
+    #[must_use]
+    pub fn proxy_tls(&self) -> Option<&ProxyTls> {
+        self.proxy.as_ref().and_then(|p| p.tls.as_ref())
+    }
+
+    /// The Caddy image the proxy runs: `proxy.image:`, the xcaddy
+    /// tag, or the default `caddy:2`.
+    #[must_use]
+    pub fn proxy_image(&self) -> String {
+        self.proxy.as_ref().map_or_else(
+            || super::CADDY_DEFAULT_IMAGE.to_string(),
+            ProxyConfig::resolved_image,
+        )
+    }
+
+    /// The raw `proxy.global_handlers:` and `proxy.global_handlers_after:`
+    /// snippets. Both empty without a `proxy:` block.
+    #[must_use]
+    pub fn proxy_global_handlers(&self) -> (&[String], &[String]) {
+        self.proxy
+            .as_ref()
+            .map_or((&[] as &[String], &[] as &[String]), |p| {
+                (
+                    p.global_handlers.as_slice(),
+                    p.global_handlers_after.as_slice(),
+                )
+            })
+    }
+
+    /// The raw `proxy.config_extra:` snippet, when set.
+    #[must_use]
+    pub fn proxy_config_extra(&self) -> Option<&str> {
+        self.proxy.as_ref().and_then(|p| p.config_extra.as_deref())
+    }
+
     /// Synthesize the `_proxy` service, ensure ingress/admin networks
     /// exist in `deploy.networks`, and add `_proxy` to every routed
     /// service's `depends_on:` list. Idempotent — safe to call after
@@ -51,71 +102,7 @@ impl Config {
         }
 
         if let Some(p) = self.proxy.as_ref() {
-            if let Some(extra) = p.config_extra.as_deref() {
-                let parsed =
-                    validate_json_shape(extra, "proxy.config_extra", JsonShape::ObjectOnly)?;
-                reject_reserved_config_extra_paths(&parsed)?;
-            }
-            // Parsed JSON for each handler-shaped field, kept so the
-            // missing-plugin warning pass below can walk them without a
-            // second parse round-trip.
-            let mut parsed_handler_snippets: Vec<(String, serde_json::Value)> = Vec::new();
-            for (i, raw) in p.global_handlers.iter().enumerate() {
-                let label = format!("proxy.global_handlers[{i}]");
-                let parsed = validate_json_shape(raw, &label, JsonShape::ObjectOrArray)?;
-                parsed_handler_snippets.push((label, parsed));
-            }
-            for (i, raw) in p.global_handlers_after.iter().enumerate() {
-                let label = format!("proxy.global_handlers_after[{i}]");
-                let parsed = validate_json_shape(raw, &label, JsonShape::ObjectOrArray)?;
-                parsed_handler_snippets.push((label, parsed));
-            }
-            // Per-service `caddy_extra_json:` is parsed lazily by the
-            // renderer; for the missing-plugin check we parse here too.
-            // Errors at this layer are best-effort (the renderer surfaces
-            // shape errors with full context); skip silently on parse fail.
-            for svc in &self.services {
-                if let Some(extra) = svc.caddy_extra_json.as_deref()
-                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(extra)
-                {
-                    let label = format!("service {:?}: caddy_extra_json", svc.name);
-                    parsed_handler_snippets.push((label, parsed));
-                }
-            }
-            if let Some(x) = &p.xcaddy {
-                for warning in unpinned_plugin_warnings(&x.plugins) {
-                    tracing::warn!(target: "yoink::proxy::xcaddy", "{warning}");
-                }
-                if p.image.is_some() {
-                    return Err(ConfigError::Invalid(
-                        "proxy.image and proxy.xcaddy are mutually exclusive — `image:` is the \
-                         bring-your-own-image escape hatch; `xcaddy:` is the managed-build path. \
-                         Pick one."
-                            .to_string(),
-                    ));
-                }
-                if x.plugins.is_empty() {
-                    return Err(ConfigError::Invalid(
-                        "proxy.xcaddy.plugins is empty — set at least one plugin or remove the \
-                         `xcaddy:` block to use vanilla `caddy:2`"
-                            .to_string(),
-                    ));
-                }
-                for plugin in &x.plugins {
-                    if !is_plausible_go_module(plugin) {
-                        return Err(ConfigError::Invalid(format!(
-                            "proxy.xcaddy.plugins entry {plugin:?} doesn't look like a Go module \
-                             path (expected `<host>/<owner>/<repo>` or \
-                             `<host>/<owner>/<repo>@<version>`)"
-                        )));
-                    }
-                }
-                for (label, snippet) in &parsed_handler_snippets {
-                    for warning in plugins::missing_plugin_warnings(snippet, &x.plugins, label) {
-                        tracing::warn!(target: "yoink::proxy::xcaddy", "{warning}");
-                    }
-                }
-            }
+            p.validate(&self.services)?;
         }
 
         // Validation: any service using `tls: cert` must name both
@@ -241,6 +228,95 @@ impl Config {
         if !self.services.iter().any(|s| s.name == PROXY_SERVICE_NAME) {
             let proxy_cfg = self.proxy.clone().unwrap_or_default();
             self.services.push(synthesized_proxy_service(&proxy_cfg));
+        }
+        Ok(())
+    }
+}
+
+impl ProxyConfig {
+    /// Check the `proxy:` block on its own: JSON shapes of the raw
+    /// Caddy snippets, reserved `config_extra` paths, and the
+    /// `xcaddy:` build. `services` supplies the per-service
+    /// `caddy_extra_json:` snippets for the missing-plugin warnings.
+    fn validate(&self, services: &[ServiceConfig]) -> Result<(), ConfigError> {
+        if let Some(extra) = self.config_extra.as_deref() {
+            let parsed = validate_json_shape(extra, "proxy.config_extra", JsonShape::ObjectOnly)?;
+            reject_reserved_config_extra_paths(&parsed)?;
+        }
+        // Parsed JSON for each handler-shaped field, kept so the
+        // missing-plugin warning pass below can walk them without a
+        // second parse round-trip.
+        let mut parsed_handler_snippets: Vec<(String, serde_json::Value)> = Vec::new();
+        for (i, raw) in self.global_handlers.iter().enumerate() {
+            let label = format!("proxy.global_handlers[{i}]");
+            let parsed = validate_json_shape(raw, &label, JsonShape::ObjectOrArray)?;
+            parsed_handler_snippets.push((label, parsed));
+        }
+        for (i, raw) in self.global_handlers_after.iter().enumerate() {
+            let label = format!("proxy.global_handlers_after[{i}]");
+            let parsed = validate_json_shape(raw, &label, JsonShape::ObjectOrArray)?;
+            parsed_handler_snippets.push((label, parsed));
+        }
+        // Per-service `caddy_extra_json:` is parsed lazily by the
+        // renderer; for the missing-plugin check we parse here too.
+        // Errors at this layer are best-effort (the renderer surfaces
+        // shape errors with full context); skip silently on parse fail.
+        for svc in services {
+            if let Some(extra) = svc.caddy_extra_json.as_deref()
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(extra)
+            {
+                let label = format!("service {:?}: caddy_extra_json", svc.name);
+                parsed_handler_snippets.push((label, parsed));
+            }
+        }
+        if let Some(x) = &self.xcaddy {
+            x.validate(self.image.is_some(), &parsed_handler_snippets)?;
+        }
+        Ok(())
+    }
+}
+
+impl XcaddyConfig {
+    /// Check the `proxy.xcaddy:` block. `image_is_set` is whether
+    /// `proxy.image:` is also set, which is an error. Warns about
+    /// unpinned plugins and about handlers in `snippets` whose plugin
+    /// is missing.
+    fn validate(
+        &self,
+        image_is_set: bool,
+        snippets: &[(String, serde_json::Value)],
+    ) -> Result<(), ConfigError> {
+        for warning in unpinned_plugin_warnings(&self.plugins) {
+            tracing::warn!(target: "yoink::proxy::xcaddy", "{warning}");
+        }
+        if image_is_set {
+            return Err(ConfigError::Invalid(
+                "proxy.image and proxy.xcaddy are mutually exclusive — `image:` is the \
+                 bring-your-own-image escape hatch; `xcaddy:` is the managed-build path. \
+                 Pick one."
+                    .to_string(),
+            ));
+        }
+        if self.plugins.is_empty() {
+            return Err(ConfigError::Invalid(
+                "proxy.xcaddy.plugins is empty — set at least one plugin or remove the \
+                 `xcaddy:` block to use vanilla `caddy:2`"
+                    .to_string(),
+            ));
+        }
+        for plugin in &self.plugins {
+            if !is_plausible_go_module(plugin) {
+                return Err(ConfigError::Invalid(format!(
+                    "proxy.xcaddy.plugins entry {plugin:?} doesn't look like a Go module \
+                     path (expected `<host>/<owner>/<repo>` or \
+                     `<host>/<owner>/<repo>@<version>`)"
+                )));
+            }
+        }
+        for (label, snippet) in snippets {
+            for warning in plugins::missing_plugin_warnings(snippet, &self.plugins, label) {
+                tracing::warn!(target: "yoink::proxy::xcaddy", "{warning}");
+            }
         }
         Ok(())
     }

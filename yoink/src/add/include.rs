@@ -24,41 +24,15 @@ pub fn plan(config: &Config, desired_glob: Option<&str>, dests: &[PathBuf]) -> I
     let Some(glob) = desired_glob else {
         return IncludePlan::AlreadyCovered;
     };
-    if config.include.iter().any(|existing| existing == glob) {
+    if config.includes_glob(glob) {
         return IncludePlan::AlreadyCovered;
     }
-    let base = config
-        .config_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("."));
-    if dests
-        .iter()
-        .all(|d| dest_matched_by_existing_globs(&base, d, &config.include))
-    {
+    if dests.iter().all(|d| config.include_covers(d)) {
         return IncludePlan::AlreadyCovered;
     }
     IncludePlan::AddGlob {
         glob: glob.to_string(),
     }
-}
-
-fn dest_matched_by_existing_globs(base: &Path, dest: &Path, globs: &[String]) -> bool {
-    let abs_dest = if dest.is_absolute() {
-        dest.to_path_buf()
-    } else {
-        base.join(dest)
-    };
-    globs.iter().any(|pattern| {
-        let pat_path = if Path::new(pattern).is_absolute() {
-            pattern.clone()
-        } else {
-            base.join(pattern).to_string_lossy().into_owned()
-        };
-        match glob::Pattern::new(&pat_path) {
-            Ok(p) => p.matches_path(&abs_dest),
-            Err(_) => false,
-        }
-    })
 }
 
 /// Apply an [`IncludePlan::AddGlob`] to `yoink.yaml` on disk by editing

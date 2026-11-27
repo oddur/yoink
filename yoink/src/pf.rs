@@ -304,9 +304,7 @@ fn parse_publish_spec(spec: &str) -> Result<PublishedEndpoint, String> {
 #[allow(clippy::result_large_err)]
 pub fn resolve_service<'a>(config: &'a Config, name: &str) -> Result<&'a ServiceConfig, PfError> {
     config
-        .services
-        .iter()
-        .find(|s| s.name == name)
+        .service(name)
         .ok_or_else(|| PfError::ServiceNotFound(name.to_string()))
 }
 

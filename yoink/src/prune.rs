@@ -9,7 +9,6 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::docker_ops::{ContainerInfo, DockerError, DockerOps};
-use crate::host::Host;
 
 #[derive(Debug, Error)]
 pub enum PruneError {
@@ -52,11 +51,10 @@ pub async fn run(
     config: &Config,
     dry_run: bool,
 ) -> Result<PruneReport, PruneError> {
-    let known_services: BTreeSet<String> = config.services.iter().map(|s| s.name.clone()).collect();
+    let known_services: BTreeSet<String> = config.service_names().map(str::to_string).collect();
 
     let mut report = PruneReport::default();
-    for host_cfg in &config.hosts {
-        let host = Host::from(host_cfg);
+    for host in config.fleet() {
         let containers = ops
             .list_containers_by_label(&host, "yoink.managed=true")
             .await

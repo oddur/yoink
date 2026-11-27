@@ -12,7 +12,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
-use crate::config::{Config, HostConfig};
+use crate::config::Config;
 use crate::docker_ops::{DockerOps, DockerVersion, HostInfo};
 use crate::host::Host;
 use crate::output::format_bytes;
@@ -63,7 +63,7 @@ impl HostsState {
     /// Convenience for tests + sync paths: `apply(fetch().await)`.
     #[cfg(test)]
     pub async fn refresh(&mut self, ops: &dyn DockerOps, config: &Config) {
-        let rows = fetch_rows(ops, &config.hosts).await;
+        let rows = fetch_rows(ops, &config.fleet()).await;
         self.apply(rows);
     }
 
@@ -198,20 +198,19 @@ impl HostsState {
 
 /// Background-friendly fetch: takes owned inputs so the resulting future
 /// is `'static + Send` and can be `tokio::spawn`-ed.
-pub async fn fetch_rows_owned(ops: Arc<dyn DockerOps>, hosts: Vec<HostConfig>) -> Vec<HostRow> {
+pub async fn fetch_rows_owned(ops: Arc<dyn DockerOps>, hosts: Vec<Host>) -> Vec<HostRow> {
     fetch_rows(ops.as_ref(), &hosts).await
 }
 
-async fn fetch_rows(ops: &dyn DockerOps, hosts: &[HostConfig]) -> Vec<HostRow> {
-    let futs = hosts.iter().map(|h| async move {
-        let host = Host::from(h);
-        let version = ops.version(&host).await;
+async fn fetch_rows(ops: &dyn DockerOps, hosts: &[Host]) -> Vec<HostRow> {
+    let futs = hosts.iter().map(|host| async move {
+        let version = ops.version(host).await;
         if let Err(e) = version {
             return (None, None, None, Some(format!("{e:#}")));
         }
         let version = version.unwrap();
-        let info = ops.host_info(&host).await.ok();
-        let usage = host_usage(ops, &host).await;
+        let info = ops.host_info(host).await.ok();
+        let usage = host_usage(ops, host).await;
         (Some(version), info, usage, None)
     });
     let results = join_all(futs).await;

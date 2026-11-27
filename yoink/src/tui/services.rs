@@ -119,7 +119,7 @@ impl ServicesState {
         let layout = pane_layout(area);
         let header = Paragraph::new(format!(
             "yoink services · {} declared · ↑↓ select · enter for instances",
-            config.services.len()
+            config.service_count()
         ))
         .style(bold());
         frame.render_widget(header, layout[0]);
@@ -181,7 +181,7 @@ fn build_service_row<'a>(
     forwards: &super::pf::PortForwardState,
     vscode: &super::vscode::VscodeSessionState,
 ) -> Row<'a> {
-    let cfg_service = config.services.iter().find(|s| s.name == name);
+    let cfg_service = config.service(name);
     let image_tag = cfg_service.map_or_else(
         || "?".into(),
         |s| match s.tag.as_deref() {
@@ -200,7 +200,7 @@ fn build_service_row<'a>(
     // Expected = replicas × real hosts the service is configured to
     // run on.
     let expected = cfg_service.map_or(running, |s| {
-        s.applicable_hosts(&config.hosts).len() * s.run.replicas as usize
+        config.fleet_for(s).len() * s.run.replicas as usize
     });
     let running_str = format!("{running}/{expected}");
     let health = summarize_health(&containers);
@@ -477,7 +477,7 @@ impl ServiceDetailState {
 /// noise on the only-takes-one-row TUI header, and `caddyserver/x`
 /// vs `mholt/y` is what an operator actually wants to see.
 fn xcaddy_plugin_list(config: &Config) -> Option<String> {
-    let plugins = config.proxy.as_ref()?.xcaddy.as_ref()?.sorted_plugins();
+    let plugins = config.xcaddy()?.sorted_plugins();
     if plugins.is_empty() {
         return None;
     }

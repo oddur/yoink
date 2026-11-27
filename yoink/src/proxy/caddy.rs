@@ -42,8 +42,8 @@ pub fn render<F>(
 where
     F: Fn(&str) -> Vec<String>,
 {
-    let proxy_tls = cfg.proxy.as_ref().and_then(|p| p.tls.as_ref());
-    let proxied: Vec<&ServiceConfig> = cfg.services.iter().filter(|s| s.is_proxied()).collect();
+    let proxy_tls = cfg.proxy_tls();
+    let proxied: Vec<&ServiceConfig> = cfg.proxied_services();
 
     // Order services so path-constrained routes come before
     // catch-all routes for the same host. Caddy uses first-match;
@@ -154,17 +154,13 @@ where
     // ACME entirely (we never want both running on the same domains).
     let any_acme = proxy_tls.is_none() && proxied.iter().any(|s| matches!(s.tls, TlsMode::Auto));
     if any_acme {
-        let email = cfg
-            .proxy
-            .as_ref()
-            .and_then(|p| p.email.as_ref())
-            .ok_or_else(|| {
-                anyhow!(
-                    "at least one service uses `tls: auto` (Let's Encrypt) but `proxy.email:` \
+        let email = cfg.proxy_email().ok_or_else(|| {
+            anyhow!(
+                "at least one service uses `tls: auto` (Let's Encrypt) but `proxy.email:` \
                      is unset — Let's Encrypt requires a registration email (or set \
                      `proxy.tls.cert_secret` for an inline cert instead)"
-                )
-            })?;
+            )
+        })?;
         config["apps"]["tls"] = json!({
             "automation": {
                 "policies": [{
@@ -262,15 +258,7 @@ where
 /// the matched service route's per-service handlers complete. No-op
 /// when both lists are empty.
 fn apply_global_handlers(routes: &mut Vec<Value>, cfg: &Config) -> Result<()> {
-    let (pre_snips, post_snips) =
-        cfg.proxy
-            .as_ref()
-            .map_or((&[] as &[String], &[] as &[String]), |p| {
-                (
-                    p.global_handlers.as_slice(),
-                    p.global_handlers_after.as_slice(),
-                )
-            });
+    let (pre_snips, post_snips) = cfg.proxy_global_handlers();
     if pre_snips.is_empty() && post_snips.is_empty() {
         return Ok(());
     }
@@ -297,7 +285,7 @@ fn apply_global_handlers(routes: &mut Vec<Value>, cfg: &Config) -> Result<()> {
 /// keys at non-overlapping paths survive. Validated as a JSON object
 /// at config-load time. No-op when `config_extra:` is unset.
 fn apply_config_extra(config: &mut Value, cfg: &Config) -> Result<()> {
-    let Some(extra) = cfg.proxy.as_ref().and_then(|p| p.config_extra.as_deref()) else {
+    let Some(extra) = cfg.proxy_config_extra() else {
         return Ok(());
     };
     let extra_value: Value = serde_json::from_str(extra)

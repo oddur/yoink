@@ -198,12 +198,7 @@ impl DashboardState {
     ) {
         let layout = pane_layout(area);
 
-        let services = config
-            .services
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let services = config.service_names().collect::<Vec<_>>().join(", ");
         let header = Paragraph::new(format!(
             "yoink dashboard · services: {services} · ↑↓ select · enter detail · ? help"
         ))

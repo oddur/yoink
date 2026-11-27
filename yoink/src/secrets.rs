@@ -177,10 +177,8 @@ pub async fn load_bundle(config: &Config) -> Result<Option<SecretsBundle>, Secre
     };
     let any_secrets_referenced = config_references_secrets(config);
     let bundle = match cfg {
-        SecretsConfig::Age {
-            file, recipients, ..
-        } => {
-            let path = sealed::resolve_sealed_path(config.config_dir.as_deref(), file.as_deref())?;
+        SecretsConfig::Age { recipients, .. } => {
+            let path = config.sealed_path()?;
             load_age_bundle(&path, recipients, any_secrets_referenced)?
         }
         SecretsConfig::Command { command, format } => {
@@ -203,11 +201,7 @@ fn config_references_secrets(config: &Config) -> bool {
     {
         return true;
     }
-    if config
-        .hosts
-        .iter()
-        .any(|h| h.address_secret.is_some() || h.ssh_key_secret.is_some())
-    {
+    if config.any_host_address_sealed() || config.host_ssh_keys().next().is_some() {
         return true;
     }
     config

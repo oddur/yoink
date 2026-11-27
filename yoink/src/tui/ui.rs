@@ -93,7 +93,7 @@ pub fn render_drift_cell(
     let Some(running_hash) = container.yoink_spec_hash.as_deref() else {
         return unknown();
     };
-    let Some(service_cfg) = config.services.iter().find(|s| s.name == service_name) else {
+    let Some(service_cfg) = config.service(service_name) else {
         return unknown();
     };
     // For services with a config-pinned tag, use it. Otherwise fall
