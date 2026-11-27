@@ -955,7 +955,8 @@ pub fn map_deploy_event(
         // didn't keep), `HealthcheckSkipped` (low-signal).
         DeployEvent::Started { .. }
         | DeployEvent::PullFinished { .. }
-        | DeployEvent::HealthcheckSkipped { .. } => None,
+        | DeployEvent::HealthcheckSkipped { .. }
+        | DeployEvent::ProxyAdminUpgradePending { .. } => None,
     }
 }
 

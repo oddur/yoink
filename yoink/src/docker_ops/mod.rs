@@ -435,6 +435,11 @@ pub struct ContainerDetail {
     pub mounts: Vec<String>,
     /// Network names this container is attached to.
     pub networks: Vec<String>,
+    /// Network name → the aliases and DNS names of the container on
+    /// that network. The proxy admin client reads it to find out if
+    /// the running proxy has the admin API alias.
+    #[serde(skip)]
+    pub network_aliases: BTreeMap<String, Vec<String>>,
     pub labels: BTreeMap<String, String>,
     /// Effective user (`container.config.user`). Empty string when
     /// the image's USER is in effect.

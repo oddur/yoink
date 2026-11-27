@@ -133,7 +133,9 @@ where
         // /load REPLACES the active config — if we omit the admin
         // block, Caddy reverts admin to the default `localhost:2019`,
         // which the published admin port cannot reach. Subsequent
-        // /load calls would then time out.
+        // /load calls would then time out. For a proxy of an earlier
+        // yoink version, `proxy::admin::push_config` replaces this
+        // block with the earlier one.
         "admin": crate::config::admin_block(),
         "apps": {
             "http": {

@@ -28,10 +28,12 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::base::host::Host;
-use crate::docker_ops::{DockerError, DockerOps, parse_published_port};
+use crate::docker_ops::{ContainerDetail, DockerError, DockerOps, parse_published_port};
 use crate::ssh::tunnel::{SshTunnel, TunnelError};
 
-use crate::config::{ADMIN_API_HOST, ADMIN_PORT, PROXY_SERVICE_NAME};
+use crate::config::{
+    ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, PROXY_SERVICE_NAME,
+};
 
 /// How long the SSH tunnel + Caddy admin readiness probe each get
 /// before giving up. 20s comfortably covers a cold proxy boot on a
@@ -102,11 +104,17 @@ pub enum AdminError {
 /// see one drop between the readiness probe and the actual `/load`,
 /// surfacing as `error sending request`. Real Caddy errors propagate
 /// immediately without a retry.
+///
+/// The `admin` block of `config` is for a proxy that has the admin API
+/// alias. A proxy from an earlier yoink version does not have it, and
+/// Caddy cannot bind that address. For such a proxy, yoink sends the
+/// earlier block instead, see [`AdminListen::Legacy`]. The return value
+/// tells the caller which block it sent.
 pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
     config: &Value,
-) -> Result<(), AdminError> {
+) -> Result<AdminListen, AdminError> {
     // The discovery phase (label lookup + inspect + port parse +
     // keyfile) is invariant across retries on transport-class
     // failures, so we run it once and only re-tunnel-and-load on
@@ -116,8 +124,9 @@ pub async fn push_config(
     // adding another retry layer here would compound the wait on
     // genuinely down hosts.
     let target = discover_admin_target(host, ops).await?;
+    let config = &config_for(config, target.listen);
     match tunnel_and_load(host, &target, config).await {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(target.listen),
         Err(e) if is_transient(&e) => {
             tracing::debug!(
                 host = %host.address,
@@ -125,10 +134,59 @@ pub async fn push_config(
                 "transient proxy admin push error; reopening tunnel and retrying once",
             );
             tokio::time::sleep(RETRY_BACKOFF).await;
-            tunnel_and_load(host, &target, config).await
+            tunnel_and_load(host, &target, config).await?;
+            Ok(target.listen)
         }
         Err(e) => Err(e),
     }
+}
+
+/// The admin address that the running proxy container can bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminListen {
+    /// The proxy is on `ADMIN_NETWORK` and has `ADMIN_API_ALIAS`
+    /// there. yoink sends [`crate::config::admin_block`].
+    Alias,
+    /// The proxy is from an earlier yoink version: it is not on
+    /// `ADMIN_NETWORK`, or it does not have the alias. Caddy cannot
+    /// bind the alias address, rejects the `/load`, and keeps the old
+    /// config. yoink thus sends the admin block of the earlier version,
+    /// see [`legacy_admin_block`], until a deploy recreates the proxy.
+    Legacy,
+}
+
+impl AdminListen {
+    /// Read the admin address from the inspect output of the running
+    /// proxy container.
+    #[must_use]
+    pub fn of(detail: &ContainerDetail) -> Self {
+        let has_alias = detail
+            .network_aliases
+            .get(ADMIN_NETWORK)
+            .is_some_and(|aliases| aliases.iter().any(|a| a == ADMIN_API_ALIAS));
+        if has_alias { Self::Alias } else { Self::Legacy }
+    }
+}
+
+/// The `admin` block that yoink sent on every `/load` before the admin
+/// API moved to `ADMIN_API_ALIAS`. The wildcard address binds in a proxy
+/// of any version. With a wildcard address, Caddy does not check the
+/// `Host` header, so the `ADMIN_API_HOST` header that yoink sends is
+/// accepted.
+fn legacy_admin_block() -> Value {
+    serde_json::json!({
+        "listen": format!("0.0.0.0:{ADMIN_PORT}"),
+        "enforce_origin": false,
+    })
+}
+
+/// `config` with the `admin` block that `listen` can bind.
+fn config_for(config: &Value, listen: AdminListen) -> Value {
+    let mut config = config.clone();
+    if listen == AdminListen::Legacy {
+        config["admin"] = legacy_admin_block();
+    }
+    config
 }
 
 fn is_transient(e: &AdminError) -> bool {
@@ -144,6 +202,7 @@ fn is_transient(e: &AdminError) -> bool {
 struct AdminTarget {
     host_port: u16,
     keyfile: Option<std::path::PathBuf>,
+    listen: AdminListen,
 }
 
 async fn discover_admin_target(
@@ -182,6 +241,7 @@ async fn discover_admin_target(
     Ok(AdminTarget {
         host_port,
         keyfile: ops.ssh_keyfile(host),
+        listen: AdminListen::of(&detail),
     })
 }
 
@@ -326,6 +386,105 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake host with one running proxy container. `network_aliases`
+    /// is its inspect output: network → aliases.
+    fn fake_proxy(network_aliases: &[(&str, &[&str])]) -> crate::docker_ops::FakeDockerOps {
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        let name = "yoink-proxy-abc1234";
+        ops.push_list_containers(Ok(vec![crate::docker_ops::ContainerInfo {
+            host: "h".into(),
+            name: name.into(),
+            image: "caddy:2".into(),
+            state: "running".into(),
+            status_text: String::new(),
+            created_unix: None,
+            yoink_service: Some(PROXY_SERVICE_NAME.into()),
+            yoink_version: None,
+            yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: network_aliases.iter().map(|(n, _)| (*n).into()).collect(),
+            other_labels: std::collections::BTreeMap::new(),
+        }]));
+        ops.set_inspect(ContainerDetail {
+            name: name.into(),
+            ports: vec![format!("32768:{ADMIN_PORT}/tcp")],
+            network_aliases: network_aliases
+                .iter()
+                .map(|(n, a)| ((*n).into(), a.iter().map(|s| (*s).into()).collect()))
+                .collect(),
+            ..ContainerDetail::default()
+        });
+        ops
+    }
+
+    /// The `admin` block that `push_config` sends to the proxy of
+    /// `ops`, for the config that a deploy renders.
+    async fn pushed_admin(ops: &crate::docker_ops::FakeDockerOps) -> (AdminListen, Value) {
+        let cfg = crate::config::Config::parse_str(
+            r"
+hosts: [{ address: h, user: u }]
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: example/api
+    tag: v1
+    domain: api.example.com
+    run: { port: 8080 }
+",
+        )
+        .expect("config parses");
+        let rendered =
+            crate::proxy::caddy::render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let host = Host {
+            user: "u".into(),
+            address: "h".into(),
+            port: None,
+        };
+        let target = discover_admin_target(&host, ops).await.expect("target");
+        assert_eq!(target.host_port, 32768);
+        let pushed = config_for(&rendered, target.listen);
+        (target.listen, pushed["admin"].clone())
+    }
+
+    /// A scoped `yoink up --service api` after an upgrade keeps the
+    /// proxy of the earlier version: on `yoink-proxy-admin`, without
+    /// the alias. Caddy there cannot bind the alias address, so a
+    /// `/load` with the new admin block was rejected, and yoink then
+    /// removed the new replicas of `api`.
+    #[tokio::test]
+    async fn old_proxy_gets_the_earlier_admin_block() {
+        let ops = fake_proxy(&[
+            ("yoink-ingress", &["yoink-proxy-abc1234"]),
+            ("yoink-proxy-admin", &["yoink-proxy-abc1234"]),
+        ]);
+        let (listen, admin) = pushed_admin(&ops).await;
+        assert_eq!(listen, AdminListen::Legacy);
+        assert_eq!(
+            admin,
+            serde_json::json!({"listen": "0.0.0.0:2019", "enforce_origin": false})
+        );
+    }
+
+    /// On `yoink-admin` without the alias, Caddy cannot bind the alias
+    /// address either.
+    #[tokio::test]
+    async fn proxy_without_the_alias_gets_the_earlier_admin_block() {
+        let ops = fake_proxy(&[(ADMIN_NETWORK, &["yoink-proxy-abc1234"])]);
+        assert_eq!(pushed_admin(&ops).await.0, AdminListen::Legacy);
+    }
+
+    #[tokio::test]
+    async fn new_proxy_gets_the_alias_admin_block() {
+        let ops = fake_proxy(&[
+            (ADMIN_NETWORK, &["yoink-proxy-abc1234", ADMIN_API_ALIAS]),
+            (crate::config::INGRESS_NETWORK, &["yoink-proxy-abc1234"]),
+        ]);
+        let (listen, admin) = pushed_admin(&ops).await;
+        assert_eq!(listen, AdminListen::Alias);
+        assert_eq!(admin, crate::config::admin_block());
+    }
 
     #[test]
     fn redact_strips_full_pem_blocks() {

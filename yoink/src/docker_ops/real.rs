@@ -1655,6 +1655,26 @@ fn parse_inspect(name: &str, resp: &bollard::models::ContainerInspectResponse) -
         })
         .unwrap_or_default();
 
+    let network_aliases: BTreeMap<String, Vec<String>> = network_settings
+        .and_then(|n| n.networks.as_ref())
+        .map(|m| {
+            m.iter()
+                .map(|(net, endpoint)| {
+                    let mut names: Vec<String> = endpoint
+                        .aliases
+                        .iter()
+                        .flatten()
+                        .chain(endpoint.dns_names.iter().flatten())
+                        .cloned()
+                        .collect();
+                    names.sort();
+                    names.dedup();
+                    (net.clone(), names)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let labels: BTreeMap<String, String> = config
         .and_then(|c| c.labels.clone())
         .unwrap_or_default()
@@ -1685,6 +1705,7 @@ fn parse_inspect(name: &str, resp: &bollard::models::ContainerInspectResponse) -
         ports,
         mounts,
         networks,
+        network_aliases,
         user: config
             .and_then(|c| c.user.clone())
             .filter(|u| !u.is_empty()),

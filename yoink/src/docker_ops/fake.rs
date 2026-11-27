@@ -57,6 +57,9 @@ struct FakeState {
     one_shot: VecDeque<Result<OneShotResult, DockerError>>,
     event_streams: VecDeque<Vec<DockerEvent>>,
     log_streams: VecDeque<Vec<LogLine>>,
+    /// Container name → the `inspect_container` answer. A name that
+    /// is not here gets an empty detail.
+    inspect: HashMap<String, ContainerDetail>,
     calls: Vec<RecordedCall>,
 }
 
@@ -163,6 +166,10 @@ impl FakeDockerOps {
     pub fn push_event_stream(&self, events: Vec<DockerEvent>) {
         self.lock().event_streams.push_back(events);
     }
+    /// Answer every `inspect_container` for `detail.name` with `detail`.
+    pub fn set_inspect(&self, detail: ContainerDetail) {
+        self.lock().inspect.insert(detail.name.clone(), detail);
+    }
 
     #[must_use]
     /// `(image, registry the credentials were for)` for each pull.
@@ -207,10 +214,11 @@ impl DockerOps for FakeDockerOps {
         _host: &Host,
         name: &str,
     ) -> Result<ContainerDetail, DockerError> {
-        Ok(ContainerDetail {
+        let detail = self.lock().inspect.get(name).cloned();
+        Ok(detail.unwrap_or_else(|| ContainerDetail {
             name: name.into(),
             ..Default::default()
-        })
+        }))
     }
     async fn list_networks(&self, _host: &Host) -> Result<Vec<NetworkInfo>, DockerError> {
         Ok(Vec::new())

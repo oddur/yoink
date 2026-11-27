@@ -186,6 +186,13 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
             error,
         } => format!("[{host}] {container} log tail unavailable: {error}"),
         DeployEvent::Done { host, container } => format!("[{host}] done — {container}"),
+        DeployEvent::ProxyAdminUpgradePending { hosts } => format!(
+            "warning: the proxy on {} is from an earlier yoink version. Its admin API \
+             still listens on all proxy networks. Run `yoink up --service {}` or an \
+             unscoped `yoink up` to move it to the admin network.",
+            hosts.join(", "),
+            crate::config::PROXY_SERVICE_NAME,
+        ),
     }
 }
 
@@ -278,6 +285,26 @@ mod tests {
                 }
             ),
             "[host-a] deploying app-a:a1b2c3d"
+        );
+    }
+
+    /// A scoped run that keeps a proxy of an earlier version must tell
+    /// the operator how to finish the admin API move.
+    #[test]
+    fn deploy_event_format_proxy_admin_upgrade_pending() {
+        let line = format_deploy_event(
+            None,
+            &DeployEvent::ProxyAdminUpgradePending {
+                hosts: vec!["h1".into(), "h2".into()],
+            },
+        );
+        assert!(
+            line.starts_with("warning: the proxy on h1, h2 "),
+            "got: {line}"
+        );
+        assert!(
+            line.contains("`yoink up --service yoink-proxy`"),
+            "got: {line}"
         );
     }
 

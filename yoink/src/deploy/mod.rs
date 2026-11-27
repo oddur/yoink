@@ -34,6 +34,7 @@ use crate::base::run_args::BuildError;
 use crate::config::{Config, HookSpec, HookTag, ServiceConfig};
 use crate::docker::{self, RunSpec, SHORT_HASH_LEN};
 use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, StoppedRemoval};
+use crate::proxy::admin::AdminListen;
 use files::{FileError, FileMount};
 use healthcheck::HealthcheckError;
 
@@ -137,6 +138,14 @@ pub enum DeployEvent {
     Done {
         host: String,
         container: String,
+    },
+    /// The proxy on `hosts` is from an earlier yoink version, so its
+    /// admin API still listens on every network of the proxy. yoink
+    /// pushed the earlier admin block to it. A deploy of the proxy
+    /// finishes the move of the admin API to the admin network. Fired
+    /// at most once per reconcile.
+    ProxyAdminUpgradePending {
+        hosts: Vec<String>,
     },
 }
 
@@ -536,12 +545,28 @@ pub async fn reconcile_with_options(
             .iter()
             .find(|s| matches!(s.kind, Some(crate::config::ServiceKind::Proxy)))
     {
+        let mut legacy = Vec::new();
         for host in config.fleet_for(proxy_svc) {
-            push_caddy_config(ops, &host, config, secrets, None).await?;
+            if push_caddy_config(ops, &host, config, secrets, None).await? == AdminListen::Legacy {
+                legacy.push(host.address.clone());
+            }
+        }
+        if let Some(event) = admin_upgrade_notice(legacy) {
+            let on_event = sink
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            on_event(None, event);
         }
     }
 
     Ok(reports)
+}
+
+/// The one warning of a reconcile that left a proxy of an earlier
+/// yoink version in place, for the hosts in `legacy`. `None` when every
+/// proxy has the admin API alias.
+fn admin_upgrade_notice(legacy: Vec<String>) -> Option<DeployEvent> {
+    (!legacy.is_empty()).then_some(DeployEvent::ProxyAdminUpgradePending { hosts: legacy })
 }
 
 /// What one host runs for a service, measured against the desired
@@ -1274,7 +1299,8 @@ async fn build_upstream_names(
 
 /// Render the Caddy config for `host`'s view of `config` and POST it
 /// to the proxy's admin API. Errors abort the deploy — old config
-/// stays active because Caddy's `/load` is atomic.
+/// stays active because Caddy's `/load` is atomic. Returns the admin
+/// block that the running proxy got, see [`AdminListen`].
 ///
 /// `in_flight_upstreams` carries `(service_name, expected_names)` for
 /// the service the caller is currently reconciling. For that service,
@@ -1301,7 +1327,7 @@ async fn push_caddy_config(
     config: &Config,
     secrets: Option<&SecretsBundle>,
     in_flight_upstreams: Option<(&str, &std::collections::BTreeSet<String>)>,
-) -> Result<(), DeployError> {
+) -> Result<AdminListen, DeployError> {
     // Expand any `caddy_extra_caddyfile:` snippets to JSON. Mutates a
     // local clone so the caller's view of config stays unchanged.
     let mut config = config.clone();
@@ -1352,8 +1378,7 @@ async fn push_caddy_config(
                 host: host.address.clone(),
                 detail: format!("push Caddy config: {source}{hint}"),
             }
-        })?;
-    Ok(())
+        })
 }
 
 /// Build a `RunSpec` for the given service+tag. Used both to compute the
@@ -2359,6 +2384,19 @@ services:
         assert!(
             test[1].contains(&format!("http://{ADMIN_API_HOST}/config/")),
             "got: {test:?}"
+        );
+    }
+
+    /// The final push of a run collects the hosts whose proxy got the
+    /// earlier admin block, and the run warns once for all of them.
+    #[test]
+    fn admin_upgrade_notice_is_one_event_for_all_legacy_hosts() {
+        assert_eq!(admin_upgrade_notice(Vec::new()), None);
+        assert_eq!(
+            admin_upgrade_notice(vec!["h1".into(), "h2".into()]),
+            Some(DeployEvent::ProxyAdminUpgradePending {
+                hosts: vec!["h1".into(), "h2".into()],
+            })
         );
     }
 
