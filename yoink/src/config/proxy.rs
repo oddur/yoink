@@ -151,6 +151,7 @@ impl Config {
     /// validation has already added the proxy.
     #[allow(clippy::too_many_lines)] // mostly straight-line validation
     pub(crate) fn inject_implicit_proxy(&mut self) -> Result<(), ConfigError> {
+        self.reject_admin_network()?;
         if !self.proxy_enabled() {
             return Ok(());
         }
@@ -245,8 +246,9 @@ impl Config {
         // service without `networks:` defaults to all of `deploy.networks`,
         // so without this pin it would also join `yoink-admin` and
         // could reach the Caddy admin API, which has no authentication.
-        // Only the proxy belongs on that network. An operator who lists an
-        // implicit network in `deploy.networks` still gets it here.
+        // Only the proxy belongs on that network. An operator who lists
+        // `yoink-ingress` in `deploy.networks` still gets it here.
+        // `reject_admin_network` refuses `yoink-admin` there.
         let operator_networks = self.deploy.networks.clone();
         for svc in &mut self.services {
             if svc.networks.is_none() && !matches!(svc.kind, Some(ServiceKind::Proxy)) {
@@ -255,8 +257,8 @@ impl Config {
         }
 
         // Ensure both implicit networks are declared, so they are created
-        // on each host. A user can also declare them explicitly (e.g. to
-        // attach extra services to `yoink-ingress`); idempotent.
+        // on each host. A user can also declare `yoink-ingress`
+        // explicitly (e.g. to attach extra services to it); idempotent.
         for net in [INGRESS_NETWORK, ADMIN_NETWORK] {
             if !self.deploy.networks.iter().any(|n| n == net) {
                 self.deploy.networks.push(net.to_string());
@@ -287,6 +289,38 @@ impl Config {
         if self.service(PROXY_SERVICE_NAME).is_none() {
             let proxy_cfg = self.proxy.clone().unwrap_or_default();
             self.services.push(synthesized_proxy_service(&proxy_cfg));
+        }
+        Ok(())
+    }
+}
+
+impl Config {
+    /// Only the proxy may join [`ADMIN_NETWORK`]. The admin API has no
+    /// authentication, so any other container on that network can
+    /// change the proxy config. Rejects the name in `deploy.networks`
+    /// and in the `networks:` of every service that is not the proxy.
+    /// A second call after [`Self::inject_implicit_proxy`] skips
+    /// `deploy.networks`, where the injection put the name.
+    fn reject_admin_network(&self) -> Result<(), ConfigError> {
+        let reserved = |field: &str| {
+            ConfigError::Invalid(format!(
+                "{field} lists {ADMIN_NETWORK:?}. This network is reserved for the \
+                 Caddy admin API of the proxy. Use a different network name."
+            ))
+        };
+        let injected = self
+            .services
+            .iter()
+            .any(|s| s.kind == Some(ServiceKind::Proxy));
+        if !injected && self.deploy.networks.iter().any(|n| n == ADMIN_NETWORK) {
+            return Err(reserved("deploy.networks"));
+        }
+        for svc in &self.services {
+            if svc.kind != Some(ServiceKind::Proxy)
+                && svc.networks.iter().flatten().any(|n| n == ADMIN_NETWORK)
+            {
+                return Err(reserved(&format!("service {:?}: networks", svc.name)));
+            }
         }
         Ok(())
     }
@@ -733,6 +767,41 @@ services:
         assert_eq!(nets(PROXY_SERVICE_NAME), [ADMIN_NETWORK, INGRESS_NETWORK]);
         // Still declared, so each host creates it for the proxy.
         assert!(cfg.deploy.networks.iter().any(|n| n == ADMIN_NETWORK));
+    }
+
+    /// Nothing stopped a service from joining `yoink-admin` through
+    /// `deploy.networks` or its own `networks:`. It could then change
+    /// the proxy config through the admin API.
+    #[test]
+    fn admin_network_is_reserved_for_the_proxy() {
+        let cases = [
+            (
+                "deploy: { networks: [app, yoink-admin] }\nservices: []",
+                "deploy.networks",
+            ),
+            (
+                "services:\n  - { name: worker, image: w, tag: v1, networks: [yoink-admin], run: {} }",
+                "service \"worker\": networks",
+            ),
+            (
+                "services:\n  - name: api\n    image: a\n    tag: v1\n    domain: api.example.com\n    networks: [yoink-admin]\n    run: { port: 8080 }",
+                "service \"api\": networks",
+            ),
+        ];
+        for (body, field) in cases {
+            let yaml = format!(
+                "hosts: [{{ address: h, user: u }}]\nproxy: {{ email: o@example.com }}\n{body}\n"
+            );
+            let err = Config::parse_str(&yaml).expect_err(field);
+            let msg = err.to_string();
+            assert!(msg.contains(field), "got: {msg}");
+            assert!(msg.contains("\"yoink-admin\""), "got: {msg}");
+            assert!(
+                msg.contains("reserved for the Caddy admin API"),
+                "got: {msg}"
+            );
+            assert!(msg.contains("Use a different network name"), "got: {msg}");
+        }
     }
 
     #[test]

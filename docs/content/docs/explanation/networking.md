@@ -110,6 +110,12 @@ A `pre_deploy` hook runs **one time**. The number of replicas and the number of 
 
 `yoink prune` examines every host independently. It removes the containers of services that the config no longer declares, and the exited and dead containers of the other services. It keeps all other containers of a declared service, also on a host that `services[].hosts` no longer lists. Thus a running, paused, restarting, or created container of a declared service stays.
 
+## Reserved network names
+
+When the proxy is on, yoink manages two docker networks. A service with `domain:` joins `yoink-ingress`. You can also list `yoink-ingress` in `deploy.networks` or in the `networks:` of a service.
+
+Only the proxy joins `yoink-admin`. The admin API of the proxy listens on this network and has no authentication. Config load rejects `yoink-admin` in `deploy.networks` and in the `networks:` of a service. Use a different name for your own networks. The [proxy guide](/docs/explanation/proxy) has more about the two networks.
+
 ## Port-forward
 
 `yoink pf <service>` opens a tunnel from your laptop to a container port, as `kubectl port-forward` does. It uses the SSH connection that yoink already has to the host. The tunnel works for a service with a published host port and for a service without one. **You do not publish a port to debug a service.**
