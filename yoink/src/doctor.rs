@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::{Config, SecretsConfig, ServiceConfig, TlsMode};
-use crate::docker_ops::{DockerOps, Host};
+use crate::docker_ops::DockerOps;
+use crate::host::Host;
 use crate::sealed;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -712,7 +713,8 @@ fn check_sealed_file_exists(config: &Config) -> Vec<Finding> {
             "sealed file check skipped (no services reference secrets)",
         )];
     }
-    let Ok(path) = sealed::resolve_sealed_path(config, file.as_deref()) else {
+    let Ok(path) = sealed::resolve_sealed_path(config.config_dir.as_deref(), file.as_deref())
+    else {
         return Vec::new();
     };
     if path.exists() {
@@ -902,7 +904,7 @@ fn check_dockerfile_paths(config: &Config) -> Vec<Finding> {
 
 fn check_tls_cert_secrets(
     config: &Config,
-    bundle: Option<&crate::secrets::SecretsBundle>,
+    bundle: Option<&crate::bundle::SecretsBundle>,
 ) -> Vec<Finding> {
     let proxy_default_cert = config
         .proxy
@@ -985,7 +987,7 @@ fn check_tls_cert_secrets(
 
 fn check_secret_references(
     config: &Config,
-    bundle: Option<&crate::secrets::SecretsBundle>,
+    bundle: Option<&crate::bundle::SecretsBundle>,
 ) -> Vec<Finding> {
     let any_refs = config
         .services

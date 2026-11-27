@@ -25,10 +25,8 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
+use crate::bundle::SecretsBundle;
 use crate::config::{Config, ServiceConfig, TlsMode};
-use crate::secrets::SecretsBundle;
-
-use super::is_proxied;
 
 /// Render `cfg` into the Caddy admin-API JSON config. Container names
 /// in the upstream pool come from `container_names_for(service_name)`
@@ -45,7 +43,7 @@ where
     F: Fn(&str) -> Vec<String>,
 {
     let proxy_tls = cfg.proxy.as_ref().and_then(|p| p.tls.as_ref());
-    let proxied: Vec<&ServiceConfig> = cfg.services.iter().filter(|s| is_proxied(s)).collect();
+    let proxied: Vec<&ServiceConfig> = cfg.services.iter().filter(|s| s.is_proxied()).collect();
 
     // Order services so path-constrained routes come before
     // catch-all routes for the same host. Caddy uses first-match;

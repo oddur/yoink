@@ -24,7 +24,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::config::HostConfig as YoinkHost;
+use crate::host::Host;
 
 #[derive(Debug, Error)]
 pub enum DockerError {
@@ -81,96 +81,12 @@ pub enum StoppedRemoval {
     Running,
 }
 
-/// Minimal host identity used by the trait; converts cheaply from
-/// [`crate::config::HostConfig`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Host {
-    pub user: String,
-    pub address: String,
-    /// SSH port from `hosts[].port`. `None` emits no port flag, so
-    /// ssh picks (22, or `~/.ssh/config`). Never part of `address`,
-    /// which stays the host's identity and display label.
-    pub port: Option<u16>,
-}
-
-impl Host {
-    /// Sentinel address that routes to the operator's local docker
-    /// socket instead of going over ssh. Two callers:
-    /// `transport::unregistry` (image-push source) and `doctor` (arch
-    /// probe). Operators can also write `address: local` in
-    /// `yoink.yaml` to deploy at their own laptop.
-    pub const LOCAL_ADDRESS: &'static str = "local";
-
-    /// `ssh://user@address[:port]`. An IPv6 address is bracketed when
-    /// a port follows it, as the URL form requires.
-    #[must_use]
-    pub fn ssh_url(&self) -> String {
-        format!(
-            "ssh://{}@{}",
-            self.user,
-            crate::config::join_address_port(&self.address, self.ssh_port())
-        )
-    }
-
-    /// The port every ssh connection to this host must use. `None`
-    /// when `port:` is unset, and always for the `local` sentinel.
-    #[must_use]
-    pub fn ssh_port(&self) -> Option<u16> {
-        if self.is_local() { None } else { self.port }
-    }
-
-    /// The `ssh` argv tail that selects this host: `[-p <port>]
-    /// user@address`. Every `ssh` shell-out ends its options with
-    /// this instead of formatting `user@address` itself, so a host
-    /// with `port:` is reached the same way everywhere. `ssh` takes
-    /// `-p`; `scp` would need `-P` (yoink has no `scp` call today).
-    #[must_use]
-    pub fn ssh_args(&self) -> Vec<String> {
-        let mut args = Vec::with_capacity(3);
-        if let Some(port) = self.ssh_port() {
-            args.push("-p".to_string());
-            args.push(port.to_string());
-        }
-        args.push(format!("{}@{}", self.user, self.address));
-        args
-    }
-
-    /// True for the local-docker sentinel host — bypasses ssh and
-    /// uses bollard's platform-default unix socket / npipe transport.
-    #[must_use]
-    pub fn is_local(&self) -> bool {
-        self.address == Self::LOCAL_ADDRESS
-    }
-
-    /// Construct a `Host` that points at the operator's local docker
-    /// socket. The empty `user` is fine — the local-socket transport
-    /// ignores it.
-    #[must_use]
-    pub fn local() -> Self {
-        Self {
-            user: String::new(),
-            address: Self::LOCAL_ADDRESS.to_string(),
-            port: None,
-        }
-    }
-}
-
 /// Hard cap on a single `build_image` call's wall-clock. Generous: an
 /// xcaddy compile against a slow link with cold caches is rarely above
 /// 5 min, so 15 covers the worst case while keeping CI runners from
 /// sitting on a hung daemon for hours. Configurable later if anyone
 /// actually hits it; a `pub const` keeps the value findable.
 pub const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
-
-impl From<&YoinkHost> for Host {
-    fn from(h: &YoinkHost) -> Self {
-        Self {
-            user: h.user.clone(),
-            address: h.address.clone(),
-            port: h.port,
-        }
-    }
-}
 
 /// What we surface for a container after listing/inspect. Independent of
 /// Docker container lifecycle state. Parsed from bollard's typed
@@ -1613,7 +1529,7 @@ impl DockerOps for RealDockerOps {
         image: &str,
         tag: &str,
     ) -> Result<bool, DockerError> {
-        let reference = crate::docker::image_reference(image, tag);
+        let reference = crate::image::image_reference(image, tag);
         self.with_retry(host, |docker| {
             let reference = reference.clone();
             async move {
@@ -2835,7 +2751,7 @@ impl FakeDockerOps {
     /// Mark `image:tag` as already present so `image_present` returns
     /// `true` and the caller skips its pull/build.
     pub fn mark_image_present(&self, image: &str, tag: &str) {
-        let key = crate::docker::image_reference(image, tag);
+        let key = crate::image::image_reference(image, tag);
         self.lock().images_present.insert(key, true);
     }
     pub fn push_list_containers(&self, v: Result<Vec<ContainerInfo>, DockerError>) {
@@ -2970,7 +2886,7 @@ impl DockerOps for FakeDockerOps {
         image: &str,
         tag: &str,
     ) -> Result<bool, DockerError> {
-        let key = crate::docker::image_reference(image, tag);
+        let key = crate::image::image_reference(image, tag);
         Ok(*self.lock().images_present.get(&key).unwrap_or(&false))
     }
     async fn load_image(&self, host: &Host, _body: ImageTarStream) -> Result<(), DockerError> {
@@ -3257,12 +3173,6 @@ mod tests {
     }
 
     #[test]
-    fn host_ssh_url_format() {
-        let h = host();
-        assert_eq!(h.ssh_url(), "ssh://deploy@host-a");
-    }
-
-    #[test]
     fn container_info_parses_yoink_labels() {
         let mut labels = HashMap::new();
         labels.insert("yoink.service".into(), "app-a".into());
@@ -3285,57 +3195,5 @@ mod tests {
             info.other_labels.get("caddy"),
             Some(&"app-a.example.com".to_string())
         );
-    }
-
-    fn host_on(address: &str, port: Option<u16>) -> Host {
-        Host {
-            user: "deploy".into(),
-            address: address.into(),
-            port,
-        }
-    }
-
-    #[test]
-    fn ssh_args_without_port_is_just_the_destination() {
-        assert_eq!(host().ssh_args(), vec!["deploy@host-a"]);
-        assert_eq!(host().ssh_port(), None);
-    }
-
-    #[test]
-    fn ssh_args_with_port_puts_dash_p_before_the_destination() {
-        let h = host_on("100.122.184.6", Some(2200));
-        assert_eq!(h.ssh_args(), vec!["-p", "2200", "deploy@100.122.184.6"]);
-        assert_eq!(h.ssh_port(), Some(2200));
-    }
-
-    #[test]
-    fn ssh_url_with_port() {
-        assert_eq!(
-            host_on("100.122.184.6", Some(2200)).ssh_url(),
-            "ssh://deploy@100.122.184.6:2200"
-        );
-        // IPv6 needs brackets once a port follows.
-        assert_eq!(
-            host_on("2001:db8::1", Some(2200)).ssh_url(),
-            "ssh://deploy@[2001:db8::1]:2200"
-        );
-    }
-
-    #[test]
-    fn local_host_ignores_port() {
-        let h = host_on(Host::LOCAL_ADDRESS, Some(2200));
-        assert_eq!(h.ssh_port(), None);
-        assert_eq!(h.ssh_args(), vec!["deploy@local"]);
-        assert_eq!(h.ssh_url(), "ssh://deploy@local");
-    }
-
-    #[test]
-    fn host_from_config_carries_port_and_keeps_address() {
-        let cfg = crate::config::Config::parse_str(
-            "hosts:\n  - { address: h1, port: 2200, user: deploy }\nservices: []\n",
-        )
-        .expect("parse");
-        let h = Host::from(&cfg.hosts[0]);
-        assert_eq!(h, host_on("h1", Some(2200)));
     }
 }

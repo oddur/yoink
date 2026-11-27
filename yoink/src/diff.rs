@@ -13,11 +13,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::bundle::SecretsBundle;
 use crate::config::Config;
 use crate::deploy::{self, DeployError, build_desired_spec};
 use crate::docker;
-use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, Host};
-use crate::secrets::SecretsBundle;
+use crate::docker_ops::{ContainerInfo, DockerError, DockerOps};
+use crate::host::Host;
+use crate::image;
 
 #[derive(Debug, Error)]
 pub enum DiffError {
@@ -258,7 +260,7 @@ pub async fn compute(
             })?;
         let desired_spec = build_desired_spec(config, svc, &tag, secrets)?;
         let desired_hash = docker::compute_spec_hash(&desired_spec);
-        let desired_image = docker::image_reference(&svc.image, &tag);
+        let desired_image = image::image_reference(&svc.image, &tag);
 
         for host_cfg in svc.applicable_hosts(&config.hosts) {
             let host = host_cfg.address.clone();
@@ -440,7 +442,7 @@ async fn inspect_field_diff(
         .options
         .memory
         .as_deref()
-        .and_then(|m| crate::docker::parse_memory(m).ok());
+        .and_then(|m| crate::run_args::parse_memory(m).ok());
     let current_memory_bytes: Option<i64> = detail.memory_bytes.filter(|&b| b > 0);
     if desired_memory_bytes != current_memory_bytes {
         let fmt_mem = |b: Option<i64>| match b {

@@ -30,7 +30,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::config::{Config, ServiceConfig};
-use crate::docker_ops::{DockerOps, Host};
+use crate::docker_ops::DockerOps;
+use crate::host::Host;
 use crate::pf::{self, SidecarError, SidecarHandle};
 
 /// Pinned major tag — code-server's `latest` floats and we don't want a

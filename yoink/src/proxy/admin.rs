@@ -22,10 +22,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::docker_ops::{DockerError, DockerOps, Host, parse_published_port};
+use crate::docker_ops::{DockerError, DockerOps, parse_published_port};
+use crate::host::Host;
 use crate::transport::tunnel::{SshTunnel, TunnelError};
 
-use super::{ADMIN_PORT, PROXY_SERVICE_NAME};
+use crate::config::{ADMIN_PORT, PROXY_SERVICE_NAME};
 
 /// How long the SSH tunnel + Caddy admin readiness probe each get
 /// before giving up. 20s comfortably covers a cold proxy boot on a

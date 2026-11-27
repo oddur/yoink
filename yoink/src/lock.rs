@@ -30,7 +30,8 @@ use std::time::Duration;
 use bollard::models::ContainerCreateBody;
 use tokio::task::JoinHandle;
 
-use crate::docker_ops::{DockerError, DockerOps, Host, StoppedRemoval};
+use crate::docker_ops::{DockerError, DockerOps, StoppedRemoval};
+use crate::host::Host;
 
 const LOCK_IMAGE_REPO: &str = "alpine";
 const LOCK_IMAGE_TAG: &str = "3.20";

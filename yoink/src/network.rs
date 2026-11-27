@@ -1,7 +1,8 @@
 //! Idempotent docker network setup. Wraps `DockerOps::ensure_network`
 //! so callers don't need to think about it.
 
-use crate::docker_ops::{DockerError, DockerOps, Host};
+use crate::docker_ops::{DockerError, DockerOps};
+use crate::host::Host;
 
 pub async fn ensure(ops: &dyn DockerOps, host: &Host, network: &str) -> Result<bool, DockerError> {
     ops.ensure_network(host, network).await

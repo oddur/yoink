@@ -16,7 +16,8 @@ use std::io::Write as _;
 use bytes::Bytes;
 
 use crate::config::XcaddyConfig;
-use crate::docker_ops::{DockerError, DockerOps, Host};
+use crate::docker_ops::{DockerError, DockerOps};
+use crate::host::Host;
 
 /// Make sure the xcaddy-built image is present on `host`. Idempotent:
 /// returns immediately if the tag is already in the host's image cache.

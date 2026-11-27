@@ -11,10 +11,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, LineGauge, Paragraph, Row, Table, TableState};
 
+use crate::bundle::SecretsBundle;
 use crate::config::Config;
-use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, Host, HostInfo};
+use crate::docker_ops::{ContainerInfo, ContainerStats, DockerOps, HostInfo};
+use crate::host::Host;
 use crate::output::format_bytes;
-use crate::secrets::SecretsBundle;
 
 use super::container_detail::StatsHistory;
 use super::ui::{
@@ -249,7 +250,7 @@ impl HostDetailState {
                         Some(svc) => {
                             let pf = forwards.is_container_forwarded(&host_addr, &c.name)
                                 || forwards.is_service_forwarded_unscoped(svc);
-                            super::services::build_marker_cell(svc, pf, vscode)
+                            super::ui::build_marker_cell(svc, pf, vscode)
                         }
                         None => Cell::from("-"),
                     };

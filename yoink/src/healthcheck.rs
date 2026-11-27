@@ -9,7 +9,8 @@ use thiserror::Error;
 use tokio::time::{Instant, sleep};
 use tracing::debug;
 
-use crate::docker_ops::{DockerError, DockerOps, Host};
+use crate::docker_ops::{DockerError, DockerOps};
+use crate::host::Host;
 
 #[derive(Debug, Error)]
 pub enum HealthcheckError {

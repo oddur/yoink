@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tracing::warn;
 
-use crate::docker_ops::Host;
+use crate::host::Host;
 
 /// How often to retry the local-port TCP connect while waiting for
 /// the SSH tunnel to come up. 100 ms balances responsiveness against

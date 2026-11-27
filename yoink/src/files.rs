@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
-use crate::docker_ops::Host;
+use crate::host::Host;
 
 /// Parsed `service.run.files` entry. Local path is operator-side
 /// (resolved against the config file's directory); container path is
@@ -61,14 +61,6 @@ pub enum FileError {
     Mkdir { host: String, message: String },
 }
 
-/// True when a `files:` spec ends in an explicit `:rw` mode. Config
-/// validation and `FileMount::parse` both reject such a spec, and
-/// share this check so they cannot disagree on what counts as `:rw`.
-#[must_use]
-pub fn has_rw_mode(spec: &str) -> bool {
-    matches!(spec.rsplit_once(':'), Some((_, "rw")))
-}
-
 impl FileMount {
     /// Parse `"local:container[:ro]"`. The mount is always read-only:
     /// `:ro` is an explicit no-op, and `:rw` is an error
@@ -79,7 +71,7 @@ impl FileMount {
     /// may be relative — they're resolved against `base_dir` (typically
     /// the config file's directory).
     pub fn parse(spec: &str, base_dir: Option<&Path>) -> Result<Self, FileError> {
-        if has_rw_mode(spec) {
+        if crate::config::has_rw_mode(spec) {
             return Err(FileError::ReadWrite(spec.to_string()));
         }
         // Split deliberately on the *first* and *last* `:` rather than
@@ -179,7 +171,7 @@ impl FileMount {
     /// This form feeds the spec hash only; the container is created
     /// with [`Self::bind_string_at`]. See [`Self::remote_staging_path`].
     /// A spec with no mode renders bare, and
-    /// `docker::default_bind_to_ro` then appends `:ro`. Do not
+    /// `run_args::default_bind_to_ro` then appends `:ro`. Do not
     /// normalise the two forms: the string feeds the spec hash, so a
     /// change here rerolls every service that has a `files:` entry.
     #[must_use]
@@ -521,7 +513,7 @@ mod tests {
             "/var/lib/yoink/files/abc123-data.json:/app/data.json"
         );
         assert_eq!(
-            crate::docker::default_bind_to_ro(&bare.as_bind_string("abc123")),
+            crate::run_args::default_bind_to_ro(&bare.as_bind_string("abc123")),
             "/var/lib/yoink/files/abc123-data.json:/app/data.json:ro"
         );
         let ro = FileMount::parse("/tmp/data.json:/app/data.json:ro", None).unwrap();
@@ -530,7 +522,7 @@ mod tests {
             "/var/lib/yoink/files/abc123-data.json:/app/data.json:ro"
         );
         assert_eq!(
-            crate::docker::default_bind_to_ro(&ro.as_bind_string("abc123")),
+            crate::run_args::default_bind_to_ro(&ro.as_bind_string("abc123")),
             "/var/lib/yoink/files/abc123-data.json:/app/data.json:ro"
         );
     }

@@ -13,7 +13,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::config::{Config, HostConfig};
-use crate::docker_ops::{DockerOps, DockerVersion, Host, HostInfo};
+use crate::docker_ops::{DockerOps, DockerVersion, HostInfo};
+use crate::host::Host;
 use crate::output::format_bytes;
 
 use super::ui::{

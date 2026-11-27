@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 
-use crate::docker_ops::Host;
+use crate::host::Host;
 
 /// Hard ceiling on probe duration. `ConnectTimeout` is the TCP
 /// handshake budget; this bounds the entire ssh process — including

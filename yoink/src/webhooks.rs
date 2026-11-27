@@ -16,8 +16,8 @@ use std::time::Duration;
 use minijinja::{Environment, UndefinedBehavior, context};
 
 use crate::audit::{AuditEventKind, AuditSink, RunContext, build_operator_event};
+use crate::bundle::SecretsBundle;
 use crate::config::{HttpMethod, WebhookSpec, WebhookTrigger};
-use crate::secrets::SecretsBundle;
 
 /// Template variables exposed to webhook bodies/headers/url.
 ///

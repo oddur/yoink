@@ -420,7 +420,7 @@ fn infer_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
     let (host_address, host_user, host_user_origin, host_origin) = resolve_host(opts, detection)?;
     // `yoink init deploy@host:2200`: the port goes to `port:`, never
     // into `address:`.
-    let (host_address, host_port) = crate::config::split_address_port(&host_address)
+    let (host_address, host_port) = crate::host::split_address_port(&host_address)
         .map_err(|e| anyhow::anyhow!("ssh host: {e}"))?;
 
     let port = if opts.no_port {
@@ -495,10 +495,10 @@ fn prompt_plan(detection: &Detection, opts: &InitOpts) -> Result<WizardPlan> {
         ImageSource::Bare(image)
     };
 
-    let suggested = crate::config::join_address_port(&plan.host_address, plan.host_port);
+    let suggested = crate::host::join_address_port(&plan.host_address, plan.host_port);
     let host = ask("ssh host (address or address:port)", &suggested)?;
     (plan.host_address, plan.host_port) =
-        crate::config::split_address_port(&host).map_err(|e| anyhow::anyhow!("ssh host: {e}"))?;
+        crate::host::split_address_port(&host).map_err(|e| anyhow::anyhow!("ssh host: {e}"))?;
     let user = ask("ssh user", &plan.host_user)?;
     plan.host_user = user;
     plan.host_user_origin = HostUserOrigin::HostArg;
@@ -610,7 +610,7 @@ fn resolve_host(
         // The ssh-config hint is keyed by the bare alias. The caller
         // splits the port off afterwards, so `prod:2200` must match
         // the hint for `prod` here.
-        let alias = crate::config::split_address_port(host)
+        let alias = crate::host::split_address_port(host)
             .map_or_else(|_| host.to_string(), |(bare, _)| bare);
         let (user, addr) = match host.split_once('@') {
             Some((u, a)) => (u.to_string(), a.to_string()),

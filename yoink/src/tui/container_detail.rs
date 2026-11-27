@@ -20,7 +20,8 @@ use ratatui::widgets::{
     Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, Wrap,
 };
 
-use crate::docker_ops::{ContainerDetail, ContainerStats, DockerOps, Host, ProcessTable};
+use crate::docker_ops::{ContainerDetail, ContainerStats, DockerOps, ProcessTable};
+use crate::host::Host;
 use crate::output::{format_bytes, format_relative_time};
 
 use super::ui::{bold, gauge_color, health_style, inline_gauge, kv, kv_styled, state_style};

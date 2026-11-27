@@ -11,6 +11,12 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::host::{Host, split_address_port};
+
+mod proxy;
+
+pub use proxy::{ADMIN_NETWORK, ADMIN_PORT, INGRESS_NETWORK, PROXY_SERVICE_NAME};
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("read config {path}: {source}")]
@@ -145,58 +151,6 @@ pub enum OnFailure {
     Continue,
 }
 
-/// Split an operator-typed `host[:port]` into the bare host and its
-/// SSH port. A trailing `:digits` is a port only after a hostname or
-/// an IPv4 address (exactly one colon), or after a bracketed IPv6
-/// address (`[::1]:2200`). A bare IPv6 address has several colons and
-/// no port. Brackets are dropped from the returned host because ssh
-/// wants the bare address.
-///
-/// Errors when the port is not in 1-65535 or a bracket is unbalanced.
-pub fn split_address_port(input: &str) -> Result<(String, Option<u16>), String> {
-    fn parse_port(digits: &str) -> Result<u16, String> {
-        match digits.parse::<u16>() {
-            Ok(p) if p != 0 => Ok(p),
-            _ => Err(format!("port {digits:?} must be a number in 1-65535")),
-        }
-    }
-    let input = input.trim();
-    if let Some(rest) = input.strip_prefix('[') {
-        let Some((v6, tail)) = rest.split_once(']') else {
-            return Err("`[` has no closing `]`".to_string());
-        };
-        if tail.is_empty() {
-            return Ok((v6.to_string(), None));
-        }
-        let Some(digits) = tail.strip_prefix(':') else {
-            return Err("expected `:port` after `]`".to_string());
-        };
-        return Ok((v6.to_string(), Some(parse_port(digits)?)));
-    }
-    match input.rsplit_once(':') {
-        Some((host, digits))
-            if !host.is_empty()
-                && !host.contains(':')
-                && !digits.is_empty()
-                && digits.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            Ok((host.to_string(), Some(parse_port(digits)?)))
-        }
-        _ => Ok((input.to_string(), None)),
-    }
-}
-
-/// Inverse of [`split_address_port`]: `address[:port]`, with brackets
-/// around an IPv6 address when a port follows it.
-#[must_use]
-pub fn join_address_port(address: &str, port: Option<u16>) -> String {
-    match port {
-        Some(port) if address.contains(':') => format!("[{address}]:{port}"),
-        Some(port) => format!("{address}:{port}"),
-        None => address.to_string(),
-    }
-}
-
 /// `Some(reason)` when `address` carries a `:port` suffix. ssh takes
 /// the whole string as a hostname and fails with "Could not resolve
 /// hostname", so config load rejects it and points at `port:`.
@@ -258,6 +212,16 @@ pub struct HostConfig {
     /// auth set up — fresh VPS with `root` user, throwaway hosts, etc.
     #[serde(default)]
     pub ssh_key_secret: Option<String>,
+}
+
+impl From<&HostConfig> for Host {
+    fn from(h: &HostConfig) -> Self {
+        Self {
+            user: h.user.clone(),
+            address: h.address.clone(),
+            port: h.port,
+        }
+    }
 }
 
 /// Reverse-proxy config. The proxy itself is a yoink-managed Caddy
@@ -572,7 +536,7 @@ impl XcaddyConfig {
             input.push_str(&r);
             input.push('\n');
         }
-        crate::deploy::short_sha256(&input)
+        crate::hash::short_sha256(&input)
     }
 
     /// `yoink-caddy:<hash>` — the local tag produced by
@@ -1076,6 +1040,14 @@ impl Default for ServiceRun {
             files: Vec::new(),
         }
     }
+}
+
+/// True when a `files:` spec ends in an explicit `:rw` mode. Config
+/// validation and `FileMount::parse` both reject such a spec, and
+/// share this check so they cannot disagree on what counts as `:rw`.
+#[must_use]
+pub fn has_rw_mode(spec: &str) -> bool {
+    matches!(spec.rsplit_once(':'), Some((_, "rw")))
 }
 
 /// Per-container runtime options. **All security-relevant fields
@@ -1618,6 +1590,26 @@ impl Config {
         Ok(())
     }
 
+    /// The config's `Host` for `address`, so Dashboard and service rows
+    /// (which carry only an address) get the ssh user and port for
+    /// transitions that need them (`HostDetail`, kill modal, log
+    /// streams). An address the config does not know falls back to a
+    /// bare host with no user and no port.
+    #[must_use]
+    pub fn host_or_bare(&self, address: &str) -> Host {
+        self.hosts
+            .iter()
+            .find(|h| h.address == address)
+            .map_or_else(
+                || Host {
+                    user: String::new(),
+                    address: address.to_string(),
+                    port: None,
+                },
+                Host::from,
+            )
+    }
+
     /// `true` when at least one host declares `address_secret:`.
     /// Used by the secrets loader to know it must decrypt the bundle
     /// even if no service-level secret keys are referenced.
@@ -1640,7 +1632,7 @@ impl Config {
     /// - `address_secret` references a key not present in the bundle.
     pub fn resolve_host_addresses(
         &mut self,
-        bundle: Option<&crate::secrets::SecretsBundle>,
+        bundle: Option<&crate::bundle::SecretsBundle>,
     ) -> Result<(), ConfigError> {
         for (i, host) in self.hosts.iter_mut().enumerate() {
             let Some(key) = host.address_secret.as_deref() else {
@@ -1720,7 +1712,7 @@ impl Config {
         registry: &'a RegistryConfig,
     ) -> impl Iterator<Item = &'a ServiceConfig> {
         self.services.iter().filter(move |svc| {
-            svc.build.is_none() && crate::docker::image_on_registry(&svc.image, &registry.server)
+            svc.build.is_none() && crate::image::image_on_registry(&svc.image, &registry.server)
         })
     }
 
@@ -1750,7 +1742,7 @@ impl Config {
         cfg.merge_includes()?;
         cfg.apply_secrets_profiles_to_hooks()?;
         cfg.normalize_image_references()?;
-        crate::proxy::inject_implicit_proxy(&mut cfg)?;
+        cfg.inject_implicit_proxy()?;
         cfg.validate()?;
         cfg.topo_sort_services()?;
         Ok(cfg)
@@ -1789,7 +1781,7 @@ impl Config {
     pub fn parse_str(text: &str) -> Result<Self, ConfigError> {
         let mut config: Self = yaml_serde::from_str(text)?;
         config.normalize_image_references()?;
-        crate::proxy::inject_implicit_proxy(&mut config)?;
+        config.inject_implicit_proxy()?;
         config.validate()?;
         config.topo_sort_services()?;
         Ok(config)
@@ -1999,7 +1991,7 @@ impl Config {
         }
         let mut registry_hosts: BTreeMap<String, &str> = BTreeMap::new();
         for reg in &self.registries {
-            let host = crate::docker::canonical_registry_host(&reg.server);
+            let host = crate::image::canonical_registry_host(&reg.server);
             if let Some(first) = registry_hosts.insert(host, &reg.server) {
                 return Err(ConfigError::Invalid(format!(
                     "registries: `{first}` and `{}` are the same registry; \
@@ -2212,7 +2204,7 @@ impl Config {
                 )));
             }
             for spec in &service.run.options.devices {
-                if let Err(e) = crate::docker::validate_device_spec(spec) {
+                if let Err(e) = crate::run_args::validate_device_spec(spec) {
                     return Err(ConfigError::Invalid(format!(
                         "service {:?}.run.options.devices: {e}",
                         service.name
@@ -2223,7 +2215,7 @@ impl Config {
             // and then mount read-only without a word; reject it here
             // so `yoink validate` catches it before a deploy does.
             for spec in &service.run.files {
-                if crate::files::has_rw_mode(spec) {
+                if has_rw_mode(spec) {
                     return Err(ConfigError::Invalid(format!(
                         "service {:?}.run.files: entry {spec:?} sets `:rw`, but `files:` mounts \
                          are always read-only; use `binds:` or a volume for data the container \
@@ -2910,7 +2902,7 @@ secrets:
 
     #[test]
     fn resolve_host_addresses_populates_from_bundle() {
-        use crate::secrets::SecretsBundle;
+        use crate::bundle::SecretsBundle;
         let dir = write_temp_tree(&[(
             "yoink.yaml",
             r#"
@@ -2936,7 +2928,7 @@ secrets:
 
     #[test]
     fn resolve_host_addresses_errors_on_missing_key() {
-        use crate::secrets::SecretsBundle;
+        use crate::bundle::SecretsBundle;
         let dir = write_temp_tree(&[(
             "yoink.yaml",
             r#"
@@ -4424,63 +4416,19 @@ hooks:
     }
 
     #[test]
-    fn split_address_port_hostname_and_ipv4() {
+    fn host_from_config_carries_port_and_keeps_address() {
+        let cfg = Config::parse_str(
+            "hosts:\n  - { address: h1, port: 2200, user: deploy }\nservices: []\n",
+        )
+        .expect("parse");
+        let h = Host::from(&cfg.hosts[0]);
         assert_eq!(
-            split_address_port("prod-eu-1:2200"),
-            Ok(("prod-eu-1".to_string(), Some(2200)))
-        );
-        assert_eq!(
-            split_address_port("100.122.184.6:2200"),
-            Ok(("100.122.184.6".to_string(), Some(2200)))
-        );
-    }
-
-    #[test]
-    fn split_address_port_without_port_is_unchanged() {
-        for addr in ["prod-eu-1", "100.122.184.6", "local", "host.example.com"] {
-            assert_eq!(split_address_port(addr), Ok((addr.to_string(), None)));
-        }
-    }
-
-    #[test]
-    fn split_address_port_bracketed_ipv6() {
-        assert_eq!(
-            split_address_port("[2001:db8::1]:2200"),
-            Ok(("2001:db8::1".to_string(), Some(2200)))
-        );
-        // Brackets without a port: just the address.
-        assert_eq!(
-            split_address_port("[2001:db8::1]"),
-            Ok(("2001:db8::1".to_string(), None))
-        );
-    }
-
-    #[test]
-    fn split_address_port_bare_ipv6_has_no_port() {
-        // The trailing group is all digits, but with several colons
-        // it is part of the address, not a port.
-        for addr in [
-            "2001:db8::1",
-            "::1",
-            "fe80::1:2200",
-            "2001:db8:0:0:0:0:0:22",
-        ] {
-            assert_eq!(split_address_port(addr), Ok((addr.to_string(), None)));
-        }
-    }
-
-    #[test]
-    fn split_address_port_rejects_bad_ports_and_brackets() {
-        assert!(split_address_port("host:0").is_err());
-        assert!(split_address_port("host:65536").is_err());
-        assert!(split_address_port("[::1]:").is_err());
-        assert!(split_address_port("[::1]:ssh").is_err());
-        assert!(split_address_port("[::1").is_err());
-        assert!(split_address_port("[::1]2200").is_err());
-        // Not all digits after the colon: not a port, left alone.
-        assert_eq!(
-            split_address_port("host:22a"),
-            Ok(("host:22a".to_string(), None))
+            h,
+            Host {
+                user: "deploy".into(),
+                address: "h1".into(),
+                port: Some(2200),
+            }
         );
     }
 
@@ -4551,7 +4499,7 @@ hooks:
 
     #[test]
     fn sealed_address_with_port_is_rejected_without_leaking_it() {
-        use crate::secrets::SecretsBundle;
+        use crate::bundle::SecretsBundle;
         let dir = write_temp_tree(&[(
             "yoink.yaml",
             r#"

@@ -27,7 +27,8 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use tui_term::widget::PseudoTerminal;
 
-use crate::docker_ops::{DockerOps, ExecKind, ExecSession, Host};
+use crate::docker_ops::{DockerOps, ExecKind, ExecSession};
+use crate::host::Host;
 
 use super::ui::pane_layout;
 

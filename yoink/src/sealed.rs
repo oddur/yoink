@@ -34,8 +34,6 @@ use age::{
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::config::Config;
-
 pub const AGE_KEY_ENV: &str = "YOINK_AGE_KEY";
 pub const AGE_KEY_FILE_ENV: &str = "YOINK_AGE_KEY_FILE";
 pub const DEFAULT_SEALED_FILENAME: &str = "secrets.age";
@@ -111,7 +109,8 @@ pub enum SealedError {
 }
 
 /// Resolve where the sealed file lives. Honors `secrets.file:` when
-/// set, falls back to `<config_dir>/secrets.age`.
+/// set, falls back to `<config_dir>/secrets.age`. `config_dir` is the
+/// directory `yoink.yaml` was loaded from; `None` means `.`.
 ///
 /// Rejects `secrets.file:` values that contain `..` components or are
 /// absolute paths pointing outside the config directory — the value
@@ -119,13 +118,10 @@ pub enum SealedError {
 /// `file: ../../../etc/passwd` should never become a sealed-file
 /// pointer (`yoink secrets edit` would happily overwrite it).
 pub fn resolve_sealed_path(
-    config: &Config,
+    config_dir: Option<&Path>,
     file_override: Option<&str>,
 ) -> Result<PathBuf, SealedError> {
-    let base = config
-        .config_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base = config_dir.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let raw = file_override.unwrap_or(DEFAULT_SEALED_FILENAME);
     let candidate = Path::new(raw);
     if candidate.is_absolute() {

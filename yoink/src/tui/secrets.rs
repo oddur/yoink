@@ -5,7 +5,7 @@
 //! identical to `yoink secrets edit`.
 //!
 //! Per-environment story: the file path comes from
-//! `sealed::resolve_sealed_path(config, file_override)` — same
+//! `sealed::resolve_sealed_path(config.config_dir.as_deref(), file_override)` — same
 //! resolution the CLI commands use. Operators run
 //! `yoink -c yoink.prod.yaml tui` to edit prod's sealed file and
 //! `yoink -c yoink.staging.yaml tui` for staging; the title bar
@@ -685,10 +685,11 @@ fn load(config: &Config) -> LoadStatus {
         SecretsConfig::Age {
             file, recipients, ..
         } => {
-            let path = match sealed::resolve_sealed_path(config, file.as_deref()) {
-                Ok(p) => p,
-                Err(e) => return LoadStatus::Failed(e.to_string()),
-            };
+            let path =
+                match sealed::resolve_sealed_path(config.config_dir.as_deref(), file.as_deref()) {
+                    Ok(p) => p,
+                    Err(e) => return LoadStatus::Failed(e.to_string()),
+                };
             let identity = match sealed::load_identity(recipients) {
                 Ok(id) => id,
                 // The key exists but the keychain did not hand it out.

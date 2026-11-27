@@ -406,7 +406,7 @@ fn seal_new_secrets(config: &Config, new_secrets: &[render::RenderedSecret]) -> 
             reason: "`secrets.recipients:` is empty".into(),
         });
     }
-    let path = sealed::resolve_sealed_path(config, file.as_deref())?;
+    let path = sealed::resolve_sealed_path(config.config_dir.as_deref(), file.as_deref())?;
 
     // Merge with existing sealed contents if the file already exists.
     // Try-read directly (avoids a TOCTOU race between exists() and read).
@@ -471,8 +471,9 @@ fn print_confirmation(
     if !rendered.secrets.is_empty() {
         match &config.secrets {
             Some(SecretsConfig::Age { file, .. }) => {
-                let path = sealed::resolve_sealed_path(config, file.as_deref())
-                    .unwrap_or_else(|_| PathBuf::from("secrets.age"));
+                let path =
+                    sealed::resolve_sealed_path(config.config_dir.as_deref(), file.as_deref())
+                        .unwrap_or_else(|_| PathBuf::from("secrets.age"));
                 eprintln!("Secrets to seal into {}:", path.display());
             }
             _ => {

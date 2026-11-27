@@ -24,7 +24,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
-use crate::docker_ops::Host;
+use crate::host::Host;
 
 /// Connect to `host`'s docker daemon over `ssh -p <port>`. Same
 /// contract as `Docker::connect_with_ssh`: lazy, the first request

@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::diff::{ChangeKind, FieldDiff, ServiceDiff};
-use crate::docker_ops::Host;
+use crate::host::Host;
 
 /// Outcome of a drift fetch — either the matching `ServiceDiff` for
 /// the focused (host, service) pair, or `None` when the host yielded

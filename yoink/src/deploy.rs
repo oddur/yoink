@@ -23,13 +23,15 @@ use thiserror::Error;
 use tracing::warn;
 use zeroize::Zeroizing;
 
+use crate::bundle::SecretsBundle;
 use crate::config::{Config, HookSpec, HookTag, ServiceConfig};
-use crate::docker::{self, BuildError, RunSpec, SHORT_HASH_LEN};
-use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, Host, StoppedRemoval};
+use crate::docker::{self, RunSpec, SHORT_HASH_LEN};
+use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, StoppedRemoval};
 use crate::files::{self, FileError, FileMount};
 use crate::healthcheck::{self, HealthcheckError};
+use crate::host::Host;
 use crate::network;
-use crate::secrets::SecretsBundle;
+use crate::run_args::BuildError;
 
 #[derive(Debug, Error)]
 pub enum DeployError {
@@ -210,22 +212,12 @@ pub fn build_labels(
         labels.insert("yoink.caddy.key_secret".into(), s.clone());
     }
     if let Some(extra) = &service.caddy_extra_json {
-        labels.insert("yoink.caddy.extra_hash".into(), short_sha256(extra));
+        labels.insert(
+            "yoink.caddy.extra_hash".into(),
+            crate::hash::short_sha256(extra),
+        );
     }
     labels
-}
-
-pub(crate) fn short_sha256(s: &str) -> String {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write;
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    let d = h.finalize();
-    let mut out = String::with_capacity(16);
-    for b in &d[..8] {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 /// Audit-trail labels added at create-container time. Deliberately
@@ -535,7 +527,7 @@ pub async fn reconcile_with_options(
     // at spec and otherwise never calls `push_caddy_config`.
     // `services_filter` is ignored on purpose — a scoped retry like
     // `yoink up --service web` should still resync Caddy.
-    if crate::proxy::proxy_enabled(config)
+    if config.proxy_enabled()
         && let Some(proxy_svc) = config
             .services
             .iter()
@@ -764,9 +756,8 @@ async fn cleanup_extra_containers(
 /// Caddy config push: the proxy is on, and the service is the proxy
 /// itself or is routed by it.
 fn triggers_caddy_load(config: &Config, service: &ServiceConfig) -> bool {
-    crate::proxy::proxy_enabled(config)
-        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy))
-            || crate::proxy::is_proxied(service))
+    config.proxy_enabled()
+        && (matches!(service.kind, Some(crate::config::ServiceKind::Proxy)) || service.is_proxied())
 }
 
 /// Reconcile a single service across its applicable hosts.
@@ -1304,11 +1295,7 @@ async fn push_caddy_config(
         })?;
     let config = &config;
 
-    let routed: Vec<&ServiceConfig> = config
-        .services
-        .iter()
-        .filter(|s| crate::proxy::is_proxied(s))
-        .collect();
+    let routed: Vec<&ServiceConfig> = config.services.iter().filter(|s| s.is_proxied()).collect();
     let upstream_names = build_upstream_names(ops, host, &routed, in_flight_upstreams).await?;
 
     let json = crate::proxy::caddy::render(
@@ -1519,7 +1506,7 @@ pub fn registry_credentials(
 ) -> Option<bollard::auth::DockerCredentials> {
     let reg = config
         .configured_registries()
-        .find(|reg| crate::docker::image_on_registry(image, &reg.server))?;
+        .find(|reg| crate::image::image_on_registry(image, &reg.server))?;
     let bundle = secrets?;
     let username = bundle.get(&reg.username_secret)?.to_string();
     let password = Zeroizing::new(bundle.get(&reg.password_secret)?.to_string());
@@ -1651,7 +1638,7 @@ pub async fn prefetch_images(
         && let Some(svc) = config
             .services
             .iter()
-            .find(|s| s.name == crate::proxy::PROXY_SERVICE_NAME)
+            .find(|s| s.name == crate::config::PROXY_SERVICE_NAME)
     {
         for host_cfg in svc.applicable_hosts(&config.hosts) {
             let host = Host::from(host_cfg);
@@ -1692,7 +1679,7 @@ pub async fn prefetch_images(
         // Likewise the xcaddy-built proxy image only exists locally on
         // each host; pulling it from a registry would 404. The build
         // fan-out above has already produced the image.
-        if service.name == crate::proxy::PROXY_SERVICE_NAME
+        if service.name == crate::config::PROXY_SERVICE_NAME
             && config.proxy.as_ref().is_some_and(|p| p.xcaddy.is_some())
         {
             continue;
@@ -3473,7 +3460,7 @@ services:
             "unexpected error: {err}"
         );
         let calls = ops.calls();
-        let proxy_label = format!("yoink.service={}", crate::proxy::PROXY_SERVICE_NAME);
+        let proxy_label = format!("yoink.service={}", crate::config::PROXY_SERVICE_NAME);
         assert!(
             calls.iter().any(
                 |c| matches!(c, RecordedCall::ListContainersByLabel(_, l) if *l == proxy_label)
@@ -4160,11 +4147,7 @@ services:
     #[tokio::test]
     async fn build_upstream_names_excludes_old_replicas_for_in_flight_service() {
         let cfg = config_proxied_service();
-        let routed: Vec<&ServiceConfig> = cfg
-            .services
-            .iter()
-            .filter(|s| crate::proxy::is_proxied(s))
-            .collect();
+        let routed: Vec<&ServiceConfig> = cfg.services.iter().filter(|s| s.is_proxied()).collect();
 
         // Both old AND new replicas show up as `running` if we ever
         // queried — the override should bypass the query entirely.
@@ -4235,11 +4218,7 @@ services:
 "#,
         )
         .unwrap();
-        let routed: Vec<&ServiceConfig> = cfg
-            .services
-            .iter()
-            .filter(|s| crate::proxy::is_proxied(s))
-            .collect();
+        let routed: Vec<&ServiceConfig> = cfg.services.iter().filter(|s| s.is_proxied()).collect();
 
         let ops = FakeDockerOps::new();
         // api: in-flight, query should be skipped via override.

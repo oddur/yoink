@@ -7,11 +7,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, TableState};
 use throbber_widgets_tui::{Throbber, ThrobberState};
 
+use crate::bundle::SecretsBundle;
 use crate::config::Config;
 use crate::deploy;
 use crate::docker;
 use crate::docker_ops::ContainerInfo;
-use crate::secrets::SecretsBundle;
 
 /// Bold style for table headers and pane titles.
 #[must_use]
@@ -781,4 +781,29 @@ pub fn clamp_selection(table: &mut TableState, len: usize) {
     {
         table.select(len.checked_sub(1));
     }
+}
+
+/// Marker-prefixed cell for a service / container row. Pass the
+/// already-decided `pf_active` (callers either ask the per-service
+/// or per-container predicate); vscode sessions are per-service so
+/// the helper looks them up itself. `↦` = port-forward active,
+/// `◊` = vscode session active. Markers stack; cyan when any active.
+pub fn build_marker_cell(
+    service: &str,
+    pf_active: bool,
+    vscode: &super::vscode::VscodeSessionState,
+) -> Cell<'static> {
+    let vs = vscode.is_service_active(service);
+    if !pf_active && !vs {
+        return Cell::from(service.to_string());
+    }
+    let mut prefix = String::with_capacity(4);
+    if pf_active {
+        prefix.push('↦');
+    }
+    if vs {
+        prefix.push('◊');
+    }
+    Cell::from(format!("{prefix} {service}"))
+        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan))
 }

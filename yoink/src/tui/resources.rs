@@ -25,7 +25,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
 
 use crate::config::Config;
-use crate::docker_ops::{DockerOps, Host, ImageInfo, NetworkInfo, VolumeInfo};
+use crate::docker_ops::{DockerOps, ImageInfo, NetworkInfo, VolumeInfo};
+use crate::host::Host;
 use crate::output::{format_bytes, format_relative_time};
 
 use super::ui::{

@@ -35,7 +35,8 @@ use tokio::time::interval;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::docker_ops::{DockerEvent, DockerEventKind, DockerOps, Host, LogLine};
+use crate::docker_ops::{DockerEvent, DockerEventKind, DockerOps, LogLine};
+use crate::host::Host;
 use crate::status::StatusReport;
 
 use super::container_detail::{self, ContainerDetailRefresh, ContainerDetailState, StatsHistory};
@@ -905,7 +906,7 @@ pub struct App {
     /// TUI doesn't block on a slow `provider: command` fetch (an
     /// external CLI can take 1–3 s). `None` means "not loaded yet" —
     /// drift cells render as `?` until the loader finishes.
-    secrets: Arc<tokio::sync::RwLock<Option<Arc<crate::secrets::SecretsBundle>>>>,
+    secrets: Arc<tokio::sync::RwLock<Option<Arc<crate::bundle::SecretsBundle>>>>,
     /// Ring of recent docker-event toasts: `(deadline, line)`. The
     /// most-recent line displaces the right-side host/service count
     /// in the breadcrumb header for `TOAST_TTL`.
@@ -2297,7 +2298,7 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.dashboard.select_next(),
                 KeyCode::Enter => {
                     if let Some(row) = self.dashboard.selected() {
-                        let host = config_host_or_bare(&self.config, &row.host);
+                        let host = self.config.host_or_bare(&row.host);
                         self.transition(View::ContainerDetail {
                             host,
                             container: row.container,
@@ -2307,7 +2308,7 @@ impl App {
                 }
                 KeyCode::Char('K') => {
                     if let Some(row) = self.dashboard.selected() {
-                        let host = config_host_or_bare(&self.config, &row.host);
+                        let host = self.config.host_or_bare(&row.host);
                         self.kill_target = Some((host, row.container));
                     }
                 }
@@ -3608,7 +3609,7 @@ impl App {
         };
         for host_status in report.hosts {
             for container in host_status.containers.iter().filter(|c| c.is_running()) {
-                let host = config_host_or_bare(&self.config, &host_status.host);
+                let host = self.config.host_or_bare(&host_status.host);
                 self.spawn_log_forwarder(host, container.name.clone()).await;
             }
         }
@@ -4088,26 +4089,6 @@ fn update_service_status(
     map.insert(service.to_string(), next);
 }
 
-/// The config's `Host` for `address`, so Dashboard and service rows
-/// (which carry only an address) get the ssh user and port for
-/// transitions that need them (`HostDetail`, kill modal, log
-/// streams). An address the config does not know falls back to a
-/// bare host with no user and no port.
-pub(super) fn config_host_or_bare(config: &Config, address: &str) -> Host {
-    config
-        .hosts
-        .iter()
-        .find(|h| h.address == address)
-        .map_or_else(
-            || Host {
-                user: String::new(),
-                address: address.to_string(),
-                port: None,
-            },
-            Host::from,
-        )
-}
-
 /// Background reconcile task. Acquires the per-host advisory lock,
 /// runs `deploy::reconcile` filtered to one service, pipes each
 /// `DeployEvent` back to the run loop as a `JobUpdate::Event`,
@@ -4116,7 +4097,7 @@ pub(super) fn config_host_or_bare(config: &Config, address: &str) -> Host {
 async fn reconcile_one(
     config: Config,
     ops: Arc<dyn DockerOps>,
-    secrets: Option<Arc<crate::secrets::SecretsBundle>>,
+    secrets: Option<Arc<crate::bundle::SecretsBundle>>,
     service: String,
     tag: String,
     tx: UnboundedSender<JobUpdate>,
@@ -4188,7 +4169,7 @@ async fn reconcile_one(
 async fn reconcile_all(
     config: Config,
     ops: Arc<dyn DockerOps>,
-    secrets: Option<Arc<crate::secrets::SecretsBundle>>,
+    secrets: Option<Arc<crate::bundle::SecretsBundle>>,
     overrides: std::collections::BTreeMap<String, String>,
     tx: UnboundedSender<JobUpdate>,
 ) {

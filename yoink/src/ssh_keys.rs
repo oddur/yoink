@@ -18,9 +18,9 @@ use anyhow::{Context, Result};
 use std::os::unix::fs::OpenOptionsExt;
 use tempfile::NamedTempFile;
 
+use crate::bundle::SecretsBundle;
 use crate::config::Config;
-use crate::docker_ops::Host;
-use crate::secrets::SecretsBundle;
+use crate::host::Host;
 
 /// Holds tempfiles for every host that declared an `ssh_key_secret:`.
 /// Keyed by host `address` (the same address bollard's ssh URL uses).

@@ -30,7 +30,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::config::{Config, ServiceConfig};
-use crate::docker_ops::{DockerOps, Host};
+use crate::docker_ops::DockerOps;
+use crate::host::Host;
 
 /// How long we'll wait for the SSH tunnel's local listener to come
 /// up before giving up. The `ssh -L` child binds locally before

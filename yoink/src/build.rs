@@ -11,23 +11,19 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
-use futures_util::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use thiserror::Error;
 use tokio::process::Command;
-use tokio_util::io::ReaderStream;
 
 use crate::config::{Config, ServiceConfig};
-use crate::docker;
-use crate::docker_ops::{DockerError, DockerOps, Host, ImageTarStream};
+use crate::docker_ops::{DockerError, DockerOps};
+use crate::host::Host;
+use crate::image;
 use crate::output::format_bytes;
 use crate::transport::{
-    Transport,
+    Transport, tarball,
     unregistry::{self, SIDECAR_LABEL, SIDECAR_LABEL_VALUE},
 };
 
@@ -44,12 +40,6 @@ pub enum BuildError {
          (is the operator logged into the registry? `docker login <registry>`)"
     )]
     DockerPushFailed { service: String, status: String },
-    #[error("`docker save` for {image:?} exited with status {status}{stderr}", stderr = if .stderr.is_empty() { String::new() } else { format!(":\n{}", .stderr) })]
-    DockerSaveFailed {
-        image: String,
-        status: String,
-        stderr: String,
-    },
     #[error(transparent)]
     Docker(#[from] DockerError),
     #[error("failed to spawn `{program}`: {source}")]
@@ -128,7 +118,7 @@ pub async fn build_and_capture_tag(
         })?;
 
     // Probe tag used only long enough to retag with the digest below.
-    let probe_ref = docker::image_reference(&service.image, "yoink-build-probe");
+    let probe_ref = image::image_reference(&service.image, "yoink-build-probe");
     let mut cmd = Command::new("docker");
     cmd.arg("build")
         .arg("--tag")
@@ -184,7 +174,7 @@ pub async fn build_and_capture_tag(
         .take(12)
         .collect();
 
-    let final_ref = docker::image_reference(&service.image, &short_tag);
+    let final_ref = image::image_reference(&service.image, &short_tag);
     let tag_status = Command::new("docker")
         .args(["tag", &probe_ref, &final_ref])
         .status()
@@ -220,7 +210,7 @@ pub async fn build_service(
         .build
         .as_ref()
         .ok_or_else(|| BuildError::NoBuildBlock(service.name.clone()))?;
-    let image_ref = docker::image_reference(&service.image, tag);
+    let image_ref = image::image_reference(&service.image, tag);
     let context_path = resolve_relative_to_config(config, &build.context);
 
     let mut cmd = Command::new("docker");
@@ -282,84 +272,6 @@ pub async fn build_service(
     Ok(())
 }
 
-/// Stream `docker save <image_ref>` from the operator's local docker
-/// daemon directly into the host's docker daemon via bollard's
-/// `import_image` (`POST /images/load`). Memory stays bounded by
-/// `ReaderStream`'s chunk size (8 KiB by default) regardless of how
-/// large the image is — a 2GB Java/Node app costs 8 KiB of buffer,
-/// not 2GB of RAM, on the operator's machine.
-///
-/// `on_progress` is called with each chunk's byte count as it flows
-/// through the pipe — wire it to a progress bar (CLI) or an event
-/// channel (TUI). Use `|_| ()` for silent transfers.
-///
-/// Multi-host: each call spawns its own `docker save` process and
-/// holds its own client connection to the host. Run multiple calls
-/// concurrently via `try_join_all` for full parallel fan-out.
-pub async fn save_and_load_to_host(
-    image_ref: &str,
-    ops: &dyn DockerOps,
-    host: &Host,
-    on_progress: impl FnMut(u64) + Send + 'static,
-) -> Result<u64, BuildError> {
-    let mut child = Command::new("docker")
-        .arg("save")
-        .arg(image_ref)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| BuildError::Spawn {
-            program: "docker".into(),
-            source,
-        })?;
-    let stdout = child
-        .stdout
-        .take()
-        .expect("piped stdout should always be available");
-    // Drain stderr concurrently into a buffer — surfaces "no such image"
-    // and similar diagnostics in the failure path; otherwise the caller
-    // only sees the exit code.
-    let stderr = child
-        .stderr
-        .take()
-        .expect("piped stderr should always be available");
-    let stderr_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = String::new();
-        let _ = tokio::io::BufReader::new(stderr)
-            .read_to_string(&mut buf)
-            .await;
-        buf
-    });
-
-    let total = Arc::new(AtomicU64::new(0));
-    let total_clone = Arc::clone(&total);
-    let mut on_progress = on_progress;
-    let stream = ReaderStream::new(stdout).inspect(move |chunk| {
-        if let Ok(bytes) = chunk {
-            let n = bytes.len() as u64;
-            total_clone.fetch_add(n, Ordering::Relaxed);
-            on_progress(n);
-        }
-    });
-    let body: ImageTarStream = Box::pin(stream);
-    ops.load_image(host, body).await?;
-
-    let status = child.wait().await.map_err(|source| BuildError::Spawn {
-        program: "docker".into(),
-        source,
-    })?;
-    let stderr_text = stderr_task.await.unwrap_or_default();
-    if !status.success() {
-        return Err(BuildError::DockerSaveFailed {
-            image: image_ref.to_string(),
-            status: status.to_string(),
-            stderr: stderr_text.trim().to_string(),
-        });
-    }
-    Ok(total.load(Ordering::Relaxed))
-}
-
 /// Pre-flight for any deploy that has locally-built images: for every
 /// selected service × applicable host, stream `docker save` from the
 /// operator's local daemon into the host's daemon via `import_image`.
@@ -398,7 +310,7 @@ pub async fn load_images_to_hosts(
             continue;
         }
         let tag = resolve_service_tag(svc, tag_overrides)?;
-        let image_ref = docker::image_reference(&svc.image, &tag);
+        let image_ref = image::image_reference(&svc.image, &tag);
         let entry = by_image.entry(image_ref).or_default();
         for host_cfg in svc.applicable_hosts(&config.hosts) {
             if !entry.iter().any(|h| h.address == host_cfg.address) {
@@ -479,7 +391,7 @@ async fn deliver_image(
 ) -> anyhow::Result<()> {
     match transport {
         Transport::Tarball => {
-            let total = save_and_load_to_host(image_ref, ops, host, on_progress).await?;
+            let total = tarball::save_and_load_to_host(image_ref, ops, host, on_progress).await?;
             let signed = i64::try_from(total).unwrap_or(i64::MAX);
             bar.finish_with_message(format!("done · {} (tarball)", format_bytes(signed)));
             Ok(())
@@ -500,7 +412,8 @@ async fn deliver_image(
                      falling back to tarball",
                     host.address,
                 );
-                let total = save_and_load_to_host(image_ref, ops, host, on_progress).await?;
+                let total =
+                    tarball::save_and_load_to_host(image_ref, ops, host, on_progress).await?;
                 let signed = i64::try_from(total).unwrap_or(i64::MAX);
                 bar.finish_with_message(format!(
                     "done · {} (tarball fallback)",

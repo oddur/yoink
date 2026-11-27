@@ -10,10 +10,10 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
+use crate::bundle::SecretsBundle;
 use crate::config::Config;
 use crate::docker_ops::{ContainerStats, DockerOps};
 use crate::output::{format_bytes, format_relative_time};
-use crate::secrets::SecretsBundle;
 use crate::status::StatusReport;
 
 use super::container_detail::StatsHistory;
@@ -340,7 +340,7 @@ impl DashboardState {
                     Some(svc) => {
                         let pf = forwards.is_container_forwarded(&host.host, &c.name)
                             || forwards.is_service_forwarded_unscoped(svc);
-                        super::services::build_marker_cell(svc, pf, vscode)
+                        super::ui::build_marker_cell(svc, pf, vscode)
                     }
                     None => Cell::from("-"),
                 };

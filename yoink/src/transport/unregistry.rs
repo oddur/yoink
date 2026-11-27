@@ -22,7 +22,8 @@ use tracing::warn;
 
 use super::oci_push::{self, OciPushError};
 use super::tunnel::{SshTunnel, TunnelError};
-use crate::docker_ops::{DockerError, DockerOps, Host, parse_published_port, rand_hex};
+use crate::docker_ops::{DockerError, DockerOps, parse_published_port, rand_hex};
+use crate::host::Host;
 use crate::ssh_probe;
 
 /// Image used for the ephemeral on-host registry sidecar.

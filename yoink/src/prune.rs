@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 use crate::config::Config;
-use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, Host};
+use crate::docker_ops::{ContainerInfo, DockerError, DockerOps};
+use crate::host::Host;
 
 #[derive(Debug, Error)]
 pub enum PruneError {

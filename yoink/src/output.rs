@@ -145,7 +145,7 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
         DeployEvent::PullStarted { host, image, tag } => {
             format!(
                 "[{host}] pulling {}",
-                crate::docker::image_reference(image, tag)
+                crate::image::image_reference(image, tag)
             )
         }
         DeployEvent::PullFinished { host } => format!("[{host}] pull complete"),

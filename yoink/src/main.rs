@@ -31,12 +31,14 @@ use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
+use yoink::bundle::SecretsBundle;
 use yoink::config::Config;
 use yoink::deploy;
-use yoink::docker_ops::{DockerOps, Host, RealDockerOps};
+use yoink::docker_ops::{DockerOps, RealDockerOps};
 use yoink::git;
+use yoink::host::Host;
 use yoink::output;
-use yoink::secrets::{self, SecretsBundle};
+use yoink::secrets;
 use yoink::status::StatusReport;
 use yoink::tui::{self, Mode};
 
@@ -1815,7 +1817,7 @@ const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[allow(clippy::too_many_lines)] // single linear up-once flow; splitting fragments the build → push → reconcile sequence
 async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Result<()> {
-    use yoink::docker_ops::Host;
+    use yoink::host::Host;
     use yoink::lock::HostLock;
     let &UpOptions {
         services,
@@ -2471,7 +2473,7 @@ async fn cmd_rollback(
     dry_run: bool,
 ) -> Result<()> {
     use std::collections::BTreeMap;
-    use yoink::docker_ops::Host;
+    use yoink::host::Host;
 
     // Validate --service filter if given.
     if let Some(name) = service_filter {
@@ -2928,8 +2930,8 @@ async fn list_running_replicas(
     config: &Config,
     service: &str,
     host_filter: Option<&str>,
-) -> Result<Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>> {
-    use yoink::docker_ops::Host;
+) -> Result<Vec<(yoink::host::Host, yoink::docker_ops::ContainerInfo)>> {
+    use yoink::host::Host;
     let label = format!("yoink.service={service}");
     let futs = config
         .hosts
@@ -2966,7 +2968,7 @@ async fn resolve_running_container(
     config: &Config,
     service: &str,
     host_filter: Option<&str>,
-) -> Result<(yoink::docker_ops::Host, String)> {
+) -> Result<(yoink::host::Host, String)> {
     let candidates = list_running_replicas(ops, config, service, host_filter).await?;
     match candidates.len() {
         0 => Err(no_replicas_err(service, host_filter)),
@@ -3003,8 +3005,8 @@ fn no_replicas_err(service: &str, host_filter: Option<&str>) -> anyhow::Error {
 /// no `healthcheck_path:` (where `health_hint()` is always `None`) so
 /// `yoink shell <svc>` still works on them.
 fn pick_healthy_replica(
-    candidates: Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>,
-) -> Option<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)> {
+    candidates: Vec<(yoink::host::Host, yoink::docker_ops::ContainerInfo)>,
+) -> Option<(yoink::host::Host, yoink::docker_ops::ContainerInfo)> {
     if let Some(idx) = candidates
         .iter()
         .position(|(_, c)| c.health_hint() == Some(yoink::docker_ops::HealthStatus::Healthy))
@@ -3062,7 +3064,7 @@ async fn cmd_logs(
 /// (preserved so shell pipelines piping `yoink logs` into `grep` keep
 /// working unchanged for the single-replica case).
 fn replica_prefix(
-    host: &yoink::docker_ops::Host,
+    host: &yoink::host::Host,
     info: &yoink::docker_ops::ContainerInfo,
     multi: bool,
 ) -> String {
@@ -3078,7 +3080,7 @@ fn replica_prefix(
 /// channel once every per-replica task exits.
 async fn cmd_logs_follow(
     ops: std::sync::Arc<dyn DockerOps>,
-    candidates: Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>,
+    candidates: Vec<(yoink::host::Host, yoink::docker_ops::ContainerInfo)>,
     tail: u32,
 ) -> Result<()> {
     let multi = candidates.len() > 1;
@@ -3128,7 +3130,7 @@ async fn cmd_logs_follow(
 /// inserted before each `\n`-delimited segment.
 async fn cmd_logs_tail(
     ops: &dyn DockerOps,
-    candidates: Vec<(yoink::docker_ops::Host, yoink::docker_ops::ContainerInfo)>,
+    candidates: Vec<(yoink::host::Host, yoink::docker_ops::ContainerInfo)>,
     tail: u32,
 ) -> Result<()> {
     let multi = candidates.len() > 1;
@@ -3255,7 +3257,7 @@ async fn cmd_pf(
         );
     }
 
-    let host = yoink::docker_ops::Host::from(host_cfg);
+    let host = yoink::host::Host::from(host_cfg);
     let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> =
         std::sync::Arc::new(build_real_ops(config, None).await?);
     let keyfile = ops.ssh_keyfile(&host);
@@ -3602,7 +3604,7 @@ async fn run_dry_run(
     config: &Config,
     tag_overrides: &std::collections::BTreeMap<String, String>,
     services_filter: Option<&[String]>,
-    secrets: Option<&yoink::secrets::SecretsBundle>,
+    secrets: Option<&yoink::bundle::SecretsBundle>,
     format: DryRunFormat,
 ) -> Result<()> {
     let report = yoink::diff::compute(ops, config, tag_overrides, services_filter, secrets)
@@ -3685,7 +3687,7 @@ async fn cmd_pull(
                 info_eprintln!(
                     "→ {}: pulling {}",
                     host.address,
-                    yoink::docker::image_reference(&image, &tag),
+                    yoink::image::image_reference(&image, &tag),
                 );
                 ops.pull_image(&host, &image, &tag, credentials)
                     .await
@@ -3842,7 +3844,8 @@ async fn cmd_audit_log(
     format: TableFormat,
 ) -> Result<()> {
     use yoink::audit::{FetchOptions, event_name, event_service, event_summary, fetch_events};
-    use yoink::docker_ops::{DockerOps as _, Host};
+    use yoink::docker_ops::DockerOps as _;
+    use yoink::host::Host;
 
     if let Some(o) = origin_filter
         && !matches!(o, "operator" | "host")
@@ -3955,7 +3958,8 @@ async fn cmd_audit_gc(
     host_filter: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    use yoink::docker_ops::{DockerOps as _, Host};
+    use yoink::docker_ops::DockerOps as _;
+    use yoink::host::Host;
     let secs = parse_since(keep)?;
     let cutoff_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4002,7 +4006,7 @@ async fn cmd_audit_gc(
 }
 
 async fn audit_gc_one(
-    host: &yoink::docker_ops::Host,
+    host: &yoink::host::Host,
     key_path: Option<&std::path::Path>,
     cutoff_unix: u64,
     dry_run: bool,
@@ -4087,7 +4091,7 @@ async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<(
             .hosts
             .iter()
             .find(|h| h.address == *host_addr)
-            .map(yoink::docker_ops::Host::from);
+            .map(yoink::host::Host::from);
         let ops = &ops;
         async move {
             let h = host?;
@@ -4554,7 +4558,7 @@ async fn cmd_validate(config: &Config, check_hosts: bool) -> Result<()> {
     // schema errors (invalid `caddy_extra_json`, bad TLS config,
     // unknown handler module) BEFORE deploy time. Best-effort —
     // skips silently if docker isn't on the operator's machine.
-    if yoink::proxy::proxy_enabled(config) {
+    if config.proxy_enabled() {
         validate_proxy_render(config).await?;
     }
     if check_hosts {
@@ -4736,7 +4740,7 @@ fn cmd_proxy_dockerfile(config: &Config) -> Result<()> {
 }
 
 async fn cmd_proxy_render(config: &Config) -> Result<()> {
-    if !yoink::proxy::proxy_enabled(config) {
+    if !config.proxy_enabled() {
         anyhow::bail!(
             "proxy is not enabled — no service has `domain:` and `proxy.enabled` is unset"
         );
@@ -4852,7 +4856,7 @@ async fn cmd_diff(config: &Config, service: &str, tag_override: Option<&str>) ->
     }
     println!(
         "\nspec: {} (env, ports, mounts compared at deploy time via spec hash)",
-        yoink::docker::image_reference(&svc_cfg.image, &target_tag),
+        yoink::image::image_reference(&svc_cfg.image, &target_tag),
     );
     Ok(())
 }
@@ -5055,8 +5059,8 @@ fn split_hosts_add_address(
     let Some(address) = address else {
         return Ok((None, port));
     };
-    let (address, inline) = yoink::config::split_address_port(address)
-        .map_err(|e| anyhow::anyhow!("--address: {e}"))?;
+    let (address, inline) =
+        yoink::host::split_address_port(address).map_err(|e| anyhow::anyhow!("--address: {e}"))?;
     match (port, inline) {
         (Some(flag), Some(inline)) if flag != inline => Err(anyhow::anyhow!(
             "--port {flag} conflicts with the port {inline} in --address"
@@ -5278,7 +5282,8 @@ fn cmd_secrets_ssh_key_generate(
 ) -> Result<()> {
     use yoink::sealed;
     let (file_override, recipients) = expect_age_block(config)?;
-    let target = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+    let target =
+        sealed::resolve_sealed_path(config.config_dir.as_deref(), file_override.as_deref())?;
     let pub_openssh = sealed::ssh_keygen_into_bundle(&target, recipients, seal_as, comment)?;
     eprintln!(
         "✓ sealed new ed25519 SSH private key as {seal_as:?} into {}",
@@ -5293,7 +5298,8 @@ fn cmd_secrets_ssh_key_public(config: &Config, name: &str) -> Result<()> {
     use yoink::sealed;
 
     let (file_override, recipients) = expect_age_block(config)?;
-    let target = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+    let target =
+        sealed::resolve_sealed_path(config.config_dir.as_deref(), file_override.as_deref())?;
     if !target.exists() {
         return Err(anyhow::anyhow!(
             "no sealed bundle at {}; nothing to derive {name:?} from",
@@ -5974,7 +5980,7 @@ fn cmd_secrets_edit(config: &Config) -> Result<()> {
     use yoink::sealed;
 
     let (file_override, recipients) = expect_age_block(config)?;
-    let path = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+    let path = sealed::resolve_sealed_path(config.config_dir.as_deref(), file_override.as_deref())?;
 
     // Decrypt the current bundle (or start with an empty template).
     let (original_bundle, plaintext) = if path.exists() {
@@ -6079,7 +6085,7 @@ fn cmd_secrets_show(config: &Config, reveal: bool) -> Result<()> {
     else {
         unreachable!()
     };
-    let path = sealed::resolve_sealed_path(config, file.as_deref())?;
+    let path = sealed::resolve_sealed_path(config.config_dir.as_deref(), file.as_deref())?;
     let bytes =
         std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
     let identity = sealed::load_identity(recipients)?;
@@ -6130,7 +6136,7 @@ fn cmd_secrets_env(config: &Config, no_export: bool, profile_name: Option<&str>)
         })?),
         None => None,
     };
-    let path = sealed::resolve_sealed_path(config, file.as_deref())?;
+    let path = sealed::resolve_sealed_path(config.config_dir.as_deref(), file.as_deref())?;
     let bytes =
         std::fs::read(&path).with_context(|| format!("read sealed file {}", path.display()))?;
     let identity = sealed::load_identity(recipients)?;
@@ -6278,7 +6284,9 @@ fn cmd_secrets_seal(
 
     let target = match out {
         Some(p) => p,
-        None => sealed::resolve_sealed_path(config, file_override.as_deref())?,
+        None => {
+            sealed::resolve_sealed_path(config.config_dir.as_deref(), file_override.as_deref())?
+        }
     };
 
     // Load existing bundle (if any). On the first seal — when
@@ -6417,7 +6425,7 @@ fn cmd_secrets_rotate(config: &Config) -> Result<()> {
     use yoink::sealed;
 
     let (file_override, current_recipients) = expect_age_block(config)?;
-    let path = sealed::resolve_sealed_path(config, file_override.as_deref())?;
+    let path = sealed::resolve_sealed_path(config.config_dir.as_deref(), file_override.as_deref())?;
     if !path.exists() {
         return Err(anyhow::anyhow!(
             "{} doesn't exist — nothing to rotate. `yoink secrets edit` to create it first",
