@@ -445,10 +445,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // `yoink up`. On a fresh proxy (no autosave yet) the
             // bootstrap takes effect as before.
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
-            cmd: vec![format!(
-                "echo '{{\"admin\":{{\"listen\":\"{ADMIN_LISTEN}\"}}}}' \
-                 | exec caddy run --config /dev/stdin --resume"
-            )],
+            cmd: vec![proxy_start_script()],
             // Yoink's `cap_drop: [ALL]` default would block Caddy
             // from binding :80/:443 (privileged ports). Re-add the
             // one cap that lets it; everything else stays dropped.
@@ -472,6 +469,21 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             ..ServiceRun::default()
         },
     }
+}
+
+/// The `sh -c` script that starts Caddy in the proxy container. The
+/// bootstrap config goes to `caddy run` on stdin from a here-document,
+/// and `exec` replaces the shell with Caddy. Thus Caddy is PID 1 and
+/// gets the SIGTERM of `docker stop`. With a pipeline (`echo … | exec
+/// caddy …`), the shell forks for each side and stays PID 1, and the
+/// shell does not forward the signal. A short here-document needs no
+/// fork. The script uses only `sh` and `caddy`.
+fn proxy_start_script() -> String {
+    format!(
+        "exec caddy run --config /dev/stdin --resume <<'EOF'\n\
+         {{\"admin\":{{\"listen\":\"{ADMIN_LISTEN}\"}}}}\n\
+         EOF\n"
+    )
 }
 
 /// JSON shapes accepted by `validate_json_shape`.
@@ -743,11 +755,58 @@ services:
         let proxy = cfg.service(PROXY_SERVICE_NAME).expect("proxy synthesized");
         assert_eq!(proxy.run.publish, ["80:80", "443:443"]);
         assert_eq!(
-            proxy.run.cmd,
-            [
-                r#"echo '{"admin":{"listen":"127.0.0.1:2019"}}' | exec caddy run --config /dev/stdin --resume"#
-            ]
+            proxy.run.entrypoint.as_deref(),
+            Some(&["sh".into(), "-c".into()][..])
         );
+        assert_eq!(proxy.run.cmd, [proxy_start_script()]);
+    }
+
+    /// Run the proxy start script with `sh`, with a stub `caddy` on
+    /// `PATH`. The stub prints its parent PID, its arguments and its
+    /// stdin.
+    #[cfg(unix)]
+    fn run_start_script(script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("caddy");
+        std::fs::write(&stub, "#!/bin/sh\necho \"ppid=$PPID args=$*\"\ncat\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// The script was `echo … | exec caddy run …`. The shell forked
+    /// for the pipeline and stayed the parent of Caddy, so the SIGTERM
+    /// of `docker stop` did not reach Caddy. Now the shell execs Caddy:
+    /// the parent of Caddy is the parent of the shell.
+    #[cfg(unix)]
+    #[test]
+    fn the_start_script_execs_caddy_with_the_bootstrap_on_stdin() {
+        let out = run_start_script(&proxy_start_script());
+        let mut lines = out.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            format!(
+                "ppid={} args=run --config /dev/stdin --resume",
+                std::process::id()
+            )
+        );
+        assert_eq!(
+            lines.next().unwrap(),
+            r#"{"admin":{"listen":"127.0.0.1:2019"}}"#
+        );
+        assert_eq!(lines.next(), None);
     }
 
     #[test]
