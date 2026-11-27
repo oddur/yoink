@@ -810,16 +810,7 @@ pub async fn deploy_service(
         on_event(DeployEvent::HookStarted {
             name: hook.name.clone(),
         });
-        if let Err(e) = run_hook(
-            ops,
-            config,
-            Some(&service.name),
-            hook,
-            &resolved_tag,
-            secrets,
-        )
-        .await
-        {
+        if let Err(e) = run_hook(ops, config, Some(service), hook, &resolved_tag, secrets).await {
             cleanup_prepared_replicas(ops, &prepared).await;
             return Err(e);
         }
@@ -2036,13 +2027,13 @@ fn resolve_hook_tag(
 /// here only has to honor that invariant.
 ///
 /// `service` is the owning service for a service-scoped hook, `None`
-/// for a top-level one. It goes into the container name so two
+/// for a top-level one. Its name goes into the container name so two
 /// services deployed in the same wave with a same-named hook at the
 /// same tag don't fight over one name.
 async fn run_hook(
     ops: &dyn DockerOps,
     config: &Config,
-    service: Option<&str>,
+    service: Option<&ServiceConfig>,
     hook: &HookSpec,
     tag: &str,
     secrets: Option<&SecretsBundle>,
@@ -2050,14 +2041,10 @@ async fn run_hook(
     if hook.is_subprocess() {
         return run_subprocess_hook(config, hook, secrets).await;
     }
-    let host = config
-        .fleet()
-        .into_iter()
-        .next()
-        .ok_or_else(|| DeployError::Hook {
-            name: hook.name.clone(),
-            message: "no hosts configured".into(),
-        })?;
+    let (host, hook_network) = hook_target(config, service).ok_or_else(|| DeployError::Hook {
+        name: hook.name.clone(),
+        message: "no hosts configured".into(),
+    })?;
 
     let image = hook
         .image
@@ -2071,20 +2058,15 @@ async fn run_hook(
             source,
         })?;
 
-    // Hooks share the deploy's first network so they can reach
-    // services on it (e.g. a migration hook hitting the database).
-    // Operators with stricter isolation needs can put their hooks
-    // on a dedicated network and put it first in deploy.networks.
-    let hook_network = config.networks().first().map_or("bridge", String::as_str);
     let body = docker::build_hook_container(
         image,
         tag,
-        hook_network,
+        &hook_network,
         hook.entrypoint.as_deref(),
         &hook.cmd,
         &hook_env(hook, secrets),
     );
-    let container_name = hook_container_name(service, &hook.name, tag);
+    let container_name = hook_container_name(service.map(|s| s.name.as_str()), &hook.name, tag);
     // The name is deterministic, so a hook container left behind by an
     // interrupted deploy (Ctrl-C, dropped ssh link) would fail the
     // create with a 409 name conflict on every later deploy. Reap it
@@ -2131,6 +2113,26 @@ async fn run_hook(
         });
     }
     Ok(())
+}
+
+/// The host and network a container hook runs on. A top-level hook
+/// uses the first host of the fleet and the first of `deploy.networks`.
+/// A service hook uses the first host and the first network of its
+/// service, so it runs where the service runs and can reach what the
+/// service reaches (e.g. a migration hook hitting the database).
+/// Operators with stricter isolation needs can put their hooks on a
+/// dedicated network and put it first. `None` when there is no host.
+fn hook_target(config: &Config, service: Option<&ServiceConfig>) -> Option<(Host, String)> {
+    let (hosts, networks) = match service {
+        Some(svc) => (config.fleet_for(svc), config.networks_for(svc)),
+        None => (config.fleet(), config.networks().to_vec()),
+    };
+    let host = hosts.into_iter().next()?;
+    let network = networks
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "bridge".to_string());
+    Some((host, network))
 }
 
 /// Docker allows only `[a-zA-Z0-9_.-]` in a container name. A digest
@@ -3946,6 +3948,95 @@ services:
             &Host::from(&cfg.hosts[0]),
             "yoink-hook-app-a-migrate-v42",
         );
+    }
+
+    /// Regression: a service hook ran on the first host of the whole
+    /// fleet and joined the first of `deploy.networks`, even when its
+    /// service runs on other hosts and networks.
+    #[test]
+    fn service_hook_targets_the_service_host_and_network() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: web-1, user: deploy }
+  - { address: db-1, user: deploy }
+deploy:
+  networks: [edge, data]
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: v1
+    hosts: [db-1]
+    networks: [data]
+    run: { port: 3000, healthcheck_path: /health }
+"#,
+        )
+        .unwrap();
+        let (host, network) = hook_target(&cfg, Some(&cfg.services[0])).unwrap();
+        assert_eq!(host.address, "db-1");
+        assert_eq!(network, "data");
+        let (host, network) = hook_target(&cfg, None).unwrap();
+        assert_eq!(host.address, "web-1");
+        assert_eq!(network, "edge");
+    }
+
+    /// End to end: `deploy_service` runs the hook of a service pinned
+    /// to `db-1` on `db-1`, not on the first host of the fleet.
+    #[tokio::test(start_paused = true)]
+    async fn service_hook_runs_on_a_host_of_its_service() {
+        let cfg = Config::parse_str(
+            r#"
+hosts:
+  - { address: web-1, user: deploy }
+  - { address: db-1, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: v1
+    hosts: [db-1]
+    run: { port: 3000, healthcheck_path: /health }
+    pre_deploy:
+      - name: migrate
+        image: registry.example.com/api
+        tag: { service: api }
+        cmd: ["bin/migrate"]
+"#,
+        )
+        .unwrap();
+
+        let ops = happy_ops(&[]);
+        ops.push_pull_image(Ok(()));
+        ops.push_remove_stopped(Ok(StoppedRemoval::Absent));
+        // Exit non-zero so the deploy stops right after the hook.
+        ops.push_one_shot(Ok(crate::docker_ops::OneShotResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+
+        let mut sink = |_e: DeployEvent| {};
+        let _ = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[0],
+            "v1",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+
+        let hook_hosts: Vec<String> = ops
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::docker_ops::RecordedCall::RunOneShot(h, _) => Some(h.address),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hook_hosts, vec!["db-1".to_string()]);
     }
 
     /// #108 end to end: a service on the configured registry pulls with
