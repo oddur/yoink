@@ -114,7 +114,7 @@ A `pre_deploy` hook runs **one time**. The number of replicas and the number of 
 
 When the proxy is on, yoink manages two docker networks. A service with `domain:` joins `yoink-ingress`. You can also list `yoink-ingress` in `deploy.networks` or in the `networks:` of a service.
 
-Only the proxy joins `yoink-admin`. The admin API of the proxy listens on this network and has no authentication. Config load rejects `yoink-admin` in `deploy.networks` and in the `networks:` of a service. Use a different name for your own networks. The [proxy guide](/docs/explanation/proxy) has more about the two networks.
+Only the proxy and its admin relay join `yoink-proxy-admin`. The admin API of the proxy listens on this network and has no authentication. Config load rejects `yoink-proxy-admin` in `deploy.networks` and in the `networks:` of a service. Use a different name for your own networks. The [proxy guide](/docs/explanation/proxy) has more about the two networks.
 
 ## Port-forward
 

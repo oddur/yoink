@@ -52,9 +52,11 @@ weight: 4
 
 **`proxy.xcaddy:`.** A build config with a list of Caddy plugins (Go modules). yoink compiles them into a custom Caddy binary on each proxy host. Examples are rate-limiting, the L4 module, third-party DNS providers, and shared ACME storage. See [Caddy plugins](/docs/how-to/caddy-plugins).
 
-**`yoink-admin` network.** A network private to the proxy, for the admin API of Caddy. The admin API listens only on the address of the proxy on this network. yoink pushes new config to the admin API through an SSH tunnel and does not restart Caddy.
-
 **`yoink-ingress` network.** The docker network that yoink attaches the proxy and every service with a `domain:` to. Caddy reaches upstream containers by name on this network. Services keep their other networks.
+
+**`yoink-proxy-admin` network.** A network private to the proxy, for the admin API of Caddy. The admin API listens only on the address of the proxy on this network. yoink pushes new config to the admin API through an SSH tunnel and the admin relay, and does not restart Caddy.
+
+**Admin relay.** The `yoink-proxy-admin-relay` container on each proxy host. It joins only `yoink-proxy-admin`, publishes the admin port on `127.0.0.1` of the host, and sends each connection to the admin API of the proxy.
 
 ## Networking
 

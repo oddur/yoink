@@ -332,7 +332,12 @@ pub async fn compute(
     // With `--service`, the plan covers only the selected services, so
     // only their containers can be orphans. The containers of the other
     // services are outside the plan, not orphans.
+    // The admin relay belongs to the proxy, see `prune::classify`.
+    let proxy_enabled = config.proxy_enabled();
     let in_scope = |c: &ContainerInfo| {
+        if crate::proxy::relay::is_relay(c) {
+            return services_filter.is_none() && !proxy_enabled;
+        }
         services_filter.is_none()
             || c.yoink_service
                 .as_deref()
@@ -962,6 +967,33 @@ services:
             .unwrap();
         let orphans: Vec<&str> = report.orphans.iter().map(|o| o.name.as_str()).collect();
         assert_eq!(orphans, [api_old.as_str()]);
+    }
+
+    /// The admin relay has no `yoink.service`, so the plan claims it for
+    /// no service. It belongs to the proxy and is not an orphan while
+    /// the proxy is on.
+    #[tokio::test]
+    async fn admin_relay_is_an_orphan_only_without_the_proxy() {
+        use crate::proxy::relay::RELAY_NAME;
+        async fn orphans(yaml: &str, relay: ContainerInfo) -> Vec<String> {
+            let cfg = crate::config::Config::parse_str(yaml).unwrap();
+            let ops = crate::docker_ops::FakeDockerOps::new();
+            ops.push_list_containers(Ok(vec![relay]));
+            let report = compute(&ops, &cfg, &BTreeMap::new(), None, None)
+                .await
+                .unwrap();
+            report.orphans.into_iter().map(|o| o.name).collect()
+        }
+        let relay = ContainerInfo {
+            yoink_service: None,
+            ..running("", RELAY_NAME, "r", "running")
+        };
+        let routed = "hosts:\n  - { address: host-a, user: deploy }\nservices:\n  - name: api\n    \
+                      image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n";
+        assert!(orphans(routed, relay.clone()).await.is_empty());
+        let plain = "hosts:\n  - { address: host-a, user: deploy }\nservices:\n  - name: api\n    \
+                     image: img\n    tag: v1\n    run: {}\n";
+        assert_eq!(orphans(plain, relay).await, [RELAY_NAME]);
     }
 
     fn running(service: &str, name: &str, hash: &str, state: &str) -> ContainerInfo {

@@ -183,7 +183,7 @@ pub enum PfError {
     #[error("invalid publish spec {spec:?}: {reason}")]
     InvalidPublishSpec { spec: String, reason: String },
     #[error(
-        "service {service:?} declares no `networks:` (other than the reserved `yoink-admin`) — sidecar mode needs at least one docker network to join. Add a `networks:` entry to the service or its `deploy.networks:` default, or pin one published container port and use `--mode published`."
+        "service {service:?} declares no `networks:` (other than the reserved `yoink-proxy-admin`) — sidecar mode needs at least one docker network to join. Add a `networks:` entry to the service or its `deploy.networks:` default, or pin one published container port and use `--mode published`."
     )]
     SidecarNoNetwork { service: String },
     #[error(transparent)]
@@ -333,8 +333,8 @@ pub enum ResolvedTarget {
 }
 
 /// The network a sidecar joins: the first of `networks` that is not
-/// [`ADMIN_NETWORK`]. Only the proxy may join the admin network, and
-/// it is the first network of `yoink-proxy`.
+/// [`ADMIN_NETWORK`]. Only the proxy and the admin relay may join the
+/// admin network.
 #[must_use]
 pub fn sidecar_network(networks: &[String]) -> Option<String> {
     networks.iter().find(|n| *n != ADMIN_NETWORK).cloned()
@@ -945,17 +945,14 @@ services:
         );
     }
 
-    /// The first network of `yoink-proxy` is the reserved admin network.
-    /// The sidecar must not join it: it joins the next network.
+    /// The sidecar must not join the reserved admin network, also when
+    /// it comes first: it joins the next network.
     #[test]
     fn sidecar_network_skips_the_admin_network() {
-        let cfg = crate::config::Config::parse_str("hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n").unwrap();
-        let proxy = cfg.service(crate::config::PROXY_SERVICE_NAME).unwrap();
-        let networks = cfg.networks_for(proxy);
-        assert_eq!(
-            networks.first().map(String::as_str),
-            Some(crate::config::ADMIN_NETWORK)
-        );
+        let networks = vec![
+            crate::config::ADMIN_NETWORK.to_string(),
+            crate::config::INGRESS_NETWORK.to_string(),
+        ];
         assert_eq!(
             sidecar_network(&networks).as_deref(),
             Some(crate::config::INGRESS_NETWORK)

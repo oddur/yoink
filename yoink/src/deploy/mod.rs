@@ -414,6 +414,7 @@ async fn reconcile_run(
             ensure_host_networks(ops, &host, config.networks(), &mut none_sink).await?;
         }
     }
+    ensure_admin_relays(ops, config).await?;
 
     // Run pre-deploy hooks first; one failure halts the whole reconcile.
     for hook in &config.hooks.pre_deploy {
@@ -626,6 +627,29 @@ async fn reconcile_run(
     }
 
     Ok(reports)
+}
+
+/// Make sure the admin relay runs on every host of the proxy, before
+/// any Caddy push of the run. Also for a scoped run: the relay is part
+/// of the proxy, and a run that recreates the proxy needs it. See
+/// [`crate::proxy::relay`].
+async fn ensure_admin_relays(ops: &dyn DockerOps, config: &Config) -> Result<(), DeployError> {
+    let proxy = config
+        .services
+        .iter()
+        .find(|s| s.kind == Some(crate::config::ServiceKind::Proxy));
+    let Some(proxy) = proxy.filter(|_| config.proxy_enabled()) else {
+        return Ok(());
+    };
+    for host in config.fleet_for(proxy) {
+        crate::proxy::relay::ensure(ops, &host)
+            .await
+            .map_err(|source| DeployError::Docker {
+                host: host.address.clone(),
+                source,
+            })?;
+    }
+    Ok(())
 }
 
 /// What one host runs for a service, measured against the desired
@@ -1999,6 +2023,18 @@ fn http_probe_target<'a>(service: &ServiceConfig, new_name: &'a str) -> &'a str 
     }
 }
 
+/// The network the deploy probe joins. It must share a network with
+/// the target: the first network of the service. The proxy is the
+/// exception: the probe targets the admin API alias, which exists only
+/// on the admin network. The first network of the proxy is
+/// `yoink-ingress`.
+fn probe_network<'a>(service: &ServiceConfig, effective: &'a [String]) -> &'a str {
+    if service.kind == Some(crate::config::ServiceKind::Proxy) {
+        return crate::config::ADMIN_NETWORK;
+    }
+    effective.first().map_or("bridge", String::as_str)
+}
+
 async fn wait_until_healthy(
     ops: &dyn DockerOps,
     host: &Host,
@@ -2017,10 +2053,8 @@ async fn wait_until_healthy(
     };
     // Path present → HTTP probe. Path absent → TCP-connect probe (for
     // non-HTTP services like redis or TLS-only edges like caddy).
-    // The probe must share at least one network with the target;
-    // pick the service's first effective network.
     let effective = config.networks_for(service);
-    let probe_network = effective.first().map_or("bridge", String::as_str);
+    let probe_network = probe_network(service, &effective);
     let result = match service.run.healthcheck_path.as_deref() {
         Some(path) => {
             healthcheck::poll(
@@ -2396,15 +2430,15 @@ mod tests {
     use super::*;
     use crate::docker_ops::{FakeDockerOps, RecordedCall};
 
-    /// The proxy is created on `yoink-admin`, the endpoint that gets
-    /// the admin API alias and gateway priority 1, so the published
-    /// admin port lands there. The deploy probe and the Docker
-    /// HEALTHCHECK use the alias, the only `Host` that Caddy accepts.
+    /// The proxy is created on `yoink-ingress`, so that network stays
+    /// its gateway and keeps ports 80 and 443. The admin API alias is on
+    /// the admin endpoint only. The deploy probe joins the admin network
+    /// and targets the alias, the only `Host` that Caddy accepts. The
+    /// Docker HEALTHCHECK uses the alias too.
     #[test]
-    fn proxy_run_spec_puts_the_admin_endpoint_first() {
+    fn proxy_run_spec_keeps_ingress_first_and_probes_the_admin_network() {
         use crate::config::{
-            ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_GW_PRIORITY, ADMIN_NETWORK, INGRESS_NETWORK,
-            PROXY_SERVICE_NAME,
+            ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, INGRESS_NETWORK, PROXY_SERVICE_NAME,
         };
         let cfg = Config::parse_str(
             r#"
@@ -2422,33 +2456,31 @@ services:
         .expect("config parses");
         let proxy = cfg.service(PROXY_SERVICE_NAME).expect("proxy");
         let spec = build_run_spec(&cfg, proxy, "2", None, "yoink-proxy-x".into(), "h", &[]);
-        assert_eq!(spec.networks, [ADMIN_NETWORK, INGRESS_NETWORK]);
+        assert_eq!(spec.networks, [INGRESS_NETWORK, ADMIN_NETWORK]);
+        assert!(
+            !spec.publish.iter().any(|p| p.contains("2019")),
+            "got: {:?}",
+            spec.publish
+        );
         let body = docker::build_container(&spec).expect("body");
         let endpoints = body.networking_config.unwrap().endpoints_config.unwrap();
-        let admin = &endpoints[ADMIN_NETWORK];
-        assert_eq!(admin.gw_priority, Some(ADMIN_GW_PRIORITY));
         assert!(
-            admin
+            !endpoints[INGRESS_NETWORK]
                 .aliases
                 .as_ref()
                 .unwrap()
                 .iter()
                 .any(|a| a == ADMIN_API_ALIAS)
         );
-        let ingress =
-            docker::endpoint_settings(INGRESS_NETWORK, &["yoink-proxy-x".to_string()], spec.proxy);
-        assert!(
-            !ingress
-                .aliases
-                .unwrap()
-                .iter()
-                .any(|a| a == ADMIN_API_ALIAS)
-        );
-        assert_eq!(ingress.gw_priority, None);
+        let admin =
+            docker::endpoint_settings(ADMIN_NETWORK, &["yoink-proxy-x".to_string()], spec.proxy);
+        assert!(admin.aliases.unwrap().iter().any(|a| a == ADMIN_API_ALIAS));
 
         assert_eq!(http_probe_target(proxy, "yoink-proxy-x"), ADMIN_API_ALIAS);
+        assert_eq!(probe_network(proxy, &spec.networks), ADMIN_NETWORK);
         let api = cfg.service("api").unwrap();
         assert_eq!(http_probe_target(api, "api-x"), "api-x");
+        assert_eq!(probe_network(api, &cfg.networks_for(api)), "app");
         let test = body.healthcheck.and_then(|h| h.test).expect("healthcheck");
         assert!(
             test[1].contains(&format!("http://{ADMIN_API_HOST}/config/")),
@@ -3624,8 +3656,21 @@ services:
         for _ in &cfg.deploy.networks {
             ops.push_ensure_network(Ok(false));
         }
+        if cfg.proxy_enabled() {
+            push_relay_at_spec(&ops);
+        }
         ops.push_list_containers(Ok(snapshot));
         ops
+    }
+
+    /// The relay lookup of `ensure_admin_relays` finds a relay at spec.
+    fn push_relay_at_spec(ops: &FakeDockerOps) {
+        use crate::proxy::relay::{RELAY_NAME, relay_spec_hash};
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: None,
+            yoink_spec_hash: Some(relay_spec_hash()),
+            ..container_with_state(RELAY_NAME, "running")
+        }]));
     }
 
     type TaggedEvents = Vec<(Option<String>, DeployEvent)>;
@@ -4827,6 +4872,41 @@ services:
             matches!(events.last(), Some(DeployEvent::Done { container, .. }) if container == "app-a-NEWHASH"),
             "expected Done as the last event, got {events:?}"
         );
+    }
+
+    /// A reconcile with the proxy on creates the admin relay on each
+    /// proxy host before the container snapshot and any Caddy push, also
+    /// when the run is scoped.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_creates_the_admin_relay_first() {
+        use crate::proxy::relay::RELAY_NAME;
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        for _ in &cfg.deploy.networks {
+            ops.push_ensure_network(Ok(false));
+        }
+        // No relay yet: create and start it.
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        // The snapshot.
+        ops.push_list_containers(Ok(Vec::new()));
+        let (result, _) = reconcile_collect(&ops, &cfg, Some(&["nonexistent".into()])).await;
+        // The final push finds no proxy container.
+        assert!(result.is_err());
+        let calls = ops.calls();
+        let start = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == RELAY_NAME))
+            .expect("relay started");
+        let snapshot = calls
+            .iter()
+            .position(
+                |c| matches!(c, RecordedCall::ListContainersByLabel(_, l) if l == "yoink.managed=true"),
+            )
+            .expect("snapshot");
+        assert!(start < snapshot, "got: {calls:?}");
     }
 
     #[tokio::test(start_paused = true)]

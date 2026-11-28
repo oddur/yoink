@@ -62,8 +62,8 @@ pub struct RunSpec {
     /// HEALTHCHECK their image's Dockerfile declares.
     pub docker_healthcheck: Option<HealthConfig>,
     /// True for the synthesized proxy. Its endpoint on
-    /// [`crate::config::ADMIN_NETWORK`] then gets the admin API alias
-    /// and the gateway priority. See [`endpoint_settings`].
+    /// [`crate::config::ADMIN_NETWORK`] then gets the admin API alias.
+    /// See [`endpoint_settings`].
     pub proxy: bool,
 }
 
@@ -250,22 +250,17 @@ fn build_networking_config(spec: &RunSpec) -> NetworkingConfig {
 /// Endpoint settings of a container on `network`. `aliases` go on
 /// every network. For the proxy (`proxy`), the endpoint on
 /// [`crate::config::ADMIN_NETWORK`] also gets
-/// [`crate::config::ADMIN_API_ALIAS`] and the gateway priority
-/// [`crate::config::ADMIN_GW_PRIORITY`]. Caddy binds the admin API to
-/// the address of that alias, and Docker forwards published ports to
-/// the gateway endpoint only. Thus no other endpoint carries the alias.
+/// [`crate::config::ADMIN_API_ALIAS`]. Caddy binds the admin API to the
+/// address of that alias, so no other endpoint may carry it.
 #[must_use]
 pub fn endpoint_settings(network: &str, aliases: &[String], proxy: bool) -> EndpointSettings {
-    use crate::config::{ADMIN_API_ALIAS, ADMIN_GW_PRIORITY, ADMIN_NETWORK};
+    use crate::config::{ADMIN_API_ALIAS, ADMIN_NETWORK};
     let mut aliases = aliases.to_vec();
-    let mut gw_priority = None;
     if proxy && network == ADMIN_NETWORK {
         aliases.push(ADMIN_API_ALIAS.to_string());
-        gw_priority = Some(ADMIN_GW_PRIORITY);
     }
     EndpointSettings {
         aliases: vec_opt(&aliases),
-        gw_priority,
         ..Default::default()
     }
 }
@@ -734,26 +729,25 @@ mod tests {
         assert!(aliases.contains(&"api".to_string()));
     }
 
-    /// The proxy is created on the admin network, with the admin API
-    /// alias and gateway priority 1 there. Docker forwards the
-    /// published admin port to the gateway endpoint only.
+    /// The proxy is created on `yoink-ingress`, its gateway endpoint,
+    /// so the published ports 80 and 443 stay there. The admin API alias
+    /// is on the admin endpoint only, which is connected after create.
     #[test]
-    fn proxy_admin_endpoint_has_alias_and_gateway_priority() {
-        use crate::config::{ADMIN_API_ALIAS, ADMIN_GW_PRIORITY, ADMIN_NETWORK, INGRESS_NETWORK};
+    fn proxy_is_created_on_ingress_without_the_alias() {
+        use crate::config::{ADMIN_API_ALIAS, ADMIN_NETWORK, INGRESS_NETWORK};
         let mut spec = sample_spec();
         spec.proxy = true;
-        spec.networks = vec![ADMIN_NETWORK.into(), INGRESS_NETWORK.into()];
+        spec.networks = vec![INGRESS_NETWORK.into(), ADMIN_NETWORK.into()];
         let body = build_container(&spec).unwrap();
         assert_eq!(
             body.host_config.unwrap().network_mode.as_deref(),
-            Some(ADMIN_NETWORK)
+            Some(INGRESS_NETWORK)
         );
         let endpoints = body.networking_config.unwrap().endpoints_config.unwrap();
         assert_eq!(endpoints.len(), 1);
-        let admin = &endpoints[ADMIN_NETWORK];
-        assert_eq!(admin.gw_priority, Some(ADMIN_GW_PRIORITY));
-        let aliases = admin.aliases.as_ref().unwrap();
-        assert!(aliases.contains(&ADMIN_API_ALIAS.to_string()));
+        let ingress = &endpoints[INGRESS_NETWORK];
+        let aliases = ingress.aliases.as_ref().unwrap();
+        assert!(!aliases.contains(&ADMIN_API_ALIAS.to_string()));
         assert!(aliases.contains(&spec.container_name));
     }
 
@@ -765,12 +759,10 @@ mod tests {
         let base = vec!["yoink-proxy-abc".to_string()];
         let ingress = endpoint_settings(INGRESS_NETWORK, &base, true);
         assert_eq!(ingress.aliases.as_deref(), Some(base.as_slice()));
-        assert_eq!(ingress.gw_priority, None);
         // Another service that an operator puts on the admin network
         // does not get the alias.
         let other = endpoint_settings(ADMIN_NETWORK, &base, false);
         assert_eq!(other.aliases.as_deref(), Some(base.as_slice()));
-        assert_eq!(other.gw_priority, None);
         let admin = endpoint_settings(ADMIN_NETWORK, &base, true);
         assert!(
             admin

@@ -11,7 +11,8 @@
 //!    `_proxy` block themselves ([`crate::config`]).
 //! 2. Caddy JSON config rendered from the user-facing schema and
 //!    pushed via Caddy's admin API at deterministic points in the
-//!    rolling deploy ([`caddy`] + [`admin`]).
+//!    rolling deploy ([`caddy`] + [`admin`]), through the admin
+//!    relay container ([`relay`]).
 //!
 //! Application-layer concerns (auth, rate limits, headers, CORS) are
 //! deliberately not modeled. Use [`crate::config::ServiceConfig::caddy_extra_json`]
@@ -19,4 +20,5 @@
 
 pub mod admin;
 pub mod caddy;
+pub mod relay;
 pub mod xcaddy;

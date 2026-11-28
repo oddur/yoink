@@ -20,19 +20,12 @@ pub const PROXY_SERVICE_NAME: &str = "yoink-proxy";
 /// name. Every service with `domain:` joins it automatically.
 pub const INGRESS_NETWORK: &str = "yoink-ingress";
 
-/// Docker network the Caddy admin API listens on. Only the proxy
-/// joins it. The name sorts before [`INGRESS_NETWORK`], and the proxy
-/// endpoint on it has gateway priority [`ADMIN_GW_PRIORITY`], so
-/// Docker makes it the gateway endpoint of the proxy. Docker programs
-/// published ports only for the gateway endpoint, so the loopback
-/// publish of the admin port lands on this network and not on
-/// `yoink-ingress`, where every routed service is.
-pub const ADMIN_NETWORK: &str = "yoink-admin";
-
-/// Gateway priority of the proxy endpoint on [`ADMIN_NETWORK`]. The
-/// other endpoints keep the default 0, and the highest priority wins.
-/// Docker Engine 28 added the field (API 1.48).
-pub const ADMIN_GW_PRIORITY: i64 = 1;
+/// Docker network the Caddy admin API listens on. Only the proxy and
+/// the admin relay join it (see `crate::proxy::relay`). The name sorts
+/// after [`INGRESS_NETWORK`], so `yoink-ingress` stays the gateway
+/// endpoint of the proxy and keeps the published ports 80 and 443.
+/// Earlier versions of yoink created this network too.
+pub const ADMIN_NETWORK: &str = "yoink-proxy-admin";
 
 /// Network alias that the proxy has only on [`ADMIN_NETWORK`]. Caddy
 /// binds the admin API to the one address this name resolves to, the
@@ -54,7 +47,7 @@ pub const ADMIN_API_HOST: &str = "yoink-proxy-admin-api:2019";
 /// The `admin` block of every Caddy config that yoink writes: the
 /// bootstrap of the proxy container and each `/load`. A `/load` that
 /// omits the block sets the admin API back to the Caddy default
-/// `localhost:2019`, which the published port cannot reach.
+/// `localhost:2019`, which the admin relay cannot reach.
 ///
 /// `enforce_origin` stays false: then Caddy checks `Origin` only when
 /// a request carries `Origin` or `Sec-Fetch-Mode`, which yoink's
@@ -244,11 +237,11 @@ impl Config {
         // Pin every service that has no `networks:` to the networks the
         // operator declared, before the implicit ones are added below. A
         // service without `networks:` defaults to all of `deploy.networks`,
-        // so without this pin it would also join `yoink-admin` and
+        // so without this pin it would also join `yoink-proxy-admin` and
         // could reach the Caddy admin API, which has no authentication.
         // Only the proxy belongs on that network. An operator who lists
         // `yoink-ingress` in `deploy.networks` still gets it here.
-        // `reject_admin_network` refuses `yoink-admin` there.
+        // `reject_admin_network` refuses `yoink-proxy-admin` there.
         let operator_networks = self.deploy.networks.clone();
         for svc in &mut self.services {
             if svc.networks.is_none() && !matches!(svc.kind, Some(ServiceKind::Proxy)) {
@@ -295,7 +288,8 @@ impl Config {
 }
 
 impl Config {
-    /// Only the proxy may join [`ADMIN_NETWORK`]. The admin API has no
+    /// Only the proxy and the admin relay may join [`ADMIN_NETWORK`].
+    /// The admin API has no
     /// authentication, so any other container on that network can
     /// change the proxy config. Rejects the name in `deploy.networks`
     /// and in the `networks:` of every service that is not the proxy.
@@ -451,9 +445,9 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         labels: std::collections::BTreeMap::default(),
         pre_deploy: Vec::new(),
         depends_on: Vec::new(),
-        // The admin network first: the create-time endpoint, and the
-        // gateway endpoint (see `ADMIN_NETWORK`).
-        networks: Some(vec![ADMIN_NETWORK.to_string(), INGRESS_NETWORK.to_string()]),
+        // `yoink-ingress` first: it is the gateway endpoint, which gets
+        // the published ports 80 and 443 (see `ADMIN_NETWORK`).
+        networks: Some(vec![INGRESS_NETWORK.to_string(), ADMIN_NETWORK.to_string()]),
         domain: None,
         tls: TlsMode::Auto,
         tls_cert_secret: None,
@@ -474,20 +468,15 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // admin is up.
             port: Some(ADMIN_PORT),
             healthcheck_path: Some("/config/".to_string()),
-            // Caddy serves :80 + :443 on the host. The admin port is
-            // published on 127.0.0.1 with an ephemeral host port
-            // (`:0:2019`) so it's reachable from the host (and only
-            // from the host) — docker doesn't route user-defined-
-            // network container IPs from the host. yoink looks up
-            // the actual host port via `inspect_container` and
-            // SSH-tunnels to it for one `/load` call. Docker forwards
-            // the publish to the proxy IP on `ADMIN_NETWORK`, the
-            // gateway endpoint.
+            // Caddy serves :80 + :443 on the host. The proxy does not
+            // publish the admin port. Docker forwards every published
+            // port of a container to its gateway endpoint, which is
+            // `yoink-ingress`. The admin relay publishes it instead,
+            // on 127.0.0.1 only, see `crate::proxy::relay`.
             //
             // `proxy.bind:` (when set) prepends the bind address to
             // :80/:443 so the proxy is reachable only on that
-            // interface (e.g. tailnet IP). Admin port stays on
-            // 127.0.0.1 regardless.
+            // interface (e.g. tailnet IP).
             //
             // The :80/:443 publishes also implicitly force stop-first
             // deploy (port bindings are exclusive at the kernel
@@ -499,11 +488,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
                     .as_deref()
                     .map(|ip| format!("{ip}:"))
                     .unwrap_or_default();
-                vec![
-                    format!("{prefix}80:80"),
-                    format!("{prefix}443:443"),
-                    format!("127.0.0.1:0:{ADMIN_PORT}"),
-                ]
+                vec![format!("{prefix}80:80"), format!("{prefix}443:443")]
             },
             // Override the official caddy:2 image's entrypoint to
             // start with a minimal bootstrap config: the `admin_block`
@@ -744,7 +729,7 @@ services:
     }
 
     /// A service without `networks:` used to default to every entry of
-    /// `deploy.networks`, which includes `yoink-admin` once the
+    /// `deploy.networks`, which includes `yoink-proxy-admin` once the
     /// proxy is on. It could then reach the unauthenticated Caddy
     /// admin API. Only the proxy may be on that network.
     #[test]
@@ -776,27 +761,27 @@ services:
         let nets = |name: &str| cfg.networks_for(cfg.service(name).unwrap());
         assert_eq!(nets("api"), ["app", INGRESS_NETWORK]);
         assert_eq!(nets("worker"), ["app"]);
-        assert_eq!(nets(PROXY_SERVICE_NAME), [ADMIN_NETWORK, INGRESS_NETWORK]);
+        assert_eq!(nets(PROXY_SERVICE_NAME), [INGRESS_NETWORK, ADMIN_NETWORK]);
         // Still declared, so each host creates it for the proxy.
         assert!(cfg.deploy.networks.iter().any(|n| n == ADMIN_NETWORK));
     }
 
-    /// Nothing stopped a service from joining `yoink-admin` through
+    /// Nothing stopped a service from joining `yoink-proxy-admin` through
     /// `deploy.networks` or its own `networks:`. It could then change
     /// the proxy config through the admin API.
     #[test]
     fn admin_network_is_reserved_for_the_proxy() {
         let cases = [
             (
-                "deploy: { networks: [app, yoink-admin] }\nservices: []",
+                "deploy: { networks: [app, yoink-proxy-admin] }\nservices: []",
                 "deploy.networks",
             ),
             (
-                "services:\n  - { name: worker, image: w, tag: v1, networks: [yoink-admin], run: {} }",
+                "services:\n  - { name: worker, image: w, tag: v1, networks: [yoink-proxy-admin], run: {} }",
                 "service \"worker\": networks",
             ),
             (
-                "services:\n  - name: api\n    image: a\n    tag: v1\n    domain: api.example.com\n    networks: [yoink-admin]\n    run: { port: 8080 }",
+                "services:\n  - name: api\n    image: a\n    tag: v1\n    domain: api.example.com\n    networks: [yoink-proxy-admin]\n    run: { port: 8080 }",
                 "service \"api\": networks",
             ),
         ];
@@ -807,7 +792,7 @@ services:
             let err = Config::parse_str(&yaml).expect_err(field);
             let msg = err.to_string();
             assert!(msg.contains(field), "got: {msg}");
-            assert!(msg.contains("\"yoink-admin\""), "got: {msg}");
+            assert!(msg.contains("\"yoink-proxy-admin\""), "got: {msg}");
             assert!(
                 msg.contains("reserved for the Caddy admin API"),
                 "got: {msg}"
@@ -824,7 +809,7 @@ services:
         let yaml = "hosts: [{ address: h, user: u }]\nproxy: { email: o@example.com }\n\
                     services:\n  - name: api\n    image: a\n    tag: v1\n    \
                     domain: api.example.com\n    run: { port: 8080 }\n  - name: worker\n    \
-                    image: w\n    tag: v1\n    kind: proxy\n    networks: [yoink-admin]\n    \
+                    image: w\n    tag: v1\n    kind: proxy\n    networks: [yoink-proxy-admin]\n    \
                     run: {}\n";
         let msg = Config::parse_str(yaml)
             .expect_err("kind: proxy")
@@ -1019,9 +1004,8 @@ services:
         }
     }
 
-    /// The bootstrap config of the proxy used `0.0.0.0:2019`. With
-    /// the publish on the gateway endpoint, which was `yoink-ingress`,
-    /// every routed service could POST `/load`.
+    /// The bootstrap config of the proxy used `0.0.0.0:2019`, so every
+    /// routed service on `yoink-ingress` could POST `/load`.
     #[test]
     fn bootstrap_admin_listens_on_the_admin_alias() {
         let proxy = synthesized_proxy_service(&ProxyConfig::default());
@@ -1041,9 +1025,17 @@ services:
         );
         assert!(!cmd.contains("0.0.0.0"), "got: {cmd}");
         assert_eq!(ADMIN_API_HOST, format!("{ADMIN_API_ALIAS}:{ADMIN_PORT}"));
-        // When gateway priorities tie, Docker picks the network name
-        // that sorts first.
-        assert!(ADMIN_NETWORK < INGRESS_NETWORK);
+        // Docker picks the network name that sorts first as the
+        // gateway, which gets the published ports 80 and 443. That
+        // must stay `yoink-ingress`.
+        assert!(INGRESS_NETWORK < ADMIN_NETWORK);
+        // The proxy does not publish the admin port: Docker would
+        // forward it to `yoink-ingress`, the gateway endpoint.
+        assert!(
+            !proxy.run.publish.iter().any(|p| p.ends_with(":2019")),
+            "got: {:?}",
+            proxy.run.publish
+        );
     }
 
     /// The bootstrap is part of the spec hash of the proxy. It came from

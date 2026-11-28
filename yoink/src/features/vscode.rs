@@ -68,7 +68,7 @@ pub enum VscodeError {
     #[error("no service named {0:?} in this config")]
     ServiceNotFound(String),
     #[error(
-        "service {service:?} declares no `networks:` (other than the reserved `yoink-admin`) — \
+        "service {service:?} declares no `networks:` (other than the reserved `yoink-proxy-admin`) — \
          `yoink vscode` needs a docker network to join \
          (so code-server can resolve service DNS in its terminal). Add a `networks:` entry to the \
          service or `deploy.networks:`."
@@ -496,8 +496,8 @@ mod tests {
         assert_eq!(network, "app");
     }
 
-    /// The first network of `yoink-proxy` is the reserved admin network.
-    /// The code-server sidecar joins the next network.
+    /// The code-server sidecar skips the reserved admin network, also
+    /// when it comes first, and joins the next network.
     #[tokio::test]
     async fn resolve_target_skips_the_admin_network() {
         use crate::config::{ADMIN_NETWORK, INGRESS_NETWORK, PROXY_SERVICE_NAME};
@@ -506,8 +506,7 @@ mod tests {
         let host = cfg.fleet().remove(0);
         let ops = crate::docker_ops::FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![running(PROXY_SERVICE_NAME, &[ADMIN_NETWORK])]));
-        let networks = cfg.networks_for(proxy);
-        assert_eq!(networks.first().map(String::as_str), Some(ADMIN_NETWORK));
+        let networks = vec![ADMIN_NETWORK.to_string(), INGRESS_NETWORK.to_string()];
         let (_, network) = resolve_target(&ops, &host, proxy, &networks).await.unwrap();
         assert_eq!(network, INGRESS_NETWORK);
 

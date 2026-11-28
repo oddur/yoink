@@ -32,7 +32,7 @@ services/staging/web.yaml   # name: web-staging
 
 ```yaml
 deploy:
-  # `yoink-ingress` and `yoink-admin` are auto-injected by the
+  # `yoink-ingress` and `yoink-proxy-admin` are auto-injected by the
   # bundled-proxy code path — no need to list them here.
   networks: [api, web, redis, otel]
 

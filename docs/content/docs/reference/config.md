@@ -58,7 +58,7 @@ hosts:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `networks` | list of string | `[yoink]` when `deploy:` is absent | Declared docker networks. Required when `deploy:` is present, with a minimum of one entry. Services attach to them with `services[].networks:`. yoink creates each network that does not exist. The name `yoink-admin` is reserved for the proxy admin API, and config load rejects it. |
+| `networks` | list of string | `[yoink]` when `deploy:` is absent | Declared docker networks. Required when `deploy:` is present, with a minimum of one entry. Services attach to them with `services[].networks:`. yoink creates each network that does not exist. The name `yoink-proxy-admin` is reserved for the proxy admin API, and config load rejects it. |
 
 ## Secrets
 
@@ -187,7 +187,7 @@ The [proxy guide](/docs/explanation/proxy) explains how the bundled Caddy revers
 | `image` | string | `caddy:2` | Pre-built caddy image that yoink pulls from a registry. Mutually exclusive with `xcaddy:`. |
 | `xcaddy` | [Xcaddy](#xcaddy) | unset | Compiles a custom caddy with plugins on each proxy host. Mutually exclusive with `image:`. |
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. If you remove the volume, Caddy requests new certs, and Let's Encrypt has strict rate limits. |
-| `bind` | string | unset (all interfaces) | Host IP that `:80` and `:443` bind to. For example, a Tailscale IP makes the proxy reachable only over the tailnet. The admin port always stays on `127.0.0.1`. |
+| `bind` | string | unset (all interfaces) | Host IP that `:80` and `:443` bind to. For example, a Tailscale IP makes the proxy reachable only over the tailnet. The admin relay always publishes the admin port on `127.0.0.1`. |
 | `tls` | [ProxyTls](#proxytls) | unset | Proxy-level TLS. Every routed service inherits this cert (and the optional mTLS) by default. When the field is set, ACME is off. |
 | `config_extra` | string (JSON) | unset | Top-level Caddy JSON object. yoink deep-merges it into the rendered config before `/load`. It is for global Caddy config that has no typed field: `trusted_proxies`, `storage`, plugin app blocks. |
 | `global_handlers` | list of string (JSON) | `[]` | Caddy handlers or routes that run for every request before a per-service route matches. It is for proxy-wide concerns: CrowdSec bouncer, Coraza WAF, fleet-wide rate limiting. |
@@ -233,7 +233,7 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `build` | [Build](#build) | unset | Local-build config. Required for the `--build` flow. |
 | `hosts` | list of string | all hosts | Restricts the hosts that run this service. The strings match `hosts[].address`. With an empty list, yoink deploys nothing for the service and runs none of its hooks. |
 | `depends_on` | list of string | `[]` | Names of other services. A topological sort of these names gives the wave order. Must be a DAG. |
-| `networks` | list of string | every network in `deploy.networks` | Docker networks to attach. Each one must be declared in `deploy.networks`. Config load rejects an empty list. The default does not include the proxy networks: a service with `domain:` also joins `yoink-ingress`, and only the proxy joins `yoink-admin`. Config load rejects `yoink-admin` in this list. |
+| `networks` | list of string | every network in `deploy.networks` | Docker networks to attach. Each one must be declared in `deploy.networks`. Config load rejects an empty list. The default does not include the proxy networks: a service with `domain:` also joins `yoink-ingress`, and only the proxy joins `yoink-proxy-admin`. Config load rejects `yoink-proxy-admin` in this list. |
 | `secrets` | list of string | `[]` | Secret names. Each secret becomes an env var of the same name. |
 | `env_from_secrets` | map of string | `{}` | `ENV_VAR_NAME: SECRET_NAME`. Exposes a secret under a different env name. |
 | `env` | map of string | `{}` | Plain env vars. **Do not put secrets here.** |

@@ -52,6 +52,7 @@ pub async fn run(
     dry_run: bool,
 ) -> Result<PruneReport, PruneError> {
     let known_services: BTreeSet<String> = config.service_names().map(str::to_string).collect();
+    let proxy_enabled = config.proxy_enabled();
 
     let mut report = PruneReport::default();
     for host in config.fleet() {
@@ -63,7 +64,7 @@ pub async fn run(
                 source,
             })?;
         for c in containers {
-            let Some(reason) = classify(&c, &known_services) else {
+            let Some(reason) = classify(&c, &known_services, proxy_enabled) else {
                 continue;
             };
             let candidate = PruneCandidate {
@@ -88,7 +89,12 @@ pub async fn run(
     Ok(report)
 }
 
-fn classify(c: &ContainerInfo, known: &BTreeSet<String>) -> Option<PruneReason> {
+fn classify(c: &ContainerInfo, known: &BTreeSet<String>, proxy: bool) -> Option<PruneReason> {
+    // The admin relay belongs to the proxy: it goes when the proxy is
+    // off. `yoink up` recreates a relay that does not run.
+    if crate::proxy::relay::is_relay(c) {
+        return (!proxy).then_some(PruneReason::ServiceNotInConfig);
+    }
     let svc = c.yoink_service.as_deref();
     match svc {
         Some(name) if !known.contains(name) => Some(PruneReason::ServiceNotInConfig),
@@ -188,6 +194,31 @@ mod tests {
             .map(|p| p.container.as_str())
             .collect();
         assert_eq!(names, ["api-dead", "api-exited"]);
+    }
+
+    /// The admin relay has no `yoink.service`. It stays while the proxy
+    /// is on, and goes with the proxy.
+    #[tokio::test]
+    async fn prune_keeps_the_admin_relay_only_while_the_proxy_is_on() {
+        use crate::proxy::relay::RELAY_NAME;
+        let relay = ContainerInfo {
+            yoink_service: None,
+            ..container(RELAY_NAME, "", true)
+        };
+        let routed = Config::parse_str(
+            "hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    \
+             image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n",
+        )
+        .unwrap();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![relay.clone()]));
+        assert!(run(&ops, &routed, true).await.unwrap().planned.is_empty());
+
+        ops.push_list_containers(Ok(vec![relay]));
+        let report = run(&ops, &cfg(&["api"]), true).await.unwrap();
+        assert_eq!(report.planned.len(), 1);
+        assert_eq!(report.planned[0].container, RELAY_NAME);
+        assert_eq!(report.planned[0].reason, PruneReason::ServiceNotInConfig);
     }
 
     #[tokio::test]

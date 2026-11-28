@@ -1,14 +1,16 @@
 //! Push rendered Caddy JSON to the proxy's admin API.
 //!
 //! Caddy's admin API listens on `ADMIN_API_HOST` *inside* the
-//! container: the proxy IP on the `yoink-admin` network only. Docker
-//! publishes it on the host's loopback at an ephemeral port (chosen by
-//! docker via `127.0.0.1:0:2019`) and forwards that port to the
-//! gateway endpoint of the proxy, which is the `yoink-admin` endpoint.
-//! The yoink CLI:
+//! container: the proxy IP on the `yoink-proxy-admin` network only.
+//! The proxy does not publish the admin port. The admin relay (see
+//! [`super::relay`]) publishes it on the host's loopback at an
+//! ephemeral port and forwards each connection to the admin API. The
+//! yoink CLI:
 //!
-//! 1. Looks up the proxy container, reads the host-side admin port
-//!    from its inspect output.
+//! 1. Looks up the proxy container. If it has the admin API alias, it
+//!    reads the host-side port of the relay. A proxy from an earlier
+//!    yoink version has no alias and publishes the admin port itself;
+//!    yoink then reads that port, see [`AdminListen::Legacy`].
 //! 2. SSH-tunnels from `operator-localhost:<rand>` to
 //!    `host-localhost:<published>`.
 //! 3. `POST`s the JSON to `http://127.0.0.1:<rand>/load`, with the
@@ -34,6 +36,8 @@ use crate::ssh::tunnel::{SshTunnel, TunnelError};
 use crate::config::{
     ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, PROXY_SERVICE_NAME,
 };
+
+use super::relay::{RELAY_NAME, relay_label_filter};
 
 /// How long the SSH tunnel + Caddy admin readiness probe each get
 /// before giving up. 20s comfortably covers a cold proxy boot on a
@@ -64,10 +68,19 @@ pub enum AdminError {
     #[error("proxy container {PROXY_SERVICE_NAME:?} not running on {host}")]
     ProxyNotRunning { host: String },
     #[error(
-        "proxy container on {host} has no published admin port — yoink expected \
+        "admin relay {RELAY_NAME:?} not running on {host}. Run an unscoped \
+         `yoink up` to create it."
+    )]
+    RelayNotRunning { host: String },
+    #[error(
+        "container {container:?} on {host} has no published admin port — yoink expected \
          it on `127.0.0.1:0:{ADMIN_PORT}` but inspect returned: {ports:?}"
     )]
-    NoPublishedAdminPort { host: String, ports: Vec<String> },
+    NoPublishedAdminPort {
+        host: String,
+        container: String,
+        ports: Vec<String>,
+    },
     #[error("ssh tunnel to proxy admin: {0}")]
     Tunnel(#[from] TunnelError),
     #[error("proxy admin endpoint did not respond within {timeout:?}")]
@@ -94,8 +107,8 @@ pub enum AdminError {
     LoadVerifyMismatch { expected: usize, actual: usize },
 }
 
-/// Push `config` to the proxy on `host`. Looks up the proxy
-/// container's host-side admin port, opens an SSH tunnel to host
+/// Push `config` to the proxy on `host`. Looks up the host-side admin
+/// port (of the relay, or of an old proxy), opens an SSH tunnel to host
 /// loopback at that port, POSTs to `/load`, drops the tunnel.
 ///
 /// Retries once on transport-class failures (tunnel didn't come up,
@@ -145,13 +158,15 @@ pub async fn push_config(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminListen {
     /// The proxy is on `ADMIN_NETWORK` and has `ADMIN_API_ALIAS`
-    /// there. yoink sends [`crate::config::admin_block`].
+    /// there. yoink tunnels to the admin relay and sends
+    /// [`crate::config::admin_block`].
     Alias,
-    /// The proxy is from an earlier yoink version: it is not on
-    /// `ADMIN_NETWORK`, or it does not have the alias. Caddy cannot
-    /// bind the alias address, rejects the `/load`, and keeps the old
-    /// config. yoink thus sends the admin block of the earlier version,
-    /// see [`legacy_admin_block`], until a deploy recreates the proxy.
+    /// The proxy is from an earlier yoink version: it does not have the
+    /// alias on `ADMIN_NETWORK`. Caddy cannot bind the alias address,
+    /// rejects the `/load`, and keeps the old config. yoink thus sends
+    /// the admin block of the earlier version, see
+    /// [`legacy_admin_block`], to the admin port that the proxy
+    /// publishes itself, until a deploy recreates the proxy.
     Legacy,
 }
 
@@ -197,8 +212,8 @@ fn is_transient(e: &AdminError) -> bool {
 }
 
 /// Resolved admin endpoint for one push attempt: the host-side TCP
-/// port docker published Caddy's `:2019` to, plus the ssh keyfile
-/// the tunnel should authenticate with.
+/// port docker published `:2019` to (of the relay or of an old proxy),
+/// plus the ssh keyfile the tunnel should authenticate with.
 struct AdminTarget {
     host_port: u16,
     keyfile: Option<std::path::PathBuf>,
@@ -224,25 +239,53 @@ async fn discover_admin_target(
             host: host.address.clone(),
         })?;
 
-    let detail = ops
-        .inspect_container(host, &running.name)
-        .await
-        .map_err(|source| AdminError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
-    let host_port = parse_published_port(&detail.ports, ADMIN_PORT).ok_or_else(|| {
+    let detail = inspect(ops, host, &running.name).await?;
+    let listen = AdminListen::of(&detail);
+    let published = match listen {
+        AdminListen::Legacy => detail,
+        AdminListen::Alias => {
+            let relays = ops
+                .list_containers_by_label(host, &relay_label_filter())
+                .await
+                .map_err(|source| AdminError::Docker {
+                    host: host.address.clone(),
+                    source,
+                })?;
+            let relay = relays
+                .into_iter()
+                .find(|c| c.name == RELAY_NAME && c.is_running())
+                .ok_or_else(|| AdminError::RelayNotRunning {
+                    host: host.address.clone(),
+                })?;
+            inspect(ops, host, &relay.name).await?
+        }
+    };
+    let host_port = parse_published_port(&published.ports, ADMIN_PORT).ok_or_else(|| {
         AdminError::NoPublishedAdminPort {
             host: host.address.clone(),
-            ports: detail.ports.clone(),
+            container: published.name.clone(),
+            ports: published.ports.clone(),
         }
     })?;
 
     Ok(AdminTarget {
         host_port,
         keyfile: ops.ssh_keyfile(host),
-        listen: AdminListen::of(&detail),
+        listen,
     })
+}
+
+async fn inspect(
+    ops: &dyn DockerOps,
+    host: &Host,
+    name: &str,
+) -> Result<ContainerDetail, AdminError> {
+    ops.inspect_container(host, name)
+        .await
+        .map_err(|source| AdminError::Docker {
+            host: host.address.clone(),
+            source,
+        })
 }
 
 async fn tunnel_and_load(
@@ -399,29 +442,37 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
 mod tests {
     use super::*;
 
-    /// A fake host with one running proxy container. `network_aliases`
-    /// is its inspect output: network → aliases.
-    fn fake_proxy(network_aliases: &[(&str, &[&str])]) -> crate::docker_ops::FakeDockerOps {
-        let ops = crate::docker_ops::FakeDockerOps::new();
-        let name = "yoink-proxy-abc1234";
-        ops.push_list_containers(Ok(vec![crate::docker_ops::ContainerInfo {
+    fn running(name: &str, service: Option<&str>) -> crate::docker_ops::ContainerInfo {
+        crate::docker_ops::ContainerInfo {
             host: "h".into(),
             name: name.into(),
-            image: "caddy:2".into(),
+            image: String::new(),
             state: "running".into(),
             status_text: String::new(),
             created_unix: None,
-            yoink_service: Some(PROXY_SERVICE_NAME.into()),
+            yoink_service: service.map(Into::into),
             yoink_version: None,
             yoink_spec_hash: None,
             yoink_deployed_by: None,
             yoink_deployed_at: None,
-            networks: network_aliases.iter().map(|(n, _)| (*n).into()).collect(),
+            networks: Vec::new(),
             other_labels: std::collections::BTreeMap::new(),
-        }]));
+        }
+    }
+
+    /// A fake host with one running proxy container. `network_aliases`
+    /// is its inspect output: network → aliases. `ports` is what the
+    /// proxy publishes.
+    fn fake_proxy(
+        network_aliases: &[(&str, &[&str])],
+        ports: &[&str],
+    ) -> crate::docker_ops::FakeDockerOps {
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        let name = "yoink-proxy-abc1234";
+        ops.push_list_containers(Ok(vec![running(name, Some(PROXY_SERVICE_NAME))]));
         ops.set_inspect(ContainerDetail {
             name: name.into(),
-            ports: vec![format!("32768:{ADMIN_PORT}/tcp")],
+            ports: ports.iter().map(|p| (*p).to_string()).collect(),
             network_aliases: network_aliases
                 .iter()
                 .map(|(n, a)| ((*n).into(), a.iter().map(|s| (*s).into()).collect()))
@@ -431,9 +482,27 @@ mod tests {
         ops
     }
 
-    /// The `admin` block that `push_config` sends to the proxy of
-    /// `ops`, for the config that a deploy renders.
-    async fn pushed_admin(ops: &crate::docker_ops::FakeDockerOps) -> (AdminListen, Value) {
+    /// Add a running admin relay that publishes `2019` on `host_port`.
+    fn add_relay(ops: &crate::docker_ops::FakeDockerOps, host_port: u16) {
+        ops.push_list_containers(Ok(vec![running(RELAY_NAME, None)]));
+        ops.set_inspect(ContainerDetail {
+            name: RELAY_NAME.into(),
+            ports: vec![format!("{host_port}:{ADMIN_PORT}/tcp")],
+            ..ContainerDetail::default()
+        });
+    }
+
+    fn host() -> Host {
+        Host {
+            user: "u".into(),
+            address: "h".into(),
+            port: None,
+        }
+    }
+
+    /// The tunnel port and the `admin` block that `push_config` sends
+    /// to the proxy of `ops`, for the config that a deploy renders.
+    async fn pushed_admin(ops: &crate::docker_ops::FakeDockerOps) -> (u16, AdminListen, Value) {
         let cfg = crate::config::Config::parse_str(
             r"
 hosts: [{ address: h, user: u }]
@@ -449,53 +518,83 @@ services:
         .expect("config parses");
         let rendered =
             crate::proxy::caddy::render(&cfg, |_| vec!["api-1".into()], None).expect("render");
-        let host = Host {
-            user: "u".into(),
-            address: "h".into(),
-            port: None,
-        };
-        let target = discover_admin_target(&host, ops).await.expect("target");
-        assert_eq!(target.host_port, 32768);
+        let target = discover_admin_target(&host(), ops).await.expect("target");
         let pushed = config_for(&rendered, target.listen);
-        (target.listen, pushed["admin"].clone())
+        (target.host_port, target.listen, pushed["admin"].clone())
     }
 
     /// A scoped `yoink up --service api` after an upgrade keeps the
     /// proxy of the earlier version: on `yoink-proxy-admin`, without
-    /// the alias. Caddy there cannot bind the alias address, so a
-    /// `/load` with the new admin block was rejected, and yoink then
-    /// removed the new replicas of `api`.
+    /// the alias, with its own published admin port. Caddy there cannot
+    /// bind the alias address, so a `/load` with the new admin block
+    /// was rejected, and yoink then removed the new replicas of `api`.
     #[tokio::test]
-    async fn old_proxy_gets_the_earlier_admin_block() {
-        let ops = fake_proxy(&[
-            ("yoink-ingress", &["yoink-proxy-abc1234"]),
-            ("yoink-proxy-admin", &["yoink-proxy-abc1234"]),
-        ]);
-        let (listen, admin) = pushed_admin(&ops).await;
+    async fn old_proxy_gets_the_earlier_admin_block_on_its_own_port() {
+        let ops = fake_proxy(
+            &[
+                (crate::config::INGRESS_NETWORK, &["yoink-proxy-abc1234"]),
+                (ADMIN_NETWORK, &["yoink-proxy-abc1234"]),
+            ],
+            &["80:80/tcp", "443:443/tcp", "32768:2019/tcp"],
+        );
+        let (port, listen, admin) = pushed_admin(&ops).await;
+        assert_eq!(port, 32768);
         assert_eq!(listen, AdminListen::Legacy);
         assert_eq!(
             admin,
             serde_json::json!({"listen": "0.0.0.0:2019", "enforce_origin": false})
         );
+        // No relay lookup for an old proxy.
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|c| matches!(
+                    c,
+                    crate::docker_ops::RecordedCall::ListContainersByLabel(..)
+                ))
+                .count(),
+            1
+        );
     }
 
-    /// On `yoink-admin` without the alias, Caddy cannot bind the alias
-    /// address either.
+    /// A proxy with the alias publishes no admin port: Docker would put
+    /// it on `yoink-ingress`, the gateway endpoint. yoink tunnels to the
+    /// port of the relay.
     #[tokio::test]
-    async fn proxy_without_the_alias_gets_the_earlier_admin_block() {
-        let ops = fake_proxy(&[(ADMIN_NETWORK, &["yoink-proxy-abc1234"])]);
-        assert_eq!(pushed_admin(&ops).await.0, AdminListen::Legacy);
-    }
-
-    #[tokio::test]
-    async fn new_proxy_gets_the_alias_admin_block() {
-        let ops = fake_proxy(&[
-            (ADMIN_NETWORK, &["yoink-proxy-abc1234", ADMIN_API_ALIAS]),
-            (crate::config::INGRESS_NETWORK, &["yoink-proxy-abc1234"]),
-        ]);
-        let (listen, admin) = pushed_admin(&ops).await;
+    async fn new_proxy_is_reached_through_the_relay() {
+        let ops = fake_proxy(
+            &[
+                (crate::config::INGRESS_NETWORK, &["yoink-proxy-abc1234"]),
+                (ADMIN_NETWORK, &["yoink-proxy-abc1234", ADMIN_API_ALIAS]),
+            ],
+            &["80:80/tcp", "443:443/tcp"],
+        );
+        add_relay(&ops, 40000);
+        let (port, listen, admin) = pushed_admin(&ops).await;
+        assert_eq!(port, 40000);
         assert_eq!(listen, AdminListen::Alias);
         assert_eq!(admin, crate::config::admin_block());
+    }
+
+    #[tokio::test]
+    async fn new_proxy_without_a_relay_is_an_error() {
+        let ops = fake_proxy(
+            &[(ADMIN_NETWORK, &["yoink-proxy-abc1234", ADMIN_API_ALIAS])],
+            &[],
+        );
+        ops.push_list_containers(Ok(Vec::new()));
+        let err = discover_admin_target(&host(), &ops)
+            .await
+            .err()
+            .expect("no relay");
+        assert!(
+            matches!(err, AdminError::RelayNotRunning { .. }),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("unscoped `yoink up`"),
+            "got: {err}"
+        );
     }
 
     #[test]
