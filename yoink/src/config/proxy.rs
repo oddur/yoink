@@ -646,19 +646,19 @@ fn socket_autosave_prefix() -> String {
     format!(r#"{{"admin":{},"#, admin_block_json())
 }
 
-/// The path of Caddy's `autosave.json` in the proxy container:
-/// `$XDG_CONFIG_HOME/caddy`, the directory of the socket too.
-fn autosave_path() -> String {
-    format!("{}/autosave.json", admin_socket_dir())
-}
-
 /// The `sh` script that starts Caddy in the proxy container. It uses
-/// only `sh` built-ins besides `mkdir`.
+/// only `sh` built-ins besides `mkdir` and `rm`.
 ///
 /// - `mkdir -p`: Caddy creates `/config/caddy` only when it writes the
 ///   first autosave, after the admin API is up. The official image
 ///   ships the directory, and Docker copies it into a new volume. A
 ///   custom image can lack it, and then the admin socket cannot bind.
+/// - `rm -f` of the admin socket: Caddy 2.6.3 and earlier do not remove
+///   an old socket file before they bind. After an unclean stop (a
+///   `SIGKILL`, a host crash), the file stays on the volume, and the
+///   bind fails with "address already in use". The removal is safe: a
+///   proxy deploy stops the old proxy first, so no other Caddy uses
+///   the socket.
 /// - `--resume` only when the admin block in `autosave.json` is the
 ///   socket block. The autosave of a yoink v0.22 proxy has the admin
 ///   API on `0.0.0.0:2019`. A proxy that resumes it has no admin socket,
@@ -671,31 +671,46 @@ fn autosave_path() -> String {
 ///   subshell of the pipeline, and the shell gets the signal. The
 ///   bootstrap and the prefix have no single quote.
 fn start_script() -> String {
+    start_script_in(admin_socket_dir())
+}
+
+/// [`start_script`] with the Caddy config directory `dir`. The tests
+/// run it in a temporary directory.
+fn start_script_in(dir: &str) -> String {
     format!(
         concat!(
             "mkdir -p {dir} || exit 1\n",
             "head=\n",
-            "{{ IFS= read -r head < {autosave} || :; }} 2>/dev/null\n",
+            "{{ IFS= read -r head < {dir}/autosave.json || :; }} 2>/dev/null\n",
             "case $head in\n",
             "'{prefix}'*) set -- --resume ;;\n",
             "*) set -- ;;\n",
             "esac\n",
+            "rm -f {dir}/{socket}\n",
             "exec caddy run --config /dev/stdin \"$@\" <<'EOF'\n",
             "{bootstrap}\n",
             "EOF",
         ),
-        dir = admin_socket_dir(),
-        autosave = autosave_path(),
+        dir = dir,
+        socket = admin_socket_name(),
         prefix = socket_autosave_prefix(),
         bootstrap = bootstrap_config(),
     )
 }
 
-/// The directory of [`ADMIN_SOCKET`].
+/// The directory of [`ADMIN_SOCKET`]: `$XDG_CONFIG_HOME/caddy` in the
+/// proxy container, the directory of Caddy's `autosave.json` too.
 fn admin_socket_dir() -> &'static str {
     ADMIN_SOCKET
         .rsplit_once('/')
         .map_or(ADMIN_SOCKET, |(dir, _)| dir)
+}
+
+/// The file name of [`ADMIN_SOCKET`].
+fn admin_socket_name() -> &'static str {
+    ADMIN_SOCKET
+        .rsplit_once('/')
+        .map_or(ADMIN_SOCKET, |(_, name)| name)
 }
 
 /// JSON shapes accepted by `validate_json_shape`.
@@ -1296,6 +1311,7 @@ services:
                 r#"'{"admin":{"listen":"unix//config/caddy/admin.sock","origins":["127.0.0.1"]},'*) set -- --resume ;;"#,
                 "\n*) set -- ;;\n",
                 "esac\n",
+                "rm -f /config/caddy/admin.sock\n",
                 "exec caddy run --config /dev/stdin \"$@\" <<'EOF'\n",
                 r#"{"admin":{"listen":"unix//config/caddy/admin.sock","origins":["127.0.0.1"]}}"#,
                 "\nEOF",
@@ -1336,6 +1352,8 @@ services:
         stdin: String,
         /// The stub ran in the process of the shell: `exec`, no fork.
         same_pid: bool,
+        /// The admin socket file existed when the stub ran.
+        socket_left: bool,
     }
 
     /// The shells to test the start script with: `/bin/sh`, and `dash`
@@ -1351,12 +1369,16 @@ services:
     /// Run the start script under `shell`, with a stub `caddy` first on
     /// `PATH` and the config directory in a temporary directory.
     /// `autosave` is the content of `autosave.json`, `None` for no file.
+    /// Each run starts with a stale admin socket file, as an unclean
+    /// stop leaves it.
     fn run_start_script(shell: &str, autosave: Option<&str>) -> StubRun {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path();
         let config_dir = dir.join("caddy");
+        std::fs::create_dir_all(&config_dir).expect("mkdir");
+        let socket = config_dir.join(admin_socket_name());
+        std::fs::write(&socket, "").expect("stale socket");
         if let Some(content) = autosave {
-            std::fs::create_dir_all(&config_dir).expect("mkdir");
             std::fs::write(config_dir.join("autosave.json"), content).expect("autosave");
         }
         let bin = dir.join("bin");
@@ -1365,23 +1387,21 @@ services:
         std::fs::write(
             &stub,
             format!(
-                "#!/bin/sh\necho $$ > {out}/pid\necho \"$*\" > {out}/args\ncat > {out}/stdin\n",
-                out = dir.display()
+                concat!(
+                    "#!/bin/sh\n",
+                    "echo $$ > {out}/pid\n",
+                    "echo \"$*\" > {out}/args\n",
+                    "cat > {out}/stdin\n",
+                    "if [ -e {socket} ]; then echo yes; else echo no; fi > {out}/socket\n",
+                ),
+                out = dir.display(),
+                socket = socket.display(),
             ),
         )
         .expect("stub");
         std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
-        let script = start_script()
-            .replace(
-                &format!("mkdir -p {} ", admin_socket_dir()),
-                &format!("mkdir -p {} ", config_dir.display()),
-            )
-            .replace(
-                &format!("< {} ", autosave_path()),
-                &format!("< {} ", config_dir.join("autosave.json").display()),
-            );
-        assert!(script.contains(&*dir.to_string_lossy()), "paths replaced");
+        let script = start_script_in(&config_dir.to_string_lossy());
         let path = format!(
             "{}:{}",
             bin.display(),
@@ -1401,6 +1421,7 @@ services:
             args: read("args").trim_end().to_string(),
             stdin: read("stdin"),
             same_pid: read("pid").trim() == shell_pid.to_string(),
+            socket_left: read("socket").trim() == "yes",
         }
     }
 
@@ -1413,6 +1434,7 @@ services:
             assert_eq!(run.args, "run --config /dev/stdin --resume", "{shell}");
             assert_eq!(run.stdin, format!("{}\n", bootstrap_config()), "{shell}");
             assert!(run.same_pid, "{shell}: caddy must replace the shell");
+            assert!(!run.socket_left, "{shell}: the stale socket must go");
         }
     }
 
@@ -1434,6 +1456,7 @@ services:
                 assert_eq!(run.args, "run --config /dev/stdin", "{shell}: {autosave:?}");
                 assert_eq!(run.stdin, format!("{}\n", bootstrap_config()), "{shell}");
                 assert!(run.same_pid, "{shell}: caddy must replace the shell");
+                assert!(!run.socket_left, "{shell}: the stale socket must go");
             }
         }
     }
