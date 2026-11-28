@@ -3,9 +3,9 @@
 //! Caddy's admin API listens on `ADMIN_API_HOST` *inside* the
 //! container: the proxy IP on the `yoink-proxy-admin` network only.
 //! The proxy does not publish the admin port. The admin relay (see
-//! [`super::relay`]) publishes it on the host's loopback at an
-//! ephemeral port and forwards each connection to the admin API. The
-//! yoink CLI:
+//! [`super::relay`]) publishes its port [`RELAY_PORT`] on the host's
+//! loopback at an ephemeral port and sends each request to the admin
+//! API. The yoink CLI:
 //!
 //! 1. Looks up the proxy container. If it has the admin API alias, it
 //!    reads the host-side port of the relay. A proxy from an earlier
@@ -15,7 +15,8 @@
 //!    `host-localhost:<published>`.
 //! 3. `POST`s the JSON to `http://127.0.0.1:<rand>/load`, with the
 //!    `Host` header `ADMIN_API_HOST`. Caddy rejects any other `Host`,
-//!    because its listen address is not a wildcard.
+//!    because its listen address is not a wildcard. The relay sets the
+//!    same `Host` again.
 //! 4. Drops the tunnel.
 //!
 //! Why loopback-published instead of using the container's docker IP
@@ -37,7 +38,7 @@ use crate::config::{
     ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, PROXY_SERVICE_NAME,
 };
 
-use super::relay::{RELAY_NAME, relay_label_filter};
+use super::relay::{RELAY_NAME, RELAY_PORT, relay_label_filter};
 
 /// How long the SSH tunnel + Caddy admin readiness probe each get
 /// before giving up. 20s comfortably covers a cold proxy boot on a
@@ -75,11 +76,12 @@ pub enum AdminError {
     RelayNotRunning { host: String },
     #[error(
         "container {container:?} on {host} has no published admin port — yoink expected \
-         it on `127.0.0.1:0:{ADMIN_PORT}` but inspect returned: {ports:?}"
+         it on `127.0.0.1:0:{port}` but inspect returned: {ports:?}"
     )]
     NoPublishedAdminPort {
         host: String,
         container: String,
+        port: u16,
         ports: Vec<String>,
     },
     #[error("ssh tunnel to proxy admin: {0}")]
@@ -205,15 +207,24 @@ fn config_for(config: &Value, listen: AdminListen) -> Value {
     config
 }
 
+/// A 502 comes from the relay: it could not reach the admin API, or
+/// the connection broke. `/load` is idempotent, so one retry is safe.
 fn is_transient(e: &AdminError) -> bool {
     matches!(
         e,
         AdminError::Tunnel(_) | AdminError::NotReady { .. } | AdminError::Http { .. }
-    )
+    ) || matches!(e, AdminError::LoadRejected { status, .. } if is_gateway_error(*status))
+}
+
+/// The relay answers 502, 503 or 504 when the admin API behind it does
+/// not answer.
+fn is_gateway_error(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 502..=504)
 }
 
 /// Resolved admin endpoint for one push attempt: the host-side TCP
-/// port docker published `:2019` to (of the relay or of an old proxy),
+/// port that docker published for the relay port, or for the admin
+/// port `:2019` of an old proxy,
 /// plus the ssh keyfile the tunnel should authenticate with.
 struct AdminTarget {
     host_port: u16,
@@ -242,8 +253,8 @@ async fn discover_admin_target(
 
     let detail = inspect(ops, host, &running.name).await?;
     let listen = AdminListen::of(&detail);
-    let published = match listen {
-        AdminListen::Legacy => detail,
+    let (published, port) = match listen {
+        AdminListen::Legacy => (detail, ADMIN_PORT),
         AdminListen::Alias => {
             let relays = ops
                 .list_containers_by_label(host, &relay_label_filter())
@@ -258,13 +269,14 @@ async fn discover_admin_target(
                 .ok_or_else(|| AdminError::RelayNotRunning {
                     host: host.address.clone(),
                 })?;
-            inspect(ops, host, &relay.name).await?
+            (inspect(ops, host, &relay.name).await?, RELAY_PORT)
         }
     };
-    let host_port = parse_published_port(&published.ports, ADMIN_PORT).ok_or_else(|| {
+    let host_port = parse_published_port(&published.ports, port).ok_or_else(|| {
         AdminError::NoPublishedAdminPort {
             host: host.address.clone(),
             container: published.name.clone(),
+            port,
             ports: published.ports.clone(),
         }
     })?;
@@ -429,7 +441,12 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
         let probe = client
             .get(&url)
             .header(reqwest::header::HOST, ADMIN_API_HOST);
-        if probe.send().await.is_ok() {
+        // Through the relay, a proxy that is not up yet gives a 502.
+        if probe
+            .send()
+            .await
+            .is_ok_and(|resp| !is_gateway_error(resp.status()))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -483,12 +500,12 @@ mod tests {
         ops
     }
 
-    /// Add a running admin relay that publishes `2019` on `host_port`.
+    /// Add a running admin relay that publishes `2020` on `host_port`.
     fn add_relay(ops: &crate::docker_ops::FakeDockerOps, host_port: u16) {
         ops.push_list_containers(Ok(vec![running(RELAY_NAME, None)]));
         ops.set_inspect(ContainerDetail {
             name: RELAY_NAME.into(),
-            ports: vec![format!("{host_port}:{ADMIN_PORT}/tcp")],
+            ports: vec![format!("{host_port}:2020/tcp")],
             ..ContainerDetail::default()
         });
     }
@@ -575,6 +592,46 @@ services:
         assert_eq!(port, 40000);
         assert_eq!(listen, AdminListen::Alias);
         assert_eq!(admin, crate::config::admin_block());
+    }
+
+    /// The relay of the earlier version (socat) published 2019. yoink
+    /// reads only the relay port 2020: `yoink up` recreates such a
+    /// relay before the first push.
+    #[tokio::test]
+    async fn relay_port_is_2020() {
+        let ops = fake_proxy(
+            &[(ADMIN_NETWORK, &["yoink-proxy-abc1234", ADMIN_API_ALIAS])],
+            &[],
+        );
+        ops.push_list_containers(Ok(vec![running(RELAY_NAME, None)]));
+        ops.set_inspect(ContainerDetail {
+            name: RELAY_NAME.into(),
+            ports: vec!["40000:2019/tcp".into()],
+            ..ContainerDetail::default()
+        });
+        let err = discover_admin_target(&host(), &ops)
+            .await
+            .err()
+            .expect("no relay port");
+        assert!(err.to_string().contains("`127.0.0.1:0:2020`"), "got: {err}");
+    }
+
+    /// A 502 from the relay means that the admin API did not answer.
+    /// The readiness probe waits, and a `/load` gets one retry.
+    #[test]
+    fn gateway_errors_from_the_relay_are_transient() {
+        for code in [502, 503, 504] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(is_gateway_error(status));
+            assert!(is_transient(&AdminError::LoadRejected {
+                status,
+                body: String::new(),
+            }));
+        }
+        assert!(!is_transient(&AdminError::LoadRejected {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: String::new(),
+        }));
     }
 
     #[tokio::test]

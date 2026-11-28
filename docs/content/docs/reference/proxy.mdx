@@ -45,7 +45,7 @@ Chains that run on every request (CrowdSec, Coraza, fleet-wide rate limit) go in
 | `image` | string | `caddy:2` | Your own Caddy image, pulled from a registry. Mutually exclusive with `xcaddy:`. |
 | `xcaddy` | block | none | Builds a custom Caddy on each host with [`xcaddy`](https://github.com/caddyserver/xcaddy). Mutually exclusive with `image:`. See the [`xcaddy:` block](#proxyxcaddy-block-caddy-plugins-without-a-registry). |
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. It persists across proxy restarts. |
-| `bind` | string | none (all interfaces) | Host IP that `:80` and `:443` bind to, for example a Tailscale IP. The admin relay publishes the admin port on `127.0.0.1` in all cases. |
+| `bind` | string | none (all interfaces) | Host IP that `:80` and `:443` bind to, for example a Tailscale IP. The admin relay publishes its port on `127.0.0.1` in all cases. |
 | `tls` | block | none | Proxy-level TLS. Every routed service inherits this cert (and the optional mTLS) by default. See the [`tls:` block](#proxytls-block). |
 | `config_extra` | string (JSON) | none | Top-level Caddy JSON that yoink deep-merges into the generated config. See the [`config_extra:` block](#proxyconfig_extra-block-global-caddy-config-escape-hatch). |
 | `global_handlers` | list of strings (JSON) | `[]` | Caddy handlers that run for every request before any service route matches. See the [`global_handlers:` block](#proxyglobal_handlers-block-proxy-wide-middleware-chain). |

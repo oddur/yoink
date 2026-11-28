@@ -317,6 +317,10 @@ pub struct ReconcileOptions {
     /// container reality (e.g. a stale upstream pool that never got
     /// cleaned up). Surfaces as `--force` on `yoink up`.
     pub force: bool,
+    /// `yoink up --no-registry`: the run ships images and pulls none.
+    /// The admin relay then fails when the proxy image is missing on a
+    /// host, instead of a pull.
+    pub no_registry: bool,
 }
 
 /// Backwards-compatible shim — call sites that don't need the new
@@ -434,7 +438,15 @@ async fn reconcile_run(
     }
     {
         let mut none_sink = |e: DeployEvent| on_event(None, e);
-        ensure_admin_relays(ops, config, &mut none_sink).await?;
+        ensure_admin_relays(
+            ops,
+            config,
+            tag_overrides,
+            secrets,
+            options.no_registry,
+            &mut none_sink,
+        )
+        .await?;
     }
 
     // Run pre-deploy hooks first; one failure halts the whole reconcile.
@@ -654,32 +666,92 @@ async fn reconcile_run(
 /// any Caddy push of the run. Also for a scoped run: the relay is part
 /// of the proxy, and a run that recreates the proxy needs it. See
 /// [`crate::proxy::relay`].
+///
+/// The relay runs the proxy image. When yoink must create the relay,
+/// it makes the proxy image present first, see [`ensure_proxy_image`].
 async fn ensure_admin_relays(
     ops: &dyn DockerOps,
     config: &Config,
+    tag_overrides: &BTreeMap<String, String>,
+    secrets: Option<&SecretsBundle>,
+    no_registry: bool,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<(), DeployError> {
-    let proxy = config
-        .services
-        .iter()
-        .find(|s| s.kind == Some(crate::config::ServiceKind::Proxy));
-    let Some(proxy) = proxy.filter(|_| config.proxy_enabled()) else {
+    use crate::proxy::relay::{self, RelayImage, RelayPlan};
+    let Some(image) = RelayImage::of(config, tag_overrides) else {
+        return Ok(());
+    };
+    let Some(proxy) = config.service(crate::config::PROXY_SERVICE_NAME) else {
         return Ok(());
     };
     for host in config.fleet_for(proxy) {
-        let change = crate::proxy::relay::ensure(ops, &host)
+        let docker_err = |source| DeployError::Docker {
+            host: host.address.clone(),
+            source,
+        };
+        let RelayPlan::Create { stale } =
+            relay::plan(ops, &host, &image).await.map_err(docker_err)?
+        else {
+            continue;
+        };
+        ensure_proxy_image(ops, config, secrets, &host, &image, no_registry, on_event).await?;
+        relay::create(ops, &host, &image, &stale)
             .await
-            .map_err(|source| DeployError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
-        if change == crate::proxy::relay::RelayChange::Created {
-            on_event(DeployEvent::AdminRelayCreated {
-                host: host.address.clone(),
-            });
-        }
+            .map_err(docker_err)?;
+        on_event(DeployEvent::AdminRelayCreated {
+            host: host.address.clone(),
+        });
     }
     Ok(())
+}
+
+/// Make the proxy image present on `host`, by the path that the proxy
+/// deploy uses: an image that is present stays as it is, an xcaddy
+/// image is built on the host, any other image is pulled. In an
+/// unscoped run the prefetch (or, with `--no-registry`, the image
+/// transfer) did this already. With `--no-registry`, yoink does not
+/// pull: a missing image is an error.
+async fn ensure_proxy_image(
+    ops: &dyn DockerOps,
+    config: &Config,
+    secrets: Option<&SecretsBundle>,
+    host: &Host,
+    image: &crate::proxy::relay::RelayImage,
+    no_registry: bool,
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<(), DeployError> {
+    let docker_err = |source| DeployError::Docker {
+        host: host.address.clone(),
+        source,
+    };
+    if ops
+        .image_present(host, &image.image, &image.tag)
+        .await
+        .map_err(docker_err)?
+    {
+        return Ok(());
+    }
+    if no_registry {
+        return Err(DeployError::Custom {
+            host: host.address.clone(),
+            detail: format!(
+                "the admin relay runs the proxy image {}, and the image is not on the host. \
+                 With --no-registry, yoink does not pull it. It sends the proxy image only \
+                 when the run deploys the proxy: run `yoink up --no-registry` without \
+                 --service, or with --service {}.",
+                image.reference(),
+                crate::config::PROXY_SERVICE_NAME,
+            ),
+        });
+    }
+    if let Some(xcaddy) = config.xcaddy() {
+        crate::proxy::xcaddy::ensure_xcaddy_image(ops, host, xcaddy, false)
+            .await
+            .map_err(docker_err)?;
+        return Ok(());
+    }
+    let credentials = registry_credentials(config, secrets, &image.image);
+    pull_image(ops, host, &image.image, &image.tag, credentials, on_event).await
 }
 
 /// What one host runs for a service, measured against the desired
@@ -3870,18 +3942,19 @@ services:
             ops.push_ensure_network(Ok(false));
         }
         if cfg.proxy_enabled() {
-            push_relay_at_spec(&ops);
+            push_relay_at_spec(&ops, cfg);
         }
         ops.push_list_containers(Ok(snapshot));
         ops
     }
 
     /// The relay lookup of `ensure_admin_relays` finds a relay at spec.
-    fn push_relay_at_spec(ops: &FakeDockerOps) {
-        use crate::proxy::relay::{RELAY_NAME, relay_spec_hash};
+    fn push_relay_at_spec(ops: &FakeDockerOps, cfg: &Config) {
+        use crate::proxy::relay::{RELAY_NAME, RelayImage, relay_spec_hash};
+        let image = RelayImage::of(cfg, &BTreeMap::new()).expect("proxy on");
         ops.push_list_containers(Ok(vec![ContainerInfo {
             yoink_service: None,
-            yoink_spec_hash: Some(relay_spec_hash()),
+            yoink_spec_hash: Some(relay_spec_hash(&image)),
             ..container_with_state(RELAY_NAME, "running")
         }]));
     }
@@ -3904,14 +3977,12 @@ services:
         )
         .unwrap();
         let ops = FakeDockerOps::new();
+        ops.mark_image_present("caddy", "2");
         ops.push_list_containers(Ok(Vec::new()));
-        ops.push_pull_image(Ok(()));
         ops.push_create_container(Ok("id".into()));
         ops.push_start_container(Ok(()));
         let mut events = Vec::new();
-        ensure_admin_relays(&ops, &cfg, &mut |e| events.push(e))
-            .await
-            .unwrap();
+        relays(&ops, &cfg, false, &mut events).await.unwrap();
         assert_eq!(
             events,
             vec![DeployEvent::AdminRelayCreated {
@@ -3920,12 +3991,139 @@ services:
         );
 
         let ops = FakeDockerOps::new();
-        push_relay_at_spec(&ops);
+        push_relay_at_spec(&ops, &cfg);
         let mut events = Vec::new();
-        ensure_admin_relays(&ops, &cfg, &mut |e| events.push(e))
-            .await
-            .unwrap();
+        relays(&ops, &cfg, false, &mut events).await.unwrap();
         assert!(events.is_empty(), "got: {events:?}");
+    }
+
+    fn relay_host() -> Host {
+        Host {
+            user: "deploy".into(),
+            address: "host-a".into(),
+            port: None,
+        }
+    }
+
+    async fn relays(
+        ops: &FakeDockerOps,
+        cfg: &Config,
+        no_registry: bool,
+        events: &mut Vec<DeployEvent>,
+    ) -> Result<(), DeployError> {
+        ensure_admin_relays(ops, cfg, &BTreeMap::new(), None, no_registry, &mut |e| {
+            events.push(e);
+        })
+        .await
+    }
+
+    /// The relay runs the proxy image. When the image is not on the
+    /// host (a scoped run, a new `proxy.image`), yoink pulls it before
+    /// it creates the relay, as for the proxy itself.
+    #[tokio::test]
+    async fn admin_relay_pulls_a_missing_proxy_image_first() {
+        use crate::proxy::relay::RELAY_NAME;
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        let mut events = Vec::new();
+        relays(&ops, &cfg, false, &mut events).await.unwrap();
+        let calls = ops.calls();
+        let pull = calls
+            .iter()
+            .position(|c| *c == RecordedCall::PullImage(relay_host(), "caddy".into(), "2".into()))
+            .expect("pull of the proxy image");
+        let create = calls
+            .iter()
+            .position(|c| *c == RecordedCall::CreateContainer(relay_host(), RELAY_NAME.into()))
+            .expect("relay created");
+        assert!(pull < create, "got: {calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PullImage(_, i, _) if i.contains("socat"))),
+            "got: {calls:?}"
+        );
+    }
+
+    /// With `--no-registry`, an unscoped run ships the proxy image
+    /// before the reconcile, and the relay uses it without a pull. When
+    /// the image is missing, yoink stops with a clear error and pulls
+    /// nothing.
+    #[tokio::test]
+    async fn admin_relay_with_no_registry_never_pulls() {
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.mark_image_present("caddy", "2");
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        relays(&ops, &cfg, true, &mut Vec::new()).await.unwrap();
+        assert!(
+            !ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PullImage(..))),
+            "got: {:?}",
+            ops.calls()
+        );
+
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new()));
+        let err = relays(&ops, &cfg, true, &mut Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("proxy image caddy:2"), "got: {err}");
+        assert!(err.contains("--service yoink-proxy"), "got: {err}");
+        assert!(
+            !ops.calls().iter().any(|c| matches!(
+                c,
+                RecordedCall::PullImage(..) | RecordedCall::CreateContainer(..)
+            )),
+            "got: {:?}",
+            ops.calls()
+        );
+    }
+
+    /// With `proxy.xcaddy:`, the proxy image exists only on the hosts.
+    /// A missing one is built, as in the prefetch, and not pulled.
+    #[tokio::test]
+    async fn admin_relay_builds_a_missing_xcaddy_image() {
+        let cfg = Config::parse_str(
+            r"
+hosts:
+  - { address: host-a, user: deploy }
+proxy:
+  xcaddy:
+    plugins: [github.com/caddy-dns/cloudflare@v0.2.1]
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: v1
+    domain: api.example.test
+    tls: off
+    run: { port: 8080 }
+",
+        )
+        .unwrap();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_pull_image(Ok(())); // the xcaddy builder image
+        ops.push_build_image(Ok(()));
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        relays(&ops, &cfg, false, &mut Vec::new()).await.unwrap();
+        let local = cfg.xcaddy().unwrap().resolved_local_tag();
+        assert!(
+            ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::BuildImage(_, t, _) if *t == local)),
+            "got: {:?}",
+            ops.calls()
+        );
     }
 
     type TaggedEvents = Vec<(Option<String>, DeployEvent)>;

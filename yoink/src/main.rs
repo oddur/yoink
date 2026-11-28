@@ -2046,7 +2046,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
             bundle: bundle.as_ref(),
             prefetch: services_filter.is_none() && needs_pull && !no_registry,
             rebuild_proxy: up.rebuild_proxy,
-            force,
+            options: deploy::ReconcileOptions { force, no_registry },
         },
         locks,
         audit_sink,
@@ -2064,7 +2064,8 @@ struct LockedUp<'a> {
     /// Pull the registry images on every host before the reconcile.
     prefetch: bool,
     rebuild_proxy: bool,
-    force: bool,
+    /// `--force` and `--no-registry`.
+    options: deploy::ReconcileOptions,
 }
 
 /// Emit the run-start events, prefetch, reconcile, then release
@@ -2085,7 +2086,7 @@ async fn run_locked_up(
         bundle,
         prefetch,
         rebuild_proxy,
-        force,
+        options,
     } = run;
     let run_ctx = yoink::features::audit::RunContext::new("up");
     let selected_service_names: Vec<String> = config
@@ -2215,7 +2216,7 @@ async fn run_locked_up(
                 tag_overrides,
                 services_filter,
                 bundle,
-                deploy::ReconcileOptions { force },
+                options,
                 &mut sink,
             )
             .await,
@@ -7259,7 +7260,7 @@ services:
                 bundle: None,
                 prefetch: true,
                 rebuild_proxy: false,
-                force: false,
+                options: yoink::deploy::ReconcileOptions::default(),
             },
             Vec::new(),
             host_sink.clone() as std::sync::Arc<dyn AuditSink>,

@@ -187,7 +187,7 @@ The [proxy guide](/docs/explanation/proxy) explains how the bundled Caddy revers
 | `image` | string | `caddy:2` | Pre-built caddy image that yoink pulls from a registry. Mutually exclusive with `xcaddy:`. |
 | `xcaddy` | [Xcaddy](#xcaddy) | unset | Compiles a custom caddy with plugins on each proxy host. Mutually exclusive with `image:`. |
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. If you remove the volume, Caddy requests new certs, and Let's Encrypt has strict rate limits. |
-| `bind` | string | unset (all interfaces) | Host IP that `:80` and `:443` bind to. For example, a Tailscale IP makes the proxy reachable only over the tailnet. The admin relay always publishes the admin port on `127.0.0.1`. |
+| `bind` | string | unset (all interfaces) | Host IP that `:80` and `:443` bind to. For example, a Tailscale IP makes the proxy reachable only over the tailnet. The admin relay always publishes its port on `127.0.0.1`. |
 | `tls` | [ProxyTls](#proxytls) | unset | Proxy-level TLS. Every routed service inherits this cert (and the optional mTLS) by default. When the field is set, ACME is off. |
 | `config_extra` | string (JSON) | unset | Top-level Caddy JSON object. yoink deep-merges it into the rendered config before `/load`. It is for global Caddy config that has no typed field: `trusted_proxies`, `storage`, plugin app blocks. |
 | `global_handlers` | list of string (JSON) | `[]` | Caddy handlers or routes that run for every request before a per-service route matches. It is for proxy-wide concerns: CrowdSec bouncer, Coraza WAF, fleet-wide rate limiting. |
