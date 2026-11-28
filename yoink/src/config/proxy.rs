@@ -733,7 +733,8 @@ const DOCKER_DEFAULT_RISKY: [&str; 1] = ["NET_RAW"];
 
 impl Config {
     /// One warning line per service on `yoink-ingress` that keeps
-    /// `NET_ADMIN` or `NET_RAW`. Empty when the proxy is off. Pure: the
+    /// `NET_ADMIN` or `NET_RAW`, and one per container hook that runs
+    /// on `yoink-ingress`. Empty when the proxy is off. Pure: the
     /// config load wraps each line in `tracing::warn!`, and `yoink
     /// doctor` reports each line as a finding.
     #[must_use]
@@ -741,6 +742,12 @@ impl Config {
         if !self.proxy_enabled() {
             return Vec::new();
         }
+        let mut warnings = self.service_capability_warnings();
+        warnings.extend(self.hook_capability_warnings());
+        warnings
+    }
+
+    fn service_capability_warnings(&self) -> Vec<String> {
         self.services
             .iter()
             .filter(|s| s.kind != Some(ServiceKind::Proxy))
@@ -758,6 +765,37 @@ impl Config {
                         caps.join(" and "),
                     )
                 })
+            })
+            .collect()
+    }
+
+    /// A container hook joins the first network of `deploy.networks`
+    /// and has the Docker default capabilities, which include
+    /// `NET_RAW`. yoink does not drop capabilities for hooks.
+    fn hook_capability_warnings(&self) -> Vec<String> {
+        if self.networks().first().map(String::as_str) != Some(INGRESS_NETWORK) {
+            return Vec::new();
+        }
+        let top_level = self.hooks.pre_deploy.iter().map(|h| (None, h));
+        let per_service = self
+            .services
+            .iter()
+            .flat_map(|s| s.pre_deploy.iter().map(move |h| (Some(s.name.as_str()), h)));
+        top_level
+            .chain(per_service)
+            .filter(|(_, h)| !h.is_subprocess())
+            .map(|(service, h)| {
+                let hook = match service {
+                    Some(service) => format!("hook {:?} of service {service:?}", h.name),
+                    None => format!("hook {:?}", h.name),
+                };
+                format!(
+                    "{hook} runs in a container on {INGRESS_NETWORK}, the first network of \
+                     `deploy.networks`. The container has the Docker default capabilities, \
+                     which include NET_RAW. With NET_RAW, a process in the container can \
+                     reach the Caddy admin API of the proxy, which has no authentication. \
+                     Put a network of your own first in `deploy.networks`."
+                )
             })
             .collect()
     }
@@ -1363,6 +1401,43 @@ services:
         assert!(warnings[0].contains("has NET_RAW."), "got: {warnings:?}");
 
         let cfg = ingress_config("      options: { cap_drop: [NET_RAW] }", "");
+        assert!(cfg.ingress_capability_warnings().is_empty());
+    }
+
+    /// A container hook joins the first network of `deploy.networks`
+    /// and keeps `NET_RAW`. With no network of the operator, that is
+    /// `yoink-ingress`.
+    #[test]
+    fn container_hooks_on_the_ingress_network_are_named() {
+        let hooks = r"hooks:
+  pre_deploy:
+    - name: migrate
+      image: registry.example.com/api
+      tag: v1
+      cmd: [bin/migrate]
+    - name: plan
+      cmd: [terraform, plan]";
+        let service_hook = "    pre_deploy:
+      - name: seed
+        image: registry.example.com/api
+        tag: v1";
+        let mut cfg = ingress_config(service_hook, hooks);
+        cfg.deploy.networks.retain(|n| n != "app");
+        let warnings = cfg.ingress_capability_warnings();
+        assert_eq!(warnings.len(), 2, "got: {warnings:?}");
+        assert!(
+            warnings[0].starts_with("hook \"migrate\" runs in a container on yoink-ingress"),
+            "got: {warnings:?}"
+        );
+        assert!(warnings[0].contains("NET_RAW"), "got: {warnings:?}");
+        assert!(
+            warnings[1].starts_with("hook \"seed\" of service \"api\" runs"),
+            "got: {warnings:?}"
+        );
+
+        // With a network of the operator first, the hooks run there.
+        let cfg = ingress_config(service_hook, hooks);
+        assert_eq!(cfg.networks()[0], "app");
         assert!(cfg.ingress_capability_warnings().is_empty());
     }
 
