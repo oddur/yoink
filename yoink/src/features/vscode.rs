@@ -68,7 +68,8 @@ pub enum VscodeError {
     #[error("no service named {0:?} in this config")]
     ServiceNotFound(String),
     #[error(
-        "service {service:?} declares no `networks:` — `yoink vscode` needs a docker network to join \
+        "service {service:?} declares no `networks:` (other than the reserved `yoink-proxy-admin`) — \
+         `yoink vscode` needs a docker network to join \
          (so code-server can resolve service DNS in its terminal). Add a `networks:` entry to the \
          service or `deploy.networks:`."
     )]
@@ -117,11 +118,14 @@ pub enum VscodeError {
 ///
 /// Returns the container name (yoink's per-replica naming, e.g.
 /// `service-r0-vN`) plus the docker network the sidecar should join so
-/// code-server's terminal can resolve sister-service DNS.
+/// code-server's terminal can resolve sister-service DNS. `networks`
+/// is the effective network list of `service` (`Config::networks_for`).
+/// The sidecar never joins [`crate::config::ADMIN_NETWORK`].
 pub async fn resolve_target(
     ops: &dyn DockerOps,
     host: &Host,
     service: &ServiceConfig,
+    networks: &[String],
 ) -> std::result::Result<(String, String), VscodeError> {
     let label = format!("yoink.service={}", service.name);
     let containers = ops
@@ -141,15 +145,14 @@ pub async fn resolve_target(
             host: host.address.clone(),
         })?;
 
-    // Pick a docker network: prefer the service's declared `networks:`
-    // (joined deterministically) over scraping the live container, so a
-    // service that's been re-attached to extra networks behind yoink's
-    // back doesn't surprise us.
-    let network = service
-        .networks
-        .as_ref()
-        .and_then(|v| v.first().cloned())
-        .or_else(|| target.networks.first().cloned())
+    // Pick a docker network: prefer the service's effective networks
+    // (its `networks:` or the `deploy.networks` default) over scraping
+    // the live container, so a service that's been re-attached to extra
+    // networks behind yoink's back doesn't surprise us.
+    // Never join the reserved admin network: `sidecar_network` skips
+    // it at any position in the list.
+    let network = pf::sidecar_network(networks)
+        .or_else(|| pf::sidecar_network(&target.networks))
         .ok_or_else(|| VscodeError::NoNetwork {
             service: service.name.clone(),
         })?;
@@ -378,7 +381,9 @@ pub async fn cmd_vscode(
         .await
         .map_err(|e| anyhow::anyhow!("ssh probe to {}: {e}", host.address))?;
 
-    let (target_container, network) = resolve_target(ops.as_ref(), &host, service).await?;
+    let networks = config.networks_for(service);
+    let (target_container, network) =
+        resolve_target(ops.as_ref(), &host, service, &networks).await?;
 
     let handle = spawn_codeserver_sidecar(
         ops.clone(),
@@ -457,5 +462,75 @@ mod tests {
         };
         let s = e.to_string();
         assert!(s.contains("yoink up"), "got: {s}");
+    }
+
+    /// A service without `networks:` joins the `deploy.networks` default.
+    /// `resolve_target` read the raw field and fell back to the live
+    /// container's networks, so it failed when inspect had none.
+    #[tokio::test]
+    async fn resolve_target_uses_the_deploy_networks_default() {
+        let cfg = crate::config::Config::parse_str("hosts:\n  - { address: h1, user: root }\ndeploy:\n  networks: [app]\nservices:\n  - name: api\n    image: img\n    tag: v1\n    run: { port: 8080 }\n").unwrap();
+        let svc = cfg.service("api").unwrap();
+        assert!(svc.networks.is_none());
+        let host = cfg.fleet().remove(0);
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![crate::docker_ops::ContainerInfo {
+            host: "h1".into(),
+            name: "api-r0".into(),
+            image: String::new(),
+            state: "running".into(),
+            status_text: String::new(),
+            created_unix: None,
+            yoink_service: Some("api".into()),
+            yoink_version: None,
+            yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: std::collections::BTreeMap::new(),
+        }]));
+        let (container, network) = resolve_target(&ops, &host, svc, &cfg.networks_for(svc))
+            .await
+            .unwrap();
+        assert_eq!(container, "api-r0");
+        assert_eq!(network, "app");
+    }
+
+    /// The code-server sidecar skips the reserved admin network, also
+    /// when it comes first, and joins the next network.
+    #[tokio::test]
+    async fn resolve_target_skips_the_admin_network() {
+        use crate::config::{ADMIN_NETWORK, INGRESS_NETWORK, PROXY_SERVICE_NAME};
+        let cfg = crate::config::Config::parse_str("hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n").unwrap();
+        let proxy = cfg.service(PROXY_SERVICE_NAME).unwrap();
+        let host = cfg.fleet().remove(0);
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![running(PROXY_SERVICE_NAME, &[ADMIN_NETWORK])]));
+        let networks = vec![ADMIN_NETWORK.to_string(), INGRESS_NETWORK.to_string()];
+        let (_, network) = resolve_target(&ops, &host, proxy, &networks).await.unwrap();
+        assert_eq!(network, INGRESS_NETWORK);
+
+        // The live-container fallback skips the admin network too.
+        ops.push_list_containers(Ok(vec![running(PROXY_SERVICE_NAME, &[ADMIN_NETWORK])]));
+        let err = resolve_target(&ops, &host, proxy, &[]).await.unwrap_err();
+        assert!(matches!(err, VscodeError::NoNetwork { .. }), "got {err:?}");
+    }
+
+    fn running(service: &str, networks: &[&str]) -> crate::docker_ops::ContainerInfo {
+        crate::docker_ops::ContainerInfo {
+            host: "h1".into(),
+            name: format!("{service}-r0"),
+            image: String::new(),
+            state: "running".into(),
+            status_text: String::new(),
+            created_unix: None,
+            yoink_service: Some(service.into()),
+            yoink_version: None,
+            yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: networks.iter().map(ToString::to_string).collect(),
+            other_labels: std::collections::BTreeMap::new(),
+        }
     }
 }

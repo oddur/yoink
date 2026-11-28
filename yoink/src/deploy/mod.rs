@@ -34,6 +34,7 @@ use crate::base::run_args::BuildError;
 use crate::config::{Config, HookSpec, HookTag, ServiceConfig};
 use crate::docker::{self, RunSpec, SHORT_HASH_LEN};
 use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, StoppedRemoval};
+use crate::proxy::admin::AdminListen;
 use files::{FileError, FileMount};
 use healthcheck::HealthcheckError;
 
@@ -113,6 +114,12 @@ pub enum DeployEvent {
         host: String,
         container: String,
     },
+    /// A stop-first deploy failed, and yoink started the old container
+    /// that it had stopped for the deploy.
+    OldContainerRestarted {
+        host: String,
+        container: String,
+    },
     AlreadyAtSpec {
         host: String,
         container: String,
@@ -137,6 +144,33 @@ pub enum DeployEvent {
     Done {
         host: String,
         container: String,
+    },
+    /// The proxy on `hosts` is from an earlier yoink version, so its
+    /// admin API still listens on `0.0.0.0:2019`, which every container
+    /// on `yoink-ingress` can reach. yoink pushed the earlier admin
+    /// block to it. A deploy of the proxy recreates it with the admin
+    /// API on the admin network only. Fired at most once per reconcile.
+    ProxyAdminUpgradePending {
+        hosts: Vec<String>,
+    },
+    /// Before v0.21, services joined `yoink-proxy-admin` by default.
+    /// yoink disconnected these yoink app containers from that network
+    /// on `host`, because the proxy admin API has no authentication.
+    AdminNetworkContainersDisconnected {
+        host: String,
+        containers: Vec<String>,
+    },
+    /// yoink created the admin relay on `host`, or replaced a relay
+    /// that did not run or had another spec.
+    AdminRelayCreated {
+        host: String,
+    },
+    /// The admin relay does not run on `host`, and the run does not
+    /// deploy the proxy. Such a run does not pull, and the proxy image
+    /// `image` is not on the host, so yoink did not create the relay.
+    AdminRelaySkipped {
+        host: String,
+        image: String,
     },
 }
 
@@ -290,6 +324,10 @@ pub struct ReconcileOptions {
     /// container reality (e.g. a stale upstream pool that never got
     /// cleaned up). Surfaces as `--force` on `yoink up`.
     pub force: bool,
+    /// `yoink up --no-registry`: the run ships images and pulls none.
+    /// The admin relay then fails when the proxy image is missing on a
+    /// host, instead of a pull.
+    pub no_registry: bool,
 }
 
 /// Backwards-compatible shim — call sites that don't need the new
@@ -314,7 +352,10 @@ pub async fn reconcile(
     .await
 }
 
-#[allow(clippy::too_many_lines)] // single linear reconcile-with-options flow; same rationale as `reconcile`
+/// Reconcile `config` on its fleet. If a Caddy push of the run sent
+/// the earlier admin block to a proxy, the run emits one
+/// [`DeployEvent::ProxyAdminUpgradePending`] before it returns, also
+/// when the run fails.
 pub async fn reconcile_with_options(
     ops: &dyn DockerOps,
     config: &Config,
@@ -324,6 +365,76 @@ pub async fn reconcile_with_options(
     options: ReconcileOptions,
     on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
 ) -> Result<Vec<ServiceDeployReport>, DeployError> {
+    let legacy = LegacyAdminHosts::default();
+    let result = reconcile_run(
+        ops,
+        config,
+        tag_overrides,
+        services_filter,
+        secrets,
+        options,
+        &legacy,
+        &mut *on_event,
+    )
+    .await;
+    // On success and on error: the old proxy stays in place either way.
+    emit_admin_notice(legacy, on_event);
+    result
+}
+
+/// Emit the admin upgrade warning for the hosts in `legacy`, if any.
+fn emit_admin_notice(
+    legacy: LegacyAdminHosts,
+    on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
+) {
+    if let Some(event) = legacy.into_notice() {
+        on_event(None, event);
+    }
+}
+
+/// The hosts whose proxy got the earlier admin block from a Caddy push
+/// in this run, see [`AdminListen::Legacy`]. Every push of the run
+/// records here: finalize, cleanup and the final push.
+#[derive(Debug, Default)]
+pub struct LegacyAdminHosts(std::sync::Mutex<Vec<String>>);
+
+impl LegacyAdminHosts {
+    /// The last push to `host` decides. A deploy of the proxy in the
+    /// same run can replace an old proxy with a new one.
+    fn record(&self, host: &str, listen: AdminListen) {
+        let mut hosts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hosts.retain(|h| h != host);
+        if listen == AdminListen::Legacy {
+            hosts.push(host.to_string());
+        }
+    }
+
+    /// The one warning for all recorded hosts. `None` when every proxy
+    /// has the admin API alias.
+    fn into_notice(self) -> Option<DeployEvent> {
+        let hosts = self
+            .0
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!hosts.is_empty()).then_some(DeployEvent::ProxyAdminUpgradePending { hosts })
+    }
+}
+
+#[allow(clippy::too_many_lines)] // single linear reconcile flow; same rationale as `reconcile`
+#[allow(clippy::too_many_arguments)] // the arguments of `reconcile_with_options`, plus `legacy`
+async fn reconcile_run(
+    ops: &dyn DockerOps,
+    config: &Config,
+    tag_overrides: &BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
+    secrets: Option<&SecretsBundle>,
+    options: ReconcileOptions,
+    legacy: &LegacyAdminHosts,
+    on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
+) -> Result<Vec<ServiceDeployReport>, DeployError> {
     // Ensure every declared network exists on every host, once. Top-
     // level event: no service context.
     {
@@ -331,6 +442,19 @@ pub async fn reconcile_with_options(
         for host in config.fleet() {
             ensure_host_networks(ops, &host, config.networks(), &mut none_sink).await?;
         }
+    }
+    {
+        let mut none_sink = |e: DeployEvent| on_event(None, e);
+        ensure_admin_relays(
+            ops,
+            config,
+            tag_overrides,
+            services_filter,
+            secrets,
+            options.no_registry,
+            &mut none_sink,
+        )
+        .await?;
     }
 
     // Run pre-deploy hooks first; one failure halts the whole reconcile.
@@ -497,6 +621,7 @@ pub async fn reconcile_with_options(
                             &tag,
                             secrets_ref,
                             hosts,
+                            legacy,
                             &mut local_sink,
                         )
                         .await;
@@ -510,6 +635,7 @@ pub async fn reconcile_with_options(
                         overrides_ref,
                         secrets_ref,
                         options.force,
+                        legacy,
                         &mut local_sink,
                     )
                     .await
@@ -537,11 +663,175 @@ pub async fn reconcile_with_options(
             .find(|s| matches!(s.kind, Some(crate::config::ServiceKind::Proxy)))
     {
         for host in config.fleet_for(proxy_svc) {
-            push_caddy_config(ops, &host, config, secrets, None).await?;
+            push_caddy_config(ops, &host, config, secrets, None, legacy).await?;
         }
     }
 
     Ok(reports)
+}
+
+/// Make sure the admin relay runs on every host of the proxy, before
+/// any Caddy push of the run. See [`crate::proxy::relay`].
+///
+/// The relay runs the image of the running proxy. This function runs
+/// before the proxy deploy, and a new configured image can fail its
+/// healthcheck there. A run that deploys the proxy (see
+/// [`relay::run_selects_proxy`]) replaces a relay at another spec than
+/// the running proxy image. When no proxy runs, it uses the configured
+/// image and makes it present first, see [`ensure_proxy_image`].
+///
+/// Any other run keeps a running relay, at any spec, and does not pull.
+/// It creates a missing or stopped relay with the image of the running
+/// proxy, or with the configured image when no proxy runs. When that
+/// image is not on the host, it sends [`DeployEvent::AdminRelaySkipped`]
+/// and continues. A new proxy image thus does not slow down or stop the
+/// deploy of a different service.
+async fn ensure_admin_relays(
+    ops: &dyn DockerOps,
+    config: &Config,
+    tag_overrides: &BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
+    secrets: Option<&SecretsBundle>,
+    no_registry: bool,
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<(), DeployError> {
+    use crate::proxy::relay::{self, RelayImage, RelayPlan};
+    let Some(configured) = RelayImage::of(config, tag_overrides) else {
+        return Ok(());
+    };
+    let Some(proxy) = config.service(crate::config::PROXY_SERVICE_NAME) else {
+        return Ok(());
+    };
+    let selects_proxy = relay::run_selects_proxy(services_filter);
+    for host in config.fleet_for(proxy) {
+        let docker_err = |source| DeployError::Docker {
+            host: host.address.clone(),
+            source,
+        };
+        // The relay follows the image of the proxy that runs now, not the
+        // configured one. This function runs before the proxy deploy, so a
+        // configured image has not passed a healthcheck yet. If it cannot
+        // run Caddy, the failed proxy deploy starts the old proxy again, and
+        // a relay on that image would make every later push fail. A new
+        // image reaches the relay on the first run after the proxy runs it.
+        //
+        // A run that does not deploy the proxy keeps a running relay at
+        // any spec, so it looks up the running proxy only to create one.
+        let running = if selects_proxy {
+            relay::running_proxy_image(ops, &host)
+                .await
+                .map_err(docker_err)?
+        } else {
+            None
+        };
+        let desired = running.clone().unwrap_or_else(|| configured.clone());
+        let RelayPlan::Create { stale } =
+            relay::plan(ops, &host, selects_proxy.then_some(&desired))
+                .await
+                .map_err(docker_err)?
+        else {
+            continue;
+        };
+        let image = if selects_proxy {
+            let present = match &running {
+                Some(r) => ops
+                    .image_present(&host, &r.image, &r.tag)
+                    .await
+                    .map_err(docker_err)?,
+                None => false,
+            };
+            if present {
+                desired
+            } else {
+                // No proxy runs, or its image has no tag on the host
+                // any more: use the configured image.
+                ensure_proxy_image(
+                    ops,
+                    config,
+                    secrets,
+                    &host,
+                    &configured,
+                    no_registry,
+                    on_event,
+                )
+                .await?;
+                configured.clone()
+            }
+        } else {
+            let image = relay::running_proxy_image(ops, &host)
+                .await
+                .map_err(docker_err)?
+                .unwrap_or_else(|| configured.clone());
+            if !ops
+                .image_present(&host, &image.image, &image.tag)
+                .await
+                .map_err(docker_err)?
+            {
+                on_event(DeployEvent::AdminRelaySkipped {
+                    host: host.address.clone(),
+                    image: image.reference(),
+                });
+                continue;
+            }
+            image
+        };
+        relay::create(ops, &host, &image, &stale)
+            .await
+            .map_err(docker_err)?;
+        on_event(DeployEvent::AdminRelayCreated {
+            host: host.address.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Make the proxy image present on `host`, by the path that the proxy
+/// deploy uses: an image that is present stays as it is, an xcaddy
+/// image is built on the host, any other image is pulled. In an
+/// unscoped run the prefetch (or, with `--no-registry`, the image
+/// transfer) did this already. With `--no-registry`, yoink does not
+/// pull: a missing image is an error.
+async fn ensure_proxy_image(
+    ops: &dyn DockerOps,
+    config: &Config,
+    secrets: Option<&SecretsBundle>,
+    host: &Host,
+    image: &crate::proxy::relay::RelayImage,
+    no_registry: bool,
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<(), DeployError> {
+    let docker_err = |source| DeployError::Docker {
+        host: host.address.clone(),
+        source,
+    };
+    if ops
+        .image_present(host, &image.image, &image.tag)
+        .await
+        .map_err(docker_err)?
+    {
+        return Ok(());
+    }
+    if no_registry {
+        return Err(DeployError::Custom {
+            host: host.address.clone(),
+            detail: format!(
+                "the admin relay runs the proxy image {}, and the image is not on the host. \
+                 With --no-registry, yoink does not pull it. It sends the proxy image only \
+                 when the run deploys the proxy: run `yoink up --no-registry` without \
+                 --service, or with --service {}.",
+                image.reference(),
+                crate::config::PROXY_SERVICE_NAME,
+            ),
+        });
+    }
+    if let Some(xcaddy) = config.xcaddy() {
+        crate::proxy::xcaddy::ensure_xcaddy_image(ops, host, xcaddy, false)
+            .await
+            .map_err(docker_err)?;
+        return Ok(());
+    }
+    let credentials = registry_credentials(config, secrets, &image.image);
+    pull_image(ops, host, &image.image, &image.tag, credentials, on_event).await
 }
 
 /// What one host runs for a service, measured against the desired
@@ -674,6 +964,7 @@ fn service_already_at_spec(
 /// A stop failure is an error here, unlike in the deploy path. The
 /// stop is the whole job of this route, and an extra that stays up
 /// would be picked up again by the final Caddy push in `reconcile`.
+#[allow(clippy::too_many_arguments)] // the per-service context of `deploy_service`, plus the hosts at spec
 async fn cleanup_extra_containers(
     ops: &dyn DockerOps,
     config: &Config,
@@ -681,6 +972,7 @@ async fn cleanup_extra_containers(
     tag: &str,
     secrets: Option<&SecretsBundle>,
     hosts: Vec<HostAtSpec>,
+    legacy: &LegacyAdminHosts,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<ServiceDeployReport, DeployError> {
     let push_caddy = triggers_caddy_load(config, service);
@@ -720,6 +1012,7 @@ async fn cleanup_extra_containers(
                     config,
                     secrets,
                     Some((service.name.as_str(), &keep)),
+                    legacy,
                 )
                 .await?;
             }
@@ -774,6 +1067,7 @@ pub async fn deploy_service(
     tag_overrides: &BTreeMap<String, String>,
     secrets: Option<&SecretsBundle>,
     force: bool,
+    legacy: &LegacyAdminHosts,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<ServiceDeployReport, DeployError> {
     let hosts = config.fleet_for(service);
@@ -838,7 +1132,7 @@ pub async fn deploy_service(
     let mut host_results = Vec::with_capacity(prepared.len());
     let mut pending = prepared.into_iter();
     while let Some(prep) = pending.next() {
-        match finalize_one_host(ops, config, service, prep, secrets, on_event).await {
+        match finalize_one_host(ops, config, service, prep, secrets, legacy, on_event).await {
             Ok(result) => host_results.push(result),
             Err(e) => {
                 // `finalize_one_host` unwinds its own host. The hosts
@@ -992,16 +1286,20 @@ async fn prepare_one_host(
 
 /// Connect `name` to every network in `effective` past the first
 /// (the first is set at container create time). Same alias set on
-/// every network so callers always reach the container by name.
+/// every network so callers always reach the container by name. The
+/// proxy (`proxy`) also gets its admin endpoint settings, see
+/// [`docker::endpoint_settings`].
 async fn attach_extra_networks(
     ops: &dyn DockerOps,
     host: &Host,
     name: &str,
     effective: &[String],
     aliases: &[String],
+    proxy: bool,
 ) -> Result<(), DeployError> {
     for net in effective.iter().skip(1) {
-        ops.connect_container_network(host, name, net, aliases)
+        let endpoint = docker::endpoint_settings(net, aliases, proxy);
+        ops.connect_container_network(host, name, net, endpoint)
             .await
             .map_err(|source| DeployError::Docker {
                 host: host.address.clone(),
@@ -1047,7 +1345,8 @@ async fn start_new_replicas(
         let effective = config.networks_for(service);
         let mut aliases = vec![replica.name.clone()];
         aliases.extend(service.run.options.network_aliases.iter().cloned());
-        attach_extra_networks(ops, host, &replica.name, &effective, &aliases).await?;
+        let proxy = service.kind == Some(crate::config::ServiceKind::Proxy);
+        attach_extra_networks(ops, host, &replica.name, &effective, &aliases, proxy).await?;
         ops.start_container(host, &replica.name)
             .await
             .map_err(|source| DeployError::Docker {
@@ -1072,6 +1371,7 @@ async fn finalize_one_host(
     service: &ServiceConfig,
     prep: HostPrep,
     secrets: Option<&SecretsBundle>,
+    legacy: &LegacyAdminHosts,
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<HostDeployResult, DeployError> {
     let HostPrep {
@@ -1106,6 +1406,7 @@ async fn finalize_one_host(
                 config,
                 secrets,
                 Some((service.name.as_str(), &expected_names)),
+                legacy,
             )
             .await?;
         }
@@ -1162,11 +1463,17 @@ async fn finalize_one_host(
     // deploy stops it, it is indistinguishable from a generation that
     // was once live, so `yoink rollback` could pick the failed version.
     // The previous generation in `existing` is never touched here.
+    //
+    // A stop-first deploy already stopped the previous generation to
+    // free its host ports. After the failed replicas are gone, start it
+    // again: else the host has no container of the service at all. For
+    // the proxy, that is an outage of every route.
     let total_attempts =
         match start_new_replicas(ops, &host, config, service, &replicas, on_event).await {
             Ok(attempts) => attempts,
             Err(e) => {
                 remove_attempt_replicas(ops, &host, &replicas).await;
+                restart_old_containers(ops, &host, &stopped_old, on_event).await;
                 return Err(e);
             }
         };
@@ -1186,6 +1493,7 @@ async fn finalize_one_host(
             config,
             secrets,
             Some((service.name.as_str(), &expected_names)),
+            legacy,
         )
         .await
     {
@@ -1195,8 +1503,14 @@ async fn finalize_one_host(
         // runs with `--resume`, so the new container is serving
         // the autosaved config. Removing it would turn a rejected
         // config push into a full outage.
+        //
+        // A stop-first service already stopped its old containers.
+        // Start them again after the removal frees the host ports, as
+        // the healthcheck failure path above does. A rolling deploy
+        // has an empty `stopped_old` here.
         if !is_proxy {
             remove_attempt_replicas(ops, &host, &replicas).await;
+            restart_old_containers(ops, &host, &stopped_old, on_event).await;
         }
         return Err(e);
     }
@@ -1269,7 +1583,8 @@ async fn build_upstream_names(
 
 /// Render the Caddy config for `host`'s view of `config` and POST it
 /// to the proxy's admin API. Errors abort the deploy — old config
-/// stays active because Caddy's `/load` is atomic.
+/// stays active because Caddy's `/load` is atomic. A proxy that got
+/// the earlier admin block goes into `legacy`, see [`AdminListen`].
 ///
 /// `in_flight_upstreams` carries `(service_name, expected_names)` for
 /// the service the caller is currently reconciling. For that service,
@@ -1296,6 +1611,7 @@ async fn push_caddy_config(
     config: &Config,
     secrets: Option<&SecretsBundle>,
     in_flight_upstreams: Option<(&str, &std::collections::BTreeSet<String>)>,
+    legacy: &LegacyAdminHosts,
 ) -> Result<(), DeployError> {
     // Expand any `caddy_extra_caddyfile:` snippets to JSON. Mutates a
     // local clone so the caller's view of config stays unchanged.
@@ -1320,9 +1636,14 @@ async fn push_caddy_config(
         host: host.address.clone(),
         detail: format!("render Caddy config: {source}"),
     })?;
-    crate::proxy::admin::push_config(host, ops, &json)
+    let listen = crate::proxy::admin::push_config(host, ops, &json)
         .await
         .map_err(|source| {
+            // The old proxy stays in place after a failed push, so the
+            // run must still warn about it.
+            if let Some(listen) = source.listen {
+                legacy.record(&host.address, listen);
+            }
             // When Caddy bounces /load, point the operator at the
             // services that have a `caddy_extra_json:` block —
             // those are the most likely sources of schema errors.
@@ -1348,6 +1669,7 @@ async fn push_caddy_config(
                 detail: format!("push Caddy config: {source}{hint}"),
             }
         })?;
+    legacy.record(&host.address, listen);
     Ok(())
 }
 
@@ -1412,6 +1734,7 @@ fn build_run_spec(
         binds,
         volumes: service.run.volumes.clone(),
         docker_healthcheck: docker_healthcheck_for(service),
+        proxy: service.kind == Some(crate::config::ServiceKind::Proxy),
     }
 }
 
@@ -1433,14 +1756,18 @@ fn docker_healthcheck_for(service: &ServiceConfig) -> Option<bollard::models::He
     if service.kind != Some(crate::config::ServiceKind::Proxy) {
         return None;
     }
-    // Probe Caddy's admin endpoint on its own loopback. /config/
+    // Probe Caddy's admin endpoint at the admin API alias: Caddy
+    // listens there only, and accepts only that `Host`. /config/
     // returns the live config blob and is what yoink itself uses
     // as the deploy-time gate. BusyBox `wget --spider` exits 0 on
     // 200, non-zero otherwise — caddy:2 (alpine-based) ships it.
     Some(HealthConfig {
         test: Some(vec![
             "CMD-SHELL".into(),
-            "wget --spider --quiet http://127.0.0.1:2019/config/ || exit 1".into(),
+            format!(
+                "wget --spider --quiet http://{}/config/ || exit 1",
+                crate::config::ADMIN_API_HOST
+            ),
         ]),
         // 30 s is enough headroom for Caddy's admin loop without
         // making `docker ps` lag the actual state.
@@ -1583,13 +1910,34 @@ pub async fn ensure_host_networks(
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<(), DeployError> {
     for net in networks {
-        let created =
+        let created = if net == crate::config::ADMIN_NETWORK {
+            let ready = network::ensure_admin(ops, host)
+                .await
+                .map_err(|e| match e {
+                    network::AdminNetworkError::Docker(source) => DeployError::Docker {
+                        host: host.address.clone(),
+                        source,
+                    },
+                    other => DeployError::Custom {
+                        host: host.address.clone(),
+                        detail: other.to_string(),
+                    },
+                })?;
+            if !ready.disconnected.is_empty() {
+                on_event(DeployEvent::AdminNetworkContainersDisconnected {
+                    host: host.address.clone(),
+                    containers: ready.disconnected,
+                });
+            }
+            ready.created
+        } else {
             network::ensure(ops, host, net)
                 .await
                 .map_err(|source| DeployError::Docker {
                     host: host.address.clone(),
                     source,
-                })?;
+                })?
+        };
         on_event(DeployEvent::NetworkReady {
             host: host.address.clone(),
             network: net.clone(),
@@ -1883,6 +2231,30 @@ async fn create_pending_container(
     Ok(())
 }
 
+/// The name the HTTP healthcheck probe connects to. For the proxy it
+/// is the admin API alias: Caddy accepts only the `Host` header
+/// [`crate::config::ADMIN_API_HOST`], and curl sends `<name>:<port>`.
+/// The proxy deploys stop-first, so the alias names the new container.
+fn http_probe_target<'a>(service: &ServiceConfig, new_name: &'a str) -> &'a str {
+    if service.kind == Some(crate::config::ServiceKind::Proxy) {
+        crate::config::ADMIN_API_ALIAS
+    } else {
+        new_name
+    }
+}
+
+/// The network the deploy probe joins. It must share a network with
+/// the target: the first network of the service. The proxy is the
+/// exception: the probe targets the admin API alias, which exists only
+/// on the admin network. The first network of the proxy is
+/// `yoink-ingress`.
+fn probe_network<'a>(service: &ServiceConfig, effective: &'a [String]) -> &'a str {
+    if service.kind == Some(crate::config::ServiceKind::Proxy) {
+        return crate::config::ADMIN_NETWORK;
+    }
+    effective.first().map_or("bridge", String::as_str)
+}
+
 async fn wait_until_healthy(
     ops: &dyn DockerOps,
     host: &Host,
@@ -1901,17 +2273,15 @@ async fn wait_until_healthy(
     };
     // Path present → HTTP probe. Path absent → TCP-connect probe (for
     // non-HTTP services like redis or TLS-only edges like caddy).
-    // The probe must share at least one network with the target;
-    // pick the service's first effective network.
     let effective = config.networks_for(service);
-    let probe_network = effective.first().map_or("bridge", String::as_str);
+    let probe_network = probe_network(service, &effective);
     let result = match service.run.healthcheck_path.as_deref() {
         Some(path) => {
             healthcheck::poll(
                 ops,
                 host,
                 probe_network,
-                new_name,
+                http_probe_target(service, new_name),
                 port,
                 path,
                 service.run.healthcheck_timeout,
@@ -1998,6 +2368,30 @@ async fn swap_out_old_containers_by_set(
         stopped.push(old.name.clone());
     }
     Ok(stopped)
+}
+
+/// Start the old containers in `stopped` again, after a stop-first
+/// deploy failed. Best-effort: a failure is logged, and the caller
+/// returns the original deploy error.
+async fn restart_old_containers(
+    ops: &dyn DockerOps,
+    host: &Host,
+    stopped: &[String],
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) {
+    for name in stopped {
+        match ops.start_container(host, name).await {
+            Ok(()) => {
+                on_event(DeployEvent::OldContainerRestarted {
+                    host: host.address.clone(),
+                    container: name.clone(),
+                });
+            }
+            Err(e) => {
+                warn!(host = %host.address, container = %name, error = %e, "could not restart the old container after the failed deploy");
+            }
+        }
+    }
 }
 
 /// Stop one container and emit `OldContainerStopped`. The caller
@@ -2279,6 +2673,139 @@ async fn run_subprocess_hook(
 mod tests {
     use super::*;
     use crate::docker_ops::{FakeDockerOps, RecordedCall};
+
+    /// The proxy is created on `yoink-ingress`, so that network stays
+    /// its gateway and keeps ports 80 and 443. The admin API alias is on
+    /// the admin endpoint only. The deploy probe joins the admin network
+    /// and targets the alias, the only `Host` that Caddy accepts. The
+    /// Docker HEALTHCHECK uses the alias too.
+    #[test]
+    fn proxy_run_spec_keeps_ingress_first_and_probes_the_admin_network() {
+        use crate::config::{
+            ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, INGRESS_NETWORK, PROXY_SERVICE_NAME,
+        };
+        let cfg = Config::parse_str(
+            r#"
+hosts: [{ address: h, user: u }]
+deploy: { networks: [app] }
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: example/api
+    tag: v1
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        )
+        .expect("config parses");
+        let proxy = cfg.service(PROXY_SERVICE_NAME).expect("proxy");
+        let spec = build_run_spec(&cfg, proxy, "2", None, "yoink-proxy-x".into(), "h", &[]);
+        assert_eq!(spec.networks, [INGRESS_NETWORK, ADMIN_NETWORK]);
+        assert!(
+            !spec.publish.iter().any(|p| p.contains("2019")),
+            "got: {:?}",
+            spec.publish
+        );
+        let body = docker::build_container(&spec).expect("body");
+        let endpoints = body.networking_config.unwrap().endpoints_config.unwrap();
+        assert!(
+            !endpoints[INGRESS_NETWORK]
+                .aliases
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|a| a == ADMIN_API_ALIAS)
+        );
+        let admin =
+            docker::endpoint_settings(ADMIN_NETWORK, &["yoink-proxy-x".to_string()], spec.proxy);
+        assert!(admin.aliases.unwrap().iter().any(|a| a == ADMIN_API_ALIAS));
+
+        assert_eq!(http_probe_target(proxy, "yoink-proxy-x"), ADMIN_API_ALIAS);
+        assert_eq!(probe_network(proxy, &spec.networks), ADMIN_NETWORK);
+        let api = cfg.service("api").unwrap();
+        assert_eq!(http_probe_target(api, "api-x"), "api-x");
+        assert_eq!(probe_network(api, &cfg.networks_for(api)), "app");
+        let test = body.healthcheck.and_then(|h| h.test).expect("healthcheck");
+        assert!(
+            test[1].contains(&format!("http://{ADMIN_API_HOST}/config/")),
+            "got: {test:?}"
+        );
+    }
+
+    /// Every Caddy push of a run records a proxy that got the earlier
+    /// admin block, and the run warns once for all of them.
+    #[test]
+    fn legacy_admin_hosts_give_one_event_for_all_hosts() {
+        assert_eq!(LegacyAdminHosts::default().into_notice(), None);
+        let legacy = LegacyAdminHosts::default();
+        legacy.record("h1", AdminListen::Legacy);
+        legacy.record("h2", AdminListen::Legacy);
+        legacy.record("h3", AdminListen::Alias);
+        legacy.record("h2", AdminListen::Legacy);
+        // The proxy on h4 was replaced later in the run.
+        legacy.record("h4", AdminListen::Legacy);
+        legacy.record("h4", AdminListen::Alias);
+        assert_eq!(
+            legacy.into_notice(),
+            Some(DeployEvent::ProxyAdminUpgradePending {
+                hosts: vec!["h1".into(), "h2".into()],
+            })
+        );
+    }
+
+    /// The warning came only from the final push loop. A scoped run
+    /// that pushed to an old proxy and then failed (a later service,
+    /// a later host, the final push) did not warn. Now every push
+    /// records the host, and `reconcile_with_options` emits the
+    /// warning after `reconcile_run` returns, also on error.
+    #[test]
+    fn recorded_legacy_proxy_is_emitted_as_a_top_level_event() {
+        let legacy = LegacyAdminHosts::default();
+        legacy.record("h1", AdminListen::Legacy);
+        let mut events: TaggedEvents = Vec::new();
+        let mut sink =
+            |svc: Option<&str>, e: DeployEvent| events.push((svc.map(str::to_string), e));
+        emit_admin_notice(legacy, &mut sink);
+        assert_eq!(
+            events,
+            vec![(
+                None,
+                DeployEvent::ProxyAdminUpgradePending {
+                    hosts: vec!["h1".into()],
+                }
+            )]
+        );
+    }
+
+    /// Regression: only a successful push recorded the admin address.
+    /// A push to an old proxy that failed did not warn, but the old
+    /// proxy stays in place. Now the failed push records it too.
+    #[tokio::test]
+    async fn failed_push_to_an_old_proxy_still_warns() {
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new())); // the api upstreams
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: Some(crate::config::PROXY_SERVICE_NAME.into()),
+            ..container_with_state("yoink-proxy-abc", "running")
+        }]));
+        // No admin alias and no published admin port: the push fails.
+        ops.set_inspect(crate::docker_ops::ContainerDetail {
+            name: "yoink-proxy-abc".into(),
+            ..Default::default()
+        });
+        let legacy = LegacyAdminHosts::default();
+        let err = push_caddy_config(&ops, &relay_host(), &cfg, None, None, &legacy)
+            .await
+            .expect_err("push fails");
+        assert!(err.to_string().contains("push Caddy config"), "got: {err}");
+        assert_eq!(
+            legacy.into_notice(),
+            Some(DeployEvent::ProxyAdminUpgradePending {
+                hosts: vec!["host-a".into()],
+            })
+        );
+    }
 
     #[test]
     fn summarize_build_outcomes_all_success_is_none() {
@@ -2602,6 +3129,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -2644,6 +3172,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -2661,6 +3190,132 @@ services:
                 .iter()
                 .any(|c| matches!(c, crate::docker_ops::RecordedCall::ForceRemoveContainer(_, n) if *n == container)),
             "failed container must be removed after it is stopped: {calls:?}"
+        );
+    }
+
+    /// A stop-first deploy (a service that publishes host ports, such
+    /// as the proxy) stops the old container before the new one starts.
+    /// When the new one then failed its healthcheck, yoink removed it
+    /// and left the old one stopped: no container of the service ran.
+    /// For the proxy, every route was down.
+    #[tokio::test(start_paused = true)]
+    async fn failed_stop_first_deploy_restarts_the_old_container() {
+        let mut cfg = config_one_service();
+        cfg.services[0].run.publish = vec!["8443:3000".into()];
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: Some("app-a".into()),
+            ..container_with_state(OLD_GENERATION, "running")
+        }]));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+        // Stop-first: the old container stops before the new start.
+        ops.push_stop_container(Ok(()));
+        ops.push_start_container(Ok(()));
+        // No healthcheck answer: the probe fails. The new container is
+        // stopped and removed.
+        ops.push_stop_container(Ok(()));
+        ops.push_force_remove(Ok(()));
+        // The old container starts again.
+        ops.push_start_container(Ok(()));
+
+        let (failed, events) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+        assert_eq!(
+            events.last(),
+            Some(&DeployEvent::OldContainerRestarted {
+                host: "host-a".into(),
+                container: OLD_GENERATION.into(),
+            }),
+            "the restart must be reported: {events:?}"
+        );
+        let calls = ops.calls();
+        let removed = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::ForceRemoveContainer(_, n) if *n == failed))
+            .expect("failed container removed");
+        let restarted = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD_GENERATION))
+            .expect("old container restarted");
+        assert!(removed < restarted, "ports must be free first: {calls:?}");
+    }
+
+    /// A deploy that does not stop first never stopped the old
+    /// container, so it has nothing to restart.
+    #[tokio::test(start_paused = true)]
+    async fn failed_rolling_deploy_starts_no_old_container() {
+        let ops = failing_deploy_ops(1, 0);
+        ops.push_force_remove(Ok(()));
+        let cfg = config_one_service();
+        deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+        assert!(
+            !ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD_GENERATION))
+        );
+    }
+
+    /// A stop-first routed service: the new container is healthy, but
+    /// the Caddy push fails. yoink removed the new container and left
+    /// the old one stopped, so no container of the service ran.
+    #[tokio::test(start_paused = true)]
+    async fn failed_caddy_push_on_stop_first_service_restarts_the_old_container() {
+        const OLD: &str = "api-9f8e7d6";
+        let mut cfg = config_proxied_service();
+        let api = cfg.services.iter().position(|s| s.name == "api").unwrap();
+        cfg.services[api].run.publish = vec!["8443:8080".into()];
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![container_with_state(OLD, "running")]));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+        // Stop-first: the old container stops before the new start.
+        ops.push_stop_container(Ok(()));
+        ops.push_start_container(Ok(()));
+        ops.push_healthcheck(Ok(200));
+        // Proxy lookup of the Caddy push: no proxy runs, the push fails.
+        ops.push_list_containers(Ok(Vec::new()));
+        // The new container goes, then the old one starts again.
+        ops.push_force_remove(Ok(()));
+        ops.push_start_container(Ok(()));
+
+        let mut events: Vec<DeployEvent> = Vec::new();
+        let mut sink = |e: DeployEvent| events.push(e);
+        let err = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[api],
+            "a1b2c3d",
+            &BTreeMap::new(),
+            None,
+            false,
+            &LegacyAdminHosts::default(),
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("push Caddy config"),
+            "unexpected error: {err}"
+        );
+        let calls = ops.calls();
+        let new_name = created_names(&ops).pop().expect("new container created");
+        let removed = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::ForceRemoveContainer(_, n) if *n == new_name))
+            .expect("new container removed");
+        let restarted = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD))
+            .expect("old container restarted");
+        assert!(removed < restarted, "ports must be free first: {calls:?}");
+        assert!(
+            events.contains(&DeployEvent::OldContainerRestarted {
+                host: "host-a".into(),
+                container: OLD.into(),
+            }),
+            "got: {events:?}"
         );
     }
 
@@ -2714,6 +3369,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -2801,6 +3457,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3013,6 +3670,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3045,6 +3703,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3098,6 +3757,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3221,6 +3881,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -3390,13 +4051,507 @@ services:
     /// `snapshot`. Nothing else is queued except what the caller adds,
     /// so an unexpected pull, hook run or stop fails the reconcile
     /// with `FakeExhausted`.
-    fn ops_with_snapshot(cfg: &Config, snapshot: Vec<ContainerInfo>) -> FakeDockerOps {
+    fn ops_with_snapshot(
+        cfg: &Config,
+        filter: Option<&[String]>,
+        snapshot: Vec<ContainerInfo>,
+    ) -> FakeDockerOps {
         let ops = FakeDockerOps::new();
         for _ in &cfg.deploy.networks {
             ops.push_ensure_network(Ok(false));
         }
+        if cfg.proxy_enabled() {
+            push_relay_at_spec(&ops, cfg, filter);
+        }
         ops.push_list_containers(Ok(snapshot));
         ops
+    }
+
+    /// The relay lookup of `ensure_admin_relays` finds a relay at spec.
+    /// A run that deploys the proxy first looks up the running proxy:
+    /// none runs, so the spec is the one of the configured image.
+    fn push_relay_at_spec(ops: &FakeDockerOps, cfg: &Config, filter: Option<&[String]>) {
+        use crate::proxy::relay::{RELAY_NAME, RelayImage, relay_spec_hash, run_selects_proxy};
+        let image = RelayImage::of(cfg, &BTreeMap::new()).expect("proxy on");
+        if run_selects_proxy(filter) {
+            ops.push_list_containers(Ok(Vec::new()));
+        }
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: None,
+            yoink_spec_hash: Some(relay_spec_hash(&image)),
+            ..container_with_state(RELAY_NAME, "running")
+        }]));
+    }
+
+    /// `ensure_admin_relays` reports a relay that it created, and stays
+    /// quiet for a relay at spec.
+    #[tokio::test]
+    async fn admin_relay_creation_is_reported() {
+        let cfg = Config::parse_str(
+            r"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    domain: api.example.test
+    tls: off
+    run: { port: 8080 }
+",
+        )
+        .unwrap();
+        let ops = FakeDockerOps::new();
+        ops.mark_image_present("caddy", "2");
+        ops.push_list_containers(Ok(Vec::new())); // no proxy runs
+        ops.push_list_containers(Ok(Vec::new())); // no relay
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        let mut events = Vec::new();
+        relays(&ops, &cfg, None, false, &mut events).await.unwrap();
+        assert_eq!(
+            events,
+            vec![DeployEvent::AdminRelayCreated {
+                host: "host-a".into()
+            }]
+        );
+
+        let ops = FakeDockerOps::new();
+        push_relay_at_spec(&ops, &cfg, None);
+        let mut events = Vec::new();
+        relays(&ops, &cfg, None, false, &mut events).await.unwrap();
+        assert!(events.is_empty(), "got: {events:?}");
+    }
+
+    fn relay_host() -> Host {
+        Host {
+            user: "deploy".into(),
+            address: "host-a".into(),
+            port: None,
+        }
+    }
+
+    async fn relays(
+        ops: &FakeDockerOps,
+        cfg: &Config,
+        filter: Option<&[String]>,
+        no_registry: bool,
+        events: &mut Vec<DeployEvent>,
+    ) -> Result<(), DeployError> {
+        ensure_admin_relays(
+            ops,
+            cfg,
+            &BTreeMap::new(),
+            filter,
+            None,
+            no_registry,
+            &mut |e| {
+                events.push(e);
+            },
+        )
+        .await
+    }
+
+    /// The relay runs the proxy image. When the image is not on the
+    /// host (a new `proxy.image`), a run that deploys the proxy pulls
+    /// it before it creates the relay, as for the proxy itself.
+    #[tokio::test]
+    async fn admin_relay_pulls_a_missing_proxy_image_first() {
+        use crate::proxy::relay::RELAY_NAME;
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new())); // no proxy runs
+        ops.push_list_containers(Ok(Vec::new())); // no relay
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        let mut events = Vec::new();
+        relays(&ops, &cfg, None, false, &mut events).await.unwrap();
+        let calls = ops.calls();
+        let pull = calls
+            .iter()
+            .position(|c| *c == RecordedCall::PullImage(relay_host(), "caddy".into(), "2".into()))
+            .expect("pull of the proxy image");
+        let create = calls
+            .iter()
+            .position(|c| *c == RecordedCall::CreateContainer(relay_host(), RELAY_NAME.into()))
+            .expect("relay created");
+        assert!(pull < create, "got: {calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PullImage(_, i, _) if i.contains("socat"))),
+            "got: {calls:?}"
+        );
+    }
+
+    /// With `--no-registry`, an unscoped run ships the proxy image
+    /// before the reconcile, and the relay uses it without a pull. When
+    /// the image is missing, yoink stops with a clear error and pulls
+    /// nothing.
+    #[tokio::test]
+    async fn admin_relay_with_no_registry_never_pulls() {
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.mark_image_present("caddy", "2");
+        ops.push_list_containers(Ok(Vec::new())); // no proxy runs
+        ops.push_list_containers(Ok(Vec::new())); // no relay
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        relays(&ops, &cfg, None, true, &mut Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            !ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PullImage(..))),
+            "got: {:?}",
+            ops.calls()
+        );
+
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new())); // no proxy runs
+        ops.push_list_containers(Ok(Vec::new())); // no relay
+        let err = relays(&ops, &cfg, None, true, &mut Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("proxy image caddy:2"), "got: {err}");
+        assert!(err.contains("--service yoink-proxy"), "got: {err}");
+        assert!(
+            !ops.calls().iter().any(|c| matches!(
+                c,
+                RecordedCall::PullImage(..) | RecordedCall::CreateContainer(..)
+            )),
+            "got: {:?}",
+            ops.calls()
+        );
+    }
+
+    /// With `proxy.xcaddy:`, the proxy image exists only on the hosts.
+    /// A missing one is built, as in the prefetch, and not pulled.
+    #[tokio::test]
+    async fn admin_relay_builds_a_missing_xcaddy_image() {
+        let cfg = Config::parse_str(
+            r"
+hosts:
+  - { address: host-a, user: deploy }
+proxy:
+  xcaddy:
+    plugins: [github.com/caddy-dns/cloudflare@v0.2.1]
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: v1
+    domain: api.example.test
+    tls: off
+    run: { port: 8080 }
+",
+        )
+        .unwrap();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new())); // no proxy runs
+        ops.push_list_containers(Ok(Vec::new())); // no relay
+        ops.push_pull_image(Ok(())); // the xcaddy builder image
+        ops.push_build_image(Ok(()));
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        relays(&ops, &cfg, None, false, &mut Vec::new())
+            .await
+            .unwrap();
+        let local = cfg.xcaddy().unwrap().resolved_local_tag();
+        assert!(
+            ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::BuildImage(_, t, _) if *t == local)),
+            "got: {:?}",
+            ops.calls()
+        );
+    }
+
+    /// A relay of an earlier proxy image: running, another spec hash.
+    fn stale_relay() -> ContainerInfo {
+        ContainerInfo {
+            yoink_service: None,
+            yoink_spec_hash: Some("0000".into()),
+            ..container_with_state(crate::proxy::relay::RELAY_NAME, "running")
+        }
+    }
+
+    fn no_pull_or_create(ops: &FakeDockerOps) {
+        assert!(
+            !ops.calls().iter().any(|c| matches!(
+                c,
+                RecordedCall::PullImage(..)
+                    | RecordedCall::BuildImage(..)
+                    | RecordedCall::CreateContainer(..)
+                    | RecordedCall::ForceRemoveContainer(..)
+            )),
+            "got: {:?}",
+            ops.calls()
+        );
+    }
+
+    /// A run that does not deploy the proxy keeps a running relay at
+    /// another spec. It does not pull the new proxy image.
+    #[tokio::test]
+    async fn scoped_run_keeps_a_stale_running_relay() {
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![stale_relay()]));
+        let filter = ["api".to_string()];
+        let mut events = Vec::new();
+        relays(&ops, &cfg, Some(&filter), false, &mut events)
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "got: {events:?}");
+        no_pull_or_create(&ops);
+    }
+
+    /// A run that does not deploy the proxy creates a missing relay
+    /// with the image of the running proxy, not the configured image,
+    /// and pulls nothing.
+    #[tokio::test]
+    async fn scoped_run_creates_a_missing_relay_with_the_running_proxy_image() {
+        use crate::proxy::relay::{RELAY_NAME, RelayImage, relay_spec_hash};
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new()));
+        let proxy = ContainerInfo {
+            yoink_service: Some(crate::config::PROXY_SERVICE_NAME.into()),
+            ..container_with_state("yoink-proxy-abc", "running")
+        };
+        ops.push_list_containers(Ok(vec![proxy]));
+        ops.set_inspect(crate::docker_ops::ContainerDetail {
+            name: "yoink-proxy-abc".into(),
+            image: Some("caddy:2.7".into()),
+            ..Default::default()
+        });
+        ops.mark_image_present("caddy", "2.7");
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        let filter = ["api".to_string()];
+        let mut events = Vec::new();
+        relays(&ops, &cfg, Some(&filter), false, &mut events)
+            .await
+            .unwrap();
+        assert_eq!(
+            events,
+            [DeployEvent::AdminRelayCreated {
+                host: "host-a".into()
+            }]
+        );
+        assert!(
+            ops.calls().contains(&RecordedCall::CreateContainer(
+                relay_host(),
+                RELAY_NAME.into()
+            )),
+            "got: {:?}",
+            ops.calls()
+        );
+        assert!(
+            !ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PullImage(..))),
+            "got: {:?}",
+            ops.calls()
+        );
+        let body = ops.created_body(RELAY_NAME).expect("relay body");
+        assert_eq!(body.image.as_deref(), Some("caddy:2.7"));
+        let running = RelayImage {
+            image: "caddy".into(),
+            tag: "2.7".into(),
+        };
+        assert_eq!(
+            body.labels.unwrap().get("yoink.spec_hash"),
+            Some(&relay_spec_hash(&running))
+        );
+    }
+
+    /// When the image of the running proxy is not on the host, a run
+    /// that does not deploy the proxy warns and creates no relay.
+    #[tokio::test]
+    async fn scoped_run_skips_the_relay_without_the_image() {
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_list_containers(Ok(Vec::new()));
+        let filter = ["api".to_string()];
+        let mut events = Vec::new();
+        relays(&ops, &cfg, Some(&filter), true, &mut events)
+            .await
+            .unwrap();
+        assert_eq!(
+            events,
+            [DeployEvent::AdminRelaySkipped {
+                host: "host-a".into(),
+                image: "caddy:2".into(),
+            }]
+        );
+        no_pull_or_create(&ops);
+    }
+
+    /// The proxy container `yoink-proxy-abc` runs `image`, after its
+    /// inspect.
+    fn push_running_proxy(ops: &FakeDockerOps, image: &str) {
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: Some(crate::config::PROXY_SERVICE_NAME.into()),
+            ..container_with_state("yoink-proxy-abc", "running")
+        }]));
+        ops.set_inspect(crate::docker_ops::ContainerDetail {
+            name: "yoink-proxy-abc".into(),
+            image: Some(image.into()),
+            ..Default::default()
+        });
+    }
+
+    /// An unscoped run, and a run with `--service yoink-proxy`, replace
+    /// a stale relay. With a running proxy, the new relay runs the
+    /// image of that proxy. With no proxy, it runs the configured
+    /// image, and yoink makes that image present first.
+    #[tokio::test]
+    async fn proxy_run_recreates_a_stale_relay() {
+        use crate::proxy::relay::RELAY_NAME;
+        let proxy_only = [crate::config::PROXY_SERVICE_NAME.to_string()];
+        for filter in [None, Some(&proxy_only[..])] {
+            for running in [Some("caddy:2.7"), None] {
+                let cfg = config_proxied_service();
+                let ops = FakeDockerOps::new();
+                if let Some(image) = running {
+                    push_running_proxy(&ops, image);
+                    ops.mark_image_present("caddy", "2.7");
+                } else {
+                    ops.push_list_containers(Ok(Vec::new()));
+                    ops.push_pull_image(Ok(()));
+                }
+                ops.push_list_containers(Ok(vec![stale_relay()]));
+                ops.push_force_remove(Ok(()));
+                ops.push_create_container(Ok("id".into()));
+                ops.push_start_container(Ok(()));
+                relays(&ops, &cfg, filter, false, &mut Vec::new())
+                    .await
+                    .unwrap();
+                let calls = ops.calls();
+                assert!(
+                    calls.contains(&RecordedCall::ForceRemoveContainer(
+                        relay_host(),
+                        RELAY_NAME.into()
+                    )),
+                    "got: {calls:?}"
+                );
+                let pulled = calls.contains(&RecordedCall::PullImage(
+                    relay_host(),
+                    "caddy".into(),
+                    "2".into(),
+                ));
+                assert_eq!(pulled, running.is_none(), "got: {calls:?}");
+                let body = ops.created_body(RELAY_NAME).expect("relay body");
+                assert_eq!(body.image.as_deref(), Some(running.unwrap_or("caddy:2")));
+            }
+        }
+    }
+
+    /// Regression: a run that deploys the proxy ensures the relay
+    /// before the proxy deploy. With a new `proxy.image` that cannot
+    /// run Caddy, the proxy deploy fails its healthcheck and starts the
+    /// old proxy again. A relay on the new image crash-looped and every
+    /// later Caddy push failed. The relay must use the image of the
+    /// running proxy and must not get the configured image.
+    #[tokio::test]
+    async fn proxy_run_builds_the_relay_from_the_running_proxy_image() {
+        use crate::proxy::relay::{RELAY_NAME, RelayImage, relay_spec_hash};
+        let cfg = Config::parse_str(
+            r"
+hosts:
+  - { address: host-a, user: deploy }
+proxy:
+  image: nginx:alpine
+services:
+  - name: api
+    image: registry.example.com/api
+    domain: api.example.test
+    tls: off
+    run: { port: 8080 }
+",
+        )
+        .unwrap();
+        let configured = RelayImage::of(&cfg, &BTreeMap::new()).unwrap();
+        assert_eq!(configured.reference(), "nginx:alpine");
+        let running = RelayImage {
+            image: "caddy".into(),
+            tag: "2".into(),
+        };
+        let ops = FakeDockerOps::new();
+        push_running_proxy(&ops, "caddy:2");
+        ops.mark_image_present("caddy", "2");
+        ops.mark_image_present("nginx", "alpine");
+        ops.push_list_containers(Ok(vec![stale_relay()]));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        relays(&ops, &cfg, None, false, &mut Vec::new())
+            .await
+            .unwrap();
+        let body = ops.created_body(RELAY_NAME).expect("relay body");
+        assert_eq!(body.image.as_deref(), Some("caddy:2"));
+        assert_eq!(
+            body.labels.unwrap().get("yoink.spec_hash"),
+            Some(&relay_spec_hash(&running))
+        );
+        no_pull(&ops);
+
+        // A relay at the spec of the running proxy stays. The run does
+        // not replace it with the configured image.
+        let ops = FakeDockerOps::new();
+        push_running_proxy(&ops, "caddy:2");
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: None,
+            yoink_spec_hash: Some(relay_spec_hash(&running)),
+            ..container_with_state(RELAY_NAME, "running")
+        }]));
+        relays(&ops, &cfg, None, false, &mut Vec::new())
+            .await
+            .unwrap();
+        no_pull_or_create(&ops);
+    }
+
+    /// When the image of the running proxy has no tag on the host any
+    /// more, a run that deploys the proxy falls back to the configured
+    /// image and makes it present, as on a fresh host.
+    #[tokio::test]
+    async fn proxy_run_uses_the_configured_image_without_the_running_one() {
+        use crate::proxy::relay::RELAY_NAME;
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        push_running_proxy(&ops, "caddy:2.7");
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        relays(&ops, &cfg, None, false, &mut Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            ops.calls().contains(&RecordedCall::PullImage(
+                relay_host(),
+                "caddy".into(),
+                "2".into()
+            )),
+            "got: {:?}",
+            ops.calls()
+        );
+        let body = ops.created_body(RELAY_NAME).expect("relay body");
+        assert_eq!(body.image.as_deref(), Some("caddy:2"));
+    }
+
+    fn no_pull(ops: &FakeDockerOps) {
+        assert!(
+            !ops.calls().iter().any(|c| matches!(
+                c,
+                RecordedCall::PullImage(..) | RecordedCall::BuildImage(..)
+            )),
+            "got: {:?}",
+            ops.calls()
+        );
     }
 
     type TaggedEvents = Vec<(Option<String>, DeployEvent)>;
@@ -3480,6 +4635,7 @@ services:
         let old_name = container_name("app-a", &"b".repeat(64), 0, 1);
         let ops = ops_with_snapshot(
             &cfg,
+            None,
             vec![
                 snapshot_container("app-a", &new_name, &hash, "running"),
                 snapshot_container("app-a", &old_name, &"b".repeat(64), "running"),
@@ -3515,6 +4671,7 @@ services:
         let surplus = container_name("app-a", &hash, 2, 3);
         let ops = ops_with_snapshot(
             &cfg,
+            None,
             expected
                 .iter()
                 .chain(std::iter::once(&surplus))
@@ -3548,6 +4705,7 @@ services:
         let old_name = container_name("api", &"b".repeat(64), 0, 1);
         let ops = ops_with_snapshot(
             &cfg,
+            Some(&["api".to_string()]),
             vec![
                 snapshot_container("api", &new_name, &hash, "running"),
                 snapshot_container("api", &old_name, &"b".repeat(64), "running"),
@@ -3588,6 +4746,7 @@ services:
         let old_name = container_name("app-a", &"b".repeat(64), 0, 1);
         let ops = ops_with_snapshot(
             &cfg,
+            None,
             vec![
                 snapshot_container("app-a", &new_name, &hash, "running"),
                 snapshot_container("app-a", &old_name, &"b".repeat(64), "running"),
@@ -3624,6 +4783,7 @@ services:
         let new_name = container_name("app-a", &hash, 0, 1);
         let ops = ops_with_snapshot(
             &cfg,
+            None,
             vec![
                 snapshot_container("app-a", &new_name, &hash, "running"),
                 // Stopped old generation and another service's
@@ -3768,6 +4928,7 @@ services:
             overrides,
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4053,6 +5214,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4131,6 +5293,7 @@ services:
             &BTreeMap::new(),
             None,
             true,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4189,6 +5352,7 @@ services:
             &BTreeMap::new(),
             None,
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4257,6 +5421,7 @@ services:
             &BTreeMap::new(),
             Some(&bundle),
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4324,6 +5489,7 @@ services:
             &BTreeMap::new(),
             Some(&bundle),
             false,
+            &LegacyAdminHosts::default(),
             &mut sink,
         )
         .await
@@ -4526,7 +5692,16 @@ services:
             stop_first: false,
         };
         let mut sink = |_e: DeployEvent| {};
-        let result = finalize_one_host(&ops, &cfg, service, prep, None, &mut sink).await;
+        let result = finalize_one_host(
+            &ops,
+            &cfg,
+            service,
+            prep,
+            None,
+            &LegacyAdminHosts::default(),
+            &mut sink,
+        )
+        .await;
 
         assert!(result.is_err(), "the failed Caddy push must abort");
         let calls = ops.calls();
@@ -4566,14 +5741,104 @@ services:
         };
         let mut events: Vec<DeployEvent> = Vec::new();
         let mut sink = |e: DeployEvent| events.push(e);
-        let result = finalize_one_host(&ops, &cfg, service, prep, None, &mut sink)
-            .await
-            .unwrap();
+        let result = finalize_one_host(
+            &ops,
+            &cfg,
+            service,
+            prep,
+            None,
+            &LegacyAdminHosts::default(),
+            &mut sink,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.stopped_old, vec!["app-a-OLDHASH".to_string()]);
         assert!(
             matches!(events.last(), Some(DeployEvent::Done { container, .. }) if container == "app-a-NEWHASH"),
             "expected Done as the last event, got {events:?}"
+        );
+    }
+
+    /// A reconcile with the proxy on creates the admin relay on each
+    /// proxy host before the container snapshot and any Caddy push, also
+    /// when the run is scoped. A scoped run does not pull: the proxy
+    /// image must be on the host.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_creates_the_admin_relay_first() {
+        use crate::proxy::relay::RELAY_NAME;
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        for _ in &cfg.deploy.networks {
+            ops.push_ensure_network(Ok(false));
+        }
+        // No relay yet and no proxy: create and start the relay with
+        // the configured image.
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.mark_image_present("caddy", "2");
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        // The snapshot.
+        ops.push_list_containers(Ok(Vec::new()));
+        let (result, _) = reconcile_collect(&ops, &cfg, Some(&["nonexistent".into()])).await;
+        // The final push finds no proxy container.
+        assert!(result.is_err());
+        let calls = ops.calls();
+        let start = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == RELAY_NAME))
+            .expect("relay started");
+        let snapshot = calls
+            .iter()
+            .position(
+                |c| matches!(c, RecordedCall::ListContainersByLabel(_, l) if l == "yoink.managed=true"),
+            )
+            .expect("snapshot");
+        assert!(start < snapshot, "got: {calls:?}");
+    }
+
+    /// The admin API alias was not part of the spec hash. A proxy with
+    /// every other input at spec but without the alias counted as at
+    /// spec, and `yoink up --service yoink-proxy` kept it, so the
+    /// warning that told the operator to run it was wrong.
+    #[tokio::test(start_paused = true)]
+    async fn proxy_without_the_alias_is_not_at_spec() {
+        use crate::config::PROXY_SERVICE_NAME;
+        let cfg = config_proxied_service();
+        let proxy = cfg.service(PROXY_SERVICE_NAME).unwrap();
+        let tag = proxy.tag.clone().unwrap();
+        let mut spec = build_desired_spec(&cfg, proxy, &tag, None).unwrap();
+        spec.proxy = false; // the endpoint settings without the alias
+        let without_alias = docker::compute_spec_hash(&spec);
+        assert_ne!(without_alias, desired_hash_of(&cfg, PROXY_SERVICE_NAME));
+        let old = container_name(PROXY_SERVICE_NAME, &without_alias, 0, 1);
+        let filter = [PROXY_SERVICE_NAME.to_string()];
+        let ops = ops_with_snapshot(
+            &cfg,
+            Some(&filter),
+            vec![snapshot_container(
+                PROXY_SERVICE_NAME,
+                &old,
+                &without_alias,
+                "running",
+            )],
+        );
+        let (result, events) = reconcile_collect(&ops, &cfg, Some(&filter)).await;
+        // The deploy starts (and stops at the unscripted pull).
+        assert!(result.is_err());
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| matches!(e, DeployEvent::AlreadyAtSpec { .. })),
+            "got: {events:?}"
+        );
+        assert!(
+            ops.calls().iter().any(
+                |c| matches!(c, RecordedCall::PullImage(_, image, _) if image == &proxy.image)
+            ),
+            "the proxy deploy did not start: {:?}",
+            ops.calls()
         );
     }
 

@@ -332,8 +332,11 @@ pub async fn load_images_to_hosts(
             .flatten()
             .map(|h| (h.address.clone(), h))
             .collect();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         for host in unique_hosts.values() {
-            sweep_leaked_sidecars(ops, host).await;
+            sweep_leaked_sidecars(ops, host, now_unix).await;
         }
     }
 
@@ -424,12 +427,21 @@ async fn deliver_image(
     }
 }
 
+/// A sidecar younger than this can belong to a push that is still
+/// running. The sweep runs before the deploy lock, so another
+/// operator's `yoink up` or `yoink build --push` can be mid-transfer
+/// on the same host. One hour is far above a normal push and also
+/// absorbs clock skew between the operator and the host.
+const LEAKED_SIDECAR_MIN_AGE_SECS: i64 = 60 * 60;
+
 /// Force-remove every container labeled
-/// `yoink.role=unregistry-ephemeral` on `host`. Catches sidecars
-/// leaked by a prior `yoink up` that crashed mid-push. Errors are
-/// logged-and-swallowed — this is hygiene, not a gate. The label
-/// scope is narrow enough that we don't bother filtering by age.
-async fn sweep_leaked_sidecars(ops: &dyn DockerOps, host: &Host) {
+/// `yoink.role=unregistry-ephemeral` on `host` that was created at
+/// least [`LEAKED_SIDECAR_MIN_AGE_SECS`] before `now_unix`. Catches
+/// sidecars leaked by a prior `yoink up` that crashed mid-push. A
+/// younger sidecar, or one with no creation time, stays: it can be a
+/// concurrent push. Errors are logged-and-swallowed — this is
+/// hygiene, not a gate.
+async fn sweep_leaked_sidecars(ops: &dyn DockerOps, host: &Host, now_unix: i64) {
     let label = format!("{SIDECAR_LABEL}={SIDECAR_LABEL_VALUE}");
     let containers = match ops.list_containers_by_label(host, &label).await {
         Ok(c) => c,
@@ -442,6 +454,12 @@ async fn sweep_leaked_sidecars(ops: &dyn DockerOps, host: &Host) {
         }
     };
     for c in containers {
+        let leaked = c
+            .created_unix
+            .is_some_and(|created| now_unix.saturating_sub(created) >= LEAKED_SIDECAR_MIN_AGE_SECS);
+        if !leaked {
+            continue;
+        }
         if let Err(e) = ops.force_remove_container(host, &c.name).await {
             tracing::warn!(
                 "sweep: failed to remove leaked unregistry sidecar {} on {}: {e}",
@@ -472,5 +490,54 @@ mod tests {
         // operator can grep their config directly.
         let e = BuildError::NoBuildBlock("api".into());
         assert!(format!("{e}").contains("\"api\""));
+    }
+
+    /// The sweep runs before the deploy lock. It used to remove every
+    /// unregistry sidecar on the host, also the one of a concurrent
+    /// operator in the middle of a push. Now only old sidecars go.
+    #[tokio::test]
+    async fn sweep_keeps_young_sidecars() {
+        use crate::docker_ops::{ContainerInfo, FakeDockerOps, RecordedCall};
+        let now = 1_000_000;
+        let sidecar = |name: &str, created: Option<i64>| ContainerInfo {
+            host: "h1".into(),
+            name: name.into(),
+            image: String::new(),
+            state: "running".into(),
+            status_text: String::new(),
+            created_unix: created,
+            yoink_service: None,
+            yoink_version: None,
+            yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: BTreeMap::new(),
+        };
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![
+            sidecar(
+                "yoink-unregistry-old",
+                Some(now - LEAKED_SIDECAR_MIN_AGE_SECS),
+            ),
+            sidecar("yoink-unregistry-busy", Some(now - 30)),
+            sidecar("yoink-unregistry-unknown", None),
+        ]));
+        ops.push_force_remove(Ok(()));
+        let host = Host {
+            address: "h1".into(),
+            user: "root".into(),
+            port: None,
+        };
+        sweep_leaked_sidecars(&ops, &host, now).await;
+        let removed: Vec<String> = ops
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRemoveContainer(_, name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed, ["yoink-unregistry-old"]);
     }
 }

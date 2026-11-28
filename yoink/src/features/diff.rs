@@ -329,10 +329,36 @@ pub async fn compute(
         }
     }
 
+    services.extend(relay_diffs(
+        config,
+        tag_overrides,
+        services_filter,
+        &snapshot,
+    ));
+
+    // With `--service`, the plan covers only the selected services, so
+    // only their containers can be orphans. The containers of the other
+    // services are outside the plan, not orphans.
+    // The admin relay belongs to the proxy, see `prune::classify`.
+    let proxy_enabled = config.proxy_enabled();
+    // A probe is not an orphan: a running probe belongs to a deploy,
+    // and `yoink prune` removes a leaked one.
+    let in_scope = |c: &ContainerInfo| {
+        if crate::docker_ops::is_probe(c) {
+            return false;
+        }
+        if crate::proxy::relay::is_relay(c) {
+            return services_filter.is_none() && !proxy_enabled;
+        }
+        services_filter.is_none()
+            || c.yoink_service
+                .as_deref()
+                .is_some_and(|s| selected.contains(s))
+    };
     let mut orphans = Vec::new();
     for (host, containers) in &snapshot {
         for c in containers {
-            if !owned.contains(&(host.clone(), c.name.clone())) {
+            if in_scope(c) && !owned.contains(&(host.clone(), c.name.clone())) {
                 orphans.push(OrphanContainer {
                     host: host.clone(),
                     name: c.name.clone(),
@@ -343,6 +369,70 @@ pub async fn compute(
     }
 
     Ok(DiffReport { services, orphans })
+}
+
+/// One row per proxy host where `yoink up` creates or replaces the
+/// admin relay: it is missing, it does not run, or its spec hash is not
+/// [`relay_spec_hash`] for the relay image. Each reconcile with the
+/// proxy on, scoped or not, does this (see `crate::deploy`). The relay
+/// image is the image of the running proxy, or the configured image
+/// when no proxy runs. A run that does not deploy the proxy keeps a
+/// running relay at any spec. A relay that stays gets no row.
+fn relay_diffs(
+    config: &Config,
+    tag_overrides: &BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
+    snapshot: &BTreeMap<String, Vec<ContainerInfo>>,
+) -> Vec<ServiceDiff> {
+    use crate::proxy::relay::{
+        RELAY_NAME, RelayImage, is_relay, relay_spec_hash, run_selects_proxy,
+    };
+    let Some(configured) = RelayImage::of(config, tag_overrides) else {
+        return Vec::new();
+    };
+    let Some(proxy) = config.service(crate::config::PROXY_SERVICE_NAME) else {
+        return Vec::new();
+    };
+    let selects_proxy = run_selects_proxy(services_filter);
+    let mut out = Vec::new();
+    for target in config.fleet_for(proxy) {
+        let containers = snapshot.get(&target.address).map_or(&[][..], Vec::as_slice);
+        let relay = containers.iter().find(|c| is_relay(c));
+        if !selects_proxy && relay.is_some_and(ContainerInfo::is_running) {
+            continue;
+        }
+        let running_proxy = containers.iter().find(|c| {
+            c.yoink_service.as_deref() == Some(crate::config::PROXY_SERVICE_NAME)
+                && c.is_running()
+                && !c.image.is_empty()
+        });
+        let relay_image =
+            running_proxy.map_or_else(|| configured.clone(), |p| RelayImage::parse(&p.image));
+        let desired_hash = relay_spec_hash(&relay_image);
+        let desired_image = relay_image.reference();
+        let change = match relay {
+            None => ChangeKind::Create {
+                desired_image: desired_image.clone(),
+            },
+            Some(c) if c.is_running() && c.yoink_spec_hash.as_deref() == Some(&desired_hash) => {
+                continue;
+            }
+            Some(c) => ChangeKind::Update {
+                current_hash: c.yoink_spec_hash.clone().unwrap_or_default(),
+                current_image: c.image.clone(),
+                desired_image: desired_image.clone(),
+                fields: FieldDiff::default(),
+            },
+        };
+        out.push(ServiceDiff {
+            service: RELAY_NAME.to_string(),
+            host: target.address.clone(),
+            tag: relay_image.tag.clone(),
+            desired_hash: desired_hash.clone(),
+            change,
+        });
+    }
+    out
 }
 
 /// Inspect the running container and return a key-only diff against the
@@ -913,6 +1003,206 @@ mod tests {
         let j: serde_json::Value = serde_json::from_str(&r.render(Format::Json)).unwrap();
         assert_eq!(j["services"][1]["change"]["kind"], "cleanup");
         assert_eq!(j["services"][1]["change"]["stop"][0], "web-0ld0ld0");
+    }
+
+    /// `yoink up --service api --dry-run` listed the containers of the
+    /// other declared services as orphans, because the plan only claims
+    /// the containers of the selected services.
+    #[tokio::test]
+    async fn compute_with_service_filter_ignores_other_services() {
+        let cfg = crate::config::Config::parse_str(
+            r"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    tag: latest
+    run: {}
+  - name: web
+    image: registry.example.com/web
+    tag: latest
+    run: {}
+",
+        )
+        .unwrap();
+        let api = &cfg.services[0];
+        let hash =
+            docker::compute_spec_hash(&build_desired_spec(&cfg, api, "latest", None).unwrap());
+        let api_name = deploy::container_name("api", &hash, 0, 1);
+        let api_old = deploy::container_name("api", &"b".repeat(64), 0, 1);
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![
+            running("api", &api_name, &hash, "running"),
+            running("api", &api_old, &"b".repeat(64), "exited"),
+            running("web", "web-cafef00", &"c".repeat(64), "running"),
+        ]));
+        let filter = ["api".to_string()];
+        let report = compute(&ops, &cfg, &BTreeMap::new(), Some(&filter), None)
+            .await
+            .unwrap();
+        let orphans: Vec<&str> = report.orphans.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(orphans, [api_old.as_str()]);
+    }
+
+    /// The admin relay has no `yoink.service`, so the plan claims it for
+    /// no service. It belongs to the proxy and is not an orphan while
+    /// the proxy is on.
+    #[tokio::test]
+    async fn admin_relay_is_an_orphan_only_without_the_proxy() {
+        use crate::proxy::relay::RELAY_NAME;
+        async fn orphans(yaml: &str, relay: ContainerInfo) -> Vec<String> {
+            let cfg = crate::config::Config::parse_str(yaml).unwrap();
+            let ops = crate::docker_ops::FakeDockerOps::new();
+            ops.push_list_containers(Ok(vec![relay]));
+            let report = compute(&ops, &cfg, &BTreeMap::new(), None, None)
+                .await
+                .unwrap();
+            report.orphans.into_iter().map(|o| o.name).collect()
+        }
+        let relay = ContainerInfo {
+            yoink_service: None,
+            ..running("", RELAY_NAME, "r", "running")
+        };
+        let routed = "hosts:\n  - { address: host-a, user: deploy }\nservices:\n  - name: api\n    \
+                      image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n";
+        assert!(orphans(routed, relay.clone()).await.is_empty());
+        let plain = "hosts:\n  - { address: host-a, user: deploy }\nservices:\n  - name: api\n    \
+                     image: img\n    tag: v1\n    run: {}\n";
+        assert_eq!(orphans(plain, relay).await, [RELAY_NAME]);
+    }
+
+    /// Probes have `yoink.managed=true` but no `yoink.service`. The
+    /// dry-run does not list them as orphans, running or stopped.
+    #[tokio::test]
+    async fn probes_are_not_orphans() {
+        let cfg = crate::config::Config::parse_str(
+            "hosts:\n  - { address: host-a, user: deploy }\nservices:\n  - name: api\n    \
+             image: img\n    tag: v1\n    run: {}\n",
+        )
+        .unwrap();
+        let probe = |name: &str, state: &str| ContainerInfo {
+            yoink_service: None,
+            ..running("", name, "p", state)
+        };
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![
+            probe("yoink-probe-api-1", "running"),
+            probe("yoink-tcp-probe-api-2", "exited"),
+            running("old", "old-abc", "h", "running"),
+        ]));
+        let report = compute(&ops, &cfg, &BTreeMap::new(), None, None)
+            .await
+            .unwrap();
+        let names: Vec<String> = report.orphans.into_iter().map(|o| o.name).collect();
+        assert_eq!(names, ["old-abc"]);
+    }
+
+    /// Each `yoink up` with the proxy on creates or replaces the admin
+    /// relay when it is missing, stopped or at another spec. The
+    /// dry-run must show that. A relay at spec gets no row. A run that
+    /// does not deploy the proxy keeps a running relay at another spec.
+    #[tokio::test]
+    async fn dry_run_plans_the_admin_relay() {
+        use crate::proxy::relay::{RELAY_NAME, RelayImage, relay_spec_hash};
+        async fn relay_rows(
+            filter: Option<&[String]>,
+            snapshot: Vec<ContainerInfo>,
+        ) -> Vec<ServiceDiff> {
+            let yaml = "hosts:\n  - { address: host-a, user: deploy }\nservices:\n  - name: api\n    \
+                        image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n";
+            let cfg = crate::config::Config::parse_str(yaml).unwrap();
+            let ops = crate::docker_ops::FakeDockerOps::new();
+            ops.push_list_containers(Ok(snapshot));
+            let report = compute(&ops, &cfg, &BTreeMap::new(), filter, None)
+                .await
+                .unwrap();
+            report
+                .services
+                .into_iter()
+                .filter(|d| d.service == RELAY_NAME)
+                .collect()
+        }
+        let relay = |hash: &str, state: &str| ContainerInfo {
+            yoink_service: None,
+            image: "alpine/socat:1.8.1.3".into(),
+            ..running("", RELAY_NAME, hash, state)
+        };
+        let scoped = ["api".to_string()];
+
+        for filter in [None, Some(&scoped[..])] {
+            let rows = relay_rows(filter, Vec::new()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].host, "host-a");
+            assert!(
+                matches!(&rows[0].change, ChangeKind::Create { desired_image } if desired_image == "caddy:2"),
+                "got: {rows:?}"
+            );
+        }
+
+        // The relay runs the proxy image. The socat relay of the
+        // earlier version has another hash and gets an update row.
+        let hash = relay_spec_hash(&RelayImage {
+            image: "caddy".into(),
+            tag: "2".into(),
+        });
+        for (filter, container) in [
+            (None, relay(&hash, "exited")),
+            (None, relay("old", "running")),
+            (Some(&scoped[..]), relay(&hash, "exited")),
+        ] {
+            let rows = relay_rows(filter, vec![container]).await;
+            assert_eq!(rows.len(), 1, "got: {rows:?}");
+            assert!(
+                matches!(&rows[0].change, ChangeKind::Update { .. }),
+                "got: {rows:?}"
+            );
+        }
+
+        assert!(
+            relay_rows(None, vec![relay(&hash, "running")])
+                .await
+                .is_empty()
+        );
+        assert!(
+            relay_rows(Some(&scoped), vec![relay("old", "running")])
+                .await
+                .is_empty()
+        );
+
+        // Each run creates a missing relay with the image of the
+        // running proxy, not the configured image. A run that deploys
+        // the proxy also replaces a relay at the configured image.
+        let proxy = ContainerInfo {
+            image: "caddy:2.7".into(),
+            ..running(
+                crate::config::PROXY_SERVICE_NAME,
+                "yoink-proxy-abc",
+                "p",
+                "running",
+            )
+        };
+        for filter in [None, Some(&scoped[..])] {
+            let rows = relay_rows(filter, vec![proxy.clone()]).await;
+            assert!(
+                matches!(&rows[..], [ServiceDiff { change: ChangeKind::Create { desired_image }, .. }] if desired_image == "caddy:2.7"),
+                "got: {rows:?}"
+            );
+        }
+        let rows = relay_rows(None, vec![proxy.clone(), relay(&hash, "running")]).await;
+        assert!(
+            matches!(&rows[..], [ServiceDiff { change: ChangeKind::Update { desired_image, .. }, .. }] if desired_image == "caddy:2.7"),
+            "got: {rows:?}"
+        );
+        let running_hash = relay_spec_hash(&RelayImage {
+            image: "caddy".into(),
+            tag: "2.7".into(),
+        });
+        assert!(
+            relay_rows(None, vec![proxy, relay(&running_hash, "running")])
+                .await
+                .is_empty()
+        );
     }
 
     fn running(service: &str, name: &str, hash: &str, state: &str) -> ContainerInfo {

@@ -131,15 +131,12 @@ where
     let mut config = json!({
         // Same admin block as the synthesized proxy's bootstrap. Caddy
         // /load REPLACES the active config — if we omit the admin
-        // block, Caddy reverts admin from `0.0.0.0:2019` to the
-        // default `localhost:2019`, which breaks docker's port
-        // forwarding (the docker-proxy on the host sends to the
-        // container's eth0:2019, not lo). Subsequent /load calls
-        // would then time out trying to reach the admin endpoint.
-        "admin": {
-            "listen": "0.0.0.0:2019",
-            "enforce_origin": false,
-        },
+        // block, Caddy reverts admin to the default `localhost:2019`,
+        // which the admin relay cannot reach. Subsequent
+        // /load calls would then time out. For a proxy of an earlier
+        // yoink version, `proxy::admin::push_config` replaces this
+        // block with the earlier one.
+        "admin": crate::config::admin_block(),
         "apps": {
             "http": {
                 "servers": {
@@ -1374,17 +1371,16 @@ services:
         assert!(!formatted.contains("hint:"));
     }
 
+    /// Every `/load` used to set `admin.listen` to `0.0.0.0:2019`,
+    /// which every routed service on `yoink-ingress` could reach.
     #[test]
-    fn config_extra_user_keys_win_on_conflict() {
-        // User explicitly overrides yoink's default admin block.
+    fn rendered_admin_listens_on_the_admin_alias() {
         let cfg = parse(
             r#"
 deploy: { networks: [n] }
 hosts: [{ address: h1, user: deploy }]
 proxy:
   email: ops@example.com
-  config_extra: |
-    {"admin": {"listen": "127.0.0.1:9999"}}
 services:
   - name: api
     image: img
@@ -1394,6 +1390,38 @@ services:
 "#,
         );
         let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
-        assert_eq!(json["admin"]["listen"].as_str(), Some("127.0.0.1:9999"));
+        assert_eq!(json["admin"], crate::config::admin_block());
+        assert_eq!(json["admin"]["listen"], crate::config::ADMIN_API_HOST);
+        assert_eq!(
+            json["admin"]["origins"],
+            serde_json::json!([crate::config::ADMIN_API_HOST])
+        );
+        assert!(!json["admin"].to_string().contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn config_extra_user_keys_win_on_conflict() {
+        // User explicitly overrides a value yoink renders.
+        let cfg = parse(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy:
+  email: ops@example.com
+  config_extra: |
+    {"apps": {"http": {"servers": {"main": {"listen": [":8443"]}}}}}
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    run: { port: 8080 }
+"#,
+        );
+        let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        assert_eq!(
+            json["apps"]["http"]["servers"]["main"]["listen"],
+            serde_json::json!([":8443"])
+        );
     }
 }

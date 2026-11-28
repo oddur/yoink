@@ -37,7 +37,7 @@ yoink reads these environment variables:
 
 ## Subcommand reference
 
-`<SERVICE>` is a service name from the config. `--host <ADDRESS>` takes a host address from the config.
+`<SERVICE>` is a service name from the config. `--host <ADDRESS>` takes a host address from the config. `yoink pull`, `yoink networks`, `yoink volumes`, and `yoink lock release` stop with an error for an address that is not in the config. The error lists the known hosts.
 
 ### Setup
 
@@ -78,7 +78,7 @@ yoink reads these environment variables:
 | `-s, --service <NAME>` | Limits the run to one service. Repeatable. |
 | `--tag <[NAME=]TAG>` | Overrides the tag of a service. Repeatable. See [Resolving tags](#resolving-tags). |
 | `--here` | Uses `git rev-parse --short HEAD` as the tag of every selected service. Conflicts with `--tag`. |
-| `--dry-run` | Prints the planned actions and exits. Connects to each host, but changes nothing. |
+| `--dry-run` | Prints the planned actions and exits. Connects to each host, but changes nothing. With `--service`, the orphan list shows only containers of the selected services. |
 | `--plan` | Alias of `--dry-run`. |
 | `--format <text\|markdown\|json>` | Output format of the dry run. Default: `text`, which shows `+`/`-`/`~` diffs of env keys and label keys for each service. |
 | `--watch` | Reconciles again when the config changes on disk. Polls every 2 s. Cannot combine with `--plan` or `--dry-run`. |
@@ -101,7 +101,7 @@ yoink reads these environment variables:
 | `yoink pull <SERVICE>` | Pulls the image on the hosts and does not deploy. |
 | `--tag <TAG>` | Overrides the tag. |
 | `--host <ADDRESS>` | Pulls on one host only. |
-| `yoink prune` | Removes yoink-managed containers whose service is not in the config, and stale exited containers. |
+| `yoink prune` | Removes yoink-managed containers whose service is not in the config, and stale exited containers. Takes the deploy lock on each host first. `--dry-run` does not take the lock. |
 | `--dry-run` | Lists the containers and removes nothing. |
 | `yoink preflight` | Makes sure that Docker is reachable on each host. |
 | `--wait <DURATION>` | Polls each host until its docker daemon answers or the time is over, for example `--wait 90s`. |
@@ -256,6 +256,8 @@ yoink up --service api --force                  # re-create + healthcheck all ap
 ```
 
 An at-spec container keeps its name, so the prepare phase removes the old container before the new one starts. The service is down for a short time (approximately the healthcheck time).
+
+If the new container does not start or fails its healthcheck, yoink cannot bring the old container back, because the old container is gone. This is also true for a service with `publish:` and for the proxy. Without `--force`, yoink starts the old container of such a service again after a failed deploy. With `--force`, no container of the service runs until the next successful deploy.
 
 ## Watch mode (`--watch`)
 

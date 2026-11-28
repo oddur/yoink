@@ -58,7 +58,7 @@ hosts:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `networks` | list of string | `[yoink]` when `deploy:` is absent | Declared docker networks. Required when `deploy:` is present, with a minimum of one entry. Services attach to them with `services[].networks:`. yoink creates each network that does not exist. |
+| `networks` | list of string | `[yoink]` when `deploy:` is absent | Declared docker networks. Required when `deploy:` is present, with a minimum of one entry. Services attach to them with `services[].networks:`. yoink creates each network that does not exist. The name `yoink-proxy-admin` is reserved for the proxy admin API, and config load rejects it. |
 
 ## Secrets
 
@@ -187,7 +187,7 @@ The [proxy guide](/docs/explanation/proxy) explains how the bundled Caddy revers
 | `image` | string | `caddy:2` | Pre-built caddy image that yoink pulls from a registry. Mutually exclusive with `xcaddy:`. |
 | `xcaddy` | [Xcaddy](#xcaddy) | unset | Compiles a custom caddy with plugins on each proxy host. Mutually exclusive with `image:`. |
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. If you remove the volume, Caddy requests new certs, and Let's Encrypt has strict rate limits. |
-| `bind` | string | unset (all interfaces) | Host IP that `:80` and `:443` bind to. For example, a Tailscale IP makes the proxy reachable only over the tailnet. The admin port always stays on `127.0.0.1`. |
+| `bind` | string | unset (all interfaces) | Host IP that `:80` and `:443` bind to. For example, a Tailscale IP makes the proxy reachable only over the tailnet. The admin relay always publishes its port on `127.0.0.1`. |
 | `tls` | [ProxyTls](#proxytls) | unset | Proxy-level TLS. Every routed service inherits this cert (and the optional mTLS) by default. When the field is set, ACME is off. |
 | `config_extra` | string (JSON) | unset | Top-level Caddy JSON object. yoink deep-merges it into the rendered config before `/load`. It is for global Caddy config that has no typed field: `trusted_proxies`, `storage`, plugin app blocks. |
 | `global_handlers` | list of string (JSON) | `[]` | Caddy handlers or routes that run for every request before a per-service route matches. It is for proxy-wide concerns: CrowdSec bouncer, Coraza WAF, fleet-wide rate limiting. |
@@ -233,13 +233,12 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `build` | [Build](#build) | unset | Local-build config. Required for the `--build` flow. |
 | `hosts` | list of string | all hosts | Restricts the hosts that run this service. The strings match `hosts[].address`. With an empty list, yoink deploys nothing for the service and runs none of its hooks. |
 | `depends_on` | list of string | `[]` | Names of other services. A topological sort of these names gives the wave order. Must be a DAG. |
-| `networks` | list of string | every network in `deploy.networks` | Docker networks to attach. Each one must be declared in `deploy.networks`. Config load rejects an empty list. The default does not include the proxy networks: a service with `domain:` also joins `yoink-ingress`, and only the proxy joins `yoink-proxy-admin`. |
+| `networks` | list of string | every network in `deploy.networks` | Docker networks to attach. Each one must be declared in `deploy.networks`. Config load rejects an empty list. The default does not include the proxy networks: a service with `domain:` also joins `yoink-ingress`, and only the proxy joins `yoink-proxy-admin`. Config load rejects `yoink-proxy-admin` in this list. |
 | `secrets` | list of string | `[]` | Secret names. Each secret becomes an env var of the same name. |
 | `env_from_secrets` | map of string | `{}` | `ENV_VAR_NAME: SECRET_NAME`. Exposes a secret under a different env name. |
 | `env` | map of string | `{}` | Plain env vars. **Do not put secrets here.** |
 | `labels` | map of string | `{}` | Extra docker labels. |
 | `description` | string | unset | yoink writes it to the container as `org.opencontainers.image.description`. The TUI shows it. |
-| `kind` | enum | unset | Internal marker for services that yoink synthesizes (the proxy). You do not set this field. |
 | `pre_deploy` | list of [Hook](#hook) | `[]` | One-shot hooks that run before yoink starts the new containers of this service. See [Hooks](#hooks). |
 | `domain` | string \| list of string | unset | One or more hostnames that the bundled proxy routes to this service. The field enables the proxy. Requires `run.port`. See the [proxy guide](/docs/explanation/proxy). |
 | `path_prefix` | string | unset | Matches this path glob in addition to `domain:`, so that many services can share a hostname. yoink puts routes with a path constraint before the catch-all routes. |
@@ -291,14 +290,14 @@ The defaults are a hardened profile. Each service can override them.
 | `cpus` | string | unset | CPU limit in cores of CPU time (`"1.5"` = 1.5 cores). |
 | `pids_limit` | integer | `1024` | Limit against fork bombs. |
 | `cap_drop` | list of string | `["ALL"]` | Linux capabilities that the container loses. |
-| `cap_add` | list of string | `[]` | Capabilities that the container gets back, for example `NET_BIND_SERVICE` for Caddy. |
+| `cap_add` | list of string | `[]` | Capabilities that the container gets back, for example `NET_BIND_SERVICE` for Caddy. With `NET_ADMIN` or `NET_RAW`, a service on `yoink-ingress` can reach the admin API of the proxy. Config load shows a warning for this. |
 | `security_opt` | list of string | `["no-new-privileges:true"]` | Docker security options. |
 | `read_only` | bool | `true` | Read-only rootfs. `tmpfs:` adds writable scratch space. |
 | `init` | bool | `true` | Runs tini as PID 1 (zombie reaping and correct SIGTERM). |
 | `tmpfs` | map of string | `{}` | `mount_path: "size=N,mode=NNNN"`. yoink applies `noexec,nosuid,nodev` automatically. |
 | `restart` | enum | `unless-stopped` | Docker restart policy: `no`, `always`, `unless-stopped`, or `on-failure`. Write `'no'` with quotes, because YAML reads a bare `no` as a boolean. |
 | `user` | string | `"65534:65534"` (nobody) | UID/GID. The default is non-root. `"0:0"` is for images that need root. A specific value (`"1000:1000"`, `"redis"`) is for images with pre-baked file ownership. |
-| `network_aliases` | list of string | `[]` | Extra DNS aliases on the attached networks, in addition to the service `name`. For example, a legacy hostname. |
+| `network_aliases` | list of string | `[]` | Extra DNS aliases on the attached networks, in addition to the service `name`. For example, a legacy hostname. Config load rejects `yoink-proxy-admin-api` and `yoink-proxy-admin-relay`. |
 | `devices` | list of string | `[]` | Host devices to expose. Each entry is `<host-path>[:<container-path>[:<perms>]]` (the `--device` syntax of docker). `<perms>` is a combination of `r`, `w`, `m`, and the default is `rwm`. An entry bind-mounts the device file and adds it to the cgroup `devices.allow` list. Only the listed devices become accessible, which is narrower than `--privileged`. Examples: `/dev/nvidia*` (GPU), `/dev/dri` (Intel/AMD VAAPI), `/dev/ttyUSB*` (USB serial), `/dev/fuse` (with `cap_add: [SYS_ADMIN]`), `/dev/snd` (audio). |
 
 [Security defaults](/docs/explanation/security) explains the reasons for these defaults.
@@ -326,7 +325,7 @@ The two places use the same [Hook](#hook) entry shape. A non-zero exit stops the
 
 The presence of `image:` selects one of two flavors:
 
-- **Container hook** (`image:` and `tag:` set): yoink pulls the image and runs `cmd:` in docker on the first host in `hosts:`. A hook of a service runs on the first host in the top-level `hosts:` list that the service runs on. All container hooks join the first network in `deploy.networks`. It is for pinned tool images, or for isolation from your filesystem.
+- **Container hook** (`image:` and `tag:` set): yoink pulls the image and runs `cmd:` in docker on the first host in `hosts:`. A hook of a service runs on the first host in the top-level `hosts:` list that the service runs on. All container hooks join the first network in `deploy.networks`. A container hook has the Docker default capabilities, which include `NET_RAW`. When the first network is `yoink-ingress`, config load shows a warning: with `NET_RAW`, the hook can reach the admin API of the proxy. It is for pinned tool images, or for isolation from your filesystem.
 - **Subprocess hook** (no `image:`, no `tag:`): yoink runs `cmd[0]` directly on your computer (or on the CI runner). The hook inherits the parent env. It is for tools that are already on PATH, for example `terraform`, `dbmate`, `alembic`, `gcloud`. See [Run Terraform from a hook](/docs/how-to/terraform-from-hooks).
 
 | Field | Type | Default | Notes |

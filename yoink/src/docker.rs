@@ -61,6 +61,10 @@ pub struct RunSpec {
     /// the synthesized `yoink-proxy`; user services inherit whatever
     /// HEALTHCHECK their image's Dockerfile declares.
     pub docker_healthcheck: Option<HealthConfig>,
+    /// True for the synthesized proxy. Its endpoint on
+    /// [`crate::config::ADMIN_NETWORK`] then gets the admin API alias.
+    /// See [`endpoint_settings`].
+    pub proxy: bool,
 }
 
 /// Build the typed body for `bollard.create_container`.
@@ -77,8 +81,7 @@ pub fn build_container(spec: &RunSpec) -> Result<ContainerCreateBody, BuildError
     let exposed_ports: Vec<String> = port_bindings.keys().cloned().collect();
 
     let host_config = build_host_config(spec, port_bindings)?;
-    let networking_config =
-        build_networking_config(&spec.networks, &spec.container_name, &spec.options);
+    let networking_config = build_networking_config(spec);
 
     Ok(ContainerCreateBody {
         image: Some(image_reference(&spec.image, &spec.tag)),
@@ -222,32 +225,43 @@ fn build_host_config(
     })
 }
 
-fn build_networking_config(
-    networks: &[String],
-    container_name: &str,
-    options: &RunOptions,
-) -> NetworkingConfig {
+fn build_networking_config(spec: &RunSpec) -> NetworkingConfig {
     // Only the first (primary) network goes here — docker silently
     // drops endpoints_config entries that don't match
     // host_config.network_mode at create time. Additional networks
-    // get attached post-start via `connect_container_network` in
-    // the deploy code, with the same aliases. The container is
-    // reachable as `container_name` on every attached network by
+    // get attached pre-start via `connect_container_network` in
+    // the deploy code, with `endpoint_settings` too. The container
+    // is reachable as `container_name` on every attached network by
     // virtue of docker's auto-alias plus our explicit one.
-    let mut aliases = vec![container_name.to_string()];
-    aliases.extend(options.network_aliases.iter().cloned());
+    let mut aliases = vec![spec.container_name.clone()];
+    aliases.extend(spec.options.network_aliases.iter().cloned());
     let mut endpoints = HashMap::new();
-    if let Some(primary) = networks.first() {
+    if let Some(primary) = spec.networks.first() {
         endpoints.insert(
             primary.clone(),
-            EndpointSettings {
-                aliases: Some(aliases),
-                ..Default::default()
-            },
+            endpoint_settings(primary, &aliases, spec.proxy),
         );
     }
     NetworkingConfig {
         endpoints_config: Some(endpoints),
+    }
+}
+
+/// Endpoint settings of a container on `network`. `aliases` go on
+/// every network. For the proxy (`proxy`), the endpoint on
+/// [`crate::config::ADMIN_NETWORK`] also gets
+/// [`crate::config::ADMIN_API_ALIAS`]. Caddy binds the admin API to the
+/// address of that alias, so no other endpoint may carry it.
+#[must_use]
+pub fn endpoint_settings(network: &str, aliases: &[String], proxy: bool) -> EndpointSettings {
+    use crate::config::{ADMIN_API_ALIAS, ADMIN_NETWORK};
+    let mut aliases = aliases.to_vec();
+    if proxy && network == ADMIN_NETWORK {
+        aliases.push(ADMIN_API_ALIAS.to_string());
+    }
+    EndpointSettings {
+        aliases: vec_opt(&aliases),
+        ..Default::default()
     }
 }
 
@@ -273,6 +287,14 @@ pub fn compute_spec_hash(spec: &RunSpec) -> String {
     let mut networks_sorted = spec.networks.clone();
     networks_sorted.sort();
     feed_list(&mut h, "networks", &networks_sorted);
+    // Per-network endpoint settings beyond the container name and
+    // `network_aliases` (hashed below): today the admin API alias of the
+    // proxy. Fed only when present, so other hashes stay the same.
+    for net in &networks_sorted {
+        if let Some(extra) = endpoint_settings(net, &[], spec.proxy).aliases {
+            feed_list(&mut h, &format!("endpoint.{net}.aliases"), &extra);
+        }
+    }
     feed_map(&mut h, "env", &spec.env);
     feed_map(&mut h, "labels", &spec.labels);
     feed_opt_list(&mut h, "entrypoint", spec.entrypoint.as_deref());
@@ -458,6 +480,7 @@ mod tests {
             binds: vec![],
             volumes: vec![],
             docker_healthcheck: None,
+            proxy: false,
         }
     }
 
@@ -502,7 +525,7 @@ mod tests {
         spec.docker_healthcheck = Some(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".into(),
-                "wget --spider --quiet http://127.0.0.1:2019/config/ || exit 1".into(),
+                "wget --spider --quiet http://yoink-proxy-admin-api:2019/config/ || exit 1".into(),
             ]),
             interval: Some(30 * 1_000_000_000),
             timeout: Some(5 * 1_000_000_000),
@@ -514,7 +537,7 @@ mod tests {
         let hc = body.healthcheck.expect("healthcheck on body");
         let test = hc.test.unwrap();
         assert_eq!(test[0], "CMD-SHELL");
-        assert!(test[1].contains("127.0.0.1:2019/config/"));
+        assert!(test[1].contains("yoink-proxy-admin-api:2019/config/"));
         assert_eq!(hc.interval, Some(30_000_000_000));
         assert_eq!(hc.retries, Some(3));
     }
@@ -664,6 +687,27 @@ mod tests {
         assert_ne!(base, compute_spec_hash(&v));
     }
 
+    /// The endpoint settings of the proxy are part of its spec hash, so
+    /// a proxy without the admin API alias is not at spec and
+    /// `yoink up --service yoink-proxy` recreates it. A service without
+    /// extra endpoint settings keeps its hash: the change recreates no
+    /// other container.
+    #[test]
+    fn spec_hash_includes_the_admin_endpoint_settings() {
+        use crate::config::{ADMIN_NETWORK, INGRESS_NETWORK};
+        // Pinned: the hash of a plain service did not change.
+        assert_eq!(compute_spec_hash(&sample_spec()), "fa432c4c0da0515f");
+        let mut proxy = sample_spec();
+        proxy.networks = vec![INGRESS_NETWORK.into(), ADMIN_NETWORK.into()];
+        let mut plain = proxy.clone();
+        proxy.proxy = true;
+        assert_ne!(compute_spec_hash(&proxy), compute_spec_hash(&plain));
+        // Without the admin network there are no extra settings.
+        plain.networks = vec![INGRESS_NETWORK.into()];
+        proxy.networks = plain.networks.clone();
+        assert_eq!(compute_spec_hash(&proxy), compute_spec_hash(&plain));
+    }
+
     #[test]
     fn compute_spec_hash_is_stable_and_short() {
         let h1 = compute_spec_hash(&sample_spec());
@@ -712,6 +756,54 @@ mod tests {
         let aliases = yoink_ep.aliases.as_ref().unwrap();
         assert!(aliases.contains(&"app-a-a1b2c3d".to_string()));
         assert!(aliases.contains(&"api".to_string()));
+    }
+
+    /// The proxy is created on `yoink-ingress`, its gateway endpoint,
+    /// so the published ports 80 and 443 stay there. The admin API alias
+    /// is on the admin endpoint only, which is connected after create.
+    #[test]
+    fn proxy_is_created_on_ingress_without_the_alias() {
+        use crate::config::{ADMIN_API_ALIAS, ADMIN_NETWORK, INGRESS_NETWORK};
+        let mut spec = sample_spec();
+        spec.proxy = true;
+        spec.networks = vec![INGRESS_NETWORK.into(), ADMIN_NETWORK.into()];
+        let body = build_container(&spec).unwrap();
+        assert_eq!(
+            body.host_config.unwrap().network_mode.as_deref(),
+            Some(INGRESS_NETWORK)
+        );
+        let endpoints = body.networking_config.unwrap().endpoints_config.unwrap();
+        assert_eq!(endpoints.len(), 1);
+        let ingress = &endpoints[INGRESS_NETWORK];
+        let aliases = ingress.aliases.as_ref().unwrap();
+        assert!(!aliases.contains(&ADMIN_API_ALIAS.to_string()));
+        assert!(aliases.contains(&spec.container_name));
+    }
+
+    /// The alias must resolve to the admin IP only: Caddy binds to
+    /// the one address that it resolves to.
+    #[test]
+    fn admin_alias_is_only_on_the_proxy_admin_endpoint() {
+        use crate::config::{ADMIN_API_ALIAS, ADMIN_NETWORK, INGRESS_NETWORK};
+        let base = vec!["yoink-proxy-abc".to_string()];
+        let ingress = endpoint_settings(INGRESS_NETWORK, &base, true);
+        assert_eq!(ingress.aliases.as_deref(), Some(base.as_slice()));
+        // Another service that an operator puts on the admin network
+        // does not get the alias.
+        let other = endpoint_settings(ADMIN_NETWORK, &base, false);
+        assert_eq!(other.aliases.as_deref(), Some(base.as_slice()));
+        let admin = endpoint_settings(ADMIN_NETWORK, &base, true);
+        assert!(
+            admin
+                .aliases
+                .unwrap()
+                .contains(&ADMIN_API_ALIAS.to_string())
+        );
+        assert!(
+            endpoint_settings(INGRESS_NETWORK, &[], false)
+                .aliases
+                .is_none()
+        );
     }
 
     #[test]

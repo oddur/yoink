@@ -58,12 +58,16 @@ impl StatusReport {
     /// in the config. Filtered server-side via the `yoink.managed=true`
     /// label. A host that does not answer goes into `failed` and the
     /// other hosts are still reported. Returns an error only when no
-    /// host answered.
+    /// host answered. The one-shot probe containers of a deploy have
+    /// the label too, but they are not part of the status.
     pub async fn collect(ops: &dyn DockerOps, config: &Config) -> Result<Self, StatusError> {
         let mut report = Self::default();
         for (host, result) in Self::query(ops, config, "yoink.managed=true").await {
             match result {
-                Ok(containers) => report.hosts.push(HostStatus { host, containers }),
+                Ok(mut containers) => {
+                    containers.retain(|c| !crate::docker_ops::is_probe(c));
+                    report.hosts.push(HostStatus { host, containers });
+                }
                 Err(e) => report.failed.push(HostFailure {
                     host,
                     error: e.to_string(),
@@ -206,6 +210,31 @@ services:
         assert_eq!(report.hosts.len(), 2);
         assert_eq!(report.hosts[0].host, "host-a");
         assert_eq!(report.hosts[1].host, "host-b");
+    }
+
+    /// Probes have `yoink.managed=true` so that prune finds a leaked
+    /// one. The status does not show them.
+    #[tokio::test]
+    async fn collect_leaves_out_probe_containers() {
+        let ops = FakeDockerOps::new();
+        let probe = ContainerInfo {
+            yoink_service: None,
+            ..container("host-a", "yoink-probe-app-a-1234", "", "running")
+        };
+        ops.push_list_containers(Ok(vec![
+            container("host-a", "app-a-a1b2c3d", "a1b2c3d", "running"),
+            probe,
+        ]));
+        ops.push_list_containers(Ok(Vec::new()));
+        let report = StatusReport::collect(&ops, &config_with_two_hosts())
+            .await
+            .unwrap();
+        let names: Vec<&str> = report.hosts[0]
+            .containers
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["app-a-a1b2c3d"]);
     }
 
     #[tokio::test]

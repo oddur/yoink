@@ -37,7 +37,24 @@ When any service sets `domain:`, yoink adds a `yoink-proxy` service that runs `c
 yoink manages two Docker networks for you:
 
 - **`yoink-ingress`**: the proxy and every service with `domain:` join this network. The proxy reaches your containers by name through it.
-- **`yoink-proxy-admin`**: the admin API of the proxy listens here. yoink publishes the admin port only on the loopback of the host, never on a public interface. yoink reaches it through an SSH tunnel for the duration of one `/load` call.
+- **`yoink-proxy-admin`**: only the proxy and the admin relay join this network. The admin API of the proxy listens here.
+
+The admin API has no authentication. Thus yoink keeps it off `yoink-ingress`:
+
+- The proxy has the alias `yoink-proxy-admin-api` on `yoink-proxy-admin` only. The admin API listens on `yoink-proxy-admin-api:2019`. Caddy binds this address to the IP of the proxy on `yoink-proxy-admin`. A service on `yoink-ingress` with the default capability profile (`cap_drop: [ALL]`) cannot connect to it. This bind is not access control. Linux accepts a packet for a local address on each interface. A container on `yoink-ingress` with `NET_ADMIN` can add a route to that address through the proxy. A container with `NET_RAW` can send such packets itself. Config load and `yoink doctor` show a warning for each service on `yoink-ingress` that has one of these two capabilities. A container hook has the Docker default capabilities, which include `NET_RAW`, and joins the first network of `deploy.networks`. Config load and `yoink doctor` also show a warning when that network is `yoink-ingress`.
+- Caddy accepts only the `Host` header `yoink-proxy-admin-api:2019`. yoink sends this header on each admin request. The deploy healthcheck of the proxy uses the same name, and runs on `yoink-proxy-admin`.
+- The proxy does not publish the admin port. Docker sends all published ports of a container to one network, the gateway network. For the proxy, this network is `yoink-ingress`. Ports 80 and 443 must stay there: a service on `yoink-ingress` that calls a public domain of its own host then reaches the proxy.
+- The admin relay `yoink-proxy-admin-relay` is a small Caddy container. It uses the same image as the proxy, so it needs no other image and no other registry. This is also true with `--no-registry`. It joins only `yoink-proxy-admin`. It publishes port 2020 on `127.0.0.1` of the host, with a random host port. It sends each request to `yoink-proxy-admin-api:2019`, with that `Host` header. The admin API of the relay itself is off. yoink reaches the relay through an SSH tunnel for the duration of one `/load` call.
+
+Each `yoink up` with the proxy on makes sure that the relay runs on each proxy host, before the first config push. A scoped run, for example `yoink up --service api`, does this too. The relay uses the image of the proxy that runs on the host. It does not use the configured image while an older proxy runs. yoink makes sure of the relay before it deploys the proxy, so a new `proxy.image` has not passed the healthcheck yet. If the new image cannot run Caddy, the proxy deploy fails and yoink starts the old proxy again. The relay stays on the old image, so the config push continues to work. The relay gets a new image on the first `yoink up` after the proxy runs that image.
+
+When the relay spec changes, an unscoped `yoink up` or `yoink up --service yoink-proxy` replaces the relay. A new image of the running proxy changes the relay spec. When no proxy runs on the host, for example on a new host, the relay uses the configured image. If that image is not on the host, yoink gets it first, in the same way as for the proxy. With `--no-registry`, yoink does not pull it: `yoink up` stops with an error. A scoped run that does not select `yoink-proxy` keeps a running relay, also at an old spec. It never pulls. When the relay does not run, this run creates it with the image of the running proxy, or with the configured image when no proxy runs. If that image is not on the host, `yoink up` shows a warning and continues without the relay. `yoink prune` and `yoink up --dry-run` do not show the relay as an orphan while the proxy is on. `yoink up --dry-run` shows a row for the relay when yoink creates or replaces it. When you turn the proxy off, `yoink prune` removes the relay with the proxy.
+
+Earlier versions of yoink published the admin port on the proxy, and the admin API listened on `0.0.0.0:2019`. Thus every service on `yoink-ingress` could change the proxy config. The next unscoped `yoink up` creates the relay and recreates the proxy. The new proxy loads its saved config at start, so the routes come back immediately. The saved config still has the admin API on `0.0.0.0:2019`, so the relay and the deploy healthcheck reach it on the alias address. The first `/load` then moves the admin API to `yoink-proxy-admin-api:2019`.
+
+A scoped run, for example `yoink up --service api` or `yoink rollback --service api`, does not recreate the proxy. The old proxy stays in place, and its admin API stays on `0.0.0.0:2019`. yoink reads the aliases of the running proxy before each `/load`. When the proxy does not have the alias `yoink-proxy-admin-api` on `yoink-proxy-admin`, yoink connects to the admin port of the old proxy and sends the earlier admin block. The routes update as before. At the end of the run, yoink shows one warning with the hosts of the old proxy. To complete the upgrade, run `yoink up --service yoink-proxy` or an unscoped `yoink up`.
+
+Use one version of yoink for all operators of a project. An earlier version recreates the proxy with its own spec. That proxy does not have the alias `yoink-proxy-admin-api`, so Caddy cannot load the saved config, the container does not start, and the routes go down. A rollback of the proxy to a container of an earlier version has the same result. To recover, run `yoink up` with the newer version.
 
 Upstream entries name containers, not IPs. As a result, a container restart with a new IP does not break routing, because Docker DNS resolves the name. The active health checks of Caddy take dead backends out of rotation.
 
@@ -55,7 +72,7 @@ yoink drives every stage, and there is no second reconciler. The config push occ
 
 If a healthcheck or the config push fails, yoink removes the new replicas. The old replicas stay in the pool and keep running.
 
-A service with `publish:` is the exception. Its old container stops before the new one starts, because only one container can bind a host port.
+A service with `publish:` is the exception. Its old container stops before the new one starts, because only one container can bind a host port. When the new container does not start, fails its healthcheck, or the config push fails, yoink removes it and starts the old container again. The proxy publishes ports 80 and 443, so this applies to the proxy too. One case is different: when the config push fails after a new proxy starts, yoink keeps the new proxy. It serves the saved config.
 
 ## What yoink does not model
 
@@ -89,7 +106,7 @@ The entries run as a pipeline, so their order matters. Cheap filters (the CrowdS
 
 yoink does not model the global config values of Caddy as typed fields. Examples are the server-level `trusted_proxies` and `client_ip_headers`, and the top-level `storage` for shared ACME state across hosts. Top-level app blocks for plugins such as `cache-handler` and `coraza` are also in this group.
 
-`proxy.config_extra:` takes raw JSON for these values, and yoink deep-merges it into the generated config. Your value wins on every leaf conflict. Two paths are the exception: yoink rejects a write to the routes or to the TLS connection policies. A write there removes routes or disables mTLS.
+`proxy.config_extra:` takes raw JSON for these values, and yoink deep-merges it into the generated config. Your value wins on every leaf conflict. Three paths are the exception: yoink rejects a write to the routes, to the TLS connection policies, or to the `admin` block. A write there removes routes, disables mTLS, or opens the admin API to the routed services.
 
 `config_extra:` injects raw config. `global_handlers:` is the typed slot for handlers. The merge rules are in the [`config_extra:` block](/docs/reference/proxy#proxyconfig_extra-block-global-caddy-config-escape-hatch) of the reference.
 

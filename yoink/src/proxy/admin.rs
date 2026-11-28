@@ -1,14 +1,22 @@
 //! Push rendered Caddy JSON to the proxy's admin API.
 //!
-//! Caddy's admin API listens on `:2019` *inside* the container and is
-//! published on the host's loopback at an ephemeral port (chosen by
-//! docker via `127.0.0.1:0:2019`). The yoink CLI:
+//! Caddy's admin API listens on `ADMIN_API_HOST` *inside* the
+//! container: the proxy IP on the `yoink-proxy-admin` network only.
+//! The proxy does not publish the admin port. The admin relay (see
+//! [`super::relay`]) publishes its port [`RELAY_PORT`] on the host's
+//! loopback at an ephemeral port and sends each request to the admin
+//! API. The yoink CLI:
 //!
-//! 1. Looks up the proxy container, reads the host-side admin port
-//!    from its inspect output.
+//! 1. Looks up the proxy container. If it has the admin API alias, it
+//!    reads the host-side port of the relay. A proxy from an earlier
+//!    yoink version has no alias and publishes the admin port itself;
+//!    yoink then reads that port, see [`AdminListen::Legacy`].
 //! 2. SSH-tunnels from `operator-localhost:<rand>` to
 //!    `host-localhost:<published>`.
-//! 3. `POST`s the JSON to `http://127.0.0.1:<rand>/load`.
+//! 3. `POST`s the JSON to `http://127.0.0.1:<rand>/load`, with the
+//!    `Host` header `ADMIN_API_HOST`. Caddy rejects any other `Host`,
+//!    because its listen address is not a wildcard. The relay sets the
+//!    same `Host` again.
 //! 4. Drops the tunnel.
 //!
 //! Why loopback-published instead of using the container's docker IP
@@ -23,10 +31,14 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::base::host::Host;
-use crate::docker_ops::{DockerError, DockerOps, parse_published_port};
+use crate::docker_ops::{ContainerDetail, DockerError, DockerOps, parse_published_port};
 use crate::ssh::tunnel::{SshTunnel, TunnelError};
 
-use crate::config::{ADMIN_PORT, PROXY_SERVICE_NAME};
+use crate::config::{
+    ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, PROXY_SERVICE_NAME,
+};
+
+use super::relay::{RELAY_NAME, RELAY_PORT, relay_label_filter};
 
 /// How long the SSH tunnel + Caddy admin readiness probe each get
 /// before giving up. 20s comfortably covers a cold proxy boot on a
@@ -57,10 +69,21 @@ pub enum AdminError {
     #[error("proxy container {PROXY_SERVICE_NAME:?} not running on {host}")]
     ProxyNotRunning { host: String },
     #[error(
-        "proxy container on {host} has no published admin port — yoink expected \
-         it on `127.0.0.1:0:{ADMIN_PORT}` but inspect returned: {ports:?}"
+        "admin relay {RELAY_NAME:?} not running on {host}. Each `yoink up` with the \
+         proxy on creates it again. If it stops again, run `docker logs {RELAY_NAME}` \
+         on the host to see why."
     )]
-    NoPublishedAdminPort { host: String, ports: Vec<String> },
+    RelayNotRunning { host: String },
+    #[error(
+        "container {container:?} on {host} has no published admin port — yoink expected \
+         it on `127.0.0.1:0:{port}` but inspect returned: {ports:?}"
+    )]
+    NoPublishedAdminPort {
+        host: String,
+        container: String,
+        port: u16,
+        ports: Vec<String>,
+    },
     #[error("ssh tunnel to proxy admin: {0}")]
     Tunnel(#[from] TunnelError),
     #[error("proxy admin endpoint did not respond within {timeout:?}")]
@@ -87,8 +110,8 @@ pub enum AdminError {
     LoadVerifyMismatch { expected: usize, actual: usize },
 }
 
-/// Push `config` to the proxy on `host`. Looks up the proxy
-/// container's host-side admin port, opens an SSH tunnel to host
+/// Push `config` to the proxy on `host`. Looks up the host-side admin
+/// port (of the relay, or of an old proxy), opens an SSH tunnel to host
 /// loopback at that port, POSTs to `/load`, drops the tunnel.
 ///
 /// Retries once on transport-class failures (tunnel didn't come up,
@@ -97,10 +120,49 @@ pub enum AdminError {
 /// see one drop between the readiness probe and the actual `/load`,
 /// surfacing as `error sending request`. Real Caddy errors propagate
 /// immediately without a retry.
+///
+/// The `admin` block of `config` is for a proxy that has the admin API
+/// alias. A proxy from an earlier yoink version does not have it, and
+/// Caddy cannot bind that address. For such a proxy, yoink sends the
+/// earlier block instead, see [`AdminListen::Legacy`]. The return value
+/// tells the caller which block it sent. A [`PushError`] tells it too,
+/// when yoink found the proxy before the push failed.
 pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
     config: &Value,
+) -> Result<AdminListen, PushError> {
+    let (proxy, listen) = running_proxy(host, ops).await.map_err(|error| PushError {
+        listen: None,
+        error,
+    })?;
+    push_to(host, ops, config, proxy, listen)
+        .await
+        .map_err(|error| PushError {
+            listen: Some(listen),
+            error,
+        })?;
+    Ok(listen)
+}
+
+/// A failed [`push_config`]. `listen` is the admin address of the
+/// running proxy, when yoink found the proxy before the failure. An
+/// old proxy is still in place after a failed push, so the caller can
+/// still warn about it.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub struct PushError {
+    pub listen: Option<AdminListen>,
+    pub error: AdminError,
+}
+
+/// The push of [`push_config`], to the running proxy `proxy`.
+async fn push_to(
+    host: &Host,
+    ops: &dyn DockerOps,
+    config: &Value,
+    proxy: ContainerDetail,
+    listen: AdminListen,
 ) -> Result<(), AdminError> {
     // The discovery phase (label lookup + inspect + port parse +
     // keyfile) is invariant across retries on transport-class
@@ -110,9 +172,9 @@ pub async fn push_config(
     // ssh-pool flakiness for those calls (see `RealDockerOps`),
     // adding another retry layer here would compound the wait on
     // genuinely down hosts.
-    let target = discover_admin_target(host, ops).await?;
+    let target = admin_target(host, ops, proxy, listen).await?;
+    let config = &config_for(config, target.listen);
     match tunnel_and_load(host, &target, config).await {
-        Ok(()) => Ok(()),
         Err(e) if is_transient(&e) => {
             tracing::debug!(
                 host = %host.address,
@@ -122,29 +184,100 @@ pub async fn push_config(
             tokio::time::sleep(RETRY_BACKOFF).await;
             tunnel_and_load(host, &target, config).await
         }
-        Err(e) => Err(e),
+        other => other,
     }
 }
 
+/// The admin address that the running proxy container can bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminListen {
+    /// The proxy is on `ADMIN_NETWORK` and has `ADMIN_API_ALIAS`
+    /// there. yoink tunnels to the admin relay and sends
+    /// [`crate::config::admin_block`].
+    Alias,
+    /// The proxy is from an earlier yoink version: it does not have the
+    /// alias on `ADMIN_NETWORK`. Caddy cannot bind the alias address,
+    /// rejects the `/load`, and keeps the old config. yoink thus sends
+    /// the admin block of the earlier version, see
+    /// [`legacy_admin_block`], to the admin port that the proxy
+    /// publishes itself, until a deploy recreates the proxy.
+    Legacy,
+}
+
+impl AdminListen {
+    /// Read the admin address from the inspect output of the running
+    /// proxy container.
+    #[must_use]
+    pub fn of(detail: &ContainerDetail) -> Self {
+        let has_alias = detail
+            .network_aliases
+            .get(ADMIN_NETWORK)
+            .is_some_and(|aliases| aliases.iter().any(|a| a == ADMIN_API_ALIAS));
+        if has_alias { Self::Alias } else { Self::Legacy }
+    }
+}
+
+/// The `admin` block that yoink sent on every `/load` before the admin
+/// API moved to `ADMIN_API_ALIAS`. The wildcard address binds in a proxy
+/// of any version. With a wildcard address, Caddy does not check the
+/// `Host` header, so the `ADMIN_API_HOST` header that yoink sends is
+/// accepted.
+fn legacy_admin_block() -> Value {
+    serde_json::json!({
+        "listen": format!("0.0.0.0:{ADMIN_PORT}"),
+        "enforce_origin": false,
+    })
+}
+
+/// `config` with the `admin` block that `listen` can bind.
+fn config_for(config: &Value, listen: AdminListen) -> Value {
+    let mut config = config.clone();
+    if listen == AdminListen::Legacy {
+        config["admin"] = legacy_admin_block();
+    }
+    config
+}
+
+/// A 502 comes from the relay: it could not reach the admin API, or
+/// the connection broke. `/load` is idempotent, so one retry is safe.
 fn is_transient(e: &AdminError) -> bool {
     matches!(
         e,
         AdminError::Tunnel(_) | AdminError::NotReady { .. } | AdminError::Http { .. }
-    )
+    ) || matches!(e, AdminError::LoadRejected { status, .. } if is_gateway_error(*status))
+}
+
+/// The relay answers 502, 503 or 504 when the admin API behind it does
+/// not answer.
+fn is_gateway_error(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 502..=504)
 }
 
 /// Resolved admin endpoint for one push attempt: the host-side TCP
-/// port docker published Caddy's `:2019` to, plus the ssh keyfile
-/// the tunnel should authenticate with.
+/// port that docker published for the relay port, or for the admin
+/// port `:2019` of an old proxy,
+/// plus the ssh keyfile the tunnel should authenticate with.
 struct AdminTarget {
     host_port: u16,
     keyfile: Option<std::path::PathBuf>,
+    listen: AdminListen,
 }
 
+#[cfg(test)]
 async fn discover_admin_target(
     host: &Host,
     ops: &dyn DockerOps,
 ) -> Result<AdminTarget, AdminError> {
+    let (proxy, listen) = running_proxy(host, ops).await?;
+    admin_target(host, ops, proxy, listen).await
+}
+
+/// The inspect of the running proxy container on `host`, and the admin
+/// address that it can bind.
+async fn running_proxy(
+    host: &Host,
+    ops: &dyn DockerOps,
+) -> Result<(ContainerDetail, AdminListen), AdminError> {
     let label = format!("yoink.service={PROXY_SERVICE_NAME}");
     let containers = ops
         .list_containers_by_label(host, &label)
@@ -160,24 +293,65 @@ async fn discover_admin_target(
             host: host.address.clone(),
         })?;
 
-    let detail = ops
-        .inspect_container(host, &running.name)
-        .await
-        .map_err(|source| AdminError::Docker {
-            host: host.address.clone(),
-            source,
-        })?;
-    let host_port = parse_published_port(&detail.ports, ADMIN_PORT).ok_or_else(|| {
+    let detail = inspect(ops, host, &running.name).await?;
+    let listen = AdminListen::of(&detail);
+    Ok((detail, listen))
+}
+
+/// The host-side port to tunnel to: of the relay for a proxy with the
+/// alias, of the proxy `detail` itself for an old proxy.
+async fn admin_target(
+    host: &Host,
+    ops: &dyn DockerOps,
+    detail: ContainerDetail,
+    listen: AdminListen,
+) -> Result<AdminTarget, AdminError> {
+    let (published, port) = match listen {
+        AdminListen::Legacy => (detail, ADMIN_PORT),
+        AdminListen::Alias => {
+            let relays = ops
+                .list_containers_by_label(host, &relay_label_filter())
+                .await
+                .map_err(|source| AdminError::Docker {
+                    host: host.address.clone(),
+                    source,
+                })?;
+            let relay = relays
+                .into_iter()
+                .find(|c| c.name == RELAY_NAME && c.is_running())
+                .ok_or_else(|| AdminError::RelayNotRunning {
+                    host: host.address.clone(),
+                })?;
+            (inspect(ops, host, &relay.name).await?, RELAY_PORT)
+        }
+    };
+    let host_port = parse_published_port(&published.ports, port).ok_or_else(|| {
         AdminError::NoPublishedAdminPort {
             host: host.address.clone(),
-            ports: detail.ports.clone(),
+            container: published.name.clone(),
+            port,
+            ports: published.ports.clone(),
         }
     })?;
 
     Ok(AdminTarget {
         host_port,
         keyfile: ops.ssh_keyfile(host),
+        listen,
     })
+}
+
+async fn inspect(
+    ops: &dyn DockerOps,
+    host: &Host,
+    name: &str,
+) -> Result<ContainerDetail, AdminError> {
+    ops.inspect_container(host, name)
+        .await
+        .map_err(|source| AdminError::Docker {
+            host: host.address.clone(),
+            source,
+        })
 }
 
 async fn tunnel_and_load(
@@ -194,14 +368,22 @@ async fn tunnel_and_load(
     .await?;
 
     wait_until_ready(tunnel.local_port(), TUNNEL_READY_TIMEOUT).await?;
+    let result = load_and_verify(tunnel.local_port(), config).await;
+    drop(tunnel);
+    result
+}
 
-    let url = format!("http://127.0.0.1:{}/load", tunnel.local_port());
+/// `POST /load` through the tunnel at `local_port`, then read the
+/// route count back.
+async fn load_and_verify(local_port: u16, config: &Value) -> Result<(), AdminError> {
+    let url = format!("http://127.0.0.1:{local_port}/load");
     let client = reqwest::Client::builder()
         .timeout(ADMIN_API_TIMEOUT)
         .build()
         .expect("reqwest client builder");
     let resp = client
         .post(&url)
+        .header(reqwest::header::HOST, ADMIN_API_HOST)
         .json(config)
         .send()
         .await
@@ -224,8 +406,7 @@ async fn tunnel_and_load(
     // domains. Verifying upfront beats discovering it from a Cloudflare
     // 521 alert.
     let expected = route_count(config);
-    let actual = read_route_count(&client, tunnel.local_port()).await?;
-    drop(tunnel);
+    let actual = read_route_count(&client, local_port).await?;
     if expected != actual {
         return Err(AdminError::LoadVerifyMismatch { expected, actual });
     }
@@ -243,6 +424,7 @@ async fn read_route_count(client: &reqwest::Client, local_port: u16) -> Result<u
     let url = format!("http://127.0.0.1:{local_port}/config/apps/http/servers/main/routes/");
     let resp = client
         .get(&url)
+        .header(reqwest::header::HOST, ADMIN_API_HOST)
         .send()
         .await
         .map_err(|source| AdminError::Http { source })?;
@@ -263,7 +445,9 @@ const REDACTED_PEM: &str = "<redacted PEM>";
 
 /// Replace `-----BEGIN <kind>----- … -----END <kind>-----` regions
 /// with a placeholder; an unterminated BEGIN is over-redacted to the
-/// end of the body (better than leaking).
+/// end of the body (better than leaking). An END line without its
+/// closing dashes is redacted to the end of that line, or to the next
+/// `-----BEGIN ` if that comes first.
 fn redact_pem_blocks(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
@@ -278,12 +462,24 @@ fn redact_pem_blocks(body: &str) -> String {
             out.push_str(REDACTED_PEM);
             return out;
         };
-        let tail = &after_begin[end_marker_pos..];
-        let after_end_label = tail
+        // Search for the closing `-----` after the `-----END ` prefix:
+        // the prefix itself starts with `-----`. Do not search past the
+        // end of the END line or into the next block: the dashes of a
+        // later `-----BEGIN ` are not the closing dashes.
+        let label_start = end_marker_pos + "-----END ".len();
+        let label = &after_begin[label_start..];
+        let line_end = [label.find('\n'), label.find("-----BEGIN ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(label.len());
+        let block_end = label[..line_end]
             .find("-----")
-            .map_or(after_begin.len(), |idx| idx + "-----".len());
+            .map_or(label_start + line_end, |idx| {
+                label_start + idx + "-----".len()
+            });
         out.push_str(REDACTED_PEM);
-        rest = &after_begin[end_marker_pos + after_end_label..];
+        rest = &after_begin[block_end..];
     }
 }
 
@@ -295,7 +491,15 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
         .expect("reqwest client builder");
     let deadline = Instant::now() + timeout;
     loop {
-        if client.get(&url).send().await.is_ok() {
+        let probe = client
+            .get(&url)
+            .header(reqwest::header::HOST, ADMIN_API_HOST);
+        // Through the relay, a proxy that is not up yet gives a 502.
+        if probe
+            .send()
+            .await
+            .is_ok_and(|resp| !is_gateway_error(resp.status()))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -309,6 +513,235 @@ async fn wait_until_ready(local_port: u16, timeout: Duration) -> Result<(), Admi
 mod tests {
     use super::*;
 
+    fn running(name: &str, service: Option<&str>) -> crate::docker_ops::ContainerInfo {
+        crate::docker_ops::ContainerInfo {
+            host: "h".into(),
+            name: name.into(),
+            image: String::new(),
+            state: "running".into(),
+            status_text: String::new(),
+            created_unix: None,
+            yoink_service: service.map(Into::into),
+            yoink_version: None,
+            yoink_spec_hash: None,
+            yoink_deployed_by: None,
+            yoink_deployed_at: None,
+            networks: Vec::new(),
+            other_labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A fake host with one running proxy container. `network_aliases`
+    /// is its inspect output: network → aliases. `ports` is what the
+    /// proxy publishes.
+    fn fake_proxy(
+        network_aliases: &[(&str, &[&str])],
+        ports: &[&str],
+    ) -> crate::docker_ops::FakeDockerOps {
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        let name = "yoink-proxy-abc1234";
+        ops.push_list_containers(Ok(vec![running(name, Some(PROXY_SERVICE_NAME))]));
+        ops.set_inspect(ContainerDetail {
+            name: name.into(),
+            ports: ports.iter().map(|p| (*p).to_string()).collect(),
+            network_aliases: network_aliases
+                .iter()
+                .map(|(n, a)| ((*n).into(), a.iter().map(|s| (*s).into()).collect()))
+                .collect(),
+            ..ContainerDetail::default()
+        });
+        ops
+    }
+
+    /// Add a running admin relay that publishes `2020` on `host_port`.
+    fn add_relay(ops: &crate::docker_ops::FakeDockerOps, host_port: u16) {
+        ops.push_list_containers(Ok(vec![running(RELAY_NAME, None)]));
+        ops.set_inspect(ContainerDetail {
+            name: RELAY_NAME.into(),
+            ports: vec![format!("{host_port}:2020/tcp")],
+            ..ContainerDetail::default()
+        });
+    }
+
+    fn host() -> Host {
+        Host {
+            user: "u".into(),
+            address: "h".into(),
+            port: None,
+        }
+    }
+
+    /// The tunnel port and the `admin` block that `push_config` sends
+    /// to the proxy of `ops`, for the config that a deploy renders.
+    async fn pushed_admin(ops: &crate::docker_ops::FakeDockerOps) -> (u16, AdminListen, Value) {
+        let cfg = crate::config::Config::parse_str(
+            r"
+hosts: [{ address: h, user: u }]
+proxy: { email: ops@example.com }
+services:
+  - name: api
+    image: example/api
+    tag: v1
+    domain: api.example.com
+    run: { port: 8080 }
+",
+        )
+        .expect("config parses");
+        let rendered =
+            crate::proxy::caddy::render(&cfg, |_| vec!["api-1".into()], None).expect("render");
+        let target = discover_admin_target(&host(), ops).await.expect("target");
+        let pushed = config_for(&rendered, target.listen);
+        (target.host_port, target.listen, pushed["admin"].clone())
+    }
+
+    /// A scoped `yoink up --service api` after an upgrade keeps the
+    /// proxy of the earlier version: on `yoink-proxy-admin`, without
+    /// the alias, with its own published admin port. Caddy there cannot
+    /// bind the alias address, so a `/load` with the new admin block
+    /// was rejected, and yoink then removed the new replicas of `api`.
+    #[tokio::test]
+    async fn old_proxy_gets_the_earlier_admin_block_on_its_own_port() {
+        let ops = fake_proxy(
+            &[
+                (crate::config::INGRESS_NETWORK, &["yoink-proxy-abc1234"]),
+                (ADMIN_NETWORK, &["yoink-proxy-abc1234"]),
+            ],
+            &["80:80/tcp", "443:443/tcp", "32768:2019/tcp"],
+        );
+        let (port, listen, admin) = pushed_admin(&ops).await;
+        assert_eq!(port, 32768);
+        assert_eq!(listen, AdminListen::Legacy);
+        assert_eq!(
+            admin,
+            serde_json::json!({"listen": "0.0.0.0:2019", "enforce_origin": false})
+        );
+        // No relay lookup for an old proxy.
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|c| matches!(
+                    c,
+                    crate::docker_ops::RecordedCall::ListContainersByLabel(..)
+                ))
+                .count(),
+            1
+        );
+    }
+
+    /// A proxy with the alias publishes no admin port: Docker would put
+    /// it on `yoink-ingress`, the gateway endpoint. yoink tunnels to the
+    /// port of the relay.
+    #[tokio::test]
+    async fn new_proxy_is_reached_through_the_relay() {
+        let ops = fake_proxy(
+            &[
+                (crate::config::INGRESS_NETWORK, &["yoink-proxy-abc1234"]),
+                (ADMIN_NETWORK, &["yoink-proxy-abc1234", ADMIN_API_ALIAS]),
+            ],
+            &["80:80/tcp", "443:443/tcp"],
+        );
+        add_relay(&ops, 40000);
+        let (port, listen, admin) = pushed_admin(&ops).await;
+        assert_eq!(port, 40000);
+        assert_eq!(listen, AdminListen::Alias);
+        assert_eq!(admin, crate::config::admin_block());
+    }
+
+    /// The relay of the earlier version (socat) published 2019. yoink
+    /// reads only the relay port 2020: `yoink up` recreates such a
+    /// relay before the first push.
+    #[tokio::test]
+    async fn relay_port_is_2020() {
+        let ops = fake_proxy(
+            &[(ADMIN_NETWORK, &["yoink-proxy-abc1234", ADMIN_API_ALIAS])],
+            &[],
+        );
+        ops.push_list_containers(Ok(vec![running(RELAY_NAME, None)]));
+        ops.set_inspect(ContainerDetail {
+            name: RELAY_NAME.into(),
+            ports: vec!["40000:2019/tcp".into()],
+            ..ContainerDetail::default()
+        });
+        let err = discover_admin_target(&host(), &ops)
+            .await
+            .err()
+            .expect("no relay port");
+        assert!(err.to_string().contains("`127.0.0.1:0:2020`"), "got: {err}");
+    }
+
+    /// A 502 from the relay means that the admin API did not answer.
+    /// The readiness probe waits, and a `/load` gets one retry.
+    #[test]
+    fn gateway_errors_from_the_relay_are_transient() {
+        for code in [502, 503, 504] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(is_gateway_error(status));
+            assert!(is_transient(&AdminError::LoadRejected {
+                status,
+                body: String::new(),
+            }));
+        }
+        assert!(!is_transient(&AdminError::LoadRejected {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: String::new(),
+        }));
+    }
+
+    /// A failed push still tells the caller the admin address of the
+    /// proxy that it found. Without a running proxy, there is none.
+    #[tokio::test]
+    async fn failed_push_keeps_the_admin_listen_of_the_proxy() {
+        // An old proxy without a published admin port: the push fails
+        // after the discovery.
+        let ops = fake_proxy(&[], &[]);
+        let err = push_config(&host(), &ops, &serde_json::json!({}))
+            .await
+            .expect_err("no admin port");
+        assert_eq!(err.listen, Some(AdminListen::Legacy));
+        assert!(
+            matches!(err.error, AdminError::NoPublishedAdminPort { .. }),
+            "got: {err}"
+        );
+
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new()));
+        let err = push_config(&host(), &ops, &serde_json::json!({}))
+            .await
+            .expect_err("no proxy");
+        assert_eq!(err.listen, None);
+        assert!(
+            matches!(err.error, AdminError::ProxyNotRunning { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_proxy_without_a_relay_is_an_error() {
+        let ops = fake_proxy(
+            &[(ADMIN_NETWORK, &["yoink-proxy-abc1234", ADMIN_API_ALIAS])],
+            &[],
+        );
+        ops.push_list_containers(Ok(Vec::new()));
+        let err = discover_admin_target(&host(), &ops)
+            .await
+            .err()
+            .expect("no relay");
+        assert!(
+            matches!(err, AdminError::RelayNotRunning { .. }),
+            "got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Each `yoink up` with the proxy on"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("`docker logs yoink-proxy-admin-relay`"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("unscoped"), "got: {msg}");
+    }
+
     #[test]
     fn redact_strips_full_pem_blocks() {
         let body = "json error at offset 42: -----BEGIN CERTIFICATE-----\nABCDEF\n-----END CERTIFICATE-----\n more context";
@@ -318,12 +751,133 @@ mod tests {
         assert!(out.contains("more context"));
     }
 
+    /// The search for the closing `-----` matched the `-----` of the
+    /// `-----END ` prefix itself, so `END CERTIFICATE-----` stayed in
+    /// the output.
+    #[test]
+    fn redact_removes_the_end_line() {
+        let body = "a -----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE----- b \
+                    -----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY----- c";
+        assert_eq!(
+            redact_pem_blocks(body),
+            "a <redacted PEM> b <redacted PEM> c"
+        );
+    }
+
+    /// An END line without its closing dashes made the search find the
+    /// dashes of the next `-----BEGIN `, so the next block leaked.
+    #[test]
+    fn redact_end_line_without_dashes_keeps_next_block_redacted() {
+        let body = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE\n\
+                    -----BEGIN PRIVATE KEY-----\nSECRET\n-----END PRIVATE KEY-----";
+        let out = redact_pem_blocks(body);
+        assert!(!out.contains("SECRET"), "got: {out}");
+        assert!(!out.contains("AAA"), "got: {out}");
+        assert_eq!(out, "<redacted PEM>\n<redacted PEM>");
+    }
+
+    /// On one line (a JSON-escaped body), an END without dashes stops
+    /// at the next `-----BEGIN `.
+    #[test]
+    fn redact_end_without_dashes_stops_at_next_begin() {
+        let body = "-----BEGIN CERTIFICATE-----AAA-----END CERTIFICATE \
+                    -----BEGIN PRIVATE KEY-----SECRET-----END PRIVATE KEY----- tail";
+        assert_eq!(redact_pem_blocks(body), "<redacted PEM><redacted PEM> tail");
+    }
+
+    #[test]
+    fn redact_several_blocks_keeps_text_between_them() {
+        let body = "x -----BEGIN A-----\n1\n-----END A-----\ny\n\
+                    -----BEGIN B-----\n2\n-----END B-----\nz\n\
+                    -----BEGIN C-----\n3\n-----END C----- w";
+        assert_eq!(
+            redact_pem_blocks(body),
+            "x <redacted PEM>\ny\n<redacted PEM>\nz\n<redacted PEM> w"
+        );
+    }
+
     #[test]
     fn redact_handles_unterminated_pem() {
         let body = "load failed: -----BEGIN PRIVATE KEY-----\nMIIabc... (truncated)";
         let out = redact_pem_blocks(body);
         assert!(out.contains("<redacted PEM>"));
         assert!(!out.contains("MIIabc"));
+    }
+
+    /// Serve `responses.len()` HTTP requests on a loopback port, one
+    /// per connection, and return the request heads in order.
+    fn serve(responses: Vec<&'static str>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for body in responses {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read");
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let length = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().to_string())
+                    })
+                    .map_or(0, |v| v.parse::<usize>().expect("length"));
+                let mut payload = vec![0; length];
+                reader.read_exact(&mut payload).expect("body");
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                reader.get_mut().write_all(reply.as_bytes()).expect("write");
+                heads.push(head);
+            }
+            heads
+        });
+        (port, handle)
+    }
+
+    fn host_header(head: &str) -> Option<&str> {
+        head.lines().find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("host").then(|| value.trim())
+        })
+    }
+
+    /// Caddy checks `Host` against `admin.origins` because the admin
+    /// listen address is not a wildcard. Without the fixed header,
+    /// reqwest sends `127.0.0.1:<tunnel port>` and Caddy answers 403.
+    #[tokio::test]
+    async fn admin_requests_send_the_admin_host_header() {
+        let (port, server) = serve(vec!["{}", "", "[]"]);
+        wait_until_ready(port, Duration::from_secs(5))
+            .await
+            .expect("ready");
+        load_and_verify(port, &serde_json::json!({"apps": {}}))
+            .await
+            .expect("load");
+        let heads = server.join().expect("server thread");
+        assert_eq!(heads.len(), 3);
+        assert!(heads[0].starts_with("GET /config/ "), "got: {}", heads[0]);
+        assert!(heads[1].starts_with("POST /load "), "got: {}", heads[1]);
+        assert!(
+            heads[2].starts_with("GET /config/apps/http/servers/main/routes/ "),
+            "got: {}",
+            heads[2]
+        );
+        for head in &heads {
+            assert_eq!(host_header(head), Some(ADMIN_API_HOST), "got: {head}");
+        }
     }
 
     #[test]

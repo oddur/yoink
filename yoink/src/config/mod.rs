@@ -16,7 +16,10 @@ use crate::base::run_args;
 
 mod proxy;
 
-pub use proxy::{ADMIN_NETWORK, ADMIN_PORT, INGRESS_NETWORK, PROXY_SERVICE_NAME};
+pub use proxy::{
+    ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, ADMIN_RELAY_NAME, CapabilitySource,
+    INGRESS_NETWORK, PROXY_SERVICE_NAME, admin_block,
+};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -30,6 +33,21 @@ pub enum ConfigError {
     Parse(#[from] yaml_serde::Error),
     #[error("invalid config: {0}")]
     Invalid(String),
+    /// A `--host` value names no declared host. Not a config error:
+    /// the config is fine, the flag is wrong.
+    ///
+    /// `unresolved` are the `address_secret` keys of sealed hosts whose
+    /// address is still blank: the `--host` can be one of them.
+    #[error(
+        "unknown --host {address:?}; {}{}",
+        known_hosts_hint(.known),
+        unresolved_hosts_hint(.unresolved)
+    )]
+    UnknownHost {
+        address: String,
+        known: Vec<String>,
+        unresolved: Vec<String>,
+    },
     #[error("invalid include glob {pattern:?}: {source}")]
     GlobPattern {
         pattern: String,
@@ -48,6 +66,29 @@ pub enum ConfigError {
         "malformed env var reference near {context:?} — expected `${{NAME}}` with NAME = [A-Za-z_][A-Za-z0-9_]*"
     )]
     EnvVarSyntax { context: String },
+}
+
+fn unresolved_hosts_hint(unresolved: &[String]) -> String {
+    if unresolved.is_empty() {
+        return String::new();
+    }
+    format!(
+        ". yoink could not resolve the sealed address of {}: the secrets bundle did not load, \
+         or it does not have the key",
+        unresolved
+            .iter()
+            .map(|key| format!("<address_secret: {key}>"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn known_hosts_hint(known: &[String]) -> String {
+    if known.is_empty() {
+        "no hosts declared".to_string()
+    } else {
+        format!("known: {}", known.join(", "))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -698,9 +739,8 @@ fn default_hsts() -> bool {
 /// Discriminator for special-purpose services. Most services are
 /// regular app workloads (`None`); the only variant today is `Proxy`
 /// for the implicit `_proxy` service yoink synthesizes when any
-/// service declares `domain:`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// service declares `domain:`. Only yoink sets it; it is not a YAML key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceKind {
     Proxy,
 }
@@ -784,8 +824,10 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub description: Option<String>,
     /// Special-purpose service marker. Set automatically on the
-    /// implicit `_proxy` service; users do not write this.
-    #[serde(default)]
+    /// implicit `_proxy` service. It is not a YAML key: a user service
+    /// with `kind: proxy` would skip the `yoink-proxy-admin` network check
+    /// and get the admin API alias. `deny_unknown_fields` refuses it.
+    #[serde(skip_deserializing)]
     pub kind: Option<ServiceKind>,
     /// Local-build instructions. When set, `yoink build [<service>]`
     /// runs `docker build` against this context, tagging the result
@@ -1667,6 +1709,39 @@ impl Config {
             .filter(|h| address.is_none_or(|a| a == h.address))
             .map(Host::from)
             .collect()
+    }
+
+    /// [`Self::fleet_matching`] for a `--host` filter, but an `address`
+    /// that names no host is an error. The error lists the known hosts,
+    /// so a typo does not turn the command into a silent no-op.
+    pub fn require_fleet_matching(&self, address: Option<&str>) -> Result<Vec<Host>, ConfigError> {
+        let hosts = self.fleet_matching(address);
+        if let Some(address) = address
+            && hosts.is_empty()
+        {
+            // The address of a sealed host is blank before resolution
+            // and a secret after it. Name the secret key instead.
+            let known = self
+                .hosts
+                .iter()
+                .map(|h| match h.address_secret.as_deref() {
+                    Some(key) => format!("<address_secret: {key}>"),
+                    None => h.address.clone(),
+                })
+                .collect();
+            let unresolved = self
+                .hosts
+                .iter()
+                .filter(|h| h.address.is_empty())
+                .filter_map(|h| h.address_secret.clone())
+                .collect();
+            return Err(ConfigError::UnknownHost {
+                address: address.to_string(),
+                known,
+                unresolved,
+            });
+        }
+        Ok(hosts)
     }
 
     /// `(address, ssh_key_secret)` for every host that names a sealed
@@ -3179,6 +3254,63 @@ secrets:
         let err = Config::load_from_path(&dir.join("yoink.yaml")).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("duplicate"), "got: {err}");
+    }
+
+    /// A mistyped `--host` gave an empty host list, so `yoink pull`,
+    /// `networks`, `volumes` and `lock release` did nothing and exited 0.
+    #[test]
+    fn require_fleet_matching_rejects_an_unknown_host() {
+        let cfg = Config::parse_str(
+            "hosts:\n  - { address: web-1, user: root }\n  - { address: web-2, user: root }\nservices: []\n",
+        )
+        .unwrap();
+        let err = cfg.require_fleet_matching(Some("web-3")).unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(msg, "unknown --host \"web-3\"; known: web-1, web-2");
+        let one = cfg.require_fleet_matching(Some("web-2")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].address, "web-2");
+        assert_eq!(cfg.require_fleet_matching(None).unwrap().len(), 2);
+    }
+
+    /// The known-hosts list showed `address`, which is blank for a host
+    /// with `address_secret:` before resolution and the sealed value
+    /// after it.
+    #[test]
+    fn require_fleet_matching_does_not_list_sealed_addresses() {
+        let mut cfg = Config::parse_str(
+            "hosts:\n  - { address: web-1, user: root }\n  - { address_secret: PROD_HOST, user: root }\nservices: []\n",
+        )
+        .unwrap();
+        let expected = "unknown --host \"web-3\"; known: web-1, <address_secret: PROD_HOST>";
+        let err = cfg.require_fleet_matching(Some("web-3")).unwrap_err();
+        // Before resolution the --host can be the sealed address.
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{expected}. yoink could not resolve the sealed address of \
+                 <address_secret: PROD_HOST>: the secrets bundle did not load, or it does \
+                 not have the key"
+            )
+        );
+        // After resolution the address is the secret value.
+        cfg.hosts[1].address = "10.0.0.7".into();
+        let err = cfg.require_fleet_matching(Some("web-3")).unwrap_err();
+        assert_eq!(err.to_string(), expected);
+        assert!(!err.to_string().contains("10.0.0.7"));
+    }
+
+    /// The error said "invalid config: …" for a wrong flag, and gave an
+    /// empty "known:" list when the config declares no hosts.
+    #[test]
+    fn require_fleet_matching_names_the_flag_and_handles_no_hosts() {
+        let cfg = Config::parse_str("hosts: []\nservices: []\n").unwrap();
+        let err = cfg.require_fleet_matching(Some("web-1")).unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownHost { .. }), "got: {err}");
+        assert_eq!(
+            err.to_string(),
+            "unknown --host \"web-1\"; no hosts declared"
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 
 use super::{
     ContainerDetail, ContainerInfo, ContainerStats, DockerError, DockerEvent, DockerOps,
-    DockerVersion, ExecSession, HostInfo, ImageTarStream, LogLine, NetworkInfo, OneShotResult,
-    StoppedRemoval, VolumeInfo,
+    DockerVersion, ExecSession, HostInfo, ImageTarStream, LogLine, NetworkDetail, NetworkInfo,
+    OneShotResult, StoppedRemoval, VolumeInfo,
 };
 use crate::base::host::Host;
 
@@ -57,6 +57,17 @@ struct FakeState {
     one_shot: VecDeque<Result<OneShotResult, DockerError>>,
     event_streams: VecDeque<Vec<DockerEvent>>,
     log_streams: VecDeque<Vec<LogLine>>,
+    /// Container name → the `inspect_container` answer. A name that
+    /// is not here gets an empty detail.
+    inspect: HashMap<String, ContainerDetail>,
+    /// Network name → the `inspect_network` answer. `create_network`
+    /// adds to it. A name that is not here does not exist.
+    networks: HashMap<String, NetworkDetail>,
+    /// Network name → the `list_containers_on_network` answer. A name
+    /// that is not here has no containers.
+    network_containers: HashMap<String, Vec<ContainerInfo>>,
+    /// Container name → the body of the last `create_container`.
+    created_bodies: HashMap<String, ContainerCreateBody>,
     calls: Vec<RecordedCall>,
 }
 
@@ -66,11 +77,16 @@ pub enum RecordedCall {
     HostInfo(Host),
     ContainerStats(Host, String),
     EnsureNetwork(Host, String),
+    /// `(host, container, network)`.
+    DisconnectContainerNetwork(Host, String, String),
+    CreateNetwork(Host, String, std::collections::BTreeMap<String, String>),
     PullImage(Host, String, String),
     LoadImage(Host),
     BuildImage(Host, String, usize),
     ListContainersByLabel(Host, String),
     ListRunningContainers(Host),
+    /// `(host, network)`.
+    ListContainersOnNetwork(Host, String),
     CreateContainer(Host, String),
     StartContainer(Host, String),
     StopContainer(Host, String, Duration),
@@ -163,6 +179,21 @@ impl FakeDockerOps {
     pub fn push_event_stream(&self, events: Vec<DockerEvent>) {
         self.lock().event_streams.push_back(events);
     }
+    /// Make `network` exist with `detail`.
+    pub fn set_network(&self, network: &str, detail: NetworkDetail) {
+        self.lock().networks.insert(network.into(), detail);
+    }
+    /// Answer every `list_containers_on_network` for `network` with
+    /// `containers`.
+    pub fn set_network_containers(&self, network: &str, containers: Vec<ContainerInfo>) {
+        self.lock()
+            .network_containers
+            .insert(network.into(), containers);
+    }
+    /// Answer every `inspect_container` for `detail.name` with `detail`.
+    pub fn set_inspect(&self, detail: ContainerDetail) {
+        self.lock().inspect.insert(detail.name.clone(), detail);
+    }
 
     #[must_use]
     /// `(image, registry the credentials were for)` for each pull.
@@ -172,6 +203,12 @@ impl FakeDockerOps {
 
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.lock().calls.clone()
+    }
+
+    /// The body of the last `create_container` for `name`.
+    #[must_use]
+    pub fn created_body(&self, name: &str) -> Option<ContainerCreateBody> {
+        self.lock().created_bodies.get(name).cloned()
     }
 }
 
@@ -207,21 +244,68 @@ impl DockerOps for FakeDockerOps {
         _host: &Host,
         name: &str,
     ) -> Result<ContainerDetail, DockerError> {
-        Ok(ContainerDetail {
+        let detail = self.lock().inspect.get(name).cloned();
+        Ok(detail.unwrap_or_else(|| ContainerDetail {
             name: name.into(),
             ..Default::default()
-        })
+        }))
     }
     async fn list_networks(&self, _host: &Host) -> Result<Vec<NetworkInfo>, DockerError> {
         Ok(Vec::new())
+    }
+    async fn inspect_network(
+        &self,
+        _host: &Host,
+        network: &str,
+    ) -> Result<Option<NetworkDetail>, DockerError> {
+        Ok(self.lock().networks.get(network).cloned())
+    }
+    async fn create_network(
+        &self,
+        host: &Host,
+        network: &str,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> Result<bool, DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::CreateNetwork(
+            host.clone(),
+            network.into(),
+            labels.clone(),
+        ));
+        if s.networks.contains_key(network) {
+            return Ok(false);
+        }
+        let detail = NetworkDetail {
+            labels: labels.clone(),
+            ..NetworkDetail::default()
+        };
+        s.networks.insert(network.into(), detail);
+        Ok(true)
     }
     async fn connect_container_network(
         &self,
         _host: &Host,
         _container: &str,
         _network: &str,
-        _aliases: &[String],
+        _endpoint: bollard::models::EndpointSettings,
     ) -> Result<(), DockerError> {
+        Ok(())
+    }
+    async fn disconnect_container_network(
+        &self,
+        host: &Host,
+        container: &str,
+        network: &str,
+    ) -> Result<(), DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::DisconnectContainerNetwork(
+            host.clone(),
+            container.into(),
+            network.into(),
+        ));
+        if let Some(detail) = s.networks.get_mut(network) {
+            detail.containers.retain(|c| c != container);
+        }
         Ok(())
     }
     async fn list_volumes(&self, _host: &Host) -> Result<Vec<VolumeInfo>, DockerError> {
@@ -302,6 +386,21 @@ impl DockerOps for FakeDockerOps {
         ));
         pop(&mut s.list_containers, "list_containers_by_label")
     }
+    async fn list_containers_on_network(
+        &self,
+        host: &Host,
+        network: &str,
+    ) -> Result<Vec<ContainerInfo>, DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::ListContainersOnNetwork(
+            host.clone(),
+            network.into(),
+        ));
+        Ok(s.network_containers
+            .get(network)
+            .cloned()
+            .unwrap_or_default())
+    }
     async fn list_running_containers(
         &self,
         host: &Host,
@@ -315,9 +414,10 @@ impl DockerOps for FakeDockerOps {
         &self,
         host: &Host,
         name: &str,
-        _body: ContainerCreateBody,
+        body: ContainerCreateBody,
     ) -> Result<String, DockerError> {
         let mut s = self.lock();
+        s.created_bodies.insert(name.into(), body);
         s.calls
             .push(RecordedCall::CreateContainer(host.clone(), name.into()));
         pop(&mut s.create_container, "create_container")

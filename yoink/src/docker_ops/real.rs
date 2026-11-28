@@ -21,8 +21,9 @@ use tracing::warn;
 use super::{
     BUILD_TIMEOUT, ContainerDetail, ContainerInfo, ContainerStats, DockerError, DockerEvent,
     DockerEventKind, DockerOps, DockerVersion, ExecKind, ExecSession, HostInfo, ImageInfo,
-    ImageTarStream, LogLine, LogStream, NetworkInfo, OneShotResult, ProcessTable, PruneReport,
-    StoppedRemoval, VolumeInfo, rand_hex,
+    ImageTarStream, LogLine, LogStream, NetworkDetail, NetworkInfo, OneShotResult,
+    PROBE_NAME_PREFIXES, PROBE_ROLE, ProcessTable, PruneReport, StoppedRemoval, VolumeInfo,
+    rand_hex,
 };
 use crate::base::host::Host;
 
@@ -387,24 +388,68 @@ impl DockerOps for RealDockerOps {
         .await
     }
 
+    async fn inspect_network(
+        &self,
+        host: &Host,
+        network: &str,
+    ) -> Result<Option<NetworkDetail>, DockerError> {
+        self.with_retry(host, |docker| async move {
+            match docker.inspect_network(network, None).await {
+                Ok(n) => Ok(Some(NetworkDetail {
+                    labels: n.labels.unwrap_or_default().into_iter().collect(),
+                    internal: n.internal.unwrap_or(false),
+                    containers: n
+                        .containers
+                        .unwrap_or_default()
+                        .into_values()
+                        .filter_map(|c| c.name)
+                        .collect(),
+                })),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(None),
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
+    async fn create_network(
+        &self,
+        host: &Host,
+        network: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<bool, DockerError> {
+        self.with_retry(host, |docker| async move {
+            let req = NetworkCreateRequest {
+                name: network.to_string(),
+                labels: Some(labels.clone().into_iter().collect()),
+                ..Default::default()
+            };
+            match docker.create_network(req).await {
+                Ok(_) => Ok(true),
+                // 409 = raced by another operator.
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409, ..
+                }) => Ok(false),
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
     async fn connect_container_network(
         &self,
         host: &Host,
         container: &str,
         network: &str,
-        aliases: &[String],
+        endpoint: EndpointSettings,
     ) -> Result<(), DockerError> {
+        let endpoint = &endpoint;
         self.with_retry(host, |docker| async move {
             let req = bollard::models::NetworkConnectRequest {
                 container: container.to_string(),
-                endpoint_config: Some(bollard::models::EndpointSettings {
-                    aliases: if aliases.is_empty() {
-                        None
-                    } else {
-                        Some(aliases.to_vec())
-                    },
-                    ..Default::default()
-                }),
+                endpoint_config: Some(endpoint.clone()),
             };
             match docker.connect_network(network, req).await {
                 // 403 = "endpoint already exists in network" — already
@@ -412,6 +457,32 @@ impl DockerOps for RealDockerOps {
                 Ok(())
                 | Err(bollard::errors::Error::DockerResponseServerError {
                     status_code: 403, ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
+    async fn disconnect_container_network(
+        &self,
+        host: &Host,
+        container: &str,
+        network: &str,
+    ) -> Result<(), DockerError> {
+        self.with_retry(host, |docker| async move {
+            let req = bollard::models::NetworkDisconnectRequest {
+                container: container.to_string(),
+                force: Some(true),
+            };
+            match docker.disconnect_network(network, req).await {
+                // 404 = no such container or network. 403 = the
+                // container is not on the network. Both leave the
+                // container off the network, which is the goal.
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403 | 404,
+                    ..
                 }) => Ok(()),
                 Err(other) => Err(other),
             }
@@ -797,6 +868,28 @@ impl DockerOps for RealDockerOps {
             .collect())
     }
 
+    async fn list_containers_on_network(
+        &self,
+        host: &Host,
+        network: &str,
+    ) -> Result<Vec<ContainerInfo>, DockerError> {
+        let summaries = self
+            .with_retry(host, |docker| async move {
+                let mut filters = HashMap::new();
+                filters.insert("network".to_string(), vec![network.to_string()]);
+                let opts = ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&filters)
+                    .build();
+                docker.list_containers(Some(opts)).await
+            })
+            .await?;
+        Ok(summaries
+            .into_iter()
+            .map(|s| ContainerInfo::from_summary(&host.address, s))
+            .collect())
+    }
+
     async fn list_running_containers(
         &self,
         host: &Host,
@@ -929,7 +1022,7 @@ impl DockerOps for RealDockerOps {
         path: &str,
     ) -> Result<u16, DockerError> {
         let url = format!("http://{target}:{port}{path}");
-        let probe_name = format!("yoink-probe-{}-{}", target, rand_hex());
+        let probe_name = format!("{}{}-{}", PROBE_NAME_PREFIXES[0], target, rand_hex());
         // Without this the first probe on a fresh daemon (a
         // just-provisioned host) 404s on create_container.
         self.ensure_probe_image(host, HEALTHCHECK_CURL_IMAGE).await;
@@ -1275,7 +1368,7 @@ impl DockerOps for RealDockerOps {
         // Without this the first probe on a fresh daemon (a
         // just-provisioned host) 404s on create_container.
         self.ensure_probe_image(host, HEALTHCHECK_TCP_IMAGE).await;
-        let probe_name = format!("yoink-tcp-probe-{}-{}", target, rand_hex());
+        let probe_name = format!("{}{}-{}", PROBE_NAME_PREFIXES[1], target, rand_hex());
         let body = probe_body_with_image(
             HEALTHCHECK_TCP_IMAGE,
             network,
@@ -1661,6 +1754,26 @@ fn parse_inspect(name: &str, resp: &bollard::models::ContainerInspectResponse) -
         })
         .unwrap_or_default();
 
+    let network_aliases: BTreeMap<String, Vec<String>> = network_settings
+        .and_then(|n| n.networks.as_ref())
+        .map(|m| {
+            m.iter()
+                .map(|(net, endpoint)| {
+                    let mut names: Vec<String> = endpoint
+                        .aliases
+                        .iter()
+                        .flatten()
+                        .chain(endpoint.dns_names.iter().flatten())
+                        .cloned()
+                        .collect();
+                    names.sort();
+                    names.dedup();
+                    (net.clone(), names)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let labels: BTreeMap<String, String> = config
         .and_then(|c| c.labels.clone())
         .unwrap_or_default()
@@ -1691,6 +1804,7 @@ fn parse_inspect(name: &str, resp: &bollard::models::ContainerInspectResponse) -
         ports,
         mounts,
         networks,
+        network_aliases,
         user: config
             .and_then(|c| c.user.clone())
             .filter(|u| !u.is_empty()),
@@ -1757,12 +1871,22 @@ fn probe_body(network: &str, cmd: Vec<String>) -> ContainerCreateBody {
     probe_body_with_image(HEALTHCHECK_CURL_IMAGE, network, cmd)
 }
 
+/// The labels mark the probe as a yoink container. A probe that leaks
+/// (Ctrl-C, a failed remove) is then not foreign on the admin network,
+/// and the admin network check and `yoink prune` remove it.
 fn probe_body_with_image(image: &str, network: &str, cmd: Vec<String>) -> ContainerCreateBody {
     let mut endpoints = HashMap::new();
     endpoints.insert(network.to_string(), EndpointSettings::default());
     ContainerCreateBody {
         image: Some(image.to_string()),
         cmd: Some(cmd),
+        labels: Some(
+            [
+                ("yoink.managed".to_string(), "true".to_string()),
+                ("yoink.role".to_string(), PROBE_ROLE.to_string()),
+            ]
+            .into(),
+        ),
         networking_config: Some(NetworkingConfig {
             endpoints_config: Some(endpoints),
         }),
@@ -1771,5 +1895,28 @@ fn probe_body_with_image(image: &str, network: &str, cmd: Vec<String>) -> Contai
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A leaked probe must not look foreign on the admin network, so
+    /// each probe has the yoink labels.
+    #[test]
+    fn probe_bodies_have_the_yoink_probe_labels() {
+        for body in [
+            probe_body("yoink-proxy-admin", Vec::new()),
+            probe_body_with_image(HEALTHCHECK_TCP_IMAGE, "yoink-proxy-admin", Vec::new()),
+        ] {
+            let labels = body.labels.expect("labels");
+            assert_eq!(
+                labels.get("yoink.managed").map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(labels.get("yoink.role").map(String::as_str), Some("probe"));
+            assert!(!labels.contains_key("yoink.service"));
+        }
     }
 }

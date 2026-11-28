@@ -14,7 +14,7 @@
 //! ## Hybrid flush policy
 //!
 //! - **Per-event flush** for forensic events (`RunStarted`/`RunFinished`,
-//!   `ContainerCreated`/`ContainerRemoved`, `Rollback*`, `SecretsRotated`,
+//!   `ContainerCreated`/`ContainerRemoved`, `OldContainerRestarted`, `Rollback*`, `SecretsRotated`,
 //!   `HookFinished`, `LockAcquired`/`LockReleased`, `FileUploaded`). One
 //!   SSH `tee -a` per event; tolerates partial runs.
 //! - **Batched flush** for progress events (`PullStarted`/`PullFinished`,
@@ -145,6 +145,12 @@ pub enum AuditEventKind {
         service: String,
         container: String,
     },
+    /// A stop-first deploy failed, and yoink started the old replica
+    /// again. Forensic: it changes what runs on the host.
+    OldContainerRestarted {
+        service: String,
+        container: String,
+    },
     /// Old replica removed. Forensic — pairs with `ContainerCreated` to
     /// reconstruct a swap.
     ContainerRemoved {
@@ -184,6 +190,15 @@ pub enum AuditEventKind {
         sha256: String,
         remote_path: String,
     },
+    /// yoink disconnected these yoink app containers from the unlabeled
+    /// `yoink-proxy-admin` network of an earlier version. Forensic: it
+    /// changes what can reach the proxy admin API.
+    AdminNetworkContainersDisconnected {
+        containers: Vec<String>,
+    },
+    /// yoink created the admin relay, or replaced one that did not run
+    /// or had another spec. Forensic: it changes what runs on the host.
+    AdminRelayCreated,
     /// Outbound webhook attempt. Recorded for every fire, success or
     /// failure — a failed webhook never aborts the run, only this event.
     WebhookFired {
@@ -209,12 +224,15 @@ impl AuditEventKind {
                 | AuditEventKind::ContainerCreated { .. }
                 | AuditEventKind::ContainerRemoved { .. }
                 | AuditEventKind::DeployFailed { .. }
+                | AuditEventKind::OldContainerRestarted { .. }
                 | AuditEventKind::RollbackStarted { .. }
                 | AuditEventKind::RollbackFinished { .. }
                 | AuditEventKind::ContainerPruned { .. }
                 | AuditEventKind::SecretsRotated { .. }
                 | AuditEventKind::FileUploaded { .. }
                 | AuditEventKind::WebhookFired { .. }
+                | AuditEventKind::AdminNetworkContainersDisconnected { .. }
+                | AuditEventKind::AdminRelayCreated
         )
     }
 }
@@ -906,6 +924,13 @@ pub fn map_deploy_event(
                 container: container.clone(),
             },
         )),
+        DeployEvent::OldContainerRestarted { host, container } => Some((
+            host.clone(),
+            AuditEventKind::OldContainerRestarted {
+                service: svc(),
+                container: container.clone(),
+            },
+        )),
         DeployEvent::AlreadyAtSpec { host, container } => Some((
             host.clone(),
             AuditEventKind::AlreadyAtSpec {
@@ -941,6 +966,15 @@ pub fn map_deploy_event(
                 log_tail: vec![format!("(yoink: could not fetch container logs: {error})")],
             },
         )),
+        DeployEvent::AdminNetworkContainersDisconnected { host, containers } => Some((
+            host.clone(),
+            AuditEventKind::AdminNetworkContainersDisconnected {
+                containers: containers.clone(),
+            },
+        )),
+        DeployEvent::AdminRelayCreated { host } => {
+            Some((host.clone(), AuditEventKind::AdminRelayCreated))
+        }
         DeployEvent::Done { host, container } => Some((
             host.clone(),
             AuditEventKind::ContainerCreated {
@@ -955,7 +989,9 @@ pub fn map_deploy_event(
         // didn't keep), `HealthcheckSkipped` (low-signal).
         DeployEvent::Started { .. }
         | DeployEvent::PullFinished { .. }
-        | DeployEvent::HealthcheckSkipped { .. } => None,
+        | DeployEvent::HealthcheckSkipped { .. }
+        | DeployEvent::ProxyAdminUpgradePending { .. }
+        | DeployEvent::AdminRelaySkipped { .. } => None,
     }
 }
 
@@ -1208,6 +1244,7 @@ pub fn event_name(kind: &AuditEventKind) -> &'static str {
         K::ContainerCreated { .. } => "ContainerCreated",
         K::AlreadyAtSpec { .. } => "AlreadyAtSpec",
         K::OldContainerStopped { .. } => "OldContainerStopped",
+        K::OldContainerRestarted { .. } => "OldContainerRestarted",
         K::ContainerRemoved { .. } => "ContainerRemoved",
         K::DeployFailed { .. } => "DeployFailed",
         K::RollbackStarted { .. } => "RollbackStarted",
@@ -1216,6 +1253,8 @@ pub fn event_name(kind: &AuditEventKind) -> &'static str {
         K::SecretsRotated { .. } => "SecretsRotated",
         K::FileUploaded { .. } => "FileUploaded",
         K::WebhookFired { .. } => "WebhookFired",
+        K::AdminNetworkContainersDisconnected { .. } => "AdminNetworkContainersDisconnected",
+        K::AdminRelayCreated => "AdminRelayCreated",
     }
 }
 
@@ -1230,6 +1269,7 @@ pub fn event_service(ev: &AuditEvent) -> Option<&str> {
         | K::ContainerRemoved { service, .. }
         | K::AlreadyAtSpec { service, .. }
         | K::OldContainerStopped { service, .. }
+        | K::OldContainerRestarted { service, .. }
         | K::DeployFailed { service, .. }
         | K::RollbackStarted { service, .. }
         | K::RollbackFinished { service, .. }
@@ -1258,6 +1298,12 @@ pub fn event_summary(kind: &AuditEventKind) -> String {
             }
         }
         K::LockAcquired | K::LockReleased => String::new(),
+        K::AdminNetworkContainersDisconnected { containers } => format!(
+            "{} from {}",
+            containers.join(","),
+            crate::config::ADMIN_NETWORK
+        ),
+        K::AdminRelayCreated => crate::config::ADMIN_RELAY_NAME.to_string(),
         K::HookStarted { name } | K::HookFinished { name } => name.clone(),
         K::PullStarted { image, tag } | K::PullFinished { image, tag } => {
             format!("{image}:{tag}")
@@ -1292,6 +1338,7 @@ pub fn event_summary(kind: &AuditEventKind) -> String {
             attempts,
         } => format!("{service} {container} after {attempts}"),
         K::OldContainerStopped { service, container }
+        | K::OldContainerRestarted { service, container }
         | K::ContainerRemoved { service, container } => format!("{service} {container}"),
         K::DeployFailed {
             service,
@@ -1591,6 +1638,57 @@ mod tests {
             }
             other => panic!("unexpected kind: {other:?}"),
         }
+    }
+
+    /// The restart of an old container after a failed stop-first
+    /// deploy changes what runs on the host, so it is forensic.
+    #[test]
+    fn map_deploy_event_records_old_container_restarted() {
+        use crate::deploy::DeployEvent;
+        let ev = DeployEvent::OldContainerRestarted {
+            host: "h1".into(),
+            container: "api-ab12cd34".into(),
+        };
+        let (host, kind) = map_deploy_event(Some("api"), &ev, &|_| "v1".into()).unwrap();
+        assert_eq!(host, "h1");
+        assert_eq!(
+            kind,
+            AuditEventKind::OldContainerRestarted {
+                service: "api".into(),
+                container: "api-ab12cd34".into(),
+            }
+        );
+        assert!(kind.is_forensic());
+        assert_eq!(event_name(&kind), "OldContainerRestarted");
+    }
+
+    /// The admin network disconnects and a new admin relay change what
+    /// can reach the proxy admin API, so both are forensic.
+    #[test]
+    fn map_deploy_event_records_admin_network_changes() {
+        use crate::deploy::DeployEvent;
+        let ev = DeployEvent::AdminNetworkContainersDisconnected {
+            host: "h1".into(),
+            containers: vec!["api-1".into()],
+        };
+        let (host, kind) = map_deploy_event(None, &ev, &|_| String::new()).unwrap();
+        assert_eq!(host, "h1");
+        assert_eq!(
+            kind,
+            AuditEventKind::AdminNetworkContainersDisconnected {
+                containers: vec!["api-1".into()],
+            }
+        );
+        assert!(kind.is_forensic());
+        assert_eq!(event_name(&kind), "AdminNetworkContainersDisconnected");
+        assert_eq!(event_summary(&kind), "api-1 from yoink-proxy-admin");
+
+        let ev = DeployEvent::AdminRelayCreated { host: "h1".into() };
+        let (host, kind) = map_deploy_event(None, &ev, &|_| String::new()).unwrap();
+        assert_eq!(host, "h1");
+        assert_eq!(kind, AuditEventKind::AdminRelayCreated);
+        assert!(kind.is_forensic());
+        assert_eq!(event_name(&kind), "AdminRelayCreated");
     }
 
     #[test]

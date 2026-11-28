@@ -1385,6 +1385,10 @@ async fn run(cli: Cli) -> Result<()> {
         Config::load_from_path(&cli.config)
     }
     .with_context(|| format!("loading {}", cli.config.display()))?;
+    // `yoink doctor` reports these warnings as findings.
+    if !matches!(cli.command, Command::Doctor { .. }) {
+        log_config_warnings(&config.ingress_capability_warnings());
+    }
 
     // Warn (best-effort) if the config file's branch has upstream
     // commits touching the file that aren't pulled yet — operators
@@ -1451,6 +1455,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // running up so the freshly-added service is included.
                 let mut reloaded = Config::load_from_path(&cli.config)
                     .with_context(|| format!("reloading {}", cli.config.display()))?;
+                log_config_warnings(&added_config_warnings(&config, &reloaded));
                 resolve_sealed_host_addresses(&mut reloaded, false).await?;
                 let no_services: Vec<String> = Vec::new();
                 let no_tags: Vec<String> = Vec::new();
@@ -1803,6 +1808,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
                     continue;
                 }
                 eprintln!("● config changed — reconciling");
+                log_config_warnings(&changed_config_warnings(&last_config, &next));
                 if let Err(e) = do_up_once(&next, &up, dry_run).await {
                     eprintln!("✗ reconcile failed: {e:#}");
                 }
@@ -1814,6 +1820,36 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
 }
 
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Write each config warning to the log. `Config::load_from_path` does
+/// not log them, so that a command shows each warning one time.
+fn log_config_warnings(warnings: &[String]) {
+    for warning in warnings {
+        tracing::warn!(target: "yoink::config", "{warning}");
+    }
+}
+
+/// The config warnings of `next` that `last` does not have. `yoink add
+/// --up` logs the warnings of the config before the add, and after the
+/// add only the new ones, so each warning shows one time.
+fn added_config_warnings(last: &Config, next: &Config) -> Vec<String> {
+    let shown = last.ingress_capability_warnings();
+    next.ingress_capability_warnings()
+        .into_iter()
+        .filter(|w| !shown.contains(w))
+        .collect()
+}
+
+/// The config warnings to show after the watch loop of `yoink up
+/// --watch` loads the config again. Empty when the config did not
+/// change: the run showed them already.
+fn changed_config_warnings(last: &Config, next: &Config) -> Vec<String> {
+    if next == last {
+        Vec::new()
+    } else {
+        next.ingress_capability_warnings()
+    }
+}
 
 #[allow(clippy::too_many_lines)] // single linear up-once flow; splitting fragments the build → push → reconcile sequence
 async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Result<()> {
@@ -2012,6 +2048,57 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     let audit_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink> = host_audit.clone();
     let operator_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink> =
         std::sync::Arc::new(yoink::features::audit::OperatorAuditSink::new());
+    run_locked_up(
+        ops,
+        LockedUp {
+            config,
+            tag_overrides: &tag_overrides,
+            services_filter,
+            bundle: bundle.as_ref(),
+            prefetch: services_filter.is_none() && needs_pull && !no_registry,
+            rebuild_proxy: up.rebuild_proxy,
+            options: deploy::ReconcileOptions { force, no_registry },
+        },
+        locks,
+        audit_sink,
+        operator_sink,
+    )
+    .await
+}
+
+/// The part of one `yoink up` run that holds the host locks.
+struct LockedUp<'a> {
+    config: &'a Config,
+    tag_overrides: &'a std::collections::BTreeMap<String, String>,
+    services_filter: Option<&'a [String]>,
+    bundle: Option<&'a SecretsBundle>,
+    /// Pull the registry images on every host before the reconcile.
+    prefetch: bool,
+    rebuild_proxy: bool,
+    /// `--force` and `--no-registry`.
+    options: deploy::ReconcileOptions,
+}
+
+/// Emit the run-start events, prefetch, reconcile, then release
+/// `locks` and emit the run-end events. The run-end events go out on
+/// every path, also when the prefetch fails.
+#[allow(clippy::too_many_lines)] // single linear start → deploy → finish flow
+async fn run_locked_up(
+    ops: std::sync::Arc<dyn DockerOps>,
+    run: LockedUp<'_>,
+    locks: Vec<yoink::deploy::lock::HostLock>,
+    audit_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink>,
+    operator_sink: std::sync::Arc<dyn yoink::features::audit::AuditSink>,
+) -> Result<()> {
+    let LockedUp {
+        config,
+        tag_overrides,
+        services_filter,
+        bundle,
+        prefetch,
+        rebuild_proxy,
+        options,
+    } = run;
     let run_ctx = yoink::features::audit::RunContext::new("up");
     let selected_service_names: Vec<String> = config
         .selected_services(services_filter)
@@ -2044,7 +2131,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     yoink::features::webhooks::dispatch_all(
         &config.webhooks,
         &started_ctx,
-        bundle.as_ref(),
+        bundle,
         &webhook_http,
         &operator_sink,
         &run_ctx,
@@ -2084,7 +2171,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
         .iter()
         .filter_map(|s| s.tag.clone().map(|t| (s.name.clone(), t)))
         .collect();
-    for (k, v) in &tag_overrides {
+    for (k, v) in tag_overrides {
         tag_lookup.insert(k.clone(), v.clone());
     }
     let run_ctx_for_closure = run_ctx.clone();
@@ -2106,40 +2193,46 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     // Skipped entirely when `--no-registry` is set (the operator chose
     // local-only mode) or when no service requires a pull (every
     // service has a `build:` block — already shipped above).
-    if services_filter.is_none() && needs_pull && !no_registry {
+    //
+    // A prefetch failure skips the reconcile but still takes the
+    // closing path below: locks released, LockReleased, RunFinished
+    // and the `run_failed` webhook.
+    let prefetch_result = if prefetch {
         let prefetch_cb: std::sync::Arc<dyn Fn(deploy::DeployEvent) + Send + Sync> =
             std::sync::Arc::new(|e| {
                 eprintln!("{}", output::format_deploy_event(None, &e));
             });
-        if let Err(e) = deploy::prefetch_images(
+        deploy::prefetch_images(
             ops.clone(),
             config,
-            &tag_overrides,
+            tag_overrides,
             services_filter,
-            bundle.as_ref(),
+            bundle,
             true,
-            up.rebuild_proxy,
+            rebuild_proxy,
             prefetch_cb,
         )
         .await
-        {
-            for lock in locks {
-                lock.release(&*ops).await;
-            }
-            return Err(e).context("prefetch images");
-        }
-    }
+    } else {
+        Ok(())
+    };
 
-    let reconcile_result = deploy::reconcile_with_options(
-        &*ops,
-        config,
-        &tag_overrides,
-        services_filter,
-        bundle.as_ref(),
-        deploy::ReconcileOptions { force },
-        &mut sink,
-    )
-    .await;
+    let (phase, reconcile_result) = match prefetch_result {
+        Err(e) => ("prefetch images", Err(e)),
+        Ok(()) => (
+            "reconcile",
+            deploy::reconcile_with_options(
+                &*ops,
+                config,
+                tag_overrides,
+                services_filter,
+                bundle,
+                options,
+                &mut sink,
+            )
+            .await,
+        ),
+    };
 
     // Drop the synchronous closure (and its tx) so the drain task can
     // notice the channel is closed, drain pending events, and exit.
@@ -2192,7 +2285,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     yoink::features::webhooks::dispatch_all(
         &config.webhooks,
         &finished_ctx,
-        bundle.as_ref(),
+        bundle,
         &webhook_http,
         &operator_sink,
         &run_ctx,
@@ -2201,7 +2294,7 @@ async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Resul
     audit_sink.flush().await;
     operator_sink.flush().await;
 
-    let reports = reconcile_result.context("reconcile")?;
+    let reports = reconcile_result.context(phase)?;
     eprintln!("{}", output::format_deploy_summary(&reports));
     Ok(())
 }
@@ -2711,7 +2804,8 @@ fn extract_image_tag(image: &str) -> &str {
 }
 async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
     use yoink::features::prune::{self, PruneReason};
-    let ops = build_real_ops(config, None).await?;
+    let ops: std::sync::Arc<dyn DockerOps> =
+        std::sync::Arc::new(build_real_ops(config, None).await?);
     let report = prune::run(&ops, config, dry_run).await.context("prune")?;
     let items = if dry_run {
         &report.planned
@@ -3270,7 +3364,9 @@ async fn cmd_pf(
 
     // Resolve the path: published host endpoint OR sidecar handle.
     // `sidecar` is bound here so its Drop fires after SIGINT.
-    let resolved = pf::resolve_target(ops.clone(), &host, service, container_port, mode).await?;
+    let networks = config.networks_for(service);
+    let resolved =
+        pf::resolve_target(ops.clone(), &host, service, &networks, container_port, mode).await?;
     let (remote_dial_host, remote_port, mode_label, sidecar) = match resolved {
         pf::ResolvedTarget::Published(ep) => (ep.host_ip, ep.host_port, "published", None),
         pf::ResolvedTarget::Sidecar(handle) => {
@@ -3664,6 +3760,7 @@ async fn cmd_pull(
     let svc_cfg = config
         .service(service)
         .with_context(|| format!("service {service:?} not in config"))?;
+    let hosts = config.require_fleet_matching(host_filter)?;
     let tag = tag_override
         .map(str::to_string)
         .or_else(|| svc_cfg.tag.clone())
@@ -3675,7 +3772,7 @@ async fn cmd_pull(
     let credentials = deploy::registry_credentials(config, bundle.as_ref(), &svc_cfg.image);
     let ops = build_real_ops(config, bundle.as_ref()).await?;
     // Fan out across hosts so a slow daemon doesn't block the others.
-    let pulls = config.fleet_matching(host_filter).into_iter().map(|host| {
+    let pulls = hosts.into_iter().map(|host| {
         let image = svc_cfg.image.clone();
         let tag = tag.clone();
         let credentials = credentials.clone();
@@ -4166,8 +4263,9 @@ async fn cmd_top(config: &Config, limit: usize, format: TableFormat) -> Result<(
 }
 
 async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> {
+    let hosts = config.require_fleet_matching(host_filter)?;
     let ops = build_real_ops(config, None).await?;
-    let probes = config.fleet_matching(host_filter).into_iter().map(|host| {
+    let probes = hosts.into_iter().map(|host| {
         let ops = &ops;
         async move {
             let nets = ops.list_networks(&host).await?;
@@ -4196,8 +4294,9 @@ async fn cmd_networks(config: &Config, host_filter: Option<&str>) -> Result<()> 
 }
 
 async fn cmd_volumes(config: &Config, host_filter: Option<&str>) -> Result<()> {
+    let hosts = config.require_fleet_matching(host_filter)?;
     let ops = build_real_ops(config, None).await?;
-    let probes = config.fleet_matching(host_filter).into_iter().map(|host| {
+    let probes = hosts.into_iter().map(|host| {
         let ops = &ops;
         async move {
             let vols = ops.list_volumes(&host).await?;
@@ -4733,9 +4832,9 @@ async fn cmd_proxy_render(config: &Config) -> Result<()> {
 
 async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
     use yoink::deploy::lock::LOCK_NAME;
-    let ops = build_real_ops(config, None).await?;
     match action {
         LockAction::Status => {
+            let ops = build_real_ops(config, None).await?;
             // Fan out across hosts — one slow daemon shouldn't make
             // the others wait. Per-host errors surface as Err inline.
             let probes = config.fleet().into_iter().map(|host| {
@@ -4759,6 +4858,7 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
             }
         }
         LockAction::Release { host, yes } => {
+            let hosts = config.require_fleet_matching(host.as_deref())?;
             if !yes {
                 eprintln!(
                     "force-releasing the deploy lock while another operator is deploying \
@@ -4766,7 +4866,10 @@ async fn cmd_lock(config: &Config, action: LockAction) -> Result<()> {
                 );
                 anyhow::bail!("aborted");
             }
-            for h in config.fleet_matching(host.as_deref()) {
+            // After the checks: with a managed ssh key, building the
+            // client loads the secrets bundle.
+            let ops = build_real_ops(config, None).await?;
+            for h in hosts {
                 match ops.force_remove_container(&h, LOCK_NAME).await {
                     Ok(()) => eprintln!("{}: released", h.address),
                     Err(e) => eprintln!("{}: {e:#}", h.address),
@@ -6627,8 +6730,8 @@ fn chrono_like_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitFallbackFailure, check_git_fallback, extract_image_tag, parse_as_pairs,
-        parse_tag_overrides_with, previous_generation, rollback_tag,
+        GitFallbackFailure, changed_config_warnings, check_git_fallback, extract_image_tag,
+        parse_as_pairs, parse_tag_overrides_with, previous_generation, rollback_tag,
     };
 
     /// `import --keychain` deletes a key file only when nothing is lost:
@@ -6659,6 +6762,40 @@ mod tests {
                 .unwrap()
                 .contains("recipients")
         );
+    }
+
+    /// `lock release --host x` built the Docker client before it
+    /// checked the host. With a host that has `ssh_key_secret:`, that
+    /// loads the secrets bundle first, so a mistyped host got a secrets
+    /// error (or a keychain prompt) instead of the unknown-host error.
+    /// The sealed file here does not exist, so a bundle load fails.
+    #[tokio::test]
+    async fn lock_release_checks_the_host_before_it_builds_the_client() {
+        let cfg = yoink::config::Config::parse_str(
+            "hosts:\n  - { address: web-1, user: root, ssh_key_secret: DEPLOY_KEY }\n\
+             secrets:\n  provider: age\n  file: lock-test-does-not-exist.age\n  \
+             recipients: [age1lvc8nwnhjruuaagj99nj3zp0djh7m7tvqs055yfl8mjcahxuvu4sn954gy]\n\
+             services: []\n",
+        )
+        .unwrap();
+        let release = |yes| super::LockAction::Release {
+            host: Some("web-9".into()),
+            yes,
+        };
+        for yes in [true, false] {
+            let msg = format!(
+                "{:#}",
+                super::cmd_lock(&cfg, release(yes)).await.unwrap_err()
+            );
+            assert!(msg.contains("unknown --host \"web-9\""), "got: {msg}");
+        }
+        // Without --yes, the command stops before it builds the client.
+        let release = super::LockAction::Release {
+            host: Some("web-1".into()),
+            yes: false,
+        };
+        let msg = format!("{:#}", super::cmd_lock(&cfg, release).await.unwrap_err());
+        assert_eq!(msg, "aborted");
     }
 
     fn tag_test_services() -> Vec<yoink::config::ServiceConfig> {
@@ -7028,6 +7165,54 @@ services:
         )
     }
 
+    /// `yoink up --watch` loads the config every 2 s. A warning shows
+    /// again only when the config changed.
+    #[test]
+    fn watch_shows_config_warnings_only_for_a_changed_config() {
+        let parse = |cap: &str| {
+            yoink::config::Config::parse_str(&format!(
+                "hosts:\n  - {{ address: host-a, user: deploy }}\n\
+                 services:\n  - name: api\n    image: registry.example.com/api\n\
+                 \x20   domain: api.example.test\n    tls: off\n\
+                 \x20   run: {{ port: 8080, options: {{ cap_add: [{cap}] }} }}\n"
+            ))
+            .unwrap()
+        };
+        let last = parse("NET_RAW");
+        assert_eq!(last.ingress_capability_warnings().len(), 1);
+        assert!(changed_config_warnings(&last, &last.clone()).is_empty());
+        let next = parse("NET_ADMIN");
+        let warnings = changed_config_warnings(&last, &next);
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("NET_ADMIN"), "got: {warnings:?}");
+    }
+
+    /// `yoink add --up` logged every warning after the load and again
+    /// after the reload. The reload now logs only new warnings.
+    #[test]
+    fn add_up_shows_each_config_warning_once() {
+        let parse = |extra: &str| {
+            yoink::config::Config::parse_str(&format!(
+                "hosts:\n  - {{ address: host-a, user: deploy }}\n\
+                 services:\n  - name: api\n    image: registry.example.com/api\n\
+                 \x20   domain: api.example.test\n    tls: off\n\
+                 \x20   run: {{ port: 8080, options: {{ cap_add: [NET_RAW] }} }}\n{extra}"
+            ))
+            .unwrap()
+        };
+        let before = parse("");
+        assert_eq!(before.ingress_capability_warnings().len(), 1);
+        let same = parse("  - name: worker\n    image: img\n    tag: v1\n    run: {}\n");
+        assert!(crate::added_config_warnings(&before, &same).is_empty());
+        let added = parse(
+            "  - name: sniff\n    image: img\n    tag: v1\n    networks: [yoink-ingress]\n\
+             \x20   run: { options: { cap_add: [NET_ADMIN] } }\n",
+        );
+        let warnings = crate::added_config_warnings(&before, &added);
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("\"sniff\""), "got: {warnings:?}");
+    }
+
     #[test]
     fn hosts_add_splits_port_out_of_address() {
         let (dir, config_path) = hosts_add_project();
@@ -7083,5 +7268,64 @@ services:
         assert!(!dir.path().join("hosts/prod.yaml").exists());
         // The same port given twice is fine.
         hosts_add(&config_path, "prod-eu-1:2200", Some(2200), "prod").unwrap();
+    }
+
+    /// A failed prefetch used to return before the run-end events. The
+    /// audit log then had a `RunStarted` with no `LockReleased` and no
+    /// `RunFinished`, and the `run_failed` webhook never fired.
+    #[tokio::test]
+    async fn up_prefetch_failure_still_emits_run_end_events() {
+        use yoink::docker_ops::{DockerError, FakeDockerOps};
+        use yoink::features::audit::{AuditEventKind, AuditSink, MemorySink};
+
+        let config = yoink::config::Config::parse_str(
+            "hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    image: img\n    tag: v1\n    run: {}\n",
+        )
+        .unwrap();
+        let fake = FakeDockerOps::new();
+        fake.push_pull_image(Err(DockerError::Invalid("pull denied".into())));
+        let ops: std::sync::Arc<dyn yoink::docker_ops::DockerOps> = std::sync::Arc::new(fake);
+        let host_sink = std::sync::Arc::new(MemorySink::new());
+        let operator_sink = std::sync::Arc::new(MemorySink::new());
+        let tag_overrides = std::collections::BTreeMap::new();
+
+        let err = super::run_locked_up(
+            ops,
+            super::LockedUp {
+                config: &config,
+                tag_overrides: &tag_overrides,
+                services_filter: None,
+                bundle: None,
+                prefetch: true,
+                rebuild_proxy: false,
+                options: yoink::deploy::ReconcileOptions::default(),
+            },
+            Vec::new(),
+            host_sink.clone() as std::sync::Arc<dyn AuditSink>,
+            operator_sink.clone() as std::sync::Arc<dyn AuditSink>,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("prefetch images"),
+            "got {err:#}"
+        );
+        let host_events = host_sink.events().await;
+        assert!(
+            host_events
+                .iter()
+                .any(|e| e.host == "h1" && matches!(e.kind, AuditEventKind::LockReleased)),
+            "no LockReleased: {host_events:?}"
+        );
+        let operator_events = operator_sink.events().await;
+        assert!(
+            operator_events.iter().any(|e| matches!(
+                &e.kind,
+                AuditEventKind::RunFinished { ok: false, error: Some(msg), .. }
+                    if msg.contains("pull denied")
+            )),
+            "no failed RunFinished: {operator_events:?}"
+        );
     }
 }

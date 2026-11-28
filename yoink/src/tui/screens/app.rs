@@ -3327,6 +3327,7 @@ impl App {
         let host_for_task = host.clone();
         let service_name_for_task = service_name.clone();
         let service_for_task = service.clone();
+        let networks_for_task = self.config.networks_for(&service);
         let ops = self.ops.clone();
         let tx = self.update_tx.clone();
         let toast_prefix = format!("→ {service_name} :{container_port}");
@@ -3348,6 +3349,7 @@ impl App {
                 ops.clone(),
                 &host_for_task,
                 &service_for_task,
+                &networks_for_task,
                 container_port,
                 crate::features::pf::Mode::Auto,
             )
@@ -3431,6 +3433,7 @@ impl App {
 
         let host_for_task = host.clone();
         let service_for_task = service.clone();
+        let networks_for_task = self.config.networks_for(&service);
         let service_name_for_task = service_name.clone();
         let ops = self.ops.clone();
         let tx = self.update_tx.clone();
@@ -3453,6 +3456,7 @@ impl App {
                 ops.as_ref(),
                 &host_for_task,
                 &service_for_task,
+                &networks_for_task,
             )
             .await
             {
@@ -4062,7 +4066,12 @@ fn update_service_status(
         | DeployEvent::HookFinished { .. }
         | DeployEvent::NetworkReady { .. }
         | DeployEvent::ContainerLogTail { .. }
-        | DeployEvent::ContainerLogTailUnavailable { .. } => return,
+        | DeployEvent::ContainerLogTailUnavailable { .. }
+        | DeployEvent::OldContainerRestarted { .. }
+        | DeployEvent::ProxyAdminUpgradePending { .. }
+        | DeployEvent::AdminNetworkContainersDisconnected { .. }
+        | DeployEvent::AdminRelayCreated { .. }
+        | DeployEvent::AdminRelaySkipped { .. } => return,
     };
     map.insert(service.to_string(), next);
 }
@@ -4256,7 +4265,7 @@ async fn prune_all(config: Config, ops: Arc<dyn DockerOps>, tx: UnboundedSender<
     }
 
     send_event(format!("scanning {} host(s)…", config.host_count()));
-    match prune::run(&*ops, &config, false).await {
+    match prune::run(&ops, &config, false).await {
         Ok(report) => {
             if report.removed.is_empty() {
                 send_event("nothing to prune".into());

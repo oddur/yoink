@@ -435,6 +435,11 @@ pub struct ContainerDetail {
     pub mounts: Vec<String>,
     /// Network names this container is attached to.
     pub networks: Vec<String>,
+    /// Network name → the aliases and DNS names of the container on
+    /// that network. The proxy admin client reads it to find out if
+    /// the running proxy has the admin API alias.
+    #[serde(skip)]
+    pub network_aliases: BTreeMap<String, Vec<String>>,
     pub labels: BTreeMap<String, String>,
     /// Effective user (`container.config.user`). Empty string when
     /// the image's USER is in effect.
@@ -468,6 +473,17 @@ impl ContainerDetail {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
     }
+}
+
+/// The parts of `docker network inspect` that yoink checks before it
+/// joins a network it owns, see `deploy::network::ensure_admin`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkDetail {
+    pub labels: BTreeMap<String, String>,
+    pub internal: bool,
+    /// Names of the containers with an endpoint on the network. Docker
+    /// lists only containers that run.
+    pub containers: Vec<String>,
 }
 
 /// One docker network as the dashboard / `yoink networks` show it.
@@ -556,6 +572,22 @@ pub trait DockerOps: Send + Sync {
 
     async fn ensure_network(&self, host: &Host, network: &str) -> Result<bool, DockerError>;
 
+    /// Inspect one network. `None` when it does not exist.
+    async fn inspect_network(
+        &self,
+        host: &Host,
+        network: &str,
+    ) -> Result<Option<NetworkDetail>, DockerError>;
+
+    /// Create a bridge network with `labels`. `false` when a network of
+    /// that name exists already (another operator was faster).
+    async fn create_network(
+        &self,
+        host: &Host,
+        network: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<bool, DockerError>;
+
     /// List every docker network on `host`. Used by `yoink networks`.
     async fn list_networks(&self, host: &Host) -> Result<Vec<NetworkInfo>, DockerError>;
 
@@ -563,14 +595,25 @@ pub trait DockerOps: Send + Sync {
     /// network. Used post-start for multi-network attachment because
     /// docker's create-time `endpoints_config` can silently drop
     /// entries that don't match `host_config.network_mode`.
-    /// Aliases ensure the container resolves by its name on the new
+    /// `endpoint` comes from [`crate::docker::endpoint_settings`]: its
+    /// aliases ensure the container resolves by its name on the new
     /// network too. Idempotent: already-connected returns Ok.
     async fn connect_container_network(
         &self,
         host: &Host,
         container: &str,
         network: &str,
-        aliases: &[String],
+        endpoint: bollard::models::EndpointSettings,
+    ) -> Result<(), DockerError>;
+
+    /// Disconnect `container` from `network`. The container can be
+    /// stopped. Idempotent: a container that is not on the network, or
+    /// that does not exist, returns Ok.
+    async fn disconnect_container_network(
+        &self,
+        host: &Host,
+        container: &str,
+        network: &str,
     ) -> Result<(), DockerError>;
 
     /// List every docker volume on `host`. Used by `yoink volumes`.
@@ -697,6 +740,16 @@ pub trait DockerOps: Send + Sync {
         &self,
         host: &Host,
         label: &str,
+    ) -> Result<Vec<ContainerInfo>, DockerError>;
+
+    /// Every container that is attached to `network`, in any state and
+    /// with any labels. `docker network inspect` lists only running
+    /// containers; this list includes stopped ones, which Docker
+    /// connects to the network again when they start.
+    async fn list_containers_on_network(
+        &self,
+        host: &Host,
+        network: &str,
     ) -> Result<Vec<ContainerInfo>, DockerError>;
 
     /// Every currently-running container on the host, regardless of label.
@@ -888,6 +941,22 @@ pub fn parse_published_port(entries: &[String], wanted: u16) -> Option<u16> {
         }
     }
     None
+}
+
+/// Value of the `yoink.role` label on the one-shot probe containers of
+/// `healthcheck` and `healthcheck_tcp`.
+pub const PROBE_ROLE: &str = "probe";
+
+/// Name prefixes of the one-shot probe containers.
+pub const PROBE_NAME_PREFIXES: [&str; 2] = ["yoink-probe-", "yoink-tcp-probe-"];
+
+/// True when `c` (from a `yoink.managed=true` listing) is a one-shot
+/// probe container. The listing drops `yoink.*` labels from
+/// `other_labels`, so the check uses the name prefix and the missing
+/// `yoink.service`.
+#[must_use]
+pub fn is_probe(c: &ContainerInfo) -> bool {
+    c.yoink_service.is_none() && PROBE_NAME_PREFIXES.iter().any(|p| c.name.starts_with(p))
 }
 
 /// Cheap random hex suffix for one-shot probe container names so two
