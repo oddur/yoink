@@ -159,21 +159,29 @@ pub async fn running_proxy_image(
 ///   request dials and resolves the alias again, so a recreated proxy
 ///   gets the next request. The relay sets no timeouts besides the
 ///   default dial timeout, so a long `/load` is not cut.
+///
+/// The string is part of the relay command, and thus of the spec hash.
+/// It is written out with a fixed key order, as `bootstrap_config` of
+/// the proxy: the key order of a `serde_json::Value` depends on the
+/// `preserve_order` feature. A dependency that turns that feature on
+/// would otherwise change the hash and recreate the relay on every
+/// host.
 #[must_use]
-pub fn relay_config() -> serde_json::Value {
-    serde_json::json!({
-        "admin": { "disabled": true, "config": { "persist": false } },
-        "apps": { "http": { "servers": { "relay": {
-            "listen": [format!(":{RELAY_PORT}")],
-            "automatic_https": { "disable": true },
-            "routes": [{ "handle": [{
-                "handler": "reverse_proxy",
-                "upstreams": [{ "dial": ADMIN_API_HOST }],
-                "headers": { "request": { "set": { "Host": [ADMIN_API_HOST] } } },
-                "transport": { "protocol": "http", "keep_alive": { "enabled": false } },
-            }] }],
-        } } } },
-    })
+pub fn relay_config() -> String {
+    format!(
+        concat!(
+            r#"{{"admin":{{"config":{{"persist":false}},"disabled":true}},"#,
+            r#""apps":{{"http":{{"servers":{{"relay":{{"#,
+            r#""automatic_https":{{"disable":true}},"#,
+            r#""listen":[":{port}"],"#,
+            r#""routes":[{{"handle":[{{"handler":"reverse_proxy","#,
+            r#""headers":{{"request":{{"set":{{"Host":["{admin}"]}}}}}},"#,
+            r#""transport":{{"keep_alive":{{"enabled":false}},"protocol":"http"}},"#,
+            r#""upstreams":[{{"dial":"{admin}"}}]}}]}}]}}}}}}}}}}"#,
+        ),
+        port = RELAY_PORT,
+        admin = ADMIN_API_HOST,
+    )
 }
 
 /// The run spec of the relay, without the spec hash label.
@@ -404,11 +412,23 @@ mod tests {
 
     /// The relay config, pinned: no admin listener of its own, one
     /// plain HTTP server on 2020, the `Host` of the admin API, no
-    /// keep-alive and no timeouts.
+    /// keep-alive and no timeouts. The string itself is pinned too: it
+    /// is part of the spec hash.
     #[test]
     fn relay_config_is_pinned() {
         assert_eq!(
             relay_config(),
+            "{\"admin\":{\"config\":{\"persist\":false},\"disabled\":true},\
+             \"apps\":{\"http\":{\"servers\":{\"relay\":{\
+             \"automatic_https\":{\"disable\":true},\"listen\":[\":2020\"],\
+             \"routes\":[{\"handle\":[{\"handler\":\"reverse_proxy\",\
+             \"headers\":{\"request\":{\"set\":{\"Host\":[\"yoink-proxy-admin-api:2019\"]}}},\
+             \"transport\":{\"keep_alive\":{\"enabled\":false},\"protocol\":\"http\"},\
+             \"upstreams\":[{\"dial\":\"yoink-proxy-admin-api:2019\"}]}]}]}}}}}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&relay_config()).expect("JSON");
+        assert_eq!(
+            parsed,
             serde_json::json!({
                 "admin": { "disabled": true, "config": { "persist": false } },
                 "apps": { "http": { "servers": { "relay": {
@@ -426,7 +446,7 @@ mod tests {
             })
         );
         // The shell command quotes the JSON in a quoted heredoc.
-        assert!(!relay_config().to_string().contains('\''));
+        assert!(!relay_config().contains('\''));
     }
 
     /// A new proxy image (a new tag, `proxy.image`, an xcaddy build)
