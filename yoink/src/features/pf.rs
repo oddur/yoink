@@ -192,13 +192,14 @@ pub enum PfError {
     SidecarNoNetwork { service: String },
     #[error(
         "the Caddy admin API of {PROXY_SERVICE_NAME:?} listens only on the unix socket \
-         {ADMIN_SOCKET}, so `yoink pf` cannot reach port {LEGACY_ADMIN_PORT}. Use the admin \
-         relay: on the host, `docker port {ADMIN_RELAY_NAME} {RELAY_PORT}` shows its port P \
-         on 127.0.0.1. Then run `ssh -L 2019:127.0.0.1:P <user>@<host>` and send requests \
-         to http://127.0.0.1:2019. The admin API has no authentication: close the tunnel \
-         when you are done."
+         {ADMIN_SOCKET}. The proxy has no port {port}, so `yoink pf` cannot reach the admin \
+         API. Use the admin relay: on the host, `docker port {ADMIN_RELAY_NAME} {RELAY_PORT}` \
+         shows its port P on 127.0.0.1. Then run `ssh -L 2019:127.0.0.1:P <user>@<host>` and \
+         send requests to http://127.0.0.1:2019. The admin API has no authentication: close \
+         the tunnel when you are done. To forward a port of the proxy, give the port, for \
+         example `yoink pf {PROXY_SERVICE_NAME} 443`."
     )]
-    ProxyAdminPort,
+    ProxyAdminPort { port: u16 },
     #[error(transparent)]
     Sidecar(#[from] SidecarError),
 }
@@ -368,9 +369,16 @@ pub async fn resolve_target(
     mode: Mode,
 ) -> Result<ResolvedTarget, PfError> {
     // A sidecar on yoink-ingress gets "connection refused" on the admin
-    // port: Caddy listens on a unix socket only.
-    if service.kind == Some(ServiceKind::Proxy) && container_port == LEGACY_ADMIN_PORT {
-        return Err(PfError::ProxyAdminPort);
+    // port: Caddy listens on a unix socket only. The relay port is
+    // `run.port` of the proxy, for the deploy probe, so a `yoink pf` or
+    // a TUI forward without a port picks it. It is a port of the relay,
+    // not of the proxy.
+    if service.kind == Some(ServiceKind::Proxy)
+        && [LEGACY_ADMIN_PORT, RELAY_PORT].contains(&container_port)
+    {
+        return Err(PfError::ProxyAdminPort {
+            port: container_port,
+        });
     }
     // 1. Try published unless the operator forced sidecar.
     let published = match mode {
@@ -995,18 +1003,35 @@ services:
     }
 
     /// `yoink pf yoink-proxy 2019` started a sidecar on yoink-ingress
-    /// and got "connection refused". It now says how to reach the
-    /// admin API, and starts no sidecar.
+    /// and got "connection refused". So did `yoink pf yoink-proxy`
+    /// without a port and the TUI forward of the proxy row: both pick
+    /// `run.port`, the relay port 2020. They now say how to reach the
+    /// admin API, and start no sidecar.
     #[tokio::test]
     async fn pf_to_the_proxy_admin_port_explains_the_relay() {
         let cfg = crate::config::Config::parse_str("hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n").unwrap();
         let svc = cfg.service(PROXY_SERVICE_NAME).unwrap();
+        // The port that the CLI and the TUI pick without a port.
+        assert!(sole_publish(svc).is_none());
+        assert_eq!(svc.run.port, Some(RELAY_PORT));
         let host = cfg.fleet().remove(0);
         let ops = Arc::new(crate::docker_ops::FakeDockerOps::new());
         let networks = cfg.networks_for(svc);
-        let result = resolve_target(ops.clone(), &host, svc, &networks, 2019, Mode::Auto).await;
-        let err = result.err().expect("refused");
-        assert!(matches!(err, PfError::ProxyAdminPort), "got {err:?}");
+        for port in [2019, RELAY_PORT] {
+            let result = resolve_target(ops.clone(), &host, svc, &networks, port, Mode::Auto).await;
+            let err = result.err().expect("refused");
+            assert!(
+                matches!(err, PfError::ProxyAdminPort { port: p } if p == port),
+                "got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("has no port {port}")), "got: {msg}");
+            assert!(msg.contains("`yoink pf yoink-proxy 443`"), "got: {msg}");
+        }
+        let err = resolve_target(ops.clone(), &host, svc, &networks, 2019, Mode::Auto)
+            .await
+            .err()
+            .expect("refused");
         let msg = err.to_string();
         assert!(
             msg.contains("`docker port yoink-proxy-admin-relay 2020`"),
