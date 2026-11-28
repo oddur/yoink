@@ -1281,11 +1281,17 @@ async fn finalize_one_host(
     // deploy stops it, it is indistinguishable from a generation that
     // was once live, so `yoink rollback` could pick the failed version.
     // The previous generation in `existing` is never touched here.
+    //
+    // A stop-first deploy already stopped the previous generation to
+    // free its host ports. After the failed replicas are gone, start it
+    // again: else the host has no container of the service at all. For
+    // the proxy, that is an outage of every route.
     let total_attempts =
         match start_new_replicas(ops, &host, config, service, &replicas, on_event).await {
             Ok(attempts) => attempts,
             Err(e) => {
                 remove_attempt_replicas(ops, &host, &replicas).await;
+                restart_old_containers(ops, &host, &stopped_old).await;
                 return Err(e);
             }
         };
@@ -2164,6 +2170,22 @@ async fn swap_out_old_containers_by_set(
     Ok(stopped)
 }
 
+/// Start the old containers in `stopped` again, after a stop-first
+/// deploy failed. Best-effort: a failure is logged, and the caller
+/// returns the original deploy error.
+async fn restart_old_containers(ops: &dyn DockerOps, host: &Host, stopped: &[String]) {
+    for name in stopped {
+        match ops.start_container(host, name).await {
+            Ok(()) => {
+                tracing::info!(host = %host.address, container = %name, "restarted the old container after the failed deploy");
+            }
+            Err(e) => {
+                warn!(host = %host.address, container = %name, error = %e, "could not restart the old container after the failed deploy");
+            }
+        }
+    }
+}
+
 /// Stop one container and emit `OldContainerStopped`. The caller
 /// decides what a failure means: the deploy path warns and moves on,
 /// the cleanup-only route fails the service.
@@ -2930,6 +2952,61 @@ services:
                 .iter()
                 .any(|c| matches!(c, crate::docker_ops::RecordedCall::ForceRemoveContainer(_, n) if *n == container)),
             "failed container must be removed after it is stopped: {calls:?}"
+        );
+    }
+
+    /// A stop-first deploy (a service that publishes host ports, such
+    /// as the proxy) stops the old container before the new one starts.
+    /// When the new one then failed its healthcheck, yoink removed it
+    /// and left the old one stopped: no container of the service ran.
+    /// For the proxy, every route was down.
+    #[tokio::test(start_paused = true)]
+    async fn failed_stop_first_deploy_restarts_the_old_container() {
+        let mut cfg = config_one_service();
+        cfg.services[0].run.publish = vec!["8443:3000".into()];
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: Some("app-a".into()),
+            ..container_with_state(OLD_GENERATION, "running")
+        }]));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+        // Stop-first: the old container stops before the new start.
+        ops.push_stop_container(Ok(()));
+        ops.push_start_container(Ok(()));
+        // No healthcheck answer: the probe fails. The new container is
+        // stopped and removed.
+        ops.push_stop_container(Ok(()));
+        ops.push_force_remove(Ok(()));
+        // The old container starts again.
+        ops.push_start_container(Ok(()));
+
+        let (failed, _events) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+        let calls = ops.calls();
+        let removed = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::ForceRemoveContainer(_, n) if *n == failed))
+            .expect("failed container removed");
+        let restarted = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD_GENERATION))
+            .expect("old container restarted");
+        assert!(removed < restarted, "ports must be free first: {calls:?}");
+    }
+
+    /// A deploy that does not stop first never stopped the old
+    /// container, so it has nothing to restart.
+    #[tokio::test(start_paused = true)]
+    async fn failed_rolling_deploy_starts_no_old_container() {
+        let ops = failing_deploy_ops(1, 0);
+        ops.push_force_remove(Ok(()));
+        let cfg = config_one_service();
+        deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+        assert!(
+            !ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD_GENERATION))
         );
     }
 
