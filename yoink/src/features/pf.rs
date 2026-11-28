@@ -30,8 +30,12 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::base::host::Host;
-use crate::config::{ADMIN_NETWORK, Config, ServiceConfig};
+use crate::config::{
+    ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, ADMIN_RELAY_NAME, Config, PROXY_SERVICE_NAME,
+    ServiceConfig, ServiceKind,
+};
 use crate::docker_ops::DockerOps;
+use crate::proxy::relay::RELAY_PORT;
 
 /// How long we'll wait for the SSH tunnel's local listener to come
 /// up before giving up. The `ssh -L` child binds locally before
@@ -186,6 +190,16 @@ pub enum PfError {
         "service {service:?} declares no `networks:` (other than the reserved `yoink-proxy-admin`) — sidecar mode needs at least one docker network to join. Add a `networks:` entry to the service or its `deploy.networks:` default, or pin one published container port and use `--mode published`."
     )]
     SidecarNoNetwork { service: String },
+    #[error(
+        "the Caddy admin API of {PROXY_SERVICE_NAME:?} listens only on \
+         {ADMIN_API_HOST} on the {ADMIN_NETWORK} network, so `yoink pf` cannot reach port \
+         {ADMIN_PORT}. Use the admin relay: on the host, `docker port {ADMIN_RELAY_NAME} \
+         {RELAY_PORT}` shows its port P on 127.0.0.1. Then run `ssh -L 2019:127.0.0.1:P \
+         <user>@<host>` and send requests to http://127.0.0.1:2019. The relay sets the \
+         `Host: {ADMIN_API_HOST}` header. The admin API has no authentication: close the \
+         tunnel when you are done."
+    )]
+    ProxyAdminPort,
     #[error(transparent)]
     Sidecar(#[from] SidecarError),
 }
@@ -354,6 +368,11 @@ pub async fn resolve_target(
     container_port: u16,
     mode: Mode,
 ) -> Result<ResolvedTarget, PfError> {
+    // A sidecar on yoink-ingress gets "connection refused" on the admin
+    // port: Caddy listens there only on the admin network.
+    if service.kind == Some(ServiceKind::Proxy) && container_port == ADMIN_PORT {
+        return Err(PfError::ProxyAdminPort);
+    }
     // 1. Try published unless the operator forced sidecar.
     let published = match mode {
         Mode::Published | Mode::Auto => match resolve_endpoint(service, container_port) {
@@ -974,5 +993,31 @@ services:
             "got {:?}",
             result.err()
         );
+    }
+
+    /// `yoink pf yoink-proxy 2019` started a sidecar on yoink-ingress
+    /// and got "connection refused". It now says how to reach the
+    /// admin API, and starts no sidecar.
+    #[tokio::test]
+    async fn pf_to_the_proxy_admin_port_explains_the_relay() {
+        let cfg = crate::config::Config::parse_str("hosts:\n  - { address: h1, user: root }\nservices:\n  - name: api\n    image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n").unwrap();
+        let svc = cfg.service(PROXY_SERVICE_NAME).unwrap();
+        let host = cfg.fleet().remove(0);
+        let ops = Arc::new(crate::docker_ops::FakeDockerOps::new());
+        let networks = cfg.networks_for(svc);
+        let result = resolve_target(ops.clone(), &host, svc, &networks, 2019, Mode::Auto).await;
+        let err = result.err().expect("refused");
+        assert!(matches!(err, PfError::ProxyAdminPort), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`docker port yoink-proxy-admin-relay 2020`"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("ssh -L 2019:127.0.0.1:P"), "got: {msg}");
+        assert!(
+            msg.contains("Host: yoink-proxy-admin-api:2019"),
+            "got: {msg}"
+        );
+        assert!(ops.calls().is_empty(), "got: {:?}", ops.calls());
     }
 }
