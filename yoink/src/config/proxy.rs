@@ -58,19 +58,31 @@ pub const CADDY_CONFIG_VOLUME: &str = "yoink_caddy_config";
 /// that sees this file and runs as root can connect to it.
 pub const ADMIN_SOCKET: &str = "/config/caddy/admin.sock";
 
+/// The `Host` header of each request to the admin API: the admin relay
+/// sets it, and [`admin_block`] allows it.
+pub const ADMIN_HOST: &str = "127.0.0.1";
+
 /// The `admin` block of every Caddy config that yoink writes: the
 /// bootstrap of the proxy container and each `/load`. A `/load` that
 /// omits the block sets the admin API back to the Caddy default
 /// `localhost:2019`, which the admin relay cannot reach.
 ///
-/// The block has no `origins` and no `enforce_origin`. With a unix
-/// listen address, Caddy 2.10 and later do not check `Host` (see
-/// `newAdminHandler` in Caddy's `admin.go`). Earlier versions accept
-/// the `Host` values `""`, `127.0.0.1` and `::1` on a unix socket. The
-/// relay sets `Host: 127.0.0.1`, so both work.
+/// `origins` is [`ADMIN_HOST`], the `Host` that the relay sends. Caddy
+/// checks `Host` on a unix socket up to v2.9 (`enforceHost` is
+/// `!addr.isWildcardInterface()`, true for a socket path). Without
+/// `origins`, v2.6 allows only an empty `Host` there, and v2.7 to v2.9
+/// allow `""`, `127.0.0.1` and `::1`. v2.10 and later do not check
+/// `Host` on a unix socket. Thus `127.0.0.1` without `origins` fails on
+/// v2.6 with a 403. With `origins` set, every version from v2.6 allows
+/// exactly that `Host`. On v2.11, `origins` also sets the allowed
+/// `Origin` of a request that has one. The block has no
+/// `enforce_origin`: yoink sends no `Origin` header.
 #[must_use]
 pub fn admin_block() -> serde_json::Value {
-    serde_json::json!({ "listen": format!("unix/{ADMIN_SOCKET}") })
+    serde_json::json!({
+        "listen": format!("unix/{ADMIN_SOCKET}"),
+        "origins": [ADMIN_HOST],
+    })
 }
 
 impl Config {
@@ -618,7 +630,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
 /// feature. A dependency that turns that feature on would otherwise
 /// change the hash and recreate the proxy on every host.
 fn admin_block_json() -> String {
-    format!(r#"{{"listen":"unix/{ADMIN_SOCKET}"}}"#)
+    format!(r#"{{"listen":"unix/{ADMIN_SOCKET}","origins":["{ADMIN_HOST}"]}}"#)
 }
 
 /// The bootstrap Caddy config of the proxy: only [`admin_block`].
@@ -1243,7 +1255,10 @@ services:
         assert_eq!(bootstrap["admin"], admin_block());
         assert_eq!(
             bootstrap["admin"],
-            serde_json::json!({ "listen": "unix//config/caddy/admin.sock" })
+            serde_json::json!({
+                "listen": "unix//config/caddy/admin.sock",
+                "origins": ["127.0.0.1"],
+            })
         );
         assert!(!cmd.contains("0.0.0.0"), "got: {cmd}");
         assert!(!cmd.contains("2019"), "got: {cmd}");
@@ -1278,11 +1293,11 @@ services:
                 "head=\n",
                 "{ IFS= read -r head < /config/caddy/autosave.json || :; } 2>/dev/null\n",
                 "case $head in\n",
-                r#"'{"admin":{"listen":"unix//config/caddy/admin.sock"},'*) set -- --resume ;;"#,
+                r#"'{"admin":{"listen":"unix//config/caddy/admin.sock","origins":["127.0.0.1"]},'*) set -- --resume ;;"#,
                 "\n*) set -- ;;\n",
                 "esac\n",
                 "exec caddy run --config /dev/stdin \"$@\" <<'EOF'\n",
-                r#"{"admin":{"listen":"unix//config/caddy/admin.sock"}}"#,
+                r#"{"admin":{"listen":"unix//config/caddy/admin.sock","origins":["127.0.0.1"]}}"#,
                 "\nEOF",
             )]
         );
@@ -1308,7 +1323,7 @@ services:
         );
         assert_eq!(
             socket_autosave_prefix(),
-            r#"{"admin":{"listen":"unix//config/caddy/admin.sock"},"#
+            r#"{"admin":{"listen":"unix//config/caddy/admin.sock","origins":["127.0.0.1"]},"#
         );
         // The prefix is in single quotes in the script.
         assert!(!socket_autosave_prefix().contains('\''));

@@ -5910,10 +5910,7 @@ services:
             .expect("old proxy stopped");
         assert!(legacy_push < stop, "got: {calls:?}");
         assert_eq!(legacy.loads().len(), 1);
-        assert_eq!(
-            legacy.loads()[0]["admin"],
-            serde_json::json!({ "listen": "unix//config/caddy/admin.sock" })
-        );
+        assert_eq!(legacy.loads()[0]["admin"], crate::config::admin_block());
         // The read-back of the first push, then the push for the new
         // proxy: both through the relay.
         assert_eq!(relay.loads().len(), 2);

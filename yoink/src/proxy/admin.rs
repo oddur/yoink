@@ -939,10 +939,7 @@ services:
                 "GET /config/apps/http/servers/main/routes/"
             ]
         );
-        assert_eq!(
-            relay.loads()[0]["admin"],
-            serde_json::json!({ "listen": "unix//config/caddy/admin.sock" })
-        );
+        assert_eq!(relay.loads()[0]["admin"], crate::config::admin_block());
     }
 
     /// v0.22 and earlier: Caddy listens on `0.0.0.0:2019`, and every
@@ -966,10 +963,7 @@ services:
         // One `/load` on the old port, no read-back there: Caddy
         // closes the TCP listener after it answers.
         assert_eq!(paths(&legacy), ["POST /load"]);
-        assert_eq!(
-            legacy.loads()[0]["admin"],
-            serde_json::json!({ "listen": "unix//config/caddy/admin.sock" })
-        );
+        assert_eq!(legacy.loads()[0]["admin"], crate::config::admin_block());
         assert_eq!(legacy.loads()[0], rendered());
         assert_eq!(
             paths(&relay),

@@ -55,10 +55,10 @@ pub fn relay_socket_path() -> String {
     format!("{RELAY_CONFIG_MOUNT}{in_volume}")
 }
 
-/// The `Host` header that the relay sends to the admin API. Caddy 2.10
-/// and later do not check `Host` on a unix socket. Earlier versions
-/// accept `127.0.0.1` there, see [`crate::config::admin_block`].
-pub const RELAY_UPSTREAM_HOST: &str = "127.0.0.1";
+/// The `Host` header that the relay sends to the admin API. The
+/// `origins` of [`crate::config::admin_block`] allow it on every Caddy
+/// version from v2.6.
+pub const RELAY_UPSTREAM_HOST: &str = crate::config::ADMIN_HOST;
 
 /// Label filter for `list_containers_by_label` that finds the relay.
 #[must_use]
@@ -483,6 +483,22 @@ mod tests {
         );
         // The shell command quotes the JSON in a quoted heredoc.
         assert!(!relay_config().contains('\''));
+    }
+
+    /// Caddy up to v2.9 checks `Host` on the admin socket against
+    /// `admin.origins`. v2.6 without `origins` allows only an empty
+    /// `Host`. The `Host` that the relay sends must be the one origin.
+    #[test]
+    fn relay_host_is_the_admin_origin() {
+        let parsed: serde_json::Value = serde_json::from_str(&relay_config()).expect("JSON");
+        let host = parsed
+            .pointer("/apps/http/servers/relay/routes/0/handle/0/headers/request/set/Host")
+            .expect("Host header");
+        assert_eq!(host, &serde_json::json!([RELAY_UPSTREAM_HOST]));
+        assert_eq!(
+            crate::config::admin_block()["origins"],
+            serde_json::json!([RELAY_UPSTREAM_HOST])
+        );
     }
 
     /// A new proxy image (a new tag, `proxy.image`, an xcaddy build)
