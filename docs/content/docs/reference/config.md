@@ -290,7 +290,7 @@ The defaults are a hardened profile. Each service can override them.
 | `cpus` | string | unset | CPU limit in cores of CPU time (`"1.5"` = 1.5 cores). |
 | `pids_limit` | integer | `1024` | Limit against fork bombs. |
 | `cap_drop` | list of string | `["ALL"]` | Linux capabilities that the container loses. |
-| `cap_add` | list of string | `[]` | Capabilities that the container gets back, for example `NET_BIND_SERVICE` for Caddy. |
+| `cap_add` | list of string | `[]` | Capabilities that the container gets back, for example `NET_BIND_SERVICE` for Caddy. With `NET_ADMIN` or `NET_RAW`, a service on `yoink-ingress` can reach the admin API of the proxy. Config load shows a warning for this. |
 | `security_opt` | list of string | `["no-new-privileges:true"]` | Docker security options. |
 | `read_only` | bool | `true` | Read-only rootfs. `tmpfs:` adds writable scratch space. |
 | `init` | bool | `true` | Runs tini as PID 1 (zombie reaping and correct SIGTERM). |

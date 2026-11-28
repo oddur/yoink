@@ -483,6 +483,13 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
         );
     }
 
+    for warning in config.ingress_capability_warnings() {
+        out.push(
+            Finding::warn("config", warning)
+                .with_fix("drop NET_ADMIN and NET_RAW, or move the service off yoink-ingress"),
+        );
+    }
+
     for svc in &proxied {
         if svc.run.port.is_none() {
             // The proxy needs a port to forward to — yoink rejects
@@ -1316,6 +1323,34 @@ services:
         assert!(
             crate::proxy::caddy::render(&config, |_| vec![], None).is_err(),
             "up fails at render for the same config"
+        );
+    }
+
+    /// A routed service with `NET_RAW` can reach the admin API of the
+    /// proxy. Doctor warns, and the exit code stays the same.
+    #[test]
+    fn ingress_service_with_net_raw_is_a_warning() {
+        let config = Config::parse_str(
+            r#"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+services:
+  - name: api
+    image: img
+    tag: t
+    domain: api.example.com
+    tls: off
+    run: { port: 8080, options: { cap_add: [NET_RAW] } }
+"#,
+        )
+        .unwrap();
+        let findings = check_proxied_services(&config);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Warn && f.title.contains("has NET_RAW")),
+            "{:?}",
+            titles(&findings)
         );
     }
 

@@ -4,6 +4,7 @@
 //! wires every routed service to them. The Docker-side work (Caddy
 //! JSON, admin API pushes, xcaddy builds) is in `crate::proxy`.
 
+mod ingress_caps;
 mod plugins;
 
 use super::{
@@ -29,8 +30,11 @@ pub const ADMIN_NETWORK: &str = "yoink-proxy-admin";
 
 /// Network alias that the proxy has only on [`ADMIN_NETWORK`]. Caddy
 /// binds the admin API to the one address this name resolves to, the
-/// proxy IP on that network. A service on `yoink-ingress` cannot
-/// connect to that address.
+/// proxy IP on that network. A service on `yoink-ingress` with the
+/// default `cap_drop: [ALL]` cannot connect to that address. The bind
+/// is not access control: with `NET_ADMIN` or `NET_RAW`, a container
+/// on `yoink-ingress` can route or craft packets to it. See
+/// `Config::ingress_capability_warnings`.
 pub const ADMIN_API_ALIAS: &str = "yoink-proxy-admin-api";
 
 /// Container port the Caddy admin API listens on (Caddy default).
