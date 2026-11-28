@@ -297,7 +297,7 @@ The defaults are a hardened profile. Each service can override them.
 | `tmpfs` | map of string | `{}` | `mount_path: "size=N,mode=NNNN"`. yoink applies `noexec,nosuid,nodev` automatically. |
 | `restart` | enum | `unless-stopped` | Docker restart policy: `no`, `always`, `unless-stopped`, or `on-failure`. Write `'no'` with quotes, because YAML reads a bare `no` as a boolean. |
 | `user` | string | `"65534:65534"` (nobody) | UID/GID. The default is non-root. `"0:0"` is for images that need root. A specific value (`"1000:1000"`, `"redis"`) is for images with pre-baked file ownership. |
-| `network_aliases` | list of string | `[]` | Extra DNS aliases on the attached networks, in addition to the service `name`. For example, a legacy hostname. |
+| `network_aliases` | list of string | `[]` | Extra DNS aliases on the attached networks, in addition to the service `name`. For example, a legacy hostname. Config load rejects `yoink-proxy-admin-api` and `yoink-proxy-admin-relay`. |
 | `devices` | list of string | `[]` | Host devices to expose. Each entry is `<host-path>[:<container-path>[:<perms>]]` (the `--device` syntax of docker). `<perms>` is a combination of `r`, `w`, `m`, and the default is `rwm`. An entry bind-mounts the device file and adds it to the cgroup `devices.allow` list. Only the listed devices become accessible, which is narrower than `--privileged`. Examples: `/dev/nvidia*` (GPU), `/dev/dri` (Intel/AMD VAAPI), `/dev/ttyUSB*` (USB serial), `/dev/fuse` (with `cap_add: [SYS_ADMIN]`), `/dev/snd` (audio). |
 
 [Security defaults](/docs/explanation/security) explains the reasons for these defaults.

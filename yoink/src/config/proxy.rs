@@ -28,6 +28,10 @@ pub const INGRESS_NETWORK: &str = "yoink-ingress";
 /// Earlier versions of yoink created this network too.
 pub const ADMIN_NETWORK: &str = "yoink-proxy-admin";
 
+/// Container name of the admin relay (see `crate::proxy::relay`). One
+/// relay per host.
+pub const ADMIN_RELAY_NAME: &str = "yoink-proxy-admin-relay";
+
 /// Network alias that the proxy has only on [`ADMIN_NETWORK`]. Caddy
 /// binds the admin API to the one address this name resolves to, the
 /// proxy IP on that network. A service on `yoink-ingress` with the
@@ -318,6 +322,20 @@ impl Config {
                 && svc.networks.iter().flatten().any(|n| n == ADMIN_NETWORK)
             {
                 return Err(reserved(&format!("service {:?}: networks", svc.name)));
+            }
+            // Docker DNS in the proxy answers for every network of the
+            // proxy. The same name on `yoink-ingress` would give Caddy
+            // a second address for its admin listener.
+            let reserved_alias = [ADMIN_API_ALIAS, ADMIN_RELAY_NAME]
+                .into_iter()
+                .find(|name| svc.run.options.network_aliases.iter().any(|a| a == name));
+            if let Some(name) = reserved_alias {
+                return Err(ConfigError::Invalid(format!(
+                    "service {:?}: run.options.network_aliases lists {name:?}. This name \
+                     is reserved for the Caddy admin API of the proxy. Use a different \
+                     alias.",
+                    svc.name
+                )));
             }
         }
         Ok(())
@@ -802,6 +820,28 @@ services:
                 "got: {msg}"
             );
             assert!(msg.contains("Use a different network name"), "got: {msg}");
+        }
+    }
+
+    /// A user alias with the name of the admin API alias or of the
+    /// relay would add a second address for that name in the DNS of
+    /// the proxy.
+    #[test]
+    fn admin_names_are_reserved_as_network_aliases() {
+        for alias in [ADMIN_API_ALIAS, ADMIN_RELAY_NAME] {
+            let yaml = format!(
+                "hosts: [{{ address: h, user: u }}]\nproxy: {{ email: o@example.com }}\n\
+                 services:\n  - name: api\n    image: a\n    tag: v1\n    \
+                 domain: api.example.com\n    \
+                 run: {{ port: 8080, options: {{ network_aliases: [api, {alias}] }} }}\n"
+            );
+            let msg = Config::parse_str(&yaml).expect_err(alias).to_string();
+            assert!(
+                msg.contains(&format!(
+                    "service \"api\": run.options.network_aliases lists \"{alias}\""
+                )),
+                "got: {msg}"
+            );
         }
     }
 

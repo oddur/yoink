@@ -26,7 +26,7 @@ use crate::docker::{self, RunSpec};
 use crate::docker_ops::{ContainerInfo, DockerError, DockerOps};
 
 /// Container name of the relay. One relay per host.
-pub const RELAY_NAME: &str = "yoink-proxy-admin-relay";
+pub const RELAY_NAME: &str = crate::config::ADMIN_RELAY_NAME;
 
 /// Label that marks the relay, with the value [`RELAY_ROLE`]. Same key
 /// as the unregistry sidecar.
