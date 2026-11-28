@@ -1941,9 +1941,6 @@ impl Config {
         cfg.inject_implicit_proxy()?;
         cfg.validate()?;
         cfg.topo_sort_services()?;
-        for warning in cfg.ingress_capability_warnings() {
-            tracing::warn!(target: "yoink::config", "{warning}");
-        }
         Ok(cfg)
     }
 

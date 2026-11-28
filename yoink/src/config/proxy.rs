@@ -734,9 +734,10 @@ const DOCKER_DEFAULT_RISKY: [&str; 1] = ["NET_RAW"];
 impl Config {
     /// One warning line per service on `yoink-ingress` that keeps
     /// `NET_ADMIN` or `NET_RAW`, and one per container hook that runs
-    /// on `yoink-ingress`. Empty when the proxy is off. Pure: the
-    /// config load wraps each line in `tracing::warn!`, and `yoink
-    /// doctor` reports each line as a finding.
+    /// on `yoink-ingress`. Empty when the proxy is off. Pure: `main`
+    /// logs each line one time after it loads the config (and again in
+    /// `yoink up --watch` when the config changes), and `yoink doctor`
+    /// reports each line as a finding.
     #[must_use]
     pub fn ingress_capability_warnings(&self) -> Vec<String> {
         if !self.proxy_enabled() {

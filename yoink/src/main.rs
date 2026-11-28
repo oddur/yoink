@@ -1385,6 +1385,10 @@ async fn run(cli: Cli) -> Result<()> {
         Config::load_from_path(&cli.config)
     }
     .with_context(|| format!("loading {}", cli.config.display()))?;
+    // `yoink doctor` reports these warnings as findings.
+    if !matches!(cli.command, Command::Doctor { .. }) {
+        log_config_warnings(&config.ingress_capability_warnings());
+    }
 
     // Warn (best-effort) if the config file's branch has upstream
     // commits touching the file that aren't pulled yet — operators
@@ -1451,6 +1455,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // running up so the freshly-added service is included.
                 let mut reloaded = Config::load_from_path(&cli.config)
                     .with_context(|| format!("reloading {}", cli.config.display()))?;
+                log_config_warnings(&reloaded.ingress_capability_warnings());
                 resolve_sealed_host_addresses(&mut reloaded, false).await?;
                 let no_services: Vec<String> = Vec::new();
                 let no_tags: Vec<String> = Vec::new();
@@ -1803,6 +1808,7 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
                     continue;
                 }
                 eprintln!("● config changed — reconciling");
+                log_config_warnings(&changed_config_warnings(&last_config, &next));
                 if let Err(e) = do_up_once(&next, &up, dry_run).await {
                     eprintln!("✗ reconcile failed: {e:#}");
                 }
@@ -1814,6 +1820,25 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
 }
 
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Write each config warning to the log. `Config::load_from_path` does
+/// not log them, so that a command shows each warning one time.
+fn log_config_warnings(warnings: &[String]) {
+    for warning in warnings {
+        tracing::warn!(target: "yoink::config", "{warning}");
+    }
+}
+
+/// The config warnings to show after the watch loop of `yoink up
+/// --watch` loads the config again. Empty when the config did not
+/// change: the run showed them already.
+fn changed_config_warnings(last: &Config, next: &Config) -> Vec<String> {
+    if next == last {
+        Vec::new()
+    } else {
+        next.ingress_capability_warnings()
+    }
+}
 
 #[allow(clippy::too_many_lines)] // single linear up-once flow; splitting fragments the build → push → reconcile sequence
 async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Result<()> {
@@ -6692,8 +6717,8 @@ fn chrono_like_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitFallbackFailure, check_git_fallback, extract_image_tag, parse_as_pairs,
-        parse_tag_overrides_with, previous_generation, rollback_tag,
+        GitFallbackFailure, changed_config_warnings, check_git_fallback, extract_image_tag,
+        parse_as_pairs, parse_tag_overrides_with, previous_generation, rollback_tag,
     };
 
     /// `import --keychain` deletes a key file only when nothing is lost:
@@ -7125,6 +7150,28 @@ services:
             Some(name),
             std::path::Path::new("hosts"),
         )
+    }
+
+    /// `yoink up --watch` loads the config every 2 s. A warning shows
+    /// again only when the config changed.
+    #[test]
+    fn watch_shows_config_warnings_only_for_a_changed_config() {
+        let parse = |cap: &str| {
+            yoink::config::Config::parse_str(&format!(
+                "hosts:\n  - {{ address: host-a, user: deploy }}\n\
+                 services:\n  - name: api\n    image: registry.example.com/api\n\
+                 \x20   domain: api.example.test\n    tls: off\n\
+                 \x20   run: {{ port: 8080, options: {{ cap_add: [{cap}] }} }}\n"
+            ))
+            .unwrap()
+        };
+        let last = parse("NET_RAW");
+        assert_eq!(last.ingress_capability_warnings().len(), 1);
+        assert!(changed_config_warnings(&last, &last.clone()).is_empty());
+        let next = parse("NET_ADMIN");
+        let warnings = changed_config_warnings(&last, &next);
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("NET_ADMIN"), "got: {warnings:?}");
     }
 
     #[test]
