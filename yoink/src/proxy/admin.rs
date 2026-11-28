@@ -68,8 +68,9 @@ pub enum AdminError {
     #[error("proxy container {PROXY_SERVICE_NAME:?} not running on {host}")]
     ProxyNotRunning { host: String },
     #[error(
-        "admin relay {RELAY_NAME:?} not running on {host}. Run an unscoped \
-         `yoink up` to create it."
+        "admin relay {RELAY_NAME:?} not running on {host}. Each `yoink up` with the \
+         proxy on creates it again. If it stops again, run `docker logs {RELAY_NAME}` \
+         on the host to see why."
     )]
     RelayNotRunning { host: String },
     #[error(
@@ -591,10 +592,16 @@ services:
             matches!(err, AdminError::RelayNotRunning { .. }),
             "got: {err}"
         );
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("unscoped `yoink up`"),
-            "got: {err}"
+            msg.contains("Each `yoink up` with the proxy on"),
+            "got: {msg}"
         );
+        assert!(
+            msg.contains("`docker logs yoink-proxy-admin-relay`"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("unscoped"), "got: {msg}");
     }
 
     #[test]
