@@ -1711,13 +1711,27 @@ pub async fn ensure_host_networks(
     on_event: &mut (dyn FnMut(DeployEvent) + Send),
 ) -> Result<(), DeployError> {
     for net in networks {
-        let created =
+        let created = if net == crate::config::ADMIN_NETWORK {
+            network::ensure_admin(ops, host)
+                .await
+                .map_err(|e| match e {
+                    network::AdminNetworkError::Docker(source) => DeployError::Docker {
+                        host: host.address.clone(),
+                        source,
+                    },
+                    other => DeployError::Custom {
+                        host: host.address.clone(),
+                        detail: other.to_string(),
+                    },
+                })?
+        } else {
             network::ensure(ops, host, net)
                 .await
                 .map_err(|source| DeployError::Docker {
                     host: host.address.clone(),
                     source,
-                })?;
+                })?
+        };
         on_event(DeployEvent::NetworkReady {
             host: host.address.clone(),
             network: net.clone(),

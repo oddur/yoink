@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 
 use super::{
     ContainerDetail, ContainerInfo, ContainerStats, DockerError, DockerEvent, DockerOps,
-    DockerVersion, ExecSession, HostInfo, ImageTarStream, LogLine, NetworkInfo, OneShotResult,
-    StoppedRemoval, VolumeInfo,
+    DockerVersion, ExecSession, HostInfo, ImageTarStream, LogLine, NetworkDetail, NetworkInfo,
+    OneShotResult, StoppedRemoval, VolumeInfo,
 };
 use crate::base::host::Host;
 
@@ -60,6 +60,9 @@ struct FakeState {
     /// Container name → the `inspect_container` answer. A name that
     /// is not here gets an empty detail.
     inspect: HashMap<String, ContainerDetail>,
+    /// Network name → the `inspect_network` answer. `create_network`
+    /// adds to it. A name that is not here does not exist.
+    networks: HashMap<String, NetworkDetail>,
     calls: Vec<RecordedCall>,
 }
 
@@ -69,6 +72,7 @@ pub enum RecordedCall {
     HostInfo(Host),
     ContainerStats(Host, String),
     EnsureNetwork(Host, String),
+    CreateNetwork(Host, String, std::collections::BTreeMap<String, String>),
     PullImage(Host, String, String),
     LoadImage(Host),
     BuildImage(Host, String, usize),
@@ -166,6 +170,10 @@ impl FakeDockerOps {
     pub fn push_event_stream(&self, events: Vec<DockerEvent>) {
         self.lock().event_streams.push_back(events);
     }
+    /// Make `network` exist with `detail`.
+    pub fn set_network(&self, network: &str, detail: NetworkDetail) {
+        self.lock().networks.insert(network.into(), detail);
+    }
     /// Answer every `inspect_container` for `detail.name` with `detail`.
     pub fn set_inspect(&self, detail: ContainerDetail) {
         self.lock().inspect.insert(detail.name.clone(), detail);
@@ -222,6 +230,35 @@ impl DockerOps for FakeDockerOps {
     }
     async fn list_networks(&self, _host: &Host) -> Result<Vec<NetworkInfo>, DockerError> {
         Ok(Vec::new())
+    }
+    async fn inspect_network(
+        &self,
+        _host: &Host,
+        network: &str,
+    ) -> Result<Option<NetworkDetail>, DockerError> {
+        Ok(self.lock().networks.get(network).cloned())
+    }
+    async fn create_network(
+        &self,
+        host: &Host,
+        network: &str,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> Result<bool, DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::CreateNetwork(
+            host.clone(),
+            network.into(),
+            labels.clone(),
+        ));
+        if s.networks.contains_key(network) {
+            return Ok(false);
+        }
+        let detail = NetworkDetail {
+            labels: labels.clone(),
+            ..NetworkDetail::default()
+        };
+        s.networks.insert(network.into(), detail);
+        Ok(true)
     }
     async fn connect_container_network(
         &self,

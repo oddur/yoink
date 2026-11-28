@@ -475,6 +475,17 @@ impl ContainerDetail {
     }
 }
 
+/// The parts of `docker network inspect` that yoink checks before it
+/// joins a network it owns, see `deploy::network::ensure_admin`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkDetail {
+    pub labels: BTreeMap<String, String>,
+    pub internal: bool,
+    /// Names of the containers with an endpoint on the network. Docker
+    /// lists only containers that run.
+    pub containers: Vec<String>,
+}
+
 /// One docker network as the dashboard / `yoink networks` show it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct NetworkInfo {
@@ -560,6 +571,22 @@ pub trait DockerOps: Send + Sync {
     ) -> Result<ContainerDetail, DockerError>;
 
     async fn ensure_network(&self, host: &Host, network: &str) -> Result<bool, DockerError>;
+
+    /// Inspect one network. `None` when it does not exist.
+    async fn inspect_network(
+        &self,
+        host: &Host,
+        network: &str,
+    ) -> Result<Option<NetworkDetail>, DockerError>;
+
+    /// Create a bridge network with `labels`. `false` when a network of
+    /// that name exists already (another operator was faster).
+    async fn create_network(
+        &self,
+        host: &Host,
+        network: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<bool, DockerError>;
 
     /// List every docker network on `host`. Used by `yoink networks`.
     async fn list_networks(&self, host: &Host) -> Result<Vec<NetworkInfo>, DockerError>;

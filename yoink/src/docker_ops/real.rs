@@ -21,8 +21,8 @@ use tracing::warn;
 use super::{
     BUILD_TIMEOUT, ContainerDetail, ContainerInfo, ContainerStats, DockerError, DockerEvent,
     DockerEventKind, DockerOps, DockerVersion, ExecKind, ExecSession, HostInfo, ImageInfo,
-    ImageTarStream, LogLine, LogStream, NetworkInfo, OneShotResult, ProcessTable, PruneReport,
-    StoppedRemoval, VolumeInfo, rand_hex,
+    ImageTarStream, LogLine, LogStream, NetworkDetail, NetworkInfo, OneShotResult, ProcessTable,
+    PruneReport, StoppedRemoval, VolumeInfo, rand_hex,
 };
 use crate::base::host::Host;
 
@@ -381,6 +381,56 @@ impl DockerOps for RealDockerOps {
                         Err(other) => Err(other),
                     }
                 }
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
+    async fn inspect_network(
+        &self,
+        host: &Host,
+        network: &str,
+    ) -> Result<Option<NetworkDetail>, DockerError> {
+        self.with_retry(host, |docker| async move {
+            match docker.inspect_network(network, None).await {
+                Ok(n) => Ok(Some(NetworkDetail {
+                    labels: n.labels.unwrap_or_default().into_iter().collect(),
+                    internal: n.internal.unwrap_or(false),
+                    containers: n
+                        .containers
+                        .unwrap_or_default()
+                        .into_values()
+                        .filter_map(|c| c.name)
+                        .collect(),
+                })),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => Ok(None),
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
+    async fn create_network(
+        &self,
+        host: &Host,
+        network: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<bool, DockerError> {
+        self.with_retry(host, |docker| async move {
+            let req = NetworkCreateRequest {
+                name: network.to_string(),
+                labels: Some(labels.clone().into_iter().collect()),
+                ..Default::default()
+            };
+            match docker.create_network(req).await {
+                Ok(_) => Ok(true),
+                // 409 = raced by another operator.
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409, ..
+                }) => Ok(false),
                 Err(other) => Err(other),
             }
         })
