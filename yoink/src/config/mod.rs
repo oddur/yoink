@@ -17,8 +17,8 @@ use crate::base::run_args;
 mod proxy;
 
 pub use proxy::{
-    ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, ADMIN_RELAY_NAME, INGRESS_NETWORK,
-    PROXY_SERVICE_NAME, admin_block,
+    ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, ADMIN_RELAY_NAME, CapabilitySource,
+    INGRESS_NETWORK, PROXY_SERVICE_NAME, admin_block,
 };
 
 #[derive(Debug, Error)]

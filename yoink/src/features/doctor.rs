@@ -506,12 +506,22 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
 /// One finding per container on `yoink-ingress` that keeps `NET_ADMIN`
 /// or `NET_RAW`. Empty when the proxy is off.
 fn check_ingress_capabilities(config: &Config) -> Vec<Finding> {
+    use crate::config::CapabilitySource;
     config
-        .ingress_capability_warnings()
+        .ingress_capability_warnings_by_source()
         .into_iter()
-        .map(|warning| {
-            Finding::warn("config", warning)
-                .with_fix("remove NET_ADMIN and NET_RAW, or move the container off yoink-ingress")
+        .map(|(source, warning)| {
+            let fix = match source {
+                CapabilitySource::Service => {
+                    "remove NET_ADMIN and NET_RAW, or move the container off yoink-ingress"
+                }
+                // yoink does not change the capabilities of a hook.
+                CapabilitySource::Hook => {
+                    "put another network first in `deploy.networks`; hooks keep the Docker \
+                     default capabilities"
+                }
+            };
+            Finding::warn("config", warning).with_fix(fix)
         })
         .collect()
 }
@@ -1469,6 +1479,52 @@ services:
             findings.iter().any(|f| f.title.contains("checks skipped")),
             "{:?}",
             titles(&findings)
+        );
+    }
+
+    /// Regression: a hook finding got the fix of a service finding
+    /// (remove `NET_ADMIN` and `NET_RAW`). yoink does not change the
+    /// capabilities of a hook, so the fix moves it off yoink-ingress.
+    #[test]
+    fn hook_capability_finding_has_its_own_fix() {
+        let config = Config::parse_str(
+            r"
+hosts: [{ address: h1, user: deploy }]
+proxy: { enabled: true }
+hooks:
+  pre_deploy:
+    - name: migrate
+      image: registry.example.com/api
+      tag: v1
+      cmd: [bin/migrate]
+services:
+  - name: worker
+    image: img
+    tag: t
+    networks: [yoink-ingress]
+    run:
+      options: { cap_add: [NET_RAW] }
+",
+        )
+        .unwrap();
+        let mut config = config;
+        config.deploy.networks.retain(|n| n == "yoink-ingress");
+        let findings = check_ingress_capabilities(&config);
+        let fix_of = |prefix: &str| {
+            findings
+                .iter()
+                .find(|f| f.title.starts_with(prefix))
+                .and_then(|f| f.fix.clone())
+                .unwrap_or_else(|| panic!("no finding {prefix:?}: {:?}", titles(&findings)))
+        };
+        assert_eq!(
+            fix_of("hook \"migrate\""),
+            "put another network first in `deploy.networks`; hooks keep the Docker default \
+             capabilities"
+        );
+        assert_eq!(
+            fix_of("service \"worker\""),
+            "remove NET_ADMIN and NET_RAW, or move the container off yoink-ingress"
         );
     }
 

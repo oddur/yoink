@@ -731,6 +731,15 @@ const RISKY_CAPS: [&str; 2] = ["NET_ADMIN", "NET_RAW"];
 /// `NET_RAW` is in Docker's default capability set. `NET_ADMIN` is not.
 const DOCKER_DEFAULT_RISKY: [&str; 1] = ["NET_RAW"];
 
+/// What an ingress capability warning is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilitySource {
+    /// A service with `NET_ADMIN` or `NET_RAW`.
+    Service,
+    /// A container hook on `yoink-ingress`.
+    Hook,
+}
+
 impl Config {
     /// One warning line per service on `yoink-ingress` that keeps
     /// `NET_ADMIN` or `NET_RAW`, and one per container hook that runs
@@ -740,12 +749,29 @@ impl Config {
     /// reports each line as a finding.
     #[must_use]
     pub fn ingress_capability_warnings(&self) -> Vec<String> {
+        self.ingress_capability_warnings_by_source()
+            .into_iter()
+            .map(|(_, warning)| warning)
+            .collect()
+    }
+
+    /// [`Self::ingress_capability_warnings`], each with its source. The
+    /// fix is not the same: a service drops the capabilities, a hook
+    /// moves off `yoink-ingress`.
+    #[must_use]
+    pub fn ingress_capability_warnings_by_source(&self) -> Vec<(CapabilitySource, String)> {
         if !self.proxy_enabled() {
             return Vec::new();
         }
-        let mut warnings = self.service_capability_warnings();
-        warnings.extend(self.hook_capability_warnings());
-        warnings
+        let services = self
+            .service_capability_warnings()
+            .into_iter()
+            .map(|w| (CapabilitySource::Service, w));
+        let hooks = self
+            .hook_capability_warnings()
+            .into_iter()
+            .map(|w| (CapabilitySource::Hook, w));
+        services.chain(hooks).collect()
     }
 
     fn service_capability_warnings(&self) -> Vec<String> {
