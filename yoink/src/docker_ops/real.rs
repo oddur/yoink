@@ -21,8 +21,9 @@ use tracing::warn;
 use super::{
     BUILD_TIMEOUT, ContainerDetail, ContainerInfo, ContainerStats, DockerError, DockerEvent,
     DockerEventKind, DockerOps, DockerVersion, ExecKind, ExecSession, HostInfo, ImageInfo,
-    ImageTarStream, LogLine, LogStream, NetworkDetail, NetworkInfo, OneShotResult, ProcessTable,
-    PruneReport, StoppedRemoval, VolumeInfo, rand_hex,
+    ImageTarStream, LogLine, LogStream, NetworkDetail, NetworkInfo, OneShotResult,
+    PROBE_NAME_PREFIXES, PROBE_ROLE, ProcessTable, PruneReport, StoppedRemoval, VolumeInfo,
+    rand_hex,
 };
 use crate::base::host::Host;
 
@@ -1021,7 +1022,7 @@ impl DockerOps for RealDockerOps {
         path: &str,
     ) -> Result<u16, DockerError> {
         let url = format!("http://{target}:{port}{path}");
-        let probe_name = format!("yoink-probe-{}-{}", target, rand_hex());
+        let probe_name = format!("{}{}-{}", PROBE_NAME_PREFIXES[0], target, rand_hex());
         // Without this the first probe on a fresh daemon (a
         // just-provisioned host) 404s on create_container.
         self.ensure_probe_image(host, HEALTHCHECK_CURL_IMAGE).await;
@@ -1367,7 +1368,7 @@ impl DockerOps for RealDockerOps {
         // Without this the first probe on a fresh daemon (a
         // just-provisioned host) 404s on create_container.
         self.ensure_probe_image(host, HEALTHCHECK_TCP_IMAGE).await;
-        let probe_name = format!("yoink-tcp-probe-{}-{}", target, rand_hex());
+        let probe_name = format!("{}{}-{}", PROBE_NAME_PREFIXES[1], target, rand_hex());
         let body = probe_body_with_image(
             HEALTHCHECK_TCP_IMAGE,
             network,
@@ -1870,12 +1871,22 @@ fn probe_body(network: &str, cmd: Vec<String>) -> ContainerCreateBody {
     probe_body_with_image(HEALTHCHECK_CURL_IMAGE, network, cmd)
 }
 
+/// The labels mark the probe as a yoink container. A probe that leaks
+/// (Ctrl-C, a failed remove) is then not foreign on the admin network,
+/// and the admin network check and `yoink prune` remove it.
 fn probe_body_with_image(image: &str, network: &str, cmd: Vec<String>) -> ContainerCreateBody {
     let mut endpoints = HashMap::new();
     endpoints.insert(network.to_string(), EndpointSettings::default());
     ContainerCreateBody {
         image: Some(image.to_string()),
         cmd: Some(cmd),
+        labels: Some(
+            [
+                ("yoink.managed".to_string(), "true".to_string()),
+                ("yoink.role".to_string(), PROBE_ROLE.to_string()),
+            ]
+            .into(),
+        ),
         networking_config: Some(NetworkingConfig {
             endpoints_config: Some(endpoints),
         }),
@@ -1884,5 +1895,28 @@ fn probe_body_with_image(image: &str, network: &str, cmd: Vec<String>) -> Contai
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A leaked probe must not look foreign on the admin network, so
+    /// each probe has the yoink labels.
+    #[test]
+    fn probe_bodies_have_the_yoink_probe_labels() {
+        for body in [
+            probe_body("yoink-proxy-admin", Vec::new()),
+            probe_body_with_image(HEALTHCHECK_TCP_IMAGE, "yoink-proxy-admin", Vec::new()),
+        ] {
+            let labels = body.labels.expect("labels");
+            assert_eq!(
+                labels.get("yoink.managed").map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(labels.get("yoink.role").map(String::as_str), Some("probe"));
+            assert!(!labels.contains_key("yoink.service"));
+        }
     }
 }

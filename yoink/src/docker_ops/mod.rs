@@ -943,6 +943,22 @@ pub fn parse_published_port(entries: &[String], wanted: u16) -> Option<u16> {
     None
 }
 
+/// Value of the `yoink.role` label on the one-shot probe containers of
+/// `healthcheck` and `healthcheck_tcp`.
+pub const PROBE_ROLE: &str = "probe";
+
+/// Name prefixes of the one-shot probe containers.
+pub const PROBE_NAME_PREFIXES: [&str; 2] = ["yoink-probe-", "yoink-tcp-probe-"];
+
+/// True when `c` (from a `yoink.managed=true` listing) is a one-shot
+/// probe container. The listing drops `yoink.*` labels from
+/// `other_labels`, so the check uses the name prefix and the missing
+/// `yoink.service`.
+#[must_use]
+pub fn is_probe(c: &ContainerInfo) -> bool {
+    c.yoink_service.is_none() && PROBE_NAME_PREFIXES.iter().any(|p| c.name.starts_with(p))
+}
+
 /// Cheap random hex suffix for one-shot probe container names so two
 /// concurrent deploys can't collide.
 pub(crate) fn rand_hex() -> String {

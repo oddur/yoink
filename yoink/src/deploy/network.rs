@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::base::host::Host;
 use crate::config::{ADMIN_NETWORK, PROXY_SERVICE_NAME};
-use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, NetworkDetail};
+use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, NetworkDetail, is_probe};
 use crate::proxy::relay::is_relay;
 
 pub async fn ensure(ops: &dyn DockerOps, host: &Host, network: &str) -> Result<bool, DockerError> {
@@ -87,6 +87,8 @@ pub struct AdminNetworkReady {
 ///   disconnects those app containers from an unlabeled network and
 ///   reports them in [`AdminNetworkReady::disconnected`]. Only the proxy
 ///   and the admin relay stay on it.
+/// - The deploy probe of the proxy joins the network. yoink removes a
+///   stopped probe from an earlier run and ignores a running probe.
 /// - An internal network is refused: the relay publishes a port.
 pub async fn ensure_admin(
     ops: &dyn DockerOps,
@@ -149,6 +151,15 @@ async fn check_admin_network(
     let managed = ops
         .list_containers_by_label(host, "yoink.managed=true")
         .await?;
+    // The deploy probe of the proxy joins this network. A stopped probe
+    // leaked (Ctrl-C, a failed remove): yoink removes it. A running probe
+    // belongs to a deploy that removes it when the probe ends.
+    for c in managed.iter().filter(|c| is_probe(c)) {
+        if !c.is_running() && on_network.contains(&c.name) {
+            ops.force_remove_container(host, &c.name).await?;
+        }
+    }
+    on_network.retain(|name| !managed.iter().any(|c| &c.name == name && is_probe(c)));
     let is_admin_peer =
         |c: &ContainerInfo| c.yoink_service.as_deref() == Some(PROXY_SERVICE_NAME) || is_relay(c);
     let (peers, others): (Vec<String>, Vec<String>) = on_network
@@ -172,7 +183,7 @@ async fn check_admin_network(
         });
     }
     let mut disconnected = Vec::new();
-    for c in managed.iter().filter(|c| !is_admin_peer(c)) {
+    for c in managed.iter().filter(|c| !is_admin_peer(c) && !is_probe(c)) {
         let attached_here =
             on_network.contains(&c.name) || c.networks.iter().any(|n| n == ADMIN_NETWORK);
         if attached_here {
@@ -468,6 +479,80 @@ mod tests {
             "got: {:?}",
             ops.calls()
         );
+    }
+
+    /// A probe that leaked (Ctrl-C, a failed remove) stays on the
+    /// network. yoink removes a stopped one, ignores a running one, and
+    /// accepts the network.
+    #[tokio::test]
+    async fn unlabeled_admin_network_removes_a_leaked_stopped_probe() {
+        let ops = FakeDockerOps::new();
+        ops.set_network(
+            ADMIN_NETWORK,
+            unlabeled(&["yoink-proxy-abc", "yoink-probe-yoink-proxy-admin-api-2"]),
+        );
+        let mut leaked = container("yoink-probe-yoink-proxy-admin-api-1", None);
+        leaked.state = "exited".into();
+        let running = container("yoink-probe-yoink-proxy-admin-api-2", None);
+        ops.set_network_containers(
+            ADMIN_NETWORK,
+            vec![
+                container("yoink-proxy-abc", Some(PROXY_SERVICE_NAME)),
+                leaked.clone(),
+                running.clone(),
+            ],
+        );
+        ops.push_list_containers(Ok(vec![
+            container("yoink-proxy-abc", Some(PROXY_SERVICE_NAME)),
+            leaked,
+            running,
+        ]));
+        ops.push_force_remove(Ok(()));
+        assert_eq!(
+            ensure_admin(&ops, &host()).await.unwrap(),
+            AdminNetworkReady::default()
+        );
+        let removes: Vec<RecordedCall> = ops
+            .calls()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RecordedCall::ForceRemoveContainer(..)
+                        | RecordedCall::DisconnectContainerNetwork(..)
+                )
+            })
+            .collect();
+        assert_eq!(
+            removes,
+            vec![RecordedCall::ForceRemoveContainer(
+                host(),
+                "yoink-probe-yoink-proxy-admin-api-1".into()
+            )]
+        );
+    }
+
+    /// With a foreign container on the network, the error lists only the
+    /// foreign container. The remedy does not name a probe: yoink
+    /// removed the stopped one, and a running one ends by itself.
+    #[tokio::test]
+    async fn refused_admin_network_does_not_list_probes() {
+        let ops = FakeDockerOps::new();
+        let mut leaked = container("yoink-tcp-probe-x-1", None);
+        leaked.state = "exited".into();
+        ops.set_network(ADMIN_NETWORK, unlabeled(&["yoink-proxy-abc", "other"]));
+        ops.set_network_containers(ADMIN_NETWORK, vec![leaked.clone()]);
+        ops.push_list_containers(Ok(vec![
+            container("yoink-proxy-abc", Some(PROXY_SERVICE_NAME)),
+            leaked,
+        ]));
+        ops.push_force_remove(Ok(()));
+        let err = ensure_admin(&ops, &host()).await.unwrap_err();
+        let AdminNetworkError::NotOwned { foreign, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(foreign, &["other"]);
+        assert!(!err.to_string().contains("probe"), "got: {err}");
     }
 
     #[tokio::test]

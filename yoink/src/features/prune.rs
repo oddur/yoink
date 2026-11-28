@@ -95,6 +95,11 @@ fn classify(c: &ContainerInfo, known: &BTreeSet<String>, proxy: bool) -> Option<
     if crate::proxy::relay::is_relay(c) {
         return (!proxy).then_some(PruneReason::ServiceNotInConfig);
     }
+    // A probe that leaked (Ctrl-C, a failed remove). A running probe
+    // belongs to a deploy that removes it when the probe ends.
+    if crate::docker_ops::is_probe(c) {
+        return matches!(c.state.as_str(), "exited" | "dead").then_some(PruneReason::StaleExited);
+    }
     let svc = c.yoink_service.as_deref();
     match svc {
         Some(name) if !known.contains(name) => Some(PruneReason::ServiceNotInConfig),
@@ -219,6 +224,29 @@ mod tests {
         assert_eq!(report.planned.len(), 1);
         assert_eq!(report.planned[0].container, RELAY_NAME);
         assert_eq!(report.planned[0].reason, PruneReason::ServiceNotInConfig);
+    }
+
+    /// A leaked probe has no `yoink.service`. A stopped one goes, a
+    /// running one stays.
+    #[tokio::test]
+    async fn prune_removes_only_a_stopped_probe() {
+        let probe = |name: &str, running: bool| ContainerInfo {
+            yoink_service: None,
+            ..container(name, "", running)
+        };
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![
+            probe("yoink-probe-api-1", false),
+            probe("yoink-tcp-probe-api-2", true),
+        ]));
+        let report = run(&ops, &cfg(&["api"]), true).await.unwrap();
+        let names: Vec<&str> = report
+            .planned
+            .iter()
+            .map(|p| p.container.as_str())
+            .collect();
+        assert_eq!(names, ["yoink-probe-api-1"]);
+        assert_eq!(report.planned[0].reason, PruneReason::StaleExited);
     }
 
     #[tokio::test]
