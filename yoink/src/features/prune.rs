@@ -142,9 +142,12 @@ fn classify(c: &ContainerInfo, known: &BTreeSet<String>, proxy: bool) -> Option<
         return (!proxy).then_some(PruneReason::ServiceNotInConfig);
     }
     // A probe that leaked (Ctrl-C, a failed remove). A running probe
-    // belongs to a deploy that removes it when the probe ends.
+    // belongs to a deploy that removes it when the probe ends. A
+    // `created` probe is a leftover, for the same reason as a `created`
+    // container of a service below.
     if crate::docker_ops::is_probe(c) {
-        return matches!(c.state.as_str(), "exited" | "dead").then_some(PruneReason::StaleExited);
+        return matches!(c.state.as_str(), "exited" | "dead" | "created")
+            .then_some(PruneReason::StaleExited);
     }
     let svc = c.yoink_service.as_deref();
     match svc {
@@ -278,18 +281,23 @@ mod tests {
         assert_eq!(report.planned[0].reason, PruneReason::ServiceNotInConfig);
     }
 
-    /// A leaked probe has no `yoink.service`. A stopped one goes, a
-    /// running one stays.
+    /// A leaked probe has no `yoink.service`. A stopped or `created`
+    /// one goes, a running one stays.
     #[tokio::test]
     async fn prune_removes_only_a_stopped_probe() {
         let probe = |name: &str, running: bool| ContainerInfo {
             yoink_service: None,
             ..container(name, "", running)
         };
+        let created = ContainerInfo {
+            state: "created".into(),
+            ..probe("yoink-probe-api-3", false)
+        };
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![
             probe("yoink-probe-api-1", false),
             probe("yoink-tcp-probe-api-2", true),
+            created,
         ]));
         let report = scan(&ops, &cfg(&["api"]), true).await.unwrap();
         let names: Vec<&str> = report
@@ -297,8 +305,13 @@ mod tests {
             .iter()
             .map(|p| p.container.as_str())
             .collect();
-        assert_eq!(names, ["yoink-probe-api-1"]);
-        assert_eq!(report.planned[0].reason, PruneReason::StaleExited);
+        assert_eq!(names, ["yoink-probe-api-1", "yoink-probe-api-3"]);
+        assert!(
+            report
+                .planned
+                .iter()
+                .all(|p| p.reason == PruneReason::StaleExited)
+        );
     }
 
     fn lock_free(ops: &FakeDockerOps) {

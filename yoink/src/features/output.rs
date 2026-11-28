@@ -191,7 +191,8 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
         DeployEvent::Done { host, container } => format!("[{host}] done — {container}"),
         DeployEvent::AdminNetworkContainersDisconnected { host, containers } => format!(
             "[{host}] warning: disconnected {} from {}. An earlier yoink version put \
-             these containers on it. Only the proxy and the admin relay stay on it.",
+             these containers on it. Only the admin relay stays on it, and a proxy of \
+             yoink v0.22 or earlier until a deploy recreates it.",
             containers.join(", "),
             crate::config::ADMIN_NETWORK,
         ),

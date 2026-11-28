@@ -347,8 +347,7 @@ pub enum ResolvedTarget {
 }
 
 /// The network a sidecar joins: the first of `networks` that is not
-/// [`ADMIN_NETWORK`]. Only the proxy and the admin relay may join the
-/// admin network.
+/// [`ADMIN_NETWORK`]. Only the admin relay may join the admin network.
 #[must_use]
 pub fn sidecar_network(networks: &[String]) -> Option<String> {
     networks.iter().find(|n| *n != ADMIN_NETWORK).cloned()

@@ -731,10 +731,19 @@ pub(crate) mod fake_caddy {
         }
     }
 
-    /// A loopback port on which nothing listens.
-    pub(crate) fn closed_port() -> u16 {
+    /// A loopback port whose listener closes each connection at once,
+    /// as `docker-proxy` does for a published port on which nothing
+    /// listens in the container. The listener stays bound until the
+    /// test process ends, so no other test can get the port.
+    pub(crate) fn closing_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.local_addr().expect("addr").port()
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        port
     }
 
     fn serve_one(stream: std::net::TcpStream, state: &Mutex<State>) {
@@ -823,7 +832,7 @@ pub(crate) mod fake_caddy {
 
 #[cfg(test)]
 mod tests {
-    use super::fake_caddy::{FakeCaddy, closed_port};
+    use super::fake_caddy::{FakeCaddy, closing_port};
     use super::*;
     use crate::docker_ops::{FakeDockerOps, RecordedCall};
 
@@ -1022,7 +1031,7 @@ services:
         let relay = FakeCaddy::start();
         relay.probe_statuses(&[502]);
         let ops = fake_host(&old_proxy_ports(), true);
-        ops.forward_loopback_to(LEGACY_HOST_PORT, closed_port());
+        ops.forward_loopback_to(LEGACY_HOST_PORT, closing_port());
         ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
         push_config(&host(), &ops, &rendered()).await.expect("push");
         assert_eq!(relay.loads().len(), 1);
@@ -1075,7 +1084,7 @@ services:
         relay.probe_statuses(&[502]);
         relay.load_statuses(&[502, 502]);
         let ops = fake_host(&old_proxy_ports(), true);
-        ops.forward_loopback_to(LEGACY_HOST_PORT, closed_port());
+        ops.forward_loopback_to(LEGACY_HOST_PORT, closing_port());
         ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
         let err = push_config(&host(), &ops, &rendered())
             .await

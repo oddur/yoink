@@ -1831,8 +1831,10 @@ fn docker_healthcheck_for(service: &ServiceConfig) -> Option<bollard::models::He
     // caddy:2 image speaks HTTP over one (BusyBox `wget` cannot). The
     // check thus asks the shell whether the socket exists: Caddy binds
     // it when the admin API starts, and removes a stale one first. The
-    // `test` builtin of `sh` needs no other binary. The deploy-time gate
-    // still sends `GET /config/` through the admin relay.
+    // `test` builtin of `sh` needs no other binary. This is weaker than
+    // an HTTP check: a Caddy that hangs but keeps its socket file stays
+    // healthy for Docker. The deploy-time gate still sends
+    // `GET /config/` through the admin relay.
     Some(HealthConfig {
         test: Some(vec![
             "CMD-SHELL".into(),
