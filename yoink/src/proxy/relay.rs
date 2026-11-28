@@ -157,11 +157,19 @@ fn relay_spec(image: &RelayImage) -> RunSpec {
         // The secure default: all capabilities dropped, read-only root
         // file system, user 65534, no-new-privileges, restart
         // unless-stopped (as the proxy). Port 2020 needs no capability.
-        // The official image gives the caddy binary the file
-        // capability `cap_net_bind_service=+p`, without the effective
-        // bit, so the kernel starts it with all capabilities dropped.
+        //
+        // The relay adds `NET_BIND_SERVICE` back all the same. The
+        // official image sets `setcap cap_net_bind_service=+p` on the
+        // caddy binary (caddy-docker `2.11/alpine/Dockerfile`, line
+        // 39). That file capability has no effective bit, so the exec
+        // works with all capabilities dropped. A custom `proxy.image`
+        // can use `+ep`. Then the kernel refuses the exec when the
+        // capability is not in the bounding set. With the capability
+        // in the bounding set, the exec works. no-new-privileges and
+        // user 65534 make sure that the process does not get it.
         options: RunOptions {
             tmpfs,
+            cap_add: vec!["NET_BIND_SERVICE".to_string()],
             ..RunOptions::default()
         },
         // The same shape as the proxy bootstrap: the config comes on
@@ -310,7 +318,13 @@ mod tests {
         assert_eq!(relay_port[0].host_ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(relay_port[0].host_port.as_deref(), Some("0"));
         assert_eq!(host_config.cap_drop, Some(vec!["ALL".to_string()]));
-        assert_eq!(host_config.cap_add, None);
+        // In the bounding set for a custom image with `+ep` file caps.
+        assert_eq!(
+            host_config.cap_add,
+            Some(vec!["NET_BIND_SERVICE".to_string()])
+        );
+        let security = host_config.security_opt.expect("security opt");
+        assert!(security.iter().any(|o| o.starts_with("no-new-privileges")));
         assert_eq!(host_config.readonly_rootfs, Some(true));
         let tmpfs = host_config.tmpfs.expect("tmpfs");
         let mut paths: Vec<&String> = tmpfs.keys().collect();
