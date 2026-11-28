@@ -1416,9 +1416,9 @@ async fn finalize_one_host(
         // The new replicas never got routed, so they go too. The
         // proxy container itself is the exception: its predecessor
         // is already stopped (it publishes host ports) and Caddy
-        // runs with `--resume`, so the new container is serving
-        // the autosaved config. Removing it would turn a rejected
-        // config push into a full outage.
+        // usually runs with `--resume`, so the new container is
+        // serving the autosaved config. Removing it would turn a
+        // rejected config push into a full outage.
         //
         // A stop-first service already stopped its old containers.
         // Start them again after the removal frees the host ports, as
@@ -1474,9 +1474,10 @@ async fn finalize_one_host(
 /// probe and the relay reach it. A failed deploy starts the old proxy
 /// again, and it resumes the same file.
 ///
-/// Without this push, the new proxy would resume the old admin address
-/// `0.0.0.0:2019`: open to every container on `yoink-ingress`, and out
-/// of reach of the relay.
+/// When no old proxy runs, yoink cannot push. Then `autosave.json` can
+/// still have the old admin address `0.0.0.0:2019`. The start script
+/// of the new proxy does not resume such a file: the proxy starts from
+/// the bootstrap, and the push after its healthcheck adds the routes.
 ///
 /// The push renders the routes of the containers that run now, as the
 /// final push of a run does. A proxy of this version gets no push here.

@@ -526,27 +526,14 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // pushed via `/load` immediately after the container is
             // healthy.
             //
-            // Caddy creates `/config/caddy` only when it writes the
-            // first autosave, after the admin API is up. The official
-            // image ships the directory, and Docker copies it into a new
-            // volume. `mkdir -p` covers an image without it: else the
-            // admin socket cannot bind on a new volume.
-            //
-            // `--resume` makes Caddy fall back to its autosaved
-            // runtime config (`/config/caddy/autosave.json` on the
-            // mounted `yoink_caddy_config` volume) when one exists,
-            // ignoring the stdin bootstrap. That's how the site
-            // survives a host reboot: yoink-proxy comes back with
-            // the last-pushed routing table instead of the empty
-            // admin-only bootstrap, even before any operator runs
-            // `yoink up`. On a fresh proxy (no autosave yet) the
-            // bootstrap takes effect as before.
+            // `--resume` makes Caddy use its autosaved config
+            // (`autosave.json` on the `yoink_caddy_config` volume)
+            // instead of the bootstrap. Thus the proxy serves the
+            // last-pushed routes after a host reboot, before the next
+            // `yoink up`. See `start_script` for when the script adds
+            // `--resume`.
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
-            cmd: vec![format!(
-                "mkdir -p {} && echo '{}' | exec caddy run --config /dev/stdin --resume",
-                admin_socket_dir(),
-                bootstrap_config(),
-            )],
+            cmd: vec![start_script()],
             // Yoink's `cap_drop: [ALL]` default would block Caddy
             // from binding :80/:443 (privileged ports). Re-add the
             // one cap that lets it; everything else stays dropped.
@@ -572,14 +559,73 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
     }
 }
 
-/// The bootstrap Caddy config of the proxy: only [`admin_block`]. The
-/// string is part of the proxy `cmd`, and thus of the spec hash. It is
-/// written out with a fixed key order, because the key order of a
-/// `serde_json::Value` depends on the `preserve_order` feature. A
-/// dependency that turns that feature on would otherwise change the
-/// hash and recreate the proxy on every host.
+/// [`admin_block`] as compact JSON, with the keys in sorted order: the
+/// form that Go's `json.Marshal` gives, and thus the form in Caddy's
+/// `autosave.json`. The string is part of the proxy `cmd`, and thus of
+/// the spec hash. It is written out with a fixed key order, because the
+/// key order of a `serde_json::Value` depends on the `preserve_order`
+/// feature. A dependency that turns that feature on would otherwise
+/// change the hash and recreate the proxy on every host.
+fn admin_block_json() -> String {
+    format!(r#"{{"listen":"unix/{ADMIN_SOCKET}"}}"#)
+}
+
+/// The bootstrap Caddy config of the proxy: only [`admin_block`].
 fn bootstrap_config() -> String {
-    format!(r#"{{"admin":{{"listen":"unix/{ADMIN_SOCKET}"}}}}"#)
+    format!(r#"{{"admin":{}}}"#, admin_block_json())
+}
+
+/// The start of an `autosave.json` whose admin API is on the socket.
+/// Caddy writes the file as compact JSON with sorted keys, so `admin`
+/// is the first key. The `,` after the block makes sure that the block
+/// is complete.
+fn socket_autosave_prefix() -> String {
+    format!(r#"{{"admin":{},"#, admin_block_json())
+}
+
+/// The path of Caddy's `autosave.json` in the proxy container:
+/// `$XDG_CONFIG_HOME/caddy`, the directory of the socket too.
+fn autosave_path() -> String {
+    format!("{}/autosave.json", admin_socket_dir())
+}
+
+/// The `sh` script that starts Caddy in the proxy container. It uses
+/// only `sh` built-ins besides `mkdir`.
+///
+/// - `mkdir -p`: Caddy creates `/config/caddy` only when it writes the
+///   first autosave, after the admin API is up. The official image
+///   ships the directory, and Docker copies it into a new volume. A
+///   custom image can lack it, and then the admin socket cannot bind.
+/// - `--resume` only when the admin block in `autosave.json` is the
+///   socket block. The autosave of a yoink v0.22 proxy has the admin
+///   API on `0.0.0.0:2019`. A proxy that resumes it has no admin socket,
+///   fails its healthcheck and is never ready. Thus the script starts
+///   from the bootstrap: the admin API is on the socket, and the push
+///   after the healthcheck adds the routes. Until that push, the proxy
+///   has no routes.
+/// - `exec` with a quoted heredoc: Caddy replaces the shell, so it gets
+///   the stop signal. In `echo … | exec caddy`, Caddy runs in a
+///   subshell of the pipeline, and the shell gets the signal. The
+///   bootstrap and the prefix have no single quote.
+fn start_script() -> String {
+    format!(
+        concat!(
+            "mkdir -p {dir} || exit 1\n",
+            "head=\n",
+            "{{ IFS= read -r head < {autosave} || :; }} 2>/dev/null\n",
+            "case $head in\n",
+            "'{prefix}'*) set -- --resume ;;\n",
+            "*) set -- ;;\n",
+            "esac\n",
+            "exec caddy run --config /dev/stdin \"$@\" <<'EOF'\n",
+            "{bootstrap}\n",
+            "EOF",
+        ),
+        dir = admin_socket_dir(),
+        autosave = autosave_path(),
+        prefix = socket_autosave_prefix(),
+        bootstrap = bootstrap_config(),
+    )
 }
 
 /// The directory of [`ADMIN_SOCKET`].
@@ -1090,9 +1136,9 @@ services:
             panic!("one shell command, got {:?}", proxy.run.cmd);
         };
         let json = cmd
-            .strip_prefix("mkdir -p /config/caddy && echo '")
-            .and_then(|rest| rest.split_once("' | exec caddy run --config /dev/stdin --resume"))
-            .map_or_else(|| panic!("unexpected bootstrap: {cmd}"), |(json, _)| json);
+            .split_once("<<'EOF'\n")
+            .and_then(|(_, rest)| rest.strip_suffix("\nEOF"))
+            .unwrap_or_else(|| panic!("unexpected bootstrap: {cmd}"));
         let bootstrap: serde_json::Value = serde_json::from_str(json).expect("bootstrap is JSON");
         assert_eq!(bootstrap["admin"], admin_block());
         assert_eq!(
@@ -1119,20 +1165,162 @@ services:
         assert_eq!(proxy.run.port, Some(ADMIN_RELAY_PORT));
     }
 
-    /// The bootstrap is part of the spec hash of the proxy. It came from
-    /// `serde_json::Value` Display, so its key order depended on the
-    /// `preserve_order` feature of `serde_json`.
+    /// The start script is part of the spec hash of the proxy. The
+    /// bootstrap came from `serde_json::Value` Display, so its key order
+    /// depended on the `preserve_order` feature of `serde_json`.
     #[test]
-    fn bootstrap_cmd_is_pinned() {
+    fn start_script_is_pinned() {
         let proxy = synthesized_proxy_service(&ProxyConfig::default());
         assert_eq!(
             proxy.run.cmd,
             [concat!(
-                "mkdir -p /config/caddy && ",
-                r#"echo '{"admin":{"listen":"unix//config/caddy/admin.sock"}}'"#,
-                " | exec caddy run --config /dev/stdin --resume",
+                "mkdir -p /config/caddy || exit 1\n",
+                "head=\n",
+                "{ IFS= read -r head < /config/caddy/autosave.json || :; } 2>/dev/null\n",
+                "case $head in\n",
+                r#"'{"admin":{"listen":"unix//config/caddy/admin.sock"},'*) set -- --resume ;;"#,
+                "\n*) set -- ;;\n",
+                "esac\n",
+                "exec caddy run --config /dev/stdin \"$@\" <<'EOF'\n",
+                r#"{"admin":{"listen":"unix//config/caddy/admin.sock"}}"#,
+                "\nEOF",
             )]
         );
+    }
+
+    /// The script resumes an autosave only when it starts with this
+    /// prefix. Caddy writes the file with Go's `json.Marshal`: compact,
+    /// with sorted map keys. `serde_json` without `preserve_order`
+    /// writes the same form. A change of `admin_block` that the prefix
+    /// does not follow breaks this test.
+    #[test]
+    fn socket_autosave_prefix_is_the_serialized_admin_block() {
+        let autosave = serde_json::json!({
+            "storage": { "module": "file_system" },
+            "apps": { "http": { "servers": {} } },
+            "admin": admin_block(),
+        });
+        let written = serde_json::to_string(&autosave).expect("JSON");
+        assert!(
+            written.starts_with(&socket_autosave_prefix()),
+            "{written} does not start with {}",
+            socket_autosave_prefix()
+        );
+        assert_eq!(
+            socket_autosave_prefix(),
+            r#"{"admin":{"listen":"unix//config/caddy/admin.sock"},"#
+        );
+        // The prefix is in single quotes in the script.
+        assert!(!socket_autosave_prefix().contains('\''));
+        assert!(!bootstrap_config().contains('\''));
+    }
+
+    /// What the stub `caddy` saw when the start script ran it.
+    struct StubRun {
+        args: String,
+        stdin: String,
+        /// The stub ran in the process of the shell: `exec`, no fork.
+        same_pid: bool,
+    }
+
+    /// The shells to test the start script with: `/bin/sh`, and `dash`
+    /// when the host has it (a strict POSIX shell, close to the busybox
+    /// `ash` of the Caddy image).
+    fn shells() -> Vec<&'static str> {
+        ["/bin/sh", "/bin/dash", "/usr/bin/dash"]
+            .into_iter()
+            .filter(|s| std::path::Path::new(s).exists())
+            .collect()
+    }
+
+    /// Run the start script under `shell`, with a stub `caddy` first on
+    /// `PATH` and the config directory in a temporary directory.
+    /// `autosave` is the content of `autosave.json`, `None` for no file.
+    fn run_start_script(shell: &str, autosave: Option<&str>) -> StubRun {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let config_dir = dir.join("caddy");
+        if let Some(content) = autosave {
+            std::fs::create_dir_all(&config_dir).expect("mkdir");
+            std::fs::write(config_dir.join("autosave.json"), content).expect("autosave");
+        }
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir bin");
+        let stub = bin.join("caddy");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho $$ > {out}/pid\necho \"$*\" > {out}/args\ncat > {out}/stdin\n",
+                out = dir.display()
+            ),
+        )
+        .expect("stub");
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let script = start_script()
+            .replace(
+                &format!("mkdir -p {} ", admin_socket_dir()),
+                &format!("mkdir -p {} ", config_dir.display()),
+            )
+            .replace(
+                &format!("< {} ", autosave_path()),
+                &format!("< {} ", config_dir.join("autosave.json").display()),
+            );
+        assert!(script.contains(&*dir.to_string_lossy()), "paths replaced");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let child = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", path)
+            .spawn()
+            .expect("spawn sh");
+        let shell_pid = child.id();
+        let status = child.wait_with_output().expect("wait").status;
+        assert!(status.success(), "{shell}: script failed: {status}");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect(name);
+        StubRun {
+            args: read("args").trim_end().to_string(),
+            stdin: read("stdin"),
+            same_pid: read("pid").trim() == shell_pid.to_string(),
+        }
+    }
+
+    /// An autosave with the socket block: Caddy resumes it.
+    #[test]
+    fn start_script_resumes_an_autosave_on_the_socket() {
+        let autosave = format!(r#"{}"apps":{{}}}}"#, socket_autosave_prefix());
+        for shell in shells() {
+            let run = run_start_script(shell, Some(&autosave));
+            assert_eq!(run.args, "run --config /dev/stdin --resume", "{shell}");
+            assert_eq!(run.stdin, format!("{}\n", bootstrap_config()), "{shell}");
+            assert!(run.same_pid, "{shell}: caddy must replace the shell");
+        }
+    }
+
+    /// The autosave of a v0.22 proxy (admin on `0.0.0.0:2019`), an
+    /// admin block with one more key, an empty file and no file: Caddy
+    /// starts from the bootstrap, so the admin API is on the socket.
+    #[test]
+    fn start_script_starts_from_the_bootstrap_otherwise() {
+        let other_key = socket_autosave_prefix().replace("},", r#","x":1},"#);
+        let autosaves = [
+            Some(r#"{"admin":{"listen":"0.0.0.0:2019"},"apps":{}}"#),
+            Some(other_key.as_str()),
+            Some(""),
+            None,
+        ];
+        for shell in shells() {
+            for autosave in autosaves {
+                let run = run_start_script(shell, autosave);
+                assert_eq!(run.args, "run --config /dev/stdin", "{shell}: {autosave:?}");
+                assert_eq!(run.stdin, format!("{}\n", bootstrap_config()), "{shell}");
+                assert!(run.same_pid, "{shell}: caddy must replace the shell");
+            }
+        }
     }
 
     #[test]
