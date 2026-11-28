@@ -149,8 +149,8 @@ pub async fn resolve_target(
     // (its `networks:` or the `deploy.networks` default) over scraping
     // the live container, so a service that's been re-attached to extra
     // networks behind yoink's back doesn't surprise us.
-    // Never join the reserved admin network (the first network of
-    // `yoink-proxy`).
+    // Never join the reserved admin network: `sidecar_network` skips
+    // it at any position in the list.
     let network = pf::sidecar_network(networks)
         .or_else(|| pf::sidecar_network(&target.networks))
         .ok_or_else(|| VscodeError::NoNetwork {
