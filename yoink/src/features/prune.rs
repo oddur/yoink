@@ -2,12 +2,20 @@
 //! describes — renamed services, removed services, or stale exited
 //! containers from a previous deploy. Run as `yoink prune` (or
 //! `yoink prune --dry-run` to see what would go).
+//!
+//! A prune that removes containers holds the deploy lock on every host,
+//! as `yoink up` does. A stop-first deploy stops the old container
+//! before the new one is healthy, and starts it again when the deploy
+//! fails. Without the lock, a prune could remove that stopped container
+//! in this window.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::config::Config;
+use crate::deploy::lock::{self, LockError};
 use crate::docker_ops::{ContainerInfo, DockerError, DockerOps};
 
 #[derive(Debug, Error)]
@@ -17,6 +25,15 @@ pub enum PruneError {
         host: String,
         #[source]
         source: DockerError,
+    },
+    #[error(
+        "could not get the deploy lock on {host}: {source}. A `yoink up` can be in \
+         progress. Run `yoink prune` again when it is complete."
+    )]
+    Lock {
+        host: String,
+        #[source]
+        source: LockError,
     },
 }
 
@@ -46,7 +63,35 @@ pub struct PruneReport {
 
 /// Compute candidates and (unless `dry_run`) actually remove them.
 /// Always reports what was found so the caller can print it either way.
+///
+/// Without `dry_run`, the prune first gets the deploy lock on every
+/// host of the fleet, and releases the locks when it ends, also on an
+/// error. When a lock is held, the prune removes nothing.
 pub async fn run(
+    ops: &Arc<dyn DockerOps>,
+    config: &Config,
+    dry_run: bool,
+) -> Result<PruneReport, PruneError> {
+    if dry_run {
+        return scan(&**ops, config, true).await;
+    }
+    let locks = lock::acquire_all(ops, config.fleet(), |host, e| {
+        tracing::warn!(host = %host.address, error = %e, "could not get the deploy lock");
+    })
+    .await
+    .map_err(|(host, source)| PruneError::Lock {
+        host: host.address,
+        source,
+    })?;
+    let result = scan(&**ops, config, false).await;
+    for lock in locks {
+        lock.release(&**ops).await;
+    }
+    result
+}
+
+/// Find the candidates on each host and, unless `dry_run`, remove them.
+async fn scan(
     ops: &dyn DockerOps,
     config: &Config,
     dry_run: bool,
@@ -165,7 +210,7 @@ mod tests {
             container("yoink-old-ccc", "yoink-old", true), // renamed away
             container("web-ddd", "web", true),
         ]));
-        let report = run(&ops, &cfg(&["api", "web"]), true).await.unwrap();
+        let report = scan(&ops, &cfg(&["api", "web"]), true).await.unwrap();
         assert_eq!(report.removed.len(), 0);
         let names: Vec<&str> = report
             .planned
@@ -192,7 +237,7 @@ mod tests {
             with_state("api-dead", "dead"),
             with_state("api-exited", "exited"),
         ]));
-        let report = run(&ops, &cfg(&["api"]), true).await.unwrap();
+        let report = scan(&ops, &cfg(&["api"]), true).await.unwrap();
         let names: Vec<&str> = report
             .planned
             .iter()
@@ -217,10 +262,10 @@ mod tests {
         .unwrap();
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![relay.clone()]));
-        assert!(run(&ops, &routed, true).await.unwrap().planned.is_empty());
+        assert!(scan(&ops, &routed, true).await.unwrap().planned.is_empty());
 
         ops.push_list_containers(Ok(vec![relay]));
-        let report = run(&ops, &cfg(&["api"]), true).await.unwrap();
+        let report = scan(&ops, &cfg(&["api"]), true).await.unwrap();
         assert_eq!(report.planned.len(), 1);
         assert_eq!(report.planned[0].container, RELAY_NAME);
         assert_eq!(report.planned[0].reason, PruneReason::ServiceNotInConfig);
@@ -239,7 +284,7 @@ mod tests {
             probe("yoink-probe-api-1", false),
             probe("yoink-tcp-probe-api-2", true),
         ]));
-        let report = run(&ops, &cfg(&["api"]), true).await.unwrap();
+        let report = scan(&ops, &cfg(&["api"]), true).await.unwrap();
         let names: Vec<&str> = report
             .planned
             .iter()
@@ -249,17 +294,95 @@ mod tests {
         assert_eq!(report.planned[0].reason, PruneReason::StaleExited);
     }
 
+    fn lock_free(ops: &FakeDockerOps) {
+        ops.mark_image_present("alpine", "3.20");
+        ops.push_create_container(Ok("lock-id".into()));
+        ops.push_start_container(Ok(()));
+    }
+
     #[tokio::test]
     async fn prune_actually_removes_when_not_dry_run() {
-        let ops = FakeDockerOps::new();
+        use crate::docker_ops::RecordedCall;
+        let ops = Arc::new(FakeDockerOps::new());
+        lock_free(&ops);
         ops.push_list_containers(Ok(vec![
             container("api-aaa", "api", true),
             container("yoink-old-ccc", "yoink-old", true),
         ]));
         ops.push_force_remove(Ok(()));
-        let report = run(&ops, &cfg(&["api"]), false).await.unwrap();
+        ops.push_force_remove(Ok(()));
+        let dyn_ops: Arc<dyn DockerOps> = ops.clone();
+        let report = run(&dyn_ops, &cfg(&["api"]), false).await.unwrap();
         assert_eq!(report.removed.len(), 1);
         assert_eq!(report.removed[0].container, "yoink-old-ccc");
         assert!(report.planned.is_empty());
+        // Lock, list, remove, release the lock by id.
+        let calls = ops.calls();
+        let h1 = cfg(&["api"]).fleet().remove(0);
+        assert_eq!(
+            calls.first(),
+            Some(&RecordedCall::CreateContainer(
+                h1.clone(),
+                lock::LOCK_NAME.into()
+            ))
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&RecordedCall::ForceRemoveContainer(h1, "lock-id".into()))
+        );
+    }
+
+    /// Regression: prune took no lock. During the healthcheck of a
+    /// stop-first deploy, it removed the stopped old container, so the
+    /// deploy could not start it again. With a deploy in progress, the
+    /// prune now removes nothing.
+    #[tokio::test]
+    async fn prune_removes_nothing_while_a_deploy_holds_the_lock() {
+        use crate::docker_ops::RecordedCall;
+        let ops = Arc::new(FakeDockerOps::new());
+        ops.mark_image_present("alpine", "3.20");
+        ops.push_create_container(Err(DockerError::Bollard {
+            host: "h1".into(),
+            source: bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message: "name in use".into(),
+            },
+        }));
+        let sentinel = ContainerInfo {
+            yoink_service: None,
+            ..container(lock::LOCK_NAME, "", true)
+        };
+        ops.push_list_containers(Ok(vec![sentinel]));
+        let dyn_ops: Arc<dyn DockerOps> = ops.clone();
+        let err = run(&dyn_ops, &cfg(&["api"]), false).await.unwrap_err();
+        assert!(
+            matches!(err, PruneError::Lock { ref host, .. } if host == "h1"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("`yoink up`"), "got: {err}");
+        assert!(
+            !ops.calls().iter().any(|c| matches!(
+                c,
+                RecordedCall::ListContainersByLabel(..) | RecordedCall::ForceRemoveContainer(..)
+            )),
+            "got: {:?}",
+            ops.calls()
+        );
+    }
+
+    /// A dry run takes no lock: it removes nothing.
+    #[tokio::test]
+    async fn prune_dry_run_takes_no_lock() {
+        let ops = Arc::new(FakeDockerOps::new());
+        ops.push_list_containers(Ok(Vec::new()));
+        let dyn_ops: Arc<dyn DockerOps> = ops.clone();
+        run(&dyn_ops, &cfg(&["api"]), true).await.unwrap();
+        assert_eq!(
+            ops.calls(),
+            [crate::docker_ops::RecordedCall::ListContainersByLabel(
+                cfg(&["api"]).fleet().remove(0),
+                "yoink.managed=true".into()
+            )]
+        );
     }
 }

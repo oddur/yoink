@@ -101,7 +101,7 @@ yoink reads these environment variables:
 | `yoink pull <SERVICE>` | Pulls the image on the hosts and does not deploy. |
 | `--tag <TAG>` | Overrides the tag. |
 | `--host <ADDRESS>` | Pulls on one host only. |
-| `yoink prune` | Removes yoink-managed containers whose service is not in the config, and stale exited containers. |
+| `yoink prune` | Removes yoink-managed containers whose service is not in the config, and stale exited containers. Takes the deploy lock on each host first. `--dry-run` does not take the lock. |
 | `--dry-run` | Lists the containers and removes nothing. |
 | `yoink preflight` | Makes sure that Docker is reachable on each host. |
 | `--wait <DURATION>` | Polls each host until its docker daemon answers or the time is over, for example `--wait 90s`. |

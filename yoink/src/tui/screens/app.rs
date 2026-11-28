@@ -4265,7 +4265,7 @@ async fn prune_all(config: Config, ops: Arc<dyn DockerOps>, tx: UnboundedSender<
     }
 
     send_event(format!("scanning {} host(s)…", config.host_count()));
-    match prune::run(&*ops, &config, false).await {
+    match prune::run(&ops, &config, false).await {
         Ok(report) => {
             if report.removed.is_empty() {
                 send_event("nothing to prune".into());

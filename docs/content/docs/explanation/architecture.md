@@ -61,6 +61,8 @@ If `yoink up` redeploys every service and you did not expect it, an input of the
 
 `yoink up` takes an advisory lock on each host. The lock stops two operators, or an operator and a CI runner, from changing the same docker daemon during a deploy.
 
+`yoink prune` takes the same lock on each host before it removes containers. `yoink prune --dry-run` does not take the lock. Thus a prune cannot remove the stopped old container of a stop-first deploy. The deploy must start that container again if the new container does not become healthy.
+
 The lock is a sentinel container with the name `yoink-deploy-lock`, not a file lock. Thus the lock releases itself after a crash on the operator side. The sentinel runs a small shell loop that watches the file `/tmp/heartbeat`. The loop exits when the file is older than approximately 30 seconds. While yoink holds the lock, it runs `docker exec` in the sentinel every 5 seconds to touch `/tmp/heartbeat`.
 
 | Situation | Result |

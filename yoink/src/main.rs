@@ -2804,7 +2804,8 @@ fn extract_image_tag(image: &str) -> &str {
 }
 async fn cmd_prune(config: &Config, dry_run: bool) -> Result<()> {
     use yoink::features::prune::{self, PruneReason};
-    let ops = build_real_ops(config, None).await?;
+    let ops: std::sync::Arc<dyn DockerOps> =
+        std::sync::Arc::new(build_real_ops(config, None).await?);
     let report = prune::run(&ops, config, dry_run).await.context("prune")?;
     let items = if dry_run {
         &report.planned
