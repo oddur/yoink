@@ -328,6 +328,17 @@ impl DockerOps for RealDockerOps {
         })
     }
 
+    async fn host_time_unix(&self, host: &Host) -> Result<i64, DockerError> {
+        let i = self
+            .with_retry(host, |docker| async move { docker.info().await })
+            .await?;
+        let raw = i
+            .system_time
+            .ok_or_else(|| DockerError::Invalid("docker info has no SystemTime".into()))?;
+        parse_system_time(&raw)
+            .ok_or_else(|| DockerError::Invalid(format!("docker info SystemTime {raw:?}")))
+    }
+
     async fn container_stats(
         &self,
         host: &Host,
@@ -1877,9 +1888,49 @@ fn probe_body_with_image(image: &str, network: &str, cmd: Vec<String>) -> Contai
     }
 }
 
+/// Parse `SystemTime` of `docker info`: RFC 3339 with an optional
+/// fraction, and `Z` or a `+HH:MM` / `-HH:MM` offset (the daemon formats
+/// its local time). Returns Unix seconds.
+fn parse_system_time(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    // `YYYY-MM-DDTHH:MM:SS` is 19 bytes. The zone follows the seconds
+    // and the optional fraction.
+    let zone_at = raw.get(19..)?.find(['Z', 'z', '+', '-']).map(|i| i + 19)?;
+    let (local, zone) = raw.split_at(zone_at);
+    let offset_secs: i64 = match zone {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = if zone.starts_with('-') { -1 } else { 1 };
+            let (h, m) = zone.get(1..)?.split_once(':')?;
+            sign * (h.parse::<i64>().ok()? * 3600 + m.parse::<i64>().ok()? * 60)
+        }
+    };
+    let utc = humantime::parse_rfc3339_weak(local.get(..19)?).ok()?;
+    let secs = i64::try_from(utc.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).ok()?;
+    Some(secs - offset_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_time_of_docker_info_parses_with_any_offset() {
+        // 2026-11-28T12:00:00Z
+        let utc = 1_795_867_200;
+        assert_eq!(
+            parse_system_time("2026-11-28T12:00:00.123456789Z"),
+            Some(utc)
+        );
+        assert_eq!(parse_system_time("2026-11-28T12:00:00Z"), Some(utc));
+        assert_eq!(parse_system_time("2026-11-28T13:00:00.5+01:00"), Some(utc));
+        assert_eq!(
+            parse_system_time("2026-11-28T06:30:00.000000001-05:30"),
+            Some(utc)
+        );
+        assert_eq!(parse_system_time("not a time"), None);
+        assert_eq!(parse_system_time("2026-11-28T12:00:00"), None);
+    }
 
     /// A leaked probe must not look foreign on the admin network, so
     /// each probe has the yoink labels.

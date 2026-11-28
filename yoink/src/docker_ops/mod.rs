@@ -570,6 +570,12 @@ pub trait DockerOps: Send + Sync {
     /// Host-level info from `docker info` — capacity, container counts.
     async fn host_info(&self, host: &Host) -> Result<HostInfo, DockerError>;
 
+    /// The clock of the Docker daemon on `host`, in Unix seconds, from
+    /// `SystemTime` of `docker info`. Compare container `Created` times
+    /// with this, not with the clock of the operator: the two can be
+    /// hours apart.
+    async fn host_time_unix(&self, host: &Host) -> Result<i64, DockerError>;
+
     /// One-shot snapshot of CPU% + memory used for a single container.
     async fn container_stats(&self, host: &Host, name: &str)
     -> Result<ContainerStats, DockerError>;

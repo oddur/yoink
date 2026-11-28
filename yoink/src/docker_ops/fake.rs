@@ -29,6 +29,7 @@ pub struct FakeDockerOps {
 struct FakeState {
     version: VecDeque<Result<DockerVersion, DockerError>>,
     host_info: VecDeque<Result<HostInfo, DockerError>>,
+    host_time: VecDeque<Result<i64, DockerError>>,
     container_stats: VecDeque<Result<ContainerStats, DockerError>>,
     ensure_network: VecDeque<Result<bool, DockerError>>,
     pull_image: VecDeque<Result<(), DockerError>>,
@@ -78,6 +79,7 @@ struct FakeState {
 pub enum RecordedCall {
     Version(Host),
     HostInfo(Host),
+    HostTime(Host),
     ContainerStats(Host, String),
     EnsureNetwork(Host, String),
     /// `(host, container, network)`.
@@ -121,6 +123,9 @@ impl FakeDockerOps {
     }
     pub fn push_host_info(&self, v: Result<HostInfo, DockerError>) {
         self.lock().host_info.push_back(v);
+    }
+    pub fn push_host_time(&self, v: Result<i64, DockerError>) {
+        self.lock().host_time.push_back(v);
     }
     pub fn push_container_stats(&self, v: Result<ContainerStats, DockerError>) {
         self.lock().container_stats.push_back(v);
@@ -257,6 +262,11 @@ impl DockerOps for FakeDockerOps {
         let mut s = self.lock();
         s.calls.push(RecordedCall::HostInfo(host.clone()));
         pop(&mut s.host_info, "host_info")
+    }
+    async fn host_time_unix(&self, host: &Host) -> Result<i64, DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::HostTime(host.clone()));
+        pop(&mut s.host_time, "host_time_unix")
     }
     async fn container_stats(
         &self,

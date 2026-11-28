@@ -332,11 +332,8 @@ pub async fn load_images_to_hosts(
             .flatten()
             .map(|h| (h.address.clone(), h))
             .collect();
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         for host in unique_hosts.values() {
-            sweep_leaked_sidecars(ops, host, now_unix).await;
+            sweep_leaked_sidecars(ops, host).await;
         }
     }
 
@@ -430,18 +427,31 @@ async fn deliver_image(
 /// A sidecar younger than this can belong to a push that is still
 /// running. The sweep runs before the deploy lock, so another
 /// operator's `yoink up` or `yoink build --push` can be mid-transfer
-/// on the same host. One hour is far above a normal push and also
-/// absorbs clock skew between the operator and the host.
+/// on the same host. One hour is far above a normal push. The age is
+/// measured with the clock of the host, which also sets the `Created`
+/// time, so clock skew between the operator and the host has no
+/// effect.
 const LEAKED_SIDECAR_MIN_AGE_SECS: i64 = 60 * 60;
 
 /// Force-remove every container labeled
 /// `yoink.role=unregistry-ephemeral` on `host` that was created at
-/// least [`LEAKED_SIDECAR_MIN_AGE_SECS`] before `now_unix`. Catches
+/// least [`LEAKED_SIDECAR_MIN_AGE_SECS`] before now, by the clock of
+/// the Docker daemon on `host` (one `docker info` per host). Catches
 /// sidecars leaked by a prior `yoink up` that crashed mid-push. A
 /// younger sidecar, or one with no creation time, stays: it can be a
-/// concurrent push. Errors are logged-and-swallowed — this is
-/// hygiene, not a gate.
-async fn sweep_leaked_sidecars(ops: &dyn DockerOps, host: &Host, now_unix: i64) {
+/// concurrent push. Without the clock of the host, nothing is removed.
+/// Errors are logged-and-swallowed — this is hygiene, not a gate.
+async fn sweep_leaked_sidecars(ops: &dyn DockerOps, host: &Host) {
+    let now_unix = match ops.host_time_unix(host).await {
+        Ok(now) => now,
+        Err(e) => {
+            tracing::debug!(
+                "sweep: no clock of the Docker daemon on {}, skipping: {e}",
+                host.address
+            );
+            return;
+        }
+    };
     let label = format!("{SIDECAR_LABEL}={SIDECAR_LABEL_VALUE}");
     let containers = match ops.list_containers_by_label(host, &label).await {
         Ok(c) => c,
@@ -492,14 +502,8 @@ mod tests {
         assert!(format!("{e}").contains("\"api\""));
     }
 
-    /// The sweep runs before the deploy lock. It used to remove every
-    /// unregistry sidecar on the host, also the one of a concurrent
-    /// operator in the middle of a push. Now only old sidecars go.
-    #[tokio::test]
-    async fn sweep_keeps_young_sidecars() {
-        use crate::docker_ops::{ContainerInfo, FakeDockerOps, RecordedCall};
-        let now = 1_000_000;
-        let sidecar = |name: &str, created: Option<i64>| ContainerInfo {
+    fn sidecar(name: &str, created: Option<i64>) -> crate::docker_ops::ContainerInfo {
+        crate::docker_ops::ContainerInfo {
             host: "h1".into(),
             name: name.into(),
             image: String::new(),
@@ -513,8 +517,35 @@ mod tests {
             yoink_deployed_at: None,
             networks: Vec::new(),
             other_labels: BTreeMap::new(),
-        };
-        let ops = FakeDockerOps::new();
+        }
+    }
+
+    fn sweep_host() -> Host {
+        Host {
+            address: "h1".into(),
+            user: "root".into(),
+            port: None,
+        }
+    }
+
+    fn removed(ops: &crate::docker_ops::FakeDockerOps) -> Vec<String> {
+        ops.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::docker_ops::RecordedCall::ForceRemoveContainer(_, name) => Some(name),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The sweep runs before the deploy lock. It used to remove every
+    /// unregistry sidecar on the host, also the one of a concurrent
+    /// operator in the middle of a push. Now only old sidecars go.
+    #[tokio::test]
+    async fn sweep_keeps_young_sidecars() {
+        let now = 1_000_000;
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_host_time(Ok(now));
         ops.push_list_containers(Ok(vec![
             sidecar(
                 "yoink-unregistry-old",
@@ -524,20 +555,56 @@ mod tests {
             sidecar("yoink-unregistry-unknown", None),
         ]));
         ops.push_force_remove(Ok(()));
-        let host = Host {
-            address: "h1".into(),
-            user: "root".into(),
-            port: None,
-        };
-        sweep_leaked_sidecars(&ops, &host, now).await;
-        let removed: Vec<String> = ops
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                RecordedCall::ForceRemoveContainer(_, name) => Some(name),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(removed, ["yoink-unregistry-old"]);
+        sweep_leaked_sidecars(&ops, &sweep_host()).await;
+        assert_eq!(removed(&ops), ["yoink-unregistry-old"]);
+    }
+
+    /// The sweep compared the `Created` time of the host with the clock
+    /// of the operator. With the host two hours behind the operator, it
+    /// removed the sidecar of a push that had just started. With the
+    /// host two hours ahead, it kept a sidecar that leaked 90 minutes
+    /// ago. The sweep now uses the clock of the host.
+    #[tokio::test]
+    async fn sweep_uses_the_clock_of_the_host() {
+        let operator_now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        for skew in [-2 * 60 * 60, 2 * 60 * 60] {
+            let host_now = operator_now + skew;
+            let ops = crate::docker_ops::FakeDockerOps::new();
+            ops.push_host_time(Ok(host_now));
+            ops.push_list_containers(Ok(vec![
+                sidecar("yoink-unregistry-busy", Some(host_now - 60)),
+                sidecar("yoink-unregistry-leaked", Some(host_now - 90 * 60)),
+            ]));
+            ops.push_force_remove(Ok(()));
+            sweep_leaked_sidecars(&ops, &sweep_host()).await;
+            assert_eq!(removed(&ops), ["yoink-unregistry-leaked"], "skew {skew}");
+            let clock_reads = ops
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, crate::docker_ops::RecordedCall::HostTime(_)))
+                .count();
+            assert_eq!(clock_reads, 1);
+        }
+    }
+
+    /// Without the clock of the host, the sweep removes nothing.
+    #[tokio::test]
+    async fn sweep_without_the_host_clock_removes_nothing() {
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_host_time(Err(crate::docker_ops::DockerError::Invalid(
+            "no SystemTime".into(),
+        )));
+        sweep_leaked_sidecars(&ops, &sweep_host()).await;
+        assert!(removed(&ops).is_empty());
+        assert!(!ops.calls().iter().any(|c| matches!(
+            c,
+            crate::docker_ops::RecordedCall::ListContainersByLabel(..)
+        )));
     }
 }
