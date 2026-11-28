@@ -115,6 +115,60 @@ pub enum AdminError {
         legacy: Box<AdminError>,
         relay: Box<AdminError>,
     },
+    /// `/load` answered with a success, then the read-back of the
+    /// routes failed.
+    #[error("proxy /load reported success, but reading the routes back failed: {source}")]
+    ReadBack {
+        #[source]
+        source: reqwest::Error,
+    },
+}
+
+impl AdminError {
+    /// False when yoink knows that Caddy did not apply the pushed
+    /// config: the push stopped before it sent a `/load`, the connection
+    /// failed before the request went out, or Caddy answered and
+    /// rejected the config (a `/load` is atomic). True otherwise: a 2xx
+    /// with a failed check after it, a timeout or a broken connection
+    /// after the request went out, or a 502-504 from the relay (it
+    /// cannot tell whether the request reached Caddy).
+    #[must_use]
+    pub fn may_have_applied(&self) -> bool {
+        match self {
+            Self::LoadVerifyMismatch { .. } | Self::ReadBack { .. } => true,
+            Self::Http { source } => !source.is_connect(),
+            Self::LoadRejected { status, .. } => is_gateway_error(*status),
+            Self::UpgradeFailed { legacy, relay } => {
+                legacy.may_have_applied() || relay.may_have_applied()
+            }
+            Self::Docker { .. }
+            | Self::ProxyNotRunning { .. }
+            | Self::RelayNotRunning { .. }
+            | Self::NoPublishedAdminPort { .. }
+            | Self::Tunnel(_)
+            | Self::NotReady { .. } => false,
+        }
+    }
+}
+
+/// A failed [`push_config`]. `may_have_applied` is false only when
+/// yoink knows that Caddy kept its old config, see
+/// [`AdminError::may_have_applied`]. It covers every `/load` of the
+/// push: a retry, and the first push to an old proxy.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub struct PushError {
+    pub error: AdminError,
+    pub may_have_applied: bool,
+}
+
+impl PushError {
+    fn not_applied(error: AdminError) -> Self {
+        Self {
+            error,
+            may_have_applied: false,
+        }
+    }
 }
 
 /// Push `config` to the proxy on `host`, through the admin relay.
@@ -133,24 +187,43 @@ pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
     config: &Value,
-) -> Result<(), AdminError> {
-    let proxy = running_proxy(host, ops).await?;
+) -> Result<(), PushError> {
+    let proxy = running_proxy(host, ops)
+        .await
+        .map_err(PushError::not_applied)?;
     // The relay must run before yoink moves the admin API of an old
     // proxy to the socket: else nothing reaches the admin API after.
-    let relay_port = relay_port(host, ops).await?;
-    let legacy_error = match legacy_admin_port(&proxy) {
+    let relay_port = relay_port(host, ops)
+        .await
+        .map_err(PushError::not_applied)?;
+    let legacy = match legacy_admin_port(&proxy) {
         Some(port) => move_admin_to_socket(host, ops, port, config).await?,
-        None => None,
+        None => LegacyPush::default(),
     };
     push_through_relay(host, ops, relay_port, config)
         .await
-        .map_err(|relay| match legacy_error {
-            Some(legacy) => AdminError::UpgradeFailed {
-                legacy: Box::new(legacy),
-                relay: Box::new(relay),
-            },
-            None => relay,
+        .map_err(|mut relay| {
+            relay.may_have_applied |= legacy.may_have_applied;
+            match legacy.error {
+                Some(error) => PushError {
+                    error: AdminError::UpgradeFailed {
+                        legacy: Box::new(error),
+                        relay: Box::new(relay.error),
+                    },
+                    may_have_applied: relay.may_have_applied,
+                },
+                None => relay,
+            }
         })
+}
+
+/// What [`move_admin_to_socket`] did, when it did not stop the push.
+#[derive(Default)]
+struct LegacyPush {
+    /// The `/load` to the old port may have changed the config.
+    may_have_applied: bool,
+    /// The transport error of that `/load`, for the message.
+    error: Option<AdminError>,
 }
 
 /// True when `proxy`, the inspect of a proxy container, is from yoink
@@ -188,30 +261,43 @@ async fn move_admin_to_socket(
     ops: &dyn DockerOps,
     port: u16,
     config: &Value,
-) -> Result<Option<AdminError>, AdminError> {
+) -> Result<LegacyPush, PushError> {
     let attempt = || async {
         let tunnel = ops
             .forward_loopback(host, port, TUNNEL_READY_TIMEOUT)
             .await?;
         post_load(&http_client(ADMIN_API_TIMEOUT), tunnel.local_port(), config).await
     };
+    let mut may_have_applied = false;
     let result = match attempt().await {
         Err(e) if !matches!(e, AdminError::LoadRejected { .. }) => {
+            may_have_applied = e.may_have_applied();
             tokio::time::sleep(RETRY_BACKOFF).await;
             attempt().await
         }
         other => other,
     };
     match result {
-        Ok(()) => Ok(None),
-        Err(e @ AdminError::LoadRejected { .. }) => Err(e),
+        Ok(()) => Ok(LegacyPush {
+            may_have_applied: true,
+            error: None,
+        }),
+        // Caddy answered on its own port, not through the relay: the
+        // rejection is final, also for a 5xx.
+        Err(error @ AdminError::LoadRejected { .. }) => Err(PushError {
+            error,
+            may_have_applied,
+        }),
         Err(e) => {
             tracing::debug!(
                 host = %host.address,
                 error = %e,
                 "push to the admin port of an old proxy failed; trying the relay",
             );
-            Ok(Some(e))
+            Ok(LegacyPush {
+                may_have_applied: may_have_applied || e.may_have_applied(),
+                error: Some(e),
+            })
         }
     }
 }
@@ -223,7 +309,7 @@ async fn push_through_relay(
     ops: &dyn DockerOps,
     relay_port: u16,
     config: &Value,
-) -> Result<(), AdminError> {
+) -> Result<(), PushError> {
     // The discovery phase (label lookup + inspect + port parse) is
     // invariant across retries on transport-class failures, so we run
     // it once and only re-tunnel-and-load on retry.
@@ -231,7 +317,7 @@ async fn push_through_relay(
     // bollard's `with_retry` already covers the ssh-pool flakiness for
     // those calls (see `RealDockerOps`), adding another retry layer here
     // would compound the wait on genuinely down hosts.
-    match tunnel_and_load(host, ops, relay_port, config).await {
+    let (first_applied, result) = match tunnel_and_load(host, ops, relay_port, config).await {
         Err(e) if is_transient(&e) => {
             tracing::debug!(
                 host = %host.address,
@@ -239,10 +325,17 @@ async fn push_through_relay(
                 "transient proxy admin push error; reopening tunnel and retrying once",
             );
             tokio::time::sleep(RETRY_BACKOFF).await;
-            tunnel_and_load(host, ops, relay_port, config).await
+            (
+                e.may_have_applied(),
+                tunnel_and_load(host, ops, relay_port, config).await,
+            )
         }
-        other => other,
-    }
+        other => (false, other),
+    };
+    result.map_err(|error| PushError {
+        may_have_applied: first_applied || error.may_have_applied(),
+        error,
+    })
 }
 
 /// A 502 comes from the relay: it could not reach the admin socket, or
@@ -400,7 +493,7 @@ async fn read_route_count(client: &reqwest::Client, local_port: u16) -> Result<u
         .get(&url)
         .send()
         .await
-        .map_err(|source| AdminError::Http { source })?;
+        .map_err(|source| AdminError::ReadBack { source })?;
     // 404 = no routes object at that pointer (e.g. a config with no
     // routed services). Treat as zero rather than an error so the
     // verify step doesn't trip on legitimate empty configs.
@@ -410,7 +503,7 @@ async fn read_route_count(client: &reqwest::Client, local_port: u16) -> Result<u
     let routes: Value = resp
         .json()
         .await
-        .map_err(|source| AdminError::Http { source })?;
+        .map_err(|source| AdminError::ReadBack { source })?;
     Ok(routes.as_array().map_or(0, Vec::len))
 }
 
@@ -501,8 +594,9 @@ pub(crate) mod fake_caddy {
         config: Option<Value>,
         /// Status for each `/load`. 200 when empty.
         load_status: Vec<u16>,
-        /// Route count of the read-back, instead of the loaded one.
-        routes: Option<usize>,
+        /// Route counts of the next read-backs, instead of the loaded
+        /// one.
+        routes: Vec<usize>,
     }
 
     pub(crate) struct FakeCaddy {
@@ -534,6 +628,12 @@ pub(crate) mod fake_caddy {
         /// Answer the next `/load` requests with these statuses.
         pub(crate) fn load_statuses(&self, statuses: &[u16]) {
             self.lock().load_status = statuses.to_vec();
+        }
+
+        /// Report `n` routes on the next read-back, whatever was
+        /// loaded.
+        pub(crate) fn report_routes_once(&self, n: usize) {
+            self.lock().routes.push(n);
         }
 
         pub(crate) fn requests(&self) -> Vec<Request> {
@@ -620,7 +720,8 @@ pub(crate) mod fake_caddy {
                     .and_then(|c| c.pointer("/apps/http/servers/main/routes"))
                     .and_then(Value::as_array)
                     .map(Vec::len);
-                match s.routes.or(loaded) {
+                let reported = (!s.routes.is_empty()).then(|| s.routes.remove(0));
+                match reported.or(loaded) {
                     Some(n) => (200, Value::Array(vec![Value::Null; n]).to_string()),
                     None => (404, String::new()),
                 }
@@ -812,9 +913,10 @@ services:
             .await
             .expect_err("rejected");
         assert!(
-            matches!(err, AdminError::LoadRejected { status, .. } if status.as_u16() == 400),
+            matches!(err.error, AdminError::LoadRejected { status, .. } if status.as_u16() == 400),
             "got: {err}"
         );
+        assert!(!err.may_have_applied);
         assert!(relay.requests().is_empty());
     }
 
@@ -829,7 +931,7 @@ services:
             .await
             .expect_err("no relay");
         assert!(
-            matches!(err, AdminError::RelayNotRunning { .. }),
+            matches!(err.error, AdminError::RelayNotRunning { .. }),
             "got: {err}"
         );
         assert!(legacy.requests().is_empty());
@@ -845,7 +947,7 @@ services:
         let err = push_config(&host(), &ops, &rendered())
             .await
             .expect_err("both fail");
-        let AdminError::UpgradeFailed { legacy, relay } = &err else {
+        let AdminError::UpgradeFailed { legacy, relay } = &err.error else {
             panic!("got: {err}");
         };
         assert!(matches!(**legacy, AdminError::Http { .. }), "got: {legacy}");
@@ -897,7 +999,7 @@ services:
             .await
             .expect_err("no proxy");
         assert!(
-            matches!(err, AdminError::ProxyNotRunning { .. }),
+            matches!(err.error, AdminError::ProxyNotRunning { .. }),
             "got: {err}"
         );
     }
@@ -909,7 +1011,7 @@ services:
             .await
             .expect_err("no relay");
         assert!(
-            matches!(err, AdminError::RelayNotRunning { .. }),
+            matches!(err.error, AdminError::RelayNotRunning { .. }),
             "got: {err}"
         );
         let msg = err.to_string();
@@ -931,6 +1033,113 @@ services:
         };
         assert!(is_legacy_proxy(&detail(&old_proxy_ports())));
         assert!(!is_legacy_proxy(&detail(&["80:80/tcp", "443:443/tcp"])));
+    }
+
+    /// A 2xx `/load` with a wrong route count applied the config.
+    #[tokio::test]
+    async fn mismatch_after_a_load_may_have_applied() {
+        let relay = FakeCaddy::start();
+        relay.report_routes_once(0);
+        let ops = fake_host(&["80:80/tcp", "443:443/tcp"], true);
+        ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        let err = push_config(&host(), &ops, &rendered())
+            .await
+            .expect_err("mismatch");
+        assert!(
+            matches!(err.error, AdminError::LoadVerifyMismatch { .. }),
+            "got: {err}"
+        );
+        assert!(err.may_have_applied);
+    }
+
+    /// A rejection by Caddy (4xx) and an error before the `/load`
+    /// applied nothing. A gateway error of the relay may have.
+    #[tokio::test]
+    async fn rejections_and_early_errors_did_not_apply() {
+        let relay = FakeCaddy::start();
+        relay.load_statuses(&[400]);
+        let ops = fake_host(&["80:80/tcp", "443:443/tcp"], true);
+        ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        let err = push_config(&host(), &ops, &rendered())
+            .await
+            .expect_err("rejected");
+        assert!(!err.may_have_applied, "got: {err}");
+
+        // No tunnel to the relay: nothing was sent.
+        let ops = fake_host(&["80:80/tcp", "443:443/tcp"], true);
+        let err = push_config(&host(), &ops, &rendered())
+            .await
+            .expect_err("no tunnel");
+        assert!(!err.may_have_applied, "got: {err}");
+
+        // The relay answers 502 on both tries: it cannot tell whether
+        // the request reached Caddy.
+        let relay = FakeCaddy::start();
+        relay.load_statuses(&[502, 502]);
+        let ops = fake_host(&["80:80/tcp", "443:443/tcp"], true);
+        ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        let err = push_config(&host(), &ops, &rendered())
+            .await
+            .expect_err("gateway");
+        assert!(err.may_have_applied, "got: {err}");
+    }
+
+    #[test]
+    fn may_have_applied_by_error() {
+        let not_applied = [
+            AdminError::ProxyNotRunning { host: "h".into() },
+            AdminError::RelayNotRunning { host: "h".into() },
+            AdminError::NotReady {
+                timeout: Duration::from_secs(1),
+            },
+            AdminError::LoadRejected {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body: String::new(),
+            },
+            AdminError::LoadRejected {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                body: String::new(),
+            },
+        ];
+        for e in &not_applied {
+            assert!(!e.may_have_applied(), "{e}");
+        }
+        let applied = [
+            AdminError::LoadVerifyMismatch {
+                expected: 1,
+                actual: 0,
+            },
+            AdminError::LoadRejected {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                body: String::new(),
+            },
+            AdminError::UpgradeFailed {
+                legacy: Box::new(AdminError::LoadVerifyMismatch {
+                    expected: 1,
+                    actual: 0,
+                }),
+                relay: Box::new(AdminError::NotReady {
+                    timeout: Duration::from_secs(1),
+                }),
+            },
+        ];
+        for e in &applied {
+            assert!(e.may_have_applied(), "{e}");
+        }
+    }
+
+    /// The `/load` to the old port succeeded, so the push may have
+    /// applied also when the relay then fails.
+    #[tokio::test]
+    async fn successful_push_to_an_old_proxy_counts_as_applied() {
+        let legacy = FakeCaddy::start();
+        let ops = fake_host(&old_proxy_ports(), true);
+        ops.forward_loopback_to(LEGACY_HOST_PORT, legacy.port);
+        let err = push_config(&host(), &ops, &rendered())
+            .await
+            .expect_err("no tunnel to the relay");
+        assert!(matches!(err.error, AdminError::Tunnel(_)), "got: {err}");
+        assert!(err.may_have_applied);
     }
 
     #[test]

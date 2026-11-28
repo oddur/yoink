@@ -1403,7 +1403,7 @@ async fn finalize_one_host(
     // for why we deliberately do NOT include the about-to-be-stopped
     // old containers in the rendered upstreams.
     if triggers_caddy_load
-        && let Err(e) = push_caddy_config(
+        && let Err(failure) = try_push_caddy_config(
             ops,
             &host,
             config,
@@ -1423,11 +1423,20 @@ async fn finalize_one_host(
         // Start them again after the removal frees the host ports, as
         // the healthcheck failure path above does. A rolling deploy
         // has an empty `stopped_old` here.
+        //
+        // The push may have reached Caddy before it failed: a route
+        // count mismatch after a 2xx, a failed read-back, a timeout.
+        // Then Caddy routes to the replicas that yoink just removed, and
+        // answers 502 until the next successful run. Push again, with
+        // the upstreams of the containers that run now: the old ones.
         if !is_proxy {
             remove_attempt_replicas(ops, &host, &replicas).await;
             restart_old_containers(ops, &host, &stopped_old, on_event).await;
+            if failure.may_have_applied {
+                return Err(route_back(ops, &host, config, secrets, failure.error).await);
+            }
         }
-        return Err(e);
+        return Err(failure.error);
     }
 
     if !stop_first {
@@ -1564,6 +1573,60 @@ async fn push_caddy_config(
     secrets: Option<&SecretsBundle>,
     in_flight_upstreams: Option<(&str, &std::collections::BTreeSet<String>)>,
 ) -> Result<(), DeployError> {
+    try_push_caddy_config(ops, host, config, secrets, in_flight_upstreams)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// A failed [`try_push_caddy_config`]. `may_have_applied` is false only
+/// when Caddy certainly kept its old config, see
+/// [`crate::proxy::admin::AdminError::may_have_applied`]. A failure
+/// before the push (expand, upstream lookup, render) sent nothing.
+struct CaddyPushFailure {
+    error: DeployError,
+    may_have_applied: bool,
+}
+
+impl From<DeployError> for CaddyPushFailure {
+    fn from(error: DeployError) -> Self {
+        Self {
+            error,
+            may_have_applied: false,
+        }
+    }
+}
+
+/// After a push that may have applied, route Caddy to the containers
+/// that run now. Returns the error of the failed push `first`, with the
+/// error of this push when it fails too.
+async fn route_back(
+    ops: &dyn DockerOps,
+    host: &Host,
+    config: &Config,
+    secrets: Option<&SecretsBundle>,
+    first: DeployError,
+) -> DeployError {
+    match push_caddy_config(ops, host, config, secrets, None).await {
+        Ok(()) => first,
+        Err(second) => DeployError::Custom {
+            host: host.address.clone(),
+            detail: format!(
+                "{first}. Caddy can still route to the removed containers: the push that \
+                 routes it to the running containers failed too: {second}"
+            ),
+        },
+    }
+}
+
+/// [`push_caddy_config`], with the information whether a failed push
+/// may have changed the config of Caddy.
+async fn try_push_caddy_config(
+    ops: &dyn DockerOps,
+    host: &Host,
+    config: &Config,
+    secrets: Option<&SecretsBundle>,
+    in_flight_upstreams: Option<(&str, &std::collections::BTreeSet<String>)>,
+) -> Result<(), CaddyPushFailure> {
     // Expand any `caddy_extra_caddyfile:` snippets to JSON. Mutates a
     // local clone so the caller's view of config stays unchanged.
     let mut config = config.clone();
@@ -1610,9 +1673,12 @@ async fn push_caddy_config(
                     extras.join(", "),
                 )
             };
-            DeployError::Custom {
-                host: host.address.clone(),
-                detail: format!("push Caddy config: {source}{hint}"),
+            CaddyPushFailure {
+                error: DeployError::Custom {
+                    host: host.address.clone(),
+                    detail: format!("push Caddy config: {source}{hint}"),
+                },
+                may_have_applied: source.may_have_applied,
             }
         })
 }
@@ -5840,6 +5906,160 @@ services:
             NEW_PROXY.into()
         )));
         assert!(relay.requests().is_empty());
+    }
+
+    const OLD_API: &str = "api-9f8e7d6";
+
+    /// A deploy of `api` next to the running `OLD_API`, with a running
+    /// proxy of this version and the relay on `relay`. The new replica
+    /// is healthy. `stop_first` makes `api` publish a host port.
+    fn api_deploy_with_relay(
+        relay: &crate::proxy::admin::fake_caddy::FakeCaddy,
+        stop_first: bool,
+    ) -> (FakeDockerOps, Config) {
+        let mut cfg = config_proxied_service();
+        if stop_first {
+            let api = cfg.services.iter().position(|s| s.name == "api").unwrap();
+            cfg.services[api].run.publish = vec!["8443:8080".into()];
+        }
+        let ops = FakeDockerOps::new();
+        ops.set_inspect(crate::docker_ops::ContainerDetail {
+            name: crate::proxy::relay::RELAY_NAME.into(),
+            ports: vec![format!("{RELAY_HOST_PORT}:2020/tcp")],
+            ..Default::default()
+        });
+        ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![container_with_state(OLD_API, "running")]));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("id".into()));
+        if stop_first {
+            ops.push_stop_container(Ok(()));
+        }
+        ops.push_start_container(Ok(()));
+        ops.push_healthcheck(Ok(200));
+        // The push of the new replica: the proxy and the relay.
+        ops.push_list_containers(Ok(vec![proxy_container("yoink-proxy-x", "running")]));
+        ops.push_list_containers(Ok(vec![relay_container()]));
+        // The new replica goes, the old one starts again (stop-first).
+        ops.push_force_remove(Ok(()));
+        if stop_first {
+            ops.push_start_container(Ok(()));
+        }
+        (ops, cfg)
+    }
+
+    async fn deploy_api(ops: &FakeDockerOps, cfg: &Config) -> DeployError {
+        let mut sink = |_e: DeployEvent| {};
+        deploy_service(
+            ops,
+            cfg,
+            cfg.service("api").unwrap(),
+            "a1b2c3d",
+            &BTreeMap::new(),
+            None,
+            false,
+            &mut sink,
+        )
+        .await
+        .expect_err("the push fails")
+    }
+
+    /// The upstreams of `api` in a `/load` body.
+    fn api_upstreams(load: &serde_json::Value) -> Vec<String> {
+        let mut dials: Vec<String> = Vec::new();
+        let text = load.to_string();
+        for part in text.split("\"dial\":\"").skip(1) {
+            if let Some(dial) = part.split('"').next() {
+                dials.push(dial.to_string());
+            }
+        }
+        dials.retain(|d| d.starts_with("api-"));
+        dials
+    }
+
+    /// Caddy took the `/load` with the new replica, then the route
+    /// count did not match. yoink removed the new replica, but Caddy
+    /// still routed to it: 502 until the next run. Now yoink pushes
+    /// again with the containers that run, for a rolling and for a
+    /// stop-first deploy.
+    #[tokio::test]
+    async fn push_that_may_have_applied_routes_caddy_back_to_the_old_container() {
+        use crate::proxy::admin::fake_caddy::FakeCaddy;
+        for stop_first in [false, true] {
+            let relay = FakeCaddy::start();
+            relay.report_routes_once(0);
+            let (ops, cfg) = api_deploy_with_relay(&relay, stop_first);
+            // The second push: `api` runs the old container again.
+            ops.push_list_containers(Ok(vec![container_with_state(OLD_API, "running")]));
+            ops.push_list_containers(Ok(vec![proxy_container("yoink-proxy-x", "running")]));
+            ops.push_list_containers(Ok(vec![relay_container()]));
+
+            let err = deploy_api(&ops, &cfg).await;
+            assert!(
+                err.to_string().contains("route count mismatch"),
+                "got: {err}"
+            );
+            let loads = relay.loads();
+            assert_eq!(loads.len(), 2, "stop_first {stop_first}");
+            let new_name = created_names(&ops).pop().expect("new replica");
+            assert_eq!(api_upstreams(&loads[0]), [format!("{new_name}:8080")]);
+            assert_eq!(api_upstreams(&loads[1]), [format!("{OLD_API}:8080")]);
+            let calls = ops.calls();
+            let removed = calls
+                .iter()
+                .rposition(
+                    |c| matches!(c, RecordedCall::ForceRemoveContainer(_, n) if *n == new_name),
+                )
+                .expect("new replica removed");
+            let second_push = calls
+                .iter()
+                .rposition(|c| matches!(c, RecordedCall::ForwardLoopback(..)))
+                .expect("second push");
+            assert!(removed < second_push, "got: {calls:?}");
+            if stop_first {
+                let restarted = calls
+                    .iter()
+                    .rposition(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD_API))
+                    .expect("old container restarted");
+                assert!(restarted < second_push, "got: {calls:?}");
+            }
+        }
+    }
+
+    /// Caddy rejected the `/load`: it kept the old config, which routes
+    /// to the old container. No second push.
+    #[tokio::test]
+    async fn rejected_push_needs_no_second_push() {
+        use crate::proxy::admin::fake_caddy::FakeCaddy;
+        for stop_first in [false, true] {
+            let relay = FakeCaddy::start();
+            relay.load_statuses(&[400]);
+            let (ops, cfg) = api_deploy_with_relay(&relay, stop_first);
+            let err = deploy_api(&ops, &cfg).await;
+            assert!(err.to_string().contains("status 400"), "got: {err}");
+            assert_eq!(relay.loads().len(), 1);
+        }
+    }
+
+    /// The second push fails too: the error names both pushes.
+    #[tokio::test]
+    async fn failed_second_push_reports_both_errors() {
+        use crate::proxy::admin::fake_caddy::FakeCaddy;
+        let relay = FakeCaddy::start();
+        relay.report_routes_once(0);
+        relay.load_statuses(&[200, 400]);
+        let (ops, cfg) = api_deploy_with_relay(&relay, false);
+        ops.push_list_containers(Ok(vec![container_with_state(OLD_API, "running")]));
+        ops.push_list_containers(Ok(vec![proxy_container("yoink-proxy-x", "running")]));
+        ops.push_list_containers(Ok(vec![relay_container()]));
+        let err = deploy_api(&ops, &cfg).await.to_string();
+        assert!(err.contains("route count mismatch"), "got: {err}");
+        assert!(
+            err.contains("the push that routes it to the running containers failed too"),
+            "got: {err}"
+        );
+        assert!(err.contains("status 400"), "got: {err}");
     }
 
     #[tokio::test(start_paused = true)]
