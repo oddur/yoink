@@ -341,7 +341,12 @@ pub async fn compute(
     // services are outside the plan, not orphans.
     // The admin relay belongs to the proxy, see `prune::classify`.
     let proxy_enabled = config.proxy_enabled();
+    // A probe is not an orphan: a running probe belongs to a deploy,
+    // and `yoink prune` removes a leaked one.
     let in_scope = |c: &ContainerInfo| {
+        if crate::docker_ops::is_probe(c) {
+            return false;
+        }
         if crate::proxy::relay::is_relay(c) {
             return services_filter.is_none() && !proxy_enabled;
         }
@@ -1066,6 +1071,32 @@ services:
         let plain = "hosts:\n  - { address: host-a, user: deploy }\nservices:\n  - name: api\n    \
                      image: img\n    tag: v1\n    run: {}\n";
         assert_eq!(orphans(plain, relay).await, [RELAY_NAME]);
+    }
+
+    /// Probes have `yoink.managed=true` but no `yoink.service`. The
+    /// dry-run does not list them as orphans, running or stopped.
+    #[tokio::test]
+    async fn probes_are_not_orphans() {
+        let cfg = crate::config::Config::parse_str(
+            "hosts:\n  - { address: host-a, user: deploy }\nservices:\n  - name: api\n    \
+             image: img\n    tag: v1\n    run: {}\n",
+        )
+        .unwrap();
+        let probe = |name: &str, state: &str| ContainerInfo {
+            yoink_service: None,
+            ..running("", name, "p", state)
+        };
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![
+            probe("yoink-probe-api-1", "running"),
+            probe("yoink-tcp-probe-api-2", "exited"),
+            running("old", "old-abc", "h", "running"),
+        ]));
+        let report = compute(&ops, &cfg, &BTreeMap::new(), None, None)
+            .await
+            .unwrap();
+        let names: Vec<String> = report.orphans.into_iter().map(|o| o.name).collect();
+        assert_eq!(names, ["old-abc"]);
     }
 
     /// Each `yoink up` with the proxy on creates or replaces the admin
