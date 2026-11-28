@@ -14,7 +14,7 @@
 //! ## Hybrid flush policy
 //!
 //! - **Per-event flush** for forensic events (`RunStarted`/`RunFinished`,
-//!   `ContainerCreated`/`ContainerRemoved`, `Rollback*`, `SecretsRotated`,
+//!   `ContainerCreated`/`ContainerRemoved`, `OldContainerRestarted`, `Rollback*`, `SecretsRotated`,
 //!   `HookFinished`, `LockAcquired`/`LockReleased`, `FileUploaded`). One
 //!   SSH `tee -a` per event; tolerates partial runs.
 //! - **Batched flush** for progress events (`PullStarted`/`PullFinished`,
@@ -145,6 +145,12 @@ pub enum AuditEventKind {
         service: String,
         container: String,
     },
+    /// A stop-first deploy failed, and yoink started the old replica
+    /// again. Forensic: it changes what runs on the host.
+    OldContainerRestarted {
+        service: String,
+        container: String,
+    },
     /// Old replica removed. Forensic — pairs with `ContainerCreated` to
     /// reconstruct a swap.
     ContainerRemoved {
@@ -209,6 +215,7 @@ impl AuditEventKind {
                 | AuditEventKind::ContainerCreated { .. }
                 | AuditEventKind::ContainerRemoved { .. }
                 | AuditEventKind::DeployFailed { .. }
+                | AuditEventKind::OldContainerRestarted { .. }
                 | AuditEventKind::RollbackStarted { .. }
                 | AuditEventKind::RollbackFinished { .. }
                 | AuditEventKind::ContainerPruned { .. }
@@ -906,6 +913,13 @@ pub fn map_deploy_event(
                 container: container.clone(),
             },
         )),
+        DeployEvent::OldContainerRestarted { host, container } => Some((
+            host.clone(),
+            AuditEventKind::OldContainerRestarted {
+                service: svc(),
+                container: container.clone(),
+            },
+        )),
         DeployEvent::AlreadyAtSpec { host, container } => Some((
             host.clone(),
             AuditEventKind::AlreadyAtSpec {
@@ -1210,6 +1224,7 @@ pub fn event_name(kind: &AuditEventKind) -> &'static str {
         K::ContainerCreated { .. } => "ContainerCreated",
         K::AlreadyAtSpec { .. } => "AlreadyAtSpec",
         K::OldContainerStopped { .. } => "OldContainerStopped",
+        K::OldContainerRestarted { .. } => "OldContainerRestarted",
         K::ContainerRemoved { .. } => "ContainerRemoved",
         K::DeployFailed { .. } => "DeployFailed",
         K::RollbackStarted { .. } => "RollbackStarted",
@@ -1232,6 +1247,7 @@ pub fn event_service(ev: &AuditEvent) -> Option<&str> {
         | K::ContainerRemoved { service, .. }
         | K::AlreadyAtSpec { service, .. }
         | K::OldContainerStopped { service, .. }
+        | K::OldContainerRestarted { service, .. }
         | K::DeployFailed { service, .. }
         | K::RollbackStarted { service, .. }
         | K::RollbackFinished { service, .. }
@@ -1294,6 +1310,7 @@ pub fn event_summary(kind: &AuditEventKind) -> String {
             attempts,
         } => format!("{service} {container} after {attempts}"),
         K::OldContainerStopped { service, container }
+        | K::OldContainerRestarted { service, container }
         | K::ContainerRemoved { service, container } => format!("{service} {container}"),
         K::DeployFailed {
             service,
@@ -1593,6 +1610,28 @@ mod tests {
             }
             other => panic!("unexpected kind: {other:?}"),
         }
+    }
+
+    /// The restart of an old container after a failed stop-first
+    /// deploy changes what runs on the host, so it is forensic.
+    #[test]
+    fn map_deploy_event_records_old_container_restarted() {
+        use crate::deploy::DeployEvent;
+        let ev = DeployEvent::OldContainerRestarted {
+            host: "h1".into(),
+            container: "api-ab12cd34".into(),
+        };
+        let (host, kind) = map_deploy_event(Some("api"), &ev, &|_| "v1".into()).unwrap();
+        assert_eq!(host, "h1");
+        assert_eq!(
+            kind,
+            AuditEventKind::OldContainerRestarted {
+                service: "api".into(),
+                container: "api-ab12cd34".into(),
+            }
+        );
+        assert!(kind.is_forensic());
+        assert_eq!(event_name(&kind), "OldContainerRestarted");
     }
 
     #[test]

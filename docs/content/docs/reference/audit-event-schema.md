@@ -105,12 +105,14 @@ The new replicas passed their healthchecks and yoink completed the swap. This ev
 
 Every replica was already at the desired spec. yoink did no work.
 
-### `OldContainerStopped`, `ContainerRemoved`
+### `OldContainerStopped`, `OldContainerRestarted`, `ContainerRemoved`
 
 | field | type |
 |---|---|
 | `service` | string |
 | `container` | string |
+
+`OldContainerRestarted`: a deploy of a service with `publish:` failed. yoink started the old container again, which it had stopped for the deploy.
 
 ### `DeployFailed`
 
@@ -181,7 +183,7 @@ In the host log, yoink appends a **forensic** event over SSH immediately, so a `
 | `LockAcquired`, `LockReleased` | `PullStarted`, `PullFinished` |
 | `HookFinished` | `NetworkReady` |
 | `ContainerCreated`, `ContainerRemoved` | `ContainerStarted` |
-| `DeployFailed` | `HealthcheckHealthy` |
+| `DeployFailed`, `OldContainerRestarted` | `HealthcheckHealthy` |
 | `RollbackStarted`, `RollbackFinished` | `OldContainerStopped` |
 | `ContainerPruned` | `AlreadyAtSpec` |
 | `SecretsRotated` |  |

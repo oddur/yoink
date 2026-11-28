@@ -160,6 +160,9 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
         DeployEvent::OldContainerStopped { host, container } => {
             format!("[{host}] stopped old {container}")
         }
+        DeployEvent::OldContainerRestarted { host, container } => {
+            format!("[{host}] started old {container} again after the failed deploy")
+        }
         DeployEvent::AlreadyAtSpec { host, container } => {
             format!("[{host}] {container} already at spec — no-op")
         }

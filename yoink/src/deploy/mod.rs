@@ -114,6 +114,12 @@ pub enum DeployEvent {
         host: String,
         container: String,
     },
+    /// A stop-first deploy failed, and yoink started the old container
+    /// that it had stopped for the deploy.
+    OldContainerRestarted {
+        host: String,
+        container: String,
+    },
     AlreadyAtSpec {
         host: String,
         container: String,
@@ -1298,7 +1304,7 @@ async fn finalize_one_host(
             Ok(attempts) => attempts,
             Err(e) => {
                 remove_attempt_replicas(ops, &host, &replicas).await;
-                restart_old_containers(ops, &host, &stopped_old).await;
+                restart_old_containers(ops, &host, &stopped_old, on_event).await;
                 return Err(e);
             }
         };
@@ -1335,7 +1341,7 @@ async fn finalize_one_host(
         // has an empty `stopped_old` here.
         if !is_proxy {
             remove_attempt_replicas(ops, &host, &replicas).await;
-            restart_old_containers(ops, &host, &stopped_old).await;
+            restart_old_containers(ops, &host, &stopped_old, on_event).await;
         }
         return Err(e);
     }
@@ -2193,11 +2199,19 @@ async fn swap_out_old_containers_by_set(
 /// Start the old containers in `stopped` again, after a stop-first
 /// deploy failed. Best-effort: a failure is logged, and the caller
 /// returns the original deploy error.
-async fn restart_old_containers(ops: &dyn DockerOps, host: &Host, stopped: &[String]) {
+async fn restart_old_containers(
+    ops: &dyn DockerOps,
+    host: &Host,
+    stopped: &[String],
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) {
     for name in stopped {
         match ops.start_container(host, name).await {
             Ok(()) => {
-                tracing::info!(host = %host.address, container = %name, "restarted the old container after the failed deploy");
+                on_event(DeployEvent::OldContainerRestarted {
+                    host: host.address.clone(),
+                    container: name.clone(),
+                });
             }
             Err(e) => {
                 warn!(host = %host.address, container = %name, error = %e, "could not restart the old container after the failed deploy");
@@ -3002,7 +3016,15 @@ services:
         // The old container starts again.
         ops.push_start_container(Ok(()));
 
-        let (failed, _events) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+        let (failed, events) = deploy_expecting_healthcheck_failure(&ops, &cfg).await;
+        assert_eq!(
+            events.last(),
+            Some(&DeployEvent::OldContainerRestarted {
+                host: "host-a".into(),
+                container: OLD_GENERATION.into(),
+            }),
+            "the restart must be reported: {events:?}"
+        );
         let calls = ops.calls();
         let removed = calls
             .iter()
@@ -3054,7 +3076,8 @@ services:
         ops.push_force_remove(Ok(()));
         ops.push_start_container(Ok(()));
 
-        let mut sink = |_: DeployEvent| {};
+        let mut events: Vec<DeployEvent> = Vec::new();
+        let mut sink = |e: DeployEvent| events.push(e);
         let err = deploy_service(
             &ops,
             &cfg,
@@ -3083,6 +3106,13 @@ services:
             .rposition(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD))
             .expect("old container restarted");
         assert!(removed < restarted, "ports must be free first: {calls:?}");
+        assert!(
+            events.contains(&DeployEvent::OldContainerRestarted {
+                host: "host-a".into(),
+                container: OLD.into(),
+            }),
+            "got: {events:?}"
+        );
     }
 
     fn config_replicas(replicas: u32) -> Config {
