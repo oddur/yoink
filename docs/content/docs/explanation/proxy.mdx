@@ -55,6 +55,8 @@ yoink v0.22 and earlier published the admin port on the proxy, and the admin API
 
 A deploy of the proxy sends this push to the old proxy before it stops the old proxy. The new proxy loads the saved config at start, so the routes come back immediately and the admin API is on the socket. If the new proxy fails its healthcheck, yoink starts the old proxy again. The old proxy loads the same saved config, so the relay reaches it too.
 
+The old proxy keeps its Docker HEALTHCHECK, which uses port 2019. After the move, Docker shows the old proxy as unhealthy, but it continues to serve. While an old proxy runs, each `yoink up` shows a warning at the end, also when the run fails. To recreate the proxy, run `yoink up --service yoink-proxy` or an unscoped `yoink up`.
+
 Use one version of yoink for all operators of a project. After the upgrade, yoink v0.22 cannot reach the admin API, and a `yoink up` with v0.22 can take sites down:
 
 - yoink v0.22 finds no published port 2019 on the proxy, and its config push fails. Then v0.22 removes the new replicas of the service. With `--force`, the old replica is already gone, so the service stops.

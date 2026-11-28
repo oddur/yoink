@@ -284,6 +284,16 @@ pub fn is_legacy_proxy(proxy: &ContainerDetail) -> bool {
     legacy_admin_port(proxy).is_some()
 }
 
+/// True when the running proxy on `host` is from yoink v0.22 or
+/// earlier. False when no proxy runs.
+pub async fn runs_legacy_proxy(host: &Host, ops: &dyn DockerOps) -> Result<bool, AdminError> {
+    match running_proxy(host, ops).await {
+        Ok(proxy) => Ok(is_legacy_proxy(&proxy)),
+        Err(AdminError::ProxyNotRunning { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// The host port of the admin port that a proxy of yoink v0.22 or
 /// earlier publishes. `None` for a proxy of this version.
 fn legacy_admin_port(proxy: &ContainerDetail) -> Option<u16> {

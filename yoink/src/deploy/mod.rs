@@ -163,6 +163,15 @@ pub enum DeployEvent {
         host: String,
         image: String,
     },
+    /// At the end of the run, the proxy on `hosts` is still from yoink
+    /// v0.22 or earlier: it publishes the admin port 2019. Its Docker
+    /// HEALTHCHECK asks that port, so Docker shows the proxy as
+    /// unhealthy after the move of the admin API to the socket. A
+    /// deploy of the proxy recreates it. Sent once per run, also when
+    /// the run fails.
+    ProxyAdminUpgradePending {
+        hosts: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,9 +352,60 @@ pub async fn reconcile(
     .await
 }
 
-/// Reconcile `config` on its fleet, with the knobs of `options`.
-#[allow(clippy::too_many_lines)] // single linear reconcile flow; same rationale as `reconcile`
+/// Reconcile `config` on its fleet, with the knobs of `options`. When a
+/// proxy of yoink v0.22 or earlier still runs at the end, the run sends
+/// one [`DeployEvent::ProxyAdminUpgradePending`] before it returns, also
+/// when the run fails.
 pub async fn reconcile_with_options(
+    ops: &dyn DockerOps,
+    config: &Config,
+    tag_overrides: &BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
+    secrets: Option<&SecretsBundle>,
+    options: ReconcileOptions,
+    on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
+) -> Result<Vec<ServiceDeployReport>, DeployError> {
+    let result = reconcile_run(
+        ops,
+        config,
+        tag_overrides,
+        services_filter,
+        secrets,
+        options,
+        &mut *on_event,
+    )
+    .await;
+    let hosts = legacy_proxy_hosts(ops, config).await;
+    if !hosts.is_empty() {
+        on_event(None, DeployEvent::ProxyAdminUpgradePending { hosts });
+    }
+    result
+}
+
+/// The proxy hosts of `config` on which a proxy of yoink v0.22 or
+/// earlier runs. Best effort: a host that yoink cannot inspect is left
+/// out, so that this check does not hide the error of the run.
+async fn legacy_proxy_hosts(ops: &dyn DockerOps, config: &Config) -> Vec<String> {
+    if !config.proxy_enabled() {
+        return Vec::new();
+    }
+    let Some(proxy) = config.service(crate::config::PROXY_SERVICE_NAME) else {
+        return Vec::new();
+    };
+    let mut hosts = Vec::new();
+    for host in config.fleet_for(proxy) {
+        if matches!(
+            crate::proxy::admin::runs_legacy_proxy(&host, ops).await,
+            Ok(true)
+        ) {
+            hosts.push(host.address);
+        }
+    }
+    hosts
+}
+
+#[allow(clippy::too_many_lines)] // single linear reconcile flow; same rationale as `reconcile`
+async fn reconcile_run(
     ops: &dyn DockerOps,
     config: &Config,
     tag_overrides: &BTreeMap<String, String>,
@@ -5706,6 +5766,51 @@ services:
             yoink_service: Some(crate::config::PROXY_SERVICE_NAME.into()),
             ..container_with_state(name, state)
         }
+    }
+
+    /// The v0.22 proxy keeps its published admin port and its HEALTHCHECK
+    /// on port 2019 until a deploy recreates it, so Docker shows it as
+    /// unhealthy after the move. A run that leaves it in place warns once,
+    /// also when the run fails. Here the run fails at its first step.
+    #[tokio::test]
+    async fn run_that_keeps_an_old_proxy_warns_also_on_error() {
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container("yoink-proxy-old", "running")]));
+        ops.set_inspect(crate::docker_ops::ContainerDetail {
+            name: "yoink-proxy-old".into(),
+            ports: vec![format!("{LEGACY_HOST_PORT}:2019/tcp")],
+            ..Default::default()
+        });
+        let (result, events) = reconcile_collect(&ops, &cfg, None).await;
+        assert!(result.is_err());
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|(_, e)| matches!(e, DeployEvent::ProxyAdminUpgradePending { .. }))
+            .collect();
+        assert_eq!(
+            warnings,
+            [&(
+                None,
+                DeployEvent::ProxyAdminUpgradePending {
+                    hosts: vec!["host-a".into()],
+                }
+            )]
+        );
+    }
+
+    /// A proxy of this version, no proxy, and a host that yoink cannot
+    /// inspect give no warning.
+    #[tokio::test]
+    async fn new_or_missing_proxy_gives_no_upgrade_warning() {
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container(NEW_PROXY, "running")]));
+        assert!(legacy_proxy_hosts(&ops, &cfg).await.is_empty());
+        ops.push_list_containers(Ok(Vec::new()));
+        assert!(legacy_proxy_hosts(&ops, &cfg).await.is_empty());
+        // The fake has no more listings: the call fails.
+        assert!(legacy_proxy_hosts(&ops, &cfg).await.is_empty());
     }
 
     fn relay_container() -> ContainerInfo {

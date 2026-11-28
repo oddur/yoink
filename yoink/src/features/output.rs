@@ -199,6 +199,14 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
             "[{host}] admin relay {} created",
             crate::config::ADMIN_RELAY_NAME
         ),
+        DeployEvent::ProxyAdminUpgradePending { hosts } => format!(
+            "warning: the proxy on {} is from yoink v0.22 or earlier. Its Docker \
+             HEALTHCHECK uses the admin port 2019, so Docker shows the proxy as unhealthy \
+             after its admin API moves to the socket. Run `yoink up --service {}` or an \
+             unscoped `yoink up` to recreate the proxy.",
+            hosts.join(", "),
+            crate::config::PROXY_SERVICE_NAME,
+        ),
         DeployEvent::AdminRelaySkipped { host, image } => format!(
             "[{host}] warning: the admin relay {relay} does not run, and the proxy image \
              {image} is not on the host. This run does not deploy the proxy, so yoink does \
@@ -299,6 +307,30 @@ mod tests {
                 }
             ),
             "[host-a] deploying app-a:a1b2c3d"
+        );
+    }
+
+    /// A run that keeps a v0.22 proxy tells the operator how to
+    /// recreate it, and why Docker shows it as unhealthy.
+    #[test]
+    fn deploy_event_format_proxy_admin_upgrade_pending() {
+        let line = format_deploy_event(
+            None,
+            &DeployEvent::ProxyAdminUpgradePending {
+                hosts: vec!["h1".into(), "h2".into()],
+            },
+        );
+        assert!(
+            line.starts_with("warning: the proxy on h1, h2 is from yoink v0.22 or earlier."),
+            "got: {line}"
+        );
+        assert!(
+            line.contains("`yoink up --service yoink-proxy` or an unscoped `yoink up`"),
+            "got: {line}"
+        );
+        assert!(
+            line.contains("Docker shows the proxy as unhealthy"),
+            "got: {line}"
         );
     }
 
