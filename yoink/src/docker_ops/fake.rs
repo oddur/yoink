@@ -63,6 +63,9 @@ struct FakeState {
     /// Network name → the `inspect_network` answer. `create_network`
     /// adds to it. A name that is not here does not exist.
     networks: HashMap<String, NetworkDetail>,
+    /// Network name → the `list_containers_on_network` answer. A name
+    /// that is not here has no containers.
+    network_containers: HashMap<String, Vec<ContainerInfo>>,
     calls: Vec<RecordedCall>,
 }
 
@@ -80,6 +83,8 @@ pub enum RecordedCall {
     BuildImage(Host, String, usize),
     ListContainersByLabel(Host, String),
     ListRunningContainers(Host),
+    /// `(host, network)`.
+    ListContainersOnNetwork(Host, String),
     CreateContainer(Host, String),
     StartContainer(Host, String),
     StopContainer(Host, String, Duration),
@@ -175,6 +180,13 @@ impl FakeDockerOps {
     /// Make `network` exist with `detail`.
     pub fn set_network(&self, network: &str, detail: NetworkDetail) {
         self.lock().networks.insert(network.into(), detail);
+    }
+    /// Answer every `list_containers_on_network` for `network` with
+    /// `containers`.
+    pub fn set_network_containers(&self, network: &str, containers: Vec<ContainerInfo>) {
+        self.lock()
+            .network_containers
+            .insert(network.into(), containers);
     }
     /// Answer every `inspect_container` for `detail.name` with `detail`.
     pub fn set_inspect(&self, detail: ContainerDetail) {
@@ -365,6 +377,21 @@ impl DockerOps for FakeDockerOps {
             label.into(),
         ));
         pop(&mut s.list_containers, "list_containers_by_label")
+    }
+    async fn list_containers_on_network(
+        &self,
+        host: &Host,
+        network: &str,
+    ) -> Result<Vec<ContainerInfo>, DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::ListContainersOnNetwork(
+            host.clone(),
+            network.into(),
+        ));
+        Ok(s.network_containers
+            .get(network)
+            .cloned()
+            .unwrap_or_default())
     }
     async fn list_running_containers(
         &self,

@@ -134,16 +134,24 @@ async fn check_admin_network(
             remedy: remedy(&[], &[]),
         });
     }
-    // The label filter returns stopped containers too. A stopped
-    // container is not in `detail.containers`, but Docker connects it
-    // to the network again when it starts.
+    // `detail.containers` comes from `docker network inspect` and has
+    // only running containers. Docker connects a stopped container to
+    // the network again when it starts, so yoink also lists the
+    // containers in each state that are attached to the network.
+    let attached = ops.list_containers_on_network(host, ADMIN_NETWORK).await?;
+    let mut on_network: Vec<String> = detail.containers.clone();
+    for c in &attached {
+        if !on_network.contains(&c.name) {
+            on_network.push(c.name.clone());
+        }
+    }
+    // The label filter returns stopped containers too.
     let managed = ops
         .list_containers_by_label(host, "yoink.managed=true")
         .await?;
     let is_admin_peer =
         |c: &ContainerInfo| c.yoink_service.as_deref() == Some(PROXY_SERVICE_NAME) || is_relay(c);
-    let (peers, others): (Vec<String>, Vec<String>) = detail
-        .containers
+    let (peers, others): (Vec<String>, Vec<String>) = on_network
         .iter()
         .cloned()
         .partition(|name| managed.iter().any(|c| &c.name == name && is_admin_peer(c)));
@@ -165,9 +173,9 @@ async fn check_admin_network(
     }
     let mut disconnected = Vec::new();
     for c in managed.iter().filter(|c| !is_admin_peer(c)) {
-        let on_network =
-            detail.containers.contains(&c.name) || c.networks.iter().any(|n| n == ADMIN_NETWORK);
-        if on_network {
+        let attached_here =
+            on_network.contains(&c.name) || c.networks.iter().any(|n| n == ADMIN_NETWORK);
+        if attached_here {
             ops.disconnect_container_network(host, &c.name, ADMIN_NETWORK)
                 .await?;
             disconnected.push(c.name.clone());
@@ -421,6 +429,42 @@ mod tests {
             !ops.calls()
                 .iter()
                 .any(|c| matches!(c, RecordedCall::DisconnectContainerNetwork(..))),
+            "got: {:?}",
+            ops.calls()
+        );
+    }
+
+    /// `docker network inspect` lists only running containers. A
+    /// stopped container that yoink does not manage is still attached:
+    /// it joins the network again when it starts, so yoink refuses the
+    /// network.
+    #[tokio::test]
+    async fn unlabeled_admin_network_with_a_stopped_foreign_container_is_refused() {
+        let ops = FakeDockerOps::new();
+        ops.set_network(ADMIN_NETWORK, unlabeled(&["yoink-proxy-abc"]));
+        let mut stopped = container("other", None);
+        stopped.state = "exited".into();
+        ops.set_network_containers(
+            ADMIN_NETWORK,
+            vec![
+                container("yoink-proxy-abc", Some(PROXY_SERVICE_NAME)),
+                stopped,
+            ],
+        );
+        ops.push_list_containers(Ok(vec![container(
+            "yoink-proxy-abc",
+            Some(PROXY_SERVICE_NAME),
+        )]));
+        let err = ensure_admin(&ops, &host()).await.unwrap_err();
+        let AdminNetworkError::NotOwned { foreign, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(foreign, &["other"]);
+        assert!(
+            ops.calls().contains(&RecordedCall::ListContainersOnNetwork(
+                host(),
+                ADMIN_NETWORK.into()
+            )),
             "got: {:?}",
             ops.calls()
         );

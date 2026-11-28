@@ -742,6 +742,16 @@ pub trait DockerOps: Send + Sync {
         label: &str,
     ) -> Result<Vec<ContainerInfo>, DockerError>;
 
+    /// Every container that is attached to `network`, in any state and
+    /// with any labels. `docker network inspect` lists only running
+    /// containers; this list includes stopped ones, which Docker
+    /// connects to the network again when they start.
+    async fn list_containers_on_network(
+        &self,
+        host: &Host,
+        network: &str,
+    ) -> Result<Vec<ContainerInfo>, DockerError>;
+
     /// Every currently-running container on the host, regardless of label.
     /// Used by the Hosts pane to sum CPU% + memory across the whole daemon.
     async fn list_running_containers(&self, host: &Host)

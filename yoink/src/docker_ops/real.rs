@@ -867,6 +867,28 @@ impl DockerOps for RealDockerOps {
             .collect())
     }
 
+    async fn list_containers_on_network(
+        &self,
+        host: &Host,
+        network: &str,
+    ) -> Result<Vec<ContainerInfo>, DockerError> {
+        let summaries = self
+            .with_retry(host, |docker| async move {
+                let mut filters = HashMap::new();
+                filters.insert("network".to_string(), vec![network.to_string()]);
+                let opts = ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&filters)
+                    .build();
+                docker.list_containers(Some(opts)).await
+            })
+            .await?;
+        Ok(summaries
+            .into_iter()
+            .map(|s| ContainerInfo::from_summary(&host.address, s))
+            .collect())
+    }
+
     async fn list_running_containers(
         &self,
         host: &Host,
