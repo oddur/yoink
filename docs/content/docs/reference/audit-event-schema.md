@@ -165,6 +165,18 @@ One for each outbound webhook call, success or failure. The origin is always `"o
 | `status` | int \| null | HTTP status code when a response arrived. `null` when the call did not get a status (DNS / TCP / TLS / timeout / template error). |
 | `error` | string \| null | The failure reason. See [Webhooks: error values](/docs/reference/webhooks#error-values). `null` when `ok=true`. |
 
+### `AdminNetworkContainersDisconnected`
+
+| field | type | notes |
+|---|---|---|
+| `containers` | array&lt;string&gt; | The yoink app containers that yoink disconnected from `yoink-proxy-admin`. |
+
+The `yoink-proxy-admin` network had no `yoink.role` label: an earlier yoink version created it. Before v0.21, services joined this network by default. yoink disconnected them, because the proxy admin API has no authentication.
+
+### `AdminRelayCreated`
+
+No fields. yoink created the admin relay `yoink-proxy-admin-relay` on the host. Or, the relay did not run or had another spec, and yoink replaced it.
+
 ## Variants that yoink does not write
 
 Readers accept these variants, but yoink writes none of them to a log file.
@@ -189,6 +201,7 @@ In the host log, yoink appends a **forensic** event over SSH immediately, so a `
 | `SecretsRotated` |  |
 | `FileUploaded` |  |
 | `WebhookFired` |  |
+| `AdminNetworkContainersDisconnected`, `AdminRelayCreated` |  |
 
 ## Storage
 

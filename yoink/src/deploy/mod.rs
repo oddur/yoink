@@ -160,6 +160,11 @@ pub enum DeployEvent {
         host: String,
         containers: Vec<String>,
     },
+    /// yoink created the admin relay on `host`, or replaced a relay
+    /// that did not run or had another spec.
+    AdminRelayCreated {
+        host: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,7 +432,10 @@ async fn reconcile_run(
             ensure_host_networks(ops, &host, config.networks(), &mut none_sink).await?;
         }
     }
-    ensure_admin_relays(ops, config).await?;
+    {
+        let mut none_sink = |e: DeployEvent| on_event(None, e);
+        ensure_admin_relays(ops, config, &mut none_sink).await?;
+    }
 
     // Run pre-deploy hooks first; one failure halts the whole reconcile.
     for hook in &config.hooks.pre_deploy {
@@ -646,7 +654,11 @@ async fn reconcile_run(
 /// any Caddy push of the run. Also for a scoped run: the relay is part
 /// of the proxy, and a run that recreates the proxy needs it. See
 /// [`crate::proxy::relay`].
-async fn ensure_admin_relays(ops: &dyn DockerOps, config: &Config) -> Result<(), DeployError> {
+async fn ensure_admin_relays(
+    ops: &dyn DockerOps,
+    config: &Config,
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) -> Result<(), DeployError> {
     let proxy = config
         .services
         .iter()
@@ -655,12 +667,17 @@ async fn ensure_admin_relays(ops: &dyn DockerOps, config: &Config) -> Result<(),
         return Ok(());
     };
     for host in config.fleet_for(proxy) {
-        crate::proxy::relay::ensure(ops, &host)
+        let change = crate::proxy::relay::ensure(ops, &host)
             .await
             .map_err(|source| DeployError::Docker {
                 host: host.address.clone(),
                 source,
             })?;
+        if change == crate::proxy::relay::RelayChange::Created {
+            on_event(DeployEvent::AdminRelayCreated {
+                host: host.address.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -3867,6 +3884,48 @@ services:
             yoink_spec_hash: Some(relay_spec_hash()),
             ..container_with_state(RELAY_NAME, "running")
         }]));
+    }
+
+    /// `ensure_admin_relays` reports a relay that it created, and stays
+    /// quiet for a relay at spec.
+    #[tokio::test]
+    async fn admin_relay_creation_is_reported() {
+        let cfg = Config::parse_str(
+            r"
+hosts:
+  - { address: host-a, user: deploy }
+services:
+  - name: api
+    image: registry.example.com/api
+    domain: api.example.test
+    tls: off
+    run: { port: 8080 }
+",
+        )
+        .unwrap();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new()));
+        ops.push_pull_image(Ok(()));
+        ops.push_create_container(Ok("id".into()));
+        ops.push_start_container(Ok(()));
+        let mut events = Vec::new();
+        ensure_admin_relays(&ops, &cfg, &mut |e| events.push(e))
+            .await
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![DeployEvent::AdminRelayCreated {
+                host: "host-a".into()
+            }]
+        );
+
+        let ops = FakeDockerOps::new();
+        push_relay_at_spec(&ops);
+        let mut events = Vec::new();
+        ensure_admin_relays(&ops, &cfg, &mut |e| events.push(e))
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "got: {events:?}");
     }
 
     type TaggedEvents = Vec<(Option<String>, DeployEvent)>;

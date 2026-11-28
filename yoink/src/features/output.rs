@@ -203,6 +203,10 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
             containers.join(", "),
             crate::config::ADMIN_NETWORK,
         ),
+        DeployEvent::AdminRelayCreated { host } => format!(
+            "[{host}] admin relay {} created",
+            crate::config::ADMIN_RELAY_NAME
+        ),
     }
 }
 

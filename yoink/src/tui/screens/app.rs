@@ -4069,7 +4069,8 @@ fn update_service_status(
         | DeployEvent::ContainerLogTailUnavailable { .. }
         | DeployEvent::OldContainerRestarted { .. }
         | DeployEvent::ProxyAdminUpgradePending { .. }
-        | DeployEvent::AdminNetworkContainersDisconnected { .. } => return,
+        | DeployEvent::AdminNetworkContainersDisconnected { .. }
+        | DeployEvent::AdminRelayCreated { .. } => return,
     };
     map.insert(service.to_string(), next);
 }

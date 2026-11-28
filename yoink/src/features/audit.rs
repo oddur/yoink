@@ -190,6 +190,15 @@ pub enum AuditEventKind {
         sha256: String,
         remote_path: String,
     },
+    /// yoink disconnected these yoink app containers from the unlabeled
+    /// `yoink-proxy-admin` network of an earlier version. Forensic: it
+    /// changes what can reach the proxy admin API.
+    AdminNetworkContainersDisconnected {
+        containers: Vec<String>,
+    },
+    /// yoink created the admin relay, or replaced one that did not run
+    /// or had another spec. Forensic: it changes what runs on the host.
+    AdminRelayCreated,
     /// Outbound webhook attempt. Recorded for every fire, success or
     /// failure — a failed webhook never aborts the run, only this event.
     WebhookFired {
@@ -222,6 +231,8 @@ impl AuditEventKind {
                 | AuditEventKind::SecretsRotated { .. }
                 | AuditEventKind::FileUploaded { .. }
                 | AuditEventKind::WebhookFired { .. }
+                | AuditEventKind::AdminNetworkContainersDisconnected { .. }
+                | AuditEventKind::AdminRelayCreated
         )
     }
 }
@@ -955,6 +966,15 @@ pub fn map_deploy_event(
                 log_tail: vec![format!("(yoink: could not fetch container logs: {error})")],
             },
         )),
+        DeployEvent::AdminNetworkContainersDisconnected { host, containers } => Some((
+            host.clone(),
+            AuditEventKind::AdminNetworkContainersDisconnected {
+                containers: containers.clone(),
+            },
+        )),
+        DeployEvent::AdminRelayCreated { host } => {
+            Some((host.clone(), AuditEventKind::AdminRelayCreated))
+        }
         DeployEvent::Done { host, container } => Some((
             host.clone(),
             AuditEventKind::ContainerCreated {
@@ -970,8 +990,7 @@ pub fn map_deploy_event(
         DeployEvent::Started { .. }
         | DeployEvent::PullFinished { .. }
         | DeployEvent::HealthcheckSkipped { .. }
-        | DeployEvent::ProxyAdminUpgradePending { .. }
-        | DeployEvent::AdminNetworkContainersDisconnected { .. } => None,
+        | DeployEvent::ProxyAdminUpgradePending { .. } => None,
     }
 }
 
@@ -1233,6 +1252,8 @@ pub fn event_name(kind: &AuditEventKind) -> &'static str {
         K::SecretsRotated { .. } => "SecretsRotated",
         K::FileUploaded { .. } => "FileUploaded",
         K::WebhookFired { .. } => "WebhookFired",
+        K::AdminNetworkContainersDisconnected { .. } => "AdminNetworkContainersDisconnected",
+        K::AdminRelayCreated => "AdminRelayCreated",
     }
 }
 
@@ -1276,6 +1297,12 @@ pub fn event_summary(kind: &AuditEventKind) -> String {
             }
         }
         K::LockAcquired | K::LockReleased => String::new(),
+        K::AdminNetworkContainersDisconnected { containers } => format!(
+            "{} from {}",
+            containers.join(","),
+            crate::config::ADMIN_NETWORK
+        ),
+        K::AdminRelayCreated => crate::config::ADMIN_RELAY_NAME.to_string(),
         K::HookStarted { name } | K::HookFinished { name } => name.clone(),
         K::PullStarted { image, tag } | K::PullFinished { image, tag } => {
             format!("{image}:{tag}")
@@ -1632,6 +1659,35 @@ mod tests {
         );
         assert!(kind.is_forensic());
         assert_eq!(event_name(&kind), "OldContainerRestarted");
+    }
+
+    /// The admin network disconnects and a new admin relay change what
+    /// can reach the proxy admin API, so both are forensic.
+    #[test]
+    fn map_deploy_event_records_admin_network_changes() {
+        use crate::deploy::DeployEvent;
+        let ev = DeployEvent::AdminNetworkContainersDisconnected {
+            host: "h1".into(),
+            containers: vec!["api-1".into()],
+        };
+        let (host, kind) = map_deploy_event(None, &ev, &|_| String::new()).unwrap();
+        assert_eq!(host, "h1");
+        assert_eq!(
+            kind,
+            AuditEventKind::AdminNetworkContainersDisconnected {
+                containers: vec!["api-1".into()],
+            }
+        );
+        assert!(kind.is_forensic());
+        assert_eq!(event_name(&kind), "AdminNetworkContainersDisconnected");
+        assert_eq!(event_summary(&kind), "api-1 from yoink-proxy-admin");
+
+        let ev = DeployEvent::AdminRelayCreated { host: "h1".into() };
+        let (host, kind) = map_deploy_event(None, &ev, &|_| String::new()).unwrap();
+        assert_eq!(host, "h1");
+        assert_eq!(kind, AuditEventKind::AdminRelayCreated);
+        assert!(kind.is_forensic());
+        assert_eq!(event_name(&kind), "AdminRelayCreated");
     }
 
     #[test]
