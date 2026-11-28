@@ -1328,8 +1328,14 @@ async fn finalize_one_host(
         // runs with `--resume`, so the new container is serving
         // the autosaved config. Removing it would turn a rejected
         // config push into a full outage.
+        //
+        // A stop-first service already stopped its old containers.
+        // Start them again after the removal frees the host ports, as
+        // the healthcheck failure path above does. A rolling deploy
+        // has an empty `stopped_old` here.
         if !is_proxy {
             remove_attempt_replicas(ops, &host, &replicas).await;
+            restart_old_containers(ops, &host, &stopped_old).await;
         }
         return Err(e);
     }
@@ -3022,6 +3028,61 @@ services:
                 .iter()
                 .any(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD_GENERATION))
         );
+    }
+
+    /// A stop-first routed service: the new container is healthy, but
+    /// the Caddy push fails. yoink removed the new container and left
+    /// the old one stopped, so no container of the service ran.
+    #[tokio::test(start_paused = true)]
+    async fn failed_caddy_push_on_stop_first_service_restarts_the_old_container() {
+        const OLD: &str = "api-9f8e7d6";
+        let mut cfg = config_proxied_service();
+        let api = cfg.services.iter().position(|s| s.name == "api").unwrap();
+        cfg.services[api].run.publish = vec!["8443:8080".into()];
+        let ops = FakeDockerOps::new();
+        ops.push_pull_image(Ok(()));
+        ops.push_list_containers(Ok(vec![container_with_state(OLD, "running")]));
+        ops.push_force_remove(Ok(()));
+        ops.push_create_container(Ok("abcdef".into()));
+        // Stop-first: the old container stops before the new start.
+        ops.push_stop_container(Ok(()));
+        ops.push_start_container(Ok(()));
+        ops.push_healthcheck(Ok(200));
+        // Proxy lookup of the Caddy push: no proxy runs, the push fails.
+        ops.push_list_containers(Ok(Vec::new()));
+        // The new container goes, then the old one starts again.
+        ops.push_force_remove(Ok(()));
+        ops.push_start_container(Ok(()));
+
+        let mut sink = |_: DeployEvent| {};
+        let err = deploy_service(
+            &ops,
+            &cfg,
+            &cfg.services[api],
+            "a1b2c3d",
+            &BTreeMap::new(),
+            None,
+            false,
+            &LegacyAdminHosts::default(),
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("push Caddy config"),
+            "unexpected error: {err}"
+        );
+        let calls = ops.calls();
+        let new_name = created_names(&ops).pop().expect("new container created");
+        let removed = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::ForceRemoveContainer(_, n) if *n == new_name))
+            .expect("new container removed");
+        let restarted = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD))
+            .expect("old container restarted");
+        assert!(removed < restarted, "ports must be free first: {calls:?}");
     }
 
     fn config_replicas(replicas: u32) -> Config {

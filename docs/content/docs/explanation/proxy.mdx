@@ -70,7 +70,7 @@ yoink drives every stage, and there is no second reconciler. The config push occ
 
 If a healthcheck or the config push fails, yoink removes the new replicas. The old replicas stay in the pool and keep running.
 
-A service with `publish:` is the exception. Its old container stops before the new one starts, because only one container can bind a host port. When the new container does not start or fails its healthcheck, yoink removes it and starts the old container again. The proxy publishes ports 80 and 443, so this applies to the proxy too.
+A service with `publish:` is the exception. Its old container stops before the new one starts, because only one container can bind a host port. When the new container does not start, fails its healthcheck, or the config push fails, yoink removes it and starts the old container again. The proxy publishes ports 80 and 443, so this applies to the proxy too. One case is different: when the config push fails after a new proxy starts, yoink keeps the new proxy. It serves the saved config.
 
 ## What yoink does not model
 
