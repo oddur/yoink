@@ -108,7 +108,7 @@ A `pre_deploy` hook runs **one time**. The number of replicas and the number of 
 
 ### Pruning
 
-`yoink prune` examines every host independently. It removes the containers of services that the config no longer declares, and the exited and dead containers of the other services. It keeps all other containers of a declared service, also on a host that `services[].hosts` no longer lists. Thus a running, paused, restarting, or created container of a declared service stays.
+`yoink prune` examines every host independently. It removes the containers of services that the config no longer declares, and the exited, dead, and created containers of the other services. A created container never started: a run stopped between the create and the start. `yoink prune` holds the deploy lock on the host, so no deploy can start that container. It keeps all other containers of a declared service, also on a host that `services[].hosts` no longer lists. Thus a running, paused, or restarting container of a declared service stays.
 
 ## Reserved network names
 

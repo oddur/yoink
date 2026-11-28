@@ -1021,7 +1021,8 @@ pub async fn deploy_service(
     // service and its hooks together (`yoink up --service api` will
     // not run web's migrations). On hook failure we clean up the
     // pre-created replicas so a failed deploy doesn't leave
-    // `created`-state containers hanging around until the next prune.
+    // `created`-state containers behind. A run that dies here (Ctrl-C,
+    // a lost SSH link) cannot clean up: `yoink prune` removes them.
     // `tag: { service: X }` mirrors X's deploy-time tag: the `--tag`
     // override for X, else X's configured tag. This service's own
     // deploy tag is authoritative for a self-reference.

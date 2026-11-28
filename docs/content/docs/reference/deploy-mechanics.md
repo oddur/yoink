@@ -82,12 +82,12 @@ The `age` provider decrypts the sealed `secrets.age` file with one X25519 identi
 | Condition | Reason in the output |
 |---|---|
 | Its service is not in the current config (renamed or removed). The container can be running or stopped. | `service not in config` |
-| Its service is in the current config and the container is not running. | `stale exited` |
+| Its service is in the current config and the container is exited, dead, or created (never started). | `stale exited` |
 
 `yoink prune` does **not** remove:
 
 - Containers without the `yoink.managed=true` label: legacy containers, containers that you started by hand, and the deploy lock sentinel.
-- Running containers of a service that is in the current config.
+- Running, paused, and restarting containers of a service that is in the current config.
 - Images, volumes, or networks. `docker volume prune` and `docker network prune` remove volumes and networks.
 
 The second rule also removes the previous generation that `yoink rollback` reads. After a prune, a rollback of that service is not possible.

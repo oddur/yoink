@@ -42,8 +42,9 @@ pub enum PruneReason {
     /// `yoink.service` label refers to a service no longer in config
     /// (renamed or deleted).
     ServiceNotInConfig,
-    /// Container exited and isn't the current spec for its service.
-    /// Old containers from a previous reconcile.
+    /// Container exited, dead or never started (`created`), of a
+    /// service in the config. Old containers from a previous reconcile,
+    /// or the replica of a run that died between create and start.
     StaleExited,
 }
 
@@ -148,10 +149,14 @@ fn classify(c: &ContainerInfo, known: &BTreeSet<String>, proxy: bool) -> Option<
     let svc = c.yoink_service.as_deref();
     match svc {
         Some(name) if !known.contains(name) => Some(PruneReason::ServiceNotInConfig),
-        // Only a container that has finished is stale. A paused,
-        // restarting or just-created container of a declared service
-        // is still in use.
-        Some(_) if matches!(c.state.as_str(), "exited" | "dead") => Some(PruneReason::StaleExited),
+        // A container that has finished is stale. A `created` one is
+        // stale too: a run that died between create and start left it.
+        // A prune that removes containers holds the deploy lock on the
+        // host, so no deploy that could start it is in flight. A paused
+        // or restarting container of a declared service is still in use.
+        Some(_) if matches!(c.state.as_str(), "exited" | "dead" | "created") => {
+            Some(PruneReason::StaleExited)
+        }
         // Any other container of a known service: keep.
         // Container with no `yoink.service` label but managed=true:
         // shouldn't happen (every yoink-created container gets the
@@ -224,7 +229,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_keeps_paused_restarting_and_created_containers() {
+    async fn prune_removes_created_but_keeps_paused_and_restarting_containers() {
         let ops = FakeDockerOps::new();
         let with_state = |name: &str, state: &str| ContainerInfo {
             state: state.into(),
@@ -243,7 +248,9 @@ mod tests {
             .iter()
             .map(|p| p.container.as_str())
             .collect();
-        assert_eq!(names, ["api-dead", "api-exited"]);
+        // `api-created`: a run killed between create and start left it.
+        // Prune holds the deploy lock, so no deploy is about to start it.
+        assert_eq!(names, ["api-created", "api-dead", "api-exited"]);
     }
 
     /// The admin relay has no `yoink.service`. It stays while the proxy
