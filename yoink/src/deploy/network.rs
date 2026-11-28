@@ -16,25 +16,51 @@ pub async fn ensure(ops: &dyn DockerOps, host: &Host, network: &str) -> Result<b
 /// Label key and value that yoink puts on the admin network it creates.
 pub const ADMIN_NETWORK_LABEL: (&str, &str) = ("yoink.role", "proxy-admin-network");
 
-/// Why yoink does not use the existing admin network.
+/// Why yoink does not use the existing admin network. Each message
+/// ends with the commands that clear the network: Docker cannot rename
+/// a network, and `docker network rm` refuses a network that a
+/// container is on.
 #[derive(Debug, thiserror::Error)]
 pub enum AdminNetworkError {
     #[error(transparent)]
     Docker(#[from] DockerError),
     #[error(
         "network {ADMIN_NETWORK:?} is internal. The admin relay cannot publish its port \
-         on an internal network. Remove the network with `docker network rm \
-         {ADMIN_NETWORK}` and run `yoink up` again."
+         on an internal network. {remedy}"
     )]
-    Internal,
+    Internal { remedy: String },
     #[error(
         "network {ADMIN_NETWORK:?} was not created by yoink: it has no \
-         `yoink.role=proxy-admin-network` label, and containers other than the proxy \
-         and the admin relay are on it ({}). yoink does not put the proxy admin API on \
-         it. Remove or rename that network, then run `yoink up` again.",
+         `yoink.role=proxy-admin-network` label, and containers that yoink does not \
+         manage are on it ({}). yoink does not put the proxy admin API on it. {remedy}",
         foreign.join(", ")
     )]
-    NotOwned { foreign: Vec<String> },
+    NotOwned {
+        foreign: Vec<String>,
+        remedy: String,
+    },
+}
+
+/// The commands that clear the admin network so that `yoink up` can
+/// create it again. `disconnect` are the containers to take off the
+/// network. `remove` are the proxy and the relay: a proxy that stays
+/// at spec is not connected again, so yoink must create it again.
+fn remedy(disconnect: &[String], remove: &[String]) -> String {
+    let mut steps = Vec::new();
+    for name in disconnect {
+        steps.push(format!(
+            "`docker network disconnect {ADMIN_NETWORK} {name}`"
+        ));
+    }
+    if !remove.is_empty() {
+        steps.push(format!(
+            "`docker rm -f {}` (the routes are down until `yoink up` creates the proxy again)",
+            remove.join(" ")
+        ));
+    }
+    steps.push(format!("`docker network rm {ADMIN_NETWORK}`"));
+    steps.push("`yoink up`".to_string());
+    format!("To fix, run on the host: {}.", steps.join(", then "))
 }
 
 /// What [`ensure_admin`] did.
@@ -98,12 +124,15 @@ async fn check_admin_network(
     host: &Host,
     detail: &NetworkDetail,
 ) -> Result<Vec<String>, AdminNetworkError> {
-    if detail.internal {
-        return Err(AdminNetworkError::Internal);
-    }
     let (key, value) = ADMIN_NETWORK_LABEL;
-    if detail.labels.get(key).map(String::as_str) == Some(value) {
+    let labeled = detail.labels.get(key).map(String::as_str) == Some(value);
+    if labeled && !detail.internal {
         return Ok(Vec::new());
+    }
+    if detail.internal && detail.containers.is_empty() {
+        return Err(AdminNetworkError::Internal {
+            remedy: remedy(&[], &[]),
+        });
     }
     // The label filter returns stopped containers too. A stopped
     // container is not in `detail.containers`, but Docker connects it
@@ -113,14 +142,26 @@ async fn check_admin_network(
         .await?;
     let is_admin_peer =
         |c: &ContainerInfo| c.yoink_service.as_deref() == Some(PROXY_SERVICE_NAME) || is_relay(c);
-    let foreign: Vec<String> = detail
+    let (peers, others): (Vec<String>, Vec<String>) = detail
         .containers
+        .iter()
+        .cloned()
+        .partition(|name| managed.iter().any(|c| &c.name == name && is_admin_peer(c)));
+    if detail.internal {
+        return Err(AdminNetworkError::Internal {
+            remedy: remedy(&others, &peers),
+        });
+    }
+    let foreign: Vec<String> = others
         .iter()
         .filter(|name| !managed.iter().any(|c| &c.name == *name))
         .cloned()
         .collect();
     if !foreign.is_empty() {
-        return Err(AdminNetworkError::NotOwned { foreign });
+        return Err(AdminNetworkError::NotOwned {
+            foreign,
+            remedy: remedy(&others, &peers),
+        });
     }
     let mut disconnected = Vec::new();
     for c in managed.iter().filter(|c| !is_admin_peer(c)) {
@@ -353,13 +394,28 @@ mod tests {
             container("api-1", Some("api")),
         ]));
         let err = ensure_admin(&ops, &host()).await.unwrap_err();
-        let AdminNetworkError::NotOwned { foreign } = &err else {
+        let AdminNetworkError::NotOwned { foreign, .. } = &err else {
             panic!("got {err:?}");
         };
         assert_eq!(foreign, &["other", "db"]);
         let msg = err.to_string();
         assert!(msg.contains("not created by yoink"), "got: {msg}");
         assert!(msg.contains("(other, db)"), "got: {msg}");
+        // Docker cannot rename a network or remove one in use, so the
+        // fix lists commands that Docker accepts, in order.
+        assert!(
+            msg.ends_with(
+                "To fix, run on the host: \
+                 `docker network disconnect yoink-proxy-admin api-1`, then \
+                 `docker network disconnect yoink-proxy-admin other`, then \
+                 `docker network disconnect yoink-proxy-admin db`, then \
+                 `docker rm -f yoink-proxy-abc` (the routes are down until `yoink up` \
+                 creates the proxy again), then \
+                 `docker network rm yoink-proxy-admin`, then `yoink up`."
+            ),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("rename"), "got: {msg}");
         // A refused network stays as it is: no yoink container leaves it.
         assert!(
             !ops.calls()
@@ -372,6 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn internal_admin_network_is_refused() {
+        use crate::proxy::relay::RELAY_NAME;
         let (k, v) = ADMIN_NETWORK_LABEL;
         let ops = FakeDockerOps::new();
         ops.set_network(
@@ -383,7 +440,34 @@ mod tests {
             },
         );
         let err = ensure_admin(&ops, &host()).await.unwrap_err();
-        assert!(matches!(err, AdminNetworkError::Internal), "got {err:?}");
+        assert!(
+            matches!(err, AdminNetworkError::Internal { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .ends_with("`docker network rm yoink-proxy-admin`, then `yoink up`."),
+            "got: {err}"
+        );
+
+        // With the proxy and the relay on it, both must go first.
+        let ops = FakeDockerOps::new();
+        ops.set_network(
+            ADMIN_NETWORK,
+            NetworkDetail {
+                internal: true,
+                ..unlabeled(&["yoink-proxy-abc", RELAY_NAME])
+            },
+        );
+        ops.push_list_containers(Ok(vec![
+            container("yoink-proxy-abc", Some(PROXY_SERVICE_NAME)),
+            container(RELAY_NAME, None),
+        ]));
+        let msg = ensure_admin(&ops, &host()).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("run on the host: `docker rm -f yoink-proxy-abc yoink-proxy-admin-relay`"),
+            "got: {msg}"
+        );
     }
 
     #[tokio::test]
