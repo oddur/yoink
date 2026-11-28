@@ -463,6 +463,32 @@ impl DockerOps for RealDockerOps {
         .await
     }
 
+    async fn disconnect_container_network(
+        &self,
+        host: &Host,
+        container: &str,
+        network: &str,
+    ) -> Result<(), DockerError> {
+        self.with_retry(host, |docker| async move {
+            let req = bollard::models::NetworkDisconnectRequest {
+                container: container.to_string(),
+                force: Some(true),
+            };
+            match docker.disconnect_network(network, req).await {
+                // 404 = no such container or network. 403 = the
+                // container is not on the network. Both leave the
+                // container off the network, which is the goal.
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403 | 404,
+                    ..
+                }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        })
+        .await
+    }
+
     async fn list_networks(&self, host: &Host) -> Result<Vec<NetworkInfo>, DockerError> {
         let nets = self
             .with_retry(host, |docker| async move {

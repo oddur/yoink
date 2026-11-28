@@ -72,6 +72,8 @@ pub enum RecordedCall {
     HostInfo(Host),
     ContainerStats(Host, String),
     EnsureNetwork(Host, String),
+    /// `(host, container, network)`.
+    DisconnectContainerNetwork(Host, String, String),
     CreateNetwork(Host, String, std::collections::BTreeMap<String, String>),
     PullImage(Host, String, String),
     LoadImage(Host),
@@ -267,6 +269,23 @@ impl DockerOps for FakeDockerOps {
         _network: &str,
         _endpoint: bollard::models::EndpointSettings,
     ) -> Result<(), DockerError> {
+        Ok(())
+    }
+    async fn disconnect_container_network(
+        &self,
+        host: &Host,
+        container: &str,
+        network: &str,
+    ) -> Result<(), DockerError> {
+        let mut s = self.lock();
+        s.calls.push(RecordedCall::DisconnectContainerNetwork(
+            host.clone(),
+            container.into(),
+            network.into(),
+        ));
+        if let Some(detail) = s.networks.get_mut(network) {
+            detail.containers.retain(|c| c != container);
+        }
         Ok(())
     }
     async fn list_volumes(&self, _host: &Host) -> Result<Vec<VolumeInfo>, DockerError> {

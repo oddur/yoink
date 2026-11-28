@@ -147,6 +147,13 @@ pub enum DeployEvent {
     ProxyAdminUpgradePending {
         hosts: Vec<String>,
     },
+    /// Before v0.21, services joined `yoink-proxy-admin` by default.
+    /// yoink disconnected these yoink app containers from that network
+    /// on `host`, because the proxy admin API has no authentication.
+    AdminNetworkContainersDisconnected {
+        host: String,
+        containers: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1718,7 +1725,7 @@ pub async fn ensure_host_networks(
 ) -> Result<(), DeployError> {
     for net in networks {
         let created = if net == crate::config::ADMIN_NETWORK {
-            network::ensure_admin(ops, host)
+            let ready = network::ensure_admin(ops, host)
                 .await
                 .map_err(|e| match e {
                     network::AdminNetworkError::Docker(source) => DeployError::Docker {
@@ -1729,7 +1736,14 @@ pub async fn ensure_host_networks(
                         host: host.address.clone(),
                         detail: other.to_string(),
                     },
-                })?
+                })?;
+            if !ready.disconnected.is_empty() {
+                on_event(DeployEvent::AdminNetworkContainersDisconnected {
+                    host: host.address.clone(),
+                    containers: ready.disconnected,
+                });
+            }
+            ready.created
         } else {
             network::ensure(ops, host, net)
                 .await

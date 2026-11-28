@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 
 use crate::base::host::Host;
 use crate::config::{ADMIN_NETWORK, PROXY_SERVICE_NAME};
-use crate::docker_ops::{DockerError, DockerOps, NetworkDetail};
+use crate::docker_ops::{ContainerInfo, DockerError, DockerOps, NetworkDetail};
+use crate::proxy::relay::is_relay;
 
 pub async fn ensure(ops: &dyn DockerOps, host: &Host, network: &str) -> Result<bool, DockerError> {
     ops.ensure_network(host, network).await
@@ -36,19 +37,35 @@ pub enum AdminNetworkError {
     NotOwned { foreign: Vec<String> },
 }
 
+/// What [`ensure_admin`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdminNetworkReady {
+    /// yoink created the network in this call.
+    pub created: bool,
+    /// yoink app containers from an earlier version that yoink removed
+    /// from the network.
+    pub disconnected: Vec<String>,
+}
+
 /// Make sure the admin network of the proxy exists and belongs to
-/// yoink. Returns `true` when yoink created it. The admin API has no
-/// authentication, so yoink does not join a network that another tool
-/// made:
+/// yoink. The admin API has no authentication, so yoink does not join
+/// a network that another tool made:
 ///
 /// - yoink creates the network with [`ADMIN_NETWORK_LABEL`].
 /// - A network with that label is yoink's.
 /// - Earlier versions of yoink created the network without labels.
 ///   Docker cannot add a label to a network, so an unlabeled network is
-///   accepted only when each container on it is a yoink proxy or the
-///   admin relay. A network without containers is accepted too.
+///   accepted only when each container on it is a yoink container. A
+///   network without containers is accepted too.
+/// - Before v0.21, services joined the network by default. yoink
+///   disconnects those app containers from an unlabeled network and
+///   reports them in [`AdminNetworkReady::disconnected`]. Only the proxy
+///   and the admin relay stay on it.
 /// - An internal network is refused: the relay publishes a port.
-pub async fn ensure_admin(ops: &dyn DockerOps, host: &Host) -> Result<bool, AdminNetworkError> {
+pub async fn ensure_admin(
+    ops: &dyn DockerOps,
+    host: &Host,
+) -> Result<AdminNetworkReady, AdminNetworkError> {
     let detail = if let Some(detail) = ops.inspect_network(host, ADMIN_NETWORK).await? {
         detail
     } else {
@@ -57,50 +74,65 @@ pub async fn ensure_admin(ops: &dyn DockerOps, host: &Host) -> Result<bool, Admi
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         if ops.create_network(host, ADMIN_NETWORK, &labels).await? {
-            return Ok(true);
+            return Ok(AdminNetworkReady {
+                created: true,
+                disconnected: Vec::new(),
+            });
         }
         // Another run created it first. Check that one.
         ops.inspect_network(host, ADMIN_NETWORK)
             .await?
             .unwrap_or_default()
     };
-    check_admin_network(ops, host, &detail).await?;
-    Ok(false)
+    let disconnected = check_admin_network(ops, host, &detail).await?;
+    Ok(AdminNetworkReady {
+        created: false,
+        disconnected,
+    })
 }
 
+/// Check an existing admin network. Returns the yoink app containers
+/// that this call disconnected from an unlabeled network.
 async fn check_admin_network(
     ops: &dyn DockerOps,
     host: &Host,
     detail: &NetworkDetail,
-) -> Result<(), AdminNetworkError> {
+) -> Result<Vec<String>, AdminNetworkError> {
     if detail.internal {
         return Err(AdminNetworkError::Internal);
     }
     let (key, value) = ADMIN_NETWORK_LABEL;
-    if detail.labels.get(key).map(String::as_str) == Some(value) || detail.containers.is_empty() {
-        return Ok(());
+    if detail.labels.get(key).map(String::as_str) == Some(value) {
+        return Ok(Vec::new());
     }
-    let ours: Vec<String> = ops
+    // The label filter returns stopped containers too. A stopped
+    // container is not in `detail.containers`, but Docker connects it
+    // to the network again when it starts.
+    let managed = ops
         .list_containers_by_label(host, "yoink.managed=true")
-        .await?
-        .into_iter()
-        .filter(|c| {
-            c.yoink_service.as_deref() == Some(PROXY_SERVICE_NAME)
-                || crate::proxy::relay::is_relay(c)
-        })
-        .map(|c| c.name)
-        .collect();
+        .await?;
+    let is_admin_peer =
+        |c: &ContainerInfo| c.yoink_service.as_deref() == Some(PROXY_SERVICE_NAME) || is_relay(c);
     let foreign: Vec<String> = detail
         .containers
         .iter()
-        .filter(|name| !ours.contains(name))
+        .filter(|name| !managed.iter().any(|c| &c.name == *name))
         .cloned()
         .collect();
-    if foreign.is_empty() {
-        Ok(())
-    } else {
-        Err(AdminNetworkError::NotOwned { foreign })
+    if !foreign.is_empty() {
+        return Err(AdminNetworkError::NotOwned { foreign });
     }
+    let mut disconnected = Vec::new();
+    for c in managed.iter().filter(|c| !is_admin_peer(c)) {
+        let on_network =
+            detail.containers.contains(&c.name) || c.networks.iter().any(|n| n == ADMIN_NETWORK);
+        if on_network {
+            ops.disconnect_container_network(host, &c.name, ADMIN_NETWORK)
+                .await?;
+            disconnected.push(c.name.clone());
+        }
+    }
+    Ok(disconnected)
 }
 
 #[cfg(test)]
@@ -164,7 +196,7 @@ mod tests {
     #[tokio::test]
     async fn admin_network_is_created_with_the_yoink_label() {
         let ops = FakeDockerOps::new();
-        assert!(ensure_admin(&ops, &host()).await.unwrap());
+        assert!(ensure_admin(&ops, &host()).await.unwrap().created);
         let labels: BTreeMap<String, String> =
             [("yoink.role".to_string(), "proxy-admin-network".to_string())].into();
         assert_eq!(
@@ -189,7 +221,10 @@ mod tests {
                 internal: false,
             },
         );
-        assert!(!ensure_admin(&ops, &host()).await.unwrap());
+        assert_eq!(
+            ensure_admin(&ops, &host()).await.unwrap(),
+            AdminNetworkReady::default()
+        );
         assert!(ops.calls().is_empty(), "got: {:?}", ops.calls());
     }
 
@@ -203,13 +238,104 @@ mod tests {
         ops.push_list_containers(Ok(vec![
             container("yoink-proxy-abc", Some(PROXY_SERVICE_NAME)),
             container(RELAY_NAME, None),
-            container("api-1", Some("api")),
         ]));
-        assert!(!ensure_admin(&ops, &host()).await.unwrap());
+        assert_eq!(
+            ensure_admin(&ops, &host()).await.unwrap(),
+            AdminNetworkReady::default()
+        );
 
         let ops = FakeDockerOps::new();
         ops.set_network(ADMIN_NETWORK, unlabeled(&[]));
-        assert!(!ensure_admin(&ops, &host()).await.unwrap());
+        ops.push_list_containers(Ok(Vec::new()));
+        assert_eq!(
+            ensure_admin(&ops, &host()).await.unwrap(),
+            AdminNetworkReady::default()
+        );
+    }
+
+    /// Before v0.21, services joined the admin network by default. A
+    /// host from that time has yoink app containers on the unlabeled
+    /// network. yoink disconnects them, reports them and keeps the
+    /// network. A stopped app container is disconnected too, because
+    /// Docker connects it again when it starts.
+    #[tokio::test]
+    async fn unlabeled_admin_network_drops_old_yoink_app_containers() {
+        use crate::proxy::relay::RELAY_NAME;
+        let ops = FakeDockerOps::new();
+        ops.set_network(ADMIN_NETWORK, unlabeled(&["yoink-proxy-abc", "api-1"]));
+        let mut stopped = container("worker-1", Some("worker"));
+        stopped.state = "exited".into();
+        let mut elsewhere = container("web-1", Some("web"));
+        elsewhere.networks = vec!["yoink-ingress".into()];
+        ops.push_list_containers(Ok(vec![
+            container("yoink-proxy-abc", Some(PROXY_SERVICE_NAME)),
+            container(RELAY_NAME, None),
+            container("api-1", Some("api")),
+            stopped,
+            elsewhere,
+        ]));
+        let ready = ensure_admin(&ops, &host()).await.unwrap();
+        assert_eq!(
+            ready,
+            AdminNetworkReady {
+                created: false,
+                disconnected: vec!["api-1".into(), "worker-1".into()],
+            }
+        );
+        let disconnects: Vec<RecordedCall> = ops
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, RecordedCall::DisconnectContainerNetwork(..)))
+            .collect();
+        assert_eq!(
+            disconnects,
+            vec![
+                RecordedCall::DisconnectContainerNetwork(
+                    host(),
+                    "api-1".into(),
+                    ADMIN_NETWORK.into()
+                ),
+                RecordedCall::DisconnectContainerNetwork(
+                    host(),
+                    "worker-1".into(),
+                    ADMIN_NETWORK.into()
+                ),
+            ]
+        );
+    }
+
+    /// The deploy turns the disconnects into one warning event.
+    #[tokio::test]
+    async fn host_networks_warn_about_disconnected_app_containers() {
+        let ops = FakeDockerOps::new();
+        ops.set_network(ADMIN_NETWORK, unlabeled(&["yoink-proxy-abc", "api-1"]));
+        ops.push_list_containers(Ok(vec![
+            container("yoink-proxy-abc", Some(PROXY_SERVICE_NAME)),
+            container("api-1", Some("api")),
+        ]));
+        let mut events = Vec::new();
+        crate::deploy::ensure_host_networks(
+            &ops,
+            &host(),
+            &[ADMIN_NETWORK.to_string()],
+            &mut |e| events.push(e),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                crate::deploy::DeployEvent::AdminNetworkContainersDisconnected {
+                    host: "host-a".into(),
+                    containers: vec!["api-1".into()],
+                },
+                crate::deploy::DeployEvent::NetworkReady {
+                    host: "host-a".into(),
+                    network: ADMIN_NETWORK.into(),
+                    created: false,
+                },
+            ]
+        );
     }
 
     /// A network of that name from another tool: the proxy and the
@@ -220,7 +346,7 @@ mod tests {
         let ops = FakeDockerOps::new();
         ops.set_network(
             ADMIN_NETWORK,
-            unlabeled(&["yoink-proxy-abc", "api-1", "other"]),
+            unlabeled(&["yoink-proxy-abc", "api-1", "other", "db"]),
         );
         ops.push_list_containers(Ok(vec![
             container("yoink-proxy-abc", Some(PROXY_SERVICE_NAME)),
@@ -230,10 +356,18 @@ mod tests {
         let AdminNetworkError::NotOwned { foreign } = &err else {
             panic!("got {err:?}");
         };
-        assert_eq!(foreign, &["api-1", "other"]);
+        assert_eq!(foreign, &["other", "db"]);
         let msg = err.to_string();
         assert!(msg.contains("not created by yoink"), "got: {msg}");
-        assert!(msg.contains("(api-1, other)"), "got: {msg}");
+        assert!(msg.contains("(other, db)"), "got: {msg}");
+        // A refused network stays as it is: no yoink container leaves it.
+        assert!(
+            !ops.calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::DisconnectContainerNetwork(..))),
+            "got: {:?}",
+            ops.calls()
+        );
     }
 
     #[tokio::test]

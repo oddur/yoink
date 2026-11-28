@@ -606,6 +606,16 @@ pub trait DockerOps: Send + Sync {
         endpoint: bollard::models::EndpointSettings,
     ) -> Result<(), DockerError>;
 
+    /// Disconnect `container` from `network`. The container can be
+    /// stopped. Idempotent: a container that is not on the network, or
+    /// that does not exist, returns Ok.
+    async fn disconnect_container_network(
+        &self,
+        host: &Host,
+        container: &str,
+        network: &str,
+    ) -> Result<(), DockerError>;
+
     /// List every docker volume on `host`. Used by `yoink volumes`.
     async fn list_volumes(&self, host: &Host) -> Result<Vec<VolumeInfo>, DockerError>;
 
