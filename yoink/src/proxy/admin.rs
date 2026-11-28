@@ -14,10 +14,10 @@
 //! 4. Drops the tunnel.
 //!
 //! A proxy of yoink v0.22 or earlier listens on `0.0.0.0:2019` and
-//! publishes that port itself. When the relay finds no admin socket, the
-//! push goes to that port first and moves the admin API to the socket,
-//! see [`move_admin_to_socket`]. Every later push goes through the relay
-//! only.
+//! publishes that port itself. When the relay finds no admin socket,
+//! yoink sends only the socket admin block to that port first, see
+//! [`move_admin_to_socket`]. The push through the relay installs the
+//! routes. Every later push goes through the relay only.
 //!
 //! Why loopback-published instead of using the container's docker IP
 //! directly: docker doesn't route user-defined-network container IPs
@@ -95,6 +95,16 @@ pub enum AdminError {
         status: reqwest::StatusCode,
         body: String,
     },
+    /// A proxy of yoink v0.22 or earlier rejected the socket admin block
+    /// on `/config/admin`. Its admin API stays on port 2019.
+    #[error(
+        "the proxy rejected the move of its admin API to the socket with status \
+         {status}: {body}"
+    )]
+    AdminMoveRejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
     /// `/load` returned 200 but reading `/config/...routes/` back yielded
     /// a different route count. Caught early so a silent under-load
     /// doesn't end up serving 521 for routes the operator believes are
@@ -105,12 +115,13 @@ pub enum AdminError {
          pushed {expected}, daemon reports {actual}"
     )]
     LoadVerifyMismatch { expected: usize, actual: usize },
-    /// The proxy is from yoink v0.22 or earlier. The push to its own
-    /// admin port failed, and then the push through the relay failed.
+    /// The proxy is from yoink v0.22 or earlier. The move of its admin
+    /// API on its own admin port failed, and then the push through the
+    /// relay failed.
     #[error(
         "the proxy publishes the admin port {LEGACY_ADMIN_PORT} of yoink v0.22 or earlier. \
-         The push to that port failed ({legacy}), and the push through the admin relay \
-         failed too: {relay}"
+         The move of the admin API on that port failed ({legacy}), and the push through \
+         the admin relay failed too: {relay}"
     )]
     UpgradeFailed {
         legacy: Box<AdminError>,
@@ -132,17 +143,18 @@ impl AdminError {
     /// rejected the config (a `/load` is atomic). True otherwise: a 2xx
     /// with a failed check after it, a timeout or a broken connection
     /// after the request went out, or a 502-504 from the relay (it
-    /// cannot tell whether the request reached Caddy).
+    /// cannot tell whether the request reached Caddy). The move of the
+    /// admin API of an old proxy changes no routes, so only the push
+    /// through the relay counts.
     #[must_use]
     pub fn may_have_applied(&self) -> bool {
         match self {
             Self::LoadVerifyMismatch { .. } | Self::ReadBack { .. } => true,
             Self::Http { source } => !source.is_connect(),
             Self::LoadRejected { status, .. } => is_gateway_error(*status),
-            Self::UpgradeFailed { legacy, relay } => {
-                legacy.may_have_applied() || relay.may_have_applied()
-            }
-            Self::Docker { .. }
+            Self::UpgradeFailed { relay, .. } => relay.may_have_applied(),
+            Self::AdminMoveRejected { .. }
+            | Self::Docker { .. }
             | Self::ProxyNotRunning { .. }
             | Self::RelayNotRunning { .. }
             | Self::NoPublishedAdminPort { .. }
@@ -153,9 +165,9 @@ impl AdminError {
 }
 
 /// A failed [`push_config`]. `may_have_applied` is false only when
-/// yoink knows that Caddy kept its old config, see
+/// yoink knows that Caddy kept its old routes, see
 /// [`AdminError::may_have_applied`]. It covers every `/load` of the
-/// push: a retry, and the first push to an old proxy.
+/// push, also a retry.
 #[derive(Debug, Error)]
 #[error("{error}")]
 pub struct PushError {
@@ -178,8 +190,9 @@ impl PushError {
 /// proxy of yoink v0.22 or earlier publishes its own admin port until a
 /// deploy recreates it. For such a proxy, yoink first asks the relay
 /// whether the admin socket answers. Only when the relay answers with a
-/// gateway error (no socket), yoink sends the push to the published
-/// admin port first, see [`move_admin_to_socket`].
+/// gateway error (no socket), yoink first sends the socket admin block
+/// to the published admin port, see [`move_admin_to_socket`]. Then the
+/// push through the relay installs the routes.
 ///
 /// The push through the relay gets one retry after a transport-class
 /// failure: the tunnel did not come up, the readiness probe timed out,
@@ -213,24 +226,52 @@ pub async fn push_config(
     {
         return push_through_relay(host, ops, relay_port, config).await;
     }
-    let legacy = move_admin_to_socket(host, ops, legacy_port, config).await?;
+    // A rejection by Caddy is the result: the admin API stays on the
+    // TCP port, and the relay cannot reach it.
+    let legacy = match move_admin_to_socket(host, ops, legacy_port).await {
+        Err(error @ AdminError::AdminMoveRejected { .. }) => {
+            return Err(PushError::not_applied(error));
+        }
+        other => other.err(),
+    };
     push_through_relay(host, ops, relay_port, config)
         .await
-        .map_err(|mut relay| {
-            relay.may_have_applied |= legacy.may_have_applied;
-            match legacy.error {
-                // Caddy answered through the relay: its rejection is the
-                // result.
-                Some(error) if !is_rejection(&relay.error) => PushError {
-                    error: AdminError::UpgradeFailed {
-                        legacy: Box::new(error),
-                        relay: Box::new(relay.error),
-                    },
-                    may_have_applied: relay.may_have_applied,
+        .map_err(|relay| match legacy {
+            // Caddy answered through the relay: its rejection is the
+            // result.
+            Some(error) if !is_rejection(&relay.error) => PushError {
+                error: AdminError::UpgradeFailed {
+                    legacy: Box::new(error),
+                    relay: Box::new(relay.error),
                 },
-                _ => relay,
-            }
+                may_have_applied: relay.may_have_applied,
+            },
+            _ => relay,
         })
+}
+
+/// Before a deploy stops the proxy `proxy` (the inspect of a running
+/// proxy container), move its admin API to the socket if it is from
+/// yoink v0.22 or earlier and the relay finds no admin socket. Caddy
+/// saves the move in `autosave.json`, and the new proxy resumes that
+/// file onto the socket. Returns true when yoink sent the move.
+///
+/// Only the admin block goes to the old proxy, not the routes: a config
+/// that only the new proxy image can load must not stop the deploy.
+pub async fn move_legacy_admin_before_stop(
+    host: &Host,
+    ops: &dyn DockerOps,
+    proxy: &ContainerDetail,
+) -> Result<bool, AdminError> {
+    let Some(legacy_port) = legacy_admin_port(proxy) else {
+        return Ok(false);
+    };
+    let relay_port = relay_port(host, ops).await?;
+    if socket_answers(host, ops, relay_port).await? {
+        return Ok(false);
+    }
+    move_admin_to_socket(host, ops, legacy_port).await?;
+    Ok(true)
 }
 
 /// True when the admin API answers through the relay at host port
@@ -268,15 +309,6 @@ fn is_rejection(e: &AdminError) -> bool {
     matches!(e, AdminError::LoadRejected { status, .. } if !is_gateway_error(*status))
 }
 
-/// What [`move_admin_to_socket`] did, when it did not stop the push.
-#[derive(Default)]
-struct LegacyPush {
-    /// The `/load` to the old port may have changed the config.
-    may_have_applied: bool,
-    /// The transport error of that `/load`, for the message.
-    error: Option<AdminError>,
-}
-
 /// True when `proxy`, the inspect of a proxy container, is from yoink
 /// v0.22 or earlier: it publishes the admin port itself.
 #[must_use]
@@ -300,67 +332,67 @@ fn legacy_admin_port(proxy: &ContainerDetail) -> Option<u16> {
     parse_published_port(&proxy.ports, LEGACY_ADMIN_PORT)
 }
 
-/// The first push to a proxy of yoink v0.22 or earlier. Caddy there
-/// listens on `0.0.0.0:2019`, published on the host loopback at
-/// `port`. yoink sends `config` to that port. Its `admin` block moves
-/// the admin API to the socket, and Caddy saves it in `autosave.json`.
-/// Caddy answers the `/load` and then closes the TCP listener. A
-/// restart of this proxy, and a new proxy that resumes the saved
+/// Move the admin API of a proxy of yoink v0.22 or earlier to the
+/// socket. Caddy there listens on `0.0.0.0:2019`, published on the host
+/// loopback at `port`. yoink sends only [`crate::config::admin_block`]
+/// with `POST /config/admin`. A `POST` sets the key, also when it does
+/// not exist. Caddy then loads its current config with the new admin
+/// block, the same as a `/load`: it saves the config in `autosave.json`,
+/// answers, and then closes the TCP listener. The routes do not change.
+/// A restart of this proxy, and a new proxy that resumes the saved
 /// config, listen on the socket.
 ///
-/// The read-back of the routes happens through the relay, after this.
-///
-/// - A rejection by Caddy is the result: Caddy keeps the old config and
-///   the TCP listener.
-/// - A transport error does not stop the push. An earlier push may have
-///   moved the admin API to the socket already (its answer was lost),
-///   and then nothing listens on the port. The push through the relay
-///   decides. The error comes back for the message if that push fails
-///   too.
+/// - A rejection by Caddy is [`AdminError::AdminMoveRejected`]: Caddy
+///   keeps the old config and the TCP listener. Caddy answered on its
+///   own port, not through the relay, so the rejection is final, also
+///   for a 5xx.
+/// - A transport error gets one retry. An earlier move can have put the
+///   admin API on the socket already (its answer was lost), and then
+///   nothing listens on the port. The caller decides what that means.
 async fn move_admin_to_socket(
     host: &Host,
     ops: &dyn DockerOps,
     port: u16,
-    config: &Value,
-) -> Result<LegacyPush, PushError> {
+) -> Result<(), AdminError> {
     let attempt = || async {
         let tunnel = ops
             .forward_loopback(host, port, TUNNEL_READY_TIMEOUT)
             .await?;
-        post_load(&http_client(ADMIN_API_TIMEOUT), tunnel.local_port(), config).await
+        post_admin_block(&http_client(ADMIN_API_TIMEOUT), tunnel.local_port()).await
     };
-    let mut may_have_applied = false;
     let result = match attempt().await {
-        Err(e) if !matches!(e, AdminError::LoadRejected { .. }) => {
-            may_have_applied = e.may_have_applied();
+        Err(e) if !matches!(e, AdminError::AdminMoveRejected { .. }) => {
             tokio::time::sleep(RETRY_BACKOFF).await;
             attempt().await
         }
         other => other,
     };
-    match result {
-        Ok(()) => Ok(LegacyPush {
-            may_have_applied: true,
-            error: None,
-        }),
-        // Caddy answered on its own port, not through the relay: the
-        // rejection is final, also for a 5xx.
-        Err(error @ AdminError::LoadRejected { .. }) => Err(PushError {
-            error,
-            may_have_applied,
-        }),
-        Err(e) => {
-            tracing::debug!(
-                host = %host.address,
-                error = %e,
-                "push to the admin port of an old proxy failed; trying the relay",
-            );
-            Ok(LegacyPush {
-                may_have_applied: may_have_applied || e.may_have_applied(),
-                error: Some(e),
-            })
-        }
+    if let Err(e) = &result {
+        tracing::debug!(
+            host = %host.address,
+            error = %e,
+            "move of the admin API of an old proxy failed",
+        );
     }
+    result
+}
+
+/// `POST /config/admin` with the socket admin block, through the tunnel
+/// at `local_port`.
+async fn post_admin_block(client: &reqwest::Client, local_port: u16) -> Result<(), AdminError> {
+    let url = format!("http://127.0.0.1:{local_port}/config/admin");
+    let resp = client
+        .post(&url)
+        .json(&crate::config::admin_block())
+        .send()
+        .await
+        .map_err(|source| AdminError::Http { source })?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = redact_pem_blocks(&resp.text().await.unwrap_or_default());
+        return Err(AdminError::AdminMoveRejected { status, body });
+    }
+    Ok(())
 }
 
 /// The push through the relay at host port `relay_port`, with one retry
@@ -659,6 +691,8 @@ pub(crate) mod fake_caddy {
         config: Option<Value>,
         /// Status for each `/load`. 200 when empty.
         load_status: Vec<u16>,
+        /// Status for each `POST /config/admin`. 200 when empty.
+        admin_status: Vec<u16>,
         /// Route counts of the next read-backs, instead of the loaded
         /// one.
         routes: Vec<usize>,
@@ -701,6 +735,12 @@ pub(crate) mod fake_caddy {
             self.lock().load_status = statuses.to_vec();
         }
 
+        /// Answer the next `POST /config/admin` requests with these
+        /// statuses.
+        pub(crate) fn admin_statuses(&self, statuses: &[u16]) {
+            self.lock().admin_status = statuses.to_vec();
+        }
+
         /// Answer the next `n` read-backs with a body that is not JSON.
         pub(crate) fn break_readbacks(&self, n: usize) {
             self.lock().broken_readbacks = n;
@@ -727,6 +767,15 @@ pub(crate) mod fake_caddy {
                 .iter()
                 .filter(|r| r.method == "POST" && r.path == "/load")
                 .map(|r| serde_json::from_str(&r.body).expect("load body is JSON"))
+                .collect()
+        }
+
+        /// The bodies of the `POST /config/admin` requests, as JSON.
+        pub(crate) fn admin_moves(&self) -> Vec<Value> {
+            self.requests()
+                .iter()
+                .filter(|r| r.method == "POST" && r.path == "/config/admin")
+                .map(|r| serde_json::from_str(&r.body).expect("admin body is JSON"))
                 .collect()
         }
     }
@@ -801,6 +850,24 @@ pub(crate) mod fake_caddy {
                 } else {
                     (status, "{\"error\":\"rejected\"}".to_string())
                 }
+            }
+            ("POST", "/config/admin") => {
+                let status = if s.admin_status.is_empty() {
+                    200
+                } else {
+                    s.admin_status.remove(0)
+                };
+                if status != 200 {
+                    return (status, "{\"error\":\"rejected\"}".to_string());
+                }
+                let admin = serde_json::from_str(body).unwrap_or(Value::Null);
+                match &mut s.config {
+                    Some(Value::Object(config)) => {
+                        config.insert("admin".into(), admin);
+                    }
+                    _ => s.config = Some(serde_json::json!({ "admin": admin })),
+                }
+                (200, String::new())
             }
             ("GET", "/config/") => {
                 match (!s.probe_status.is_empty()).then(|| s.probe_status.remove(0)) {
@@ -953,9 +1020,8 @@ services:
 
     /// v0.22 and earlier: Caddy listens on `0.0.0.0:2019`, and every
     /// container on `yoink-ingress` can reach it. The relay finds no
-    /// admin socket (502), so the push goes to the published admin port
-    /// and moves the admin API to the socket. The read-back goes through
-    /// the relay.
+    /// admin socket (502), so yoink sends only the socket admin block to
+    /// the published admin port. The routes go through the relay.
     #[tokio::test]
     async fn first_push_to_an_old_proxy_moves_the_admin_api_to_the_socket() {
         let legacy = FakeCaddy::start();
@@ -969,11 +1035,11 @@ services:
             forwards(&ops),
             [RELAY_HOST_PORT, LEGACY_HOST_PORT, RELAY_HOST_PORT]
         );
-        // One `/load` on the old port, no read-back there: Caddy
-        // closes the TCP listener after it answers.
-        assert_eq!(paths(&legacy), ["POST /load"]);
-        assert_eq!(legacy.loads()[0]["admin"], crate::config::admin_block());
-        assert_eq!(legacy.loads()[0], rendered());
+        // Only the admin block on the old port, no `/load` and no
+        // read-back there: Caddy closes the TCP listener after it
+        // answers.
+        assert_eq!(paths(&legacy), ["POST /config/admin"]);
+        assert_eq!(legacy.admin_moves(), [crate::config::admin_block()]);
         assert_eq!(
             paths(&relay),
             [
@@ -1037,12 +1103,12 @@ services:
         assert_eq!(relay.loads().len(), 1);
     }
 
-    /// Caddy rejects the config: it keeps the old one and the TCP
-    /// listener. yoink does not try the relay.
+    /// Caddy rejects the admin block: it keeps the old config and the
+    /// TCP listener. yoink does not try the relay.
     #[tokio::test]
     async fn rejected_push_to_an_old_proxy_stops_the_push() {
         let legacy = FakeCaddy::start();
-        legacy.load_statuses(&[400]);
+        legacy.admin_statuses(&[400]);
         let relay = FakeCaddy::start();
         relay.probe_statuses(&[502]);
         let ops = fake_host(&old_proxy_ports(), true);
@@ -1052,7 +1118,7 @@ services:
             .await
             .expect_err("rejected");
         assert!(
-            matches!(err.error, AdminError::LoadRejected { status, .. } if status.as_u16() == 400),
+            matches!(err.error, AdminError::AdminMoveRejected { status, .. } if status.as_u16() == 400),
             "got: {err}"
         );
         assert!(!err.may_have_applied);
@@ -1274,6 +1340,20 @@ services:
                 status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
                 body: String::new(),
             },
+            AdminError::AdminMoveRejected {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                body: String::new(),
+            },
+            // The move of the admin API changes no routes.
+            AdminError::UpgradeFailed {
+                legacy: Box::new(AdminError::LoadVerifyMismatch {
+                    expected: 1,
+                    actual: 0,
+                }),
+                relay: Box::new(AdminError::NotReady {
+                    timeout: Duration::from_secs(1),
+                }),
+            },
         ];
         for e in &not_applied {
             assert!(!e.may_have_applied(), "{e}");
@@ -1288,12 +1368,12 @@ services:
                 body: String::new(),
             },
             AdminError::UpgradeFailed {
-                legacy: Box::new(AdminError::LoadVerifyMismatch {
+                legacy: Box::new(AdminError::NotReady {
+                    timeout: Duration::from_secs(1),
+                }),
+                relay: Box::new(AdminError::LoadVerifyMismatch {
                     expected: 1,
                     actual: 0,
-                }),
-                relay: Box::new(AdminError::NotReady {
-                    timeout: Duration::from_secs(1),
                 }),
             },
         ];
@@ -1302,10 +1382,10 @@ services:
         }
     }
 
-    /// The `/load` to the old port succeeded, so the push may have
-    /// applied also when Caddy then rejects the push through the relay.
+    /// The move of the admin API on the old port changes no routes. When
+    /// Caddy then rejects the push through the relay, nothing applied.
     #[tokio::test]
-    async fn successful_push_to_an_old_proxy_counts_as_applied() {
+    async fn moved_admin_api_alone_does_not_count_as_applied() {
         let legacy = FakeCaddy::start();
         let relay = FakeCaddy::start();
         relay.probe_statuses(&[502]);
@@ -1320,7 +1400,86 @@ services:
             matches!(err.error, AdminError::LoadRejected { status, .. } if status.as_u16() == 400),
             "got: {err}"
         );
-        assert!(err.may_have_applied);
+        assert!(!err.may_have_applied);
+        assert_eq!(legacy.admin_moves().len(), 1);
+        assert!(legacy.loads().is_empty());
+    }
+
+    /// Before a deploy stops an old proxy, yoink sends it only the
+    /// socket admin block. A proxy of this version, and an old proxy
+    /// whose admin API is on the socket, get nothing.
+    #[tokio::test]
+    async fn move_before_stop_sends_only_the_admin_block() {
+        let detail = |ports: &[&str]| ContainerDetail {
+            name: PROXY.into(),
+            ports: ports.iter().map(|p| (*p).to_string()).collect(),
+            ..ContainerDetail::default()
+        };
+        let relay_ops = |relay: &FakeCaddy, legacy: Option<&FakeCaddy>| {
+            let ops = FakeDockerOps::new();
+            ops.push_list_containers(Ok(vec![running(RELAY_NAME, None)]));
+            ops.set_inspect(ContainerDetail {
+                name: RELAY_NAME.into(),
+                ports: vec![format!("{RELAY_HOST_PORT}:2020/tcp")],
+                ..ContainerDetail::default()
+            });
+            ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+            if let Some(legacy) = legacy {
+                ops.forward_loopback_to(LEGACY_HOST_PORT, legacy.port);
+            }
+            ops
+        };
+
+        let (legacy, relay) = (FakeCaddy::start(), FakeCaddy::start());
+        relay.probe_statuses(&[502]);
+        let ops = relay_ops(&relay, Some(&legacy));
+        let moved = move_legacy_admin_before_stop(&host(), &ops, &detail(&old_proxy_ports()))
+            .await
+            .expect("move");
+        assert!(moved);
+        assert_eq!(paths(&legacy), ["POST /config/admin"]);
+        assert_eq!(legacy.admin_moves(), [crate::config::admin_block()]);
+        assert!(relay.loads().is_empty());
+
+        // The admin API is on the socket already.
+        let (legacy, relay) = (FakeCaddy::start(), FakeCaddy::start());
+        let ops = relay_ops(&relay, Some(&legacy));
+        let moved = move_legacy_admin_before_stop(&host(), &ops, &detail(&old_proxy_ports()))
+            .await
+            .expect("no move");
+        assert!(!moved);
+        assert!(legacy.requests().is_empty());
+
+        // A proxy of this version: no call at all.
+        let ops = FakeDockerOps::new();
+        let moved = move_legacy_admin_before_stop(&host(), &ops, &detail(&["80:80/tcp"]))
+            .await
+            .expect("no move");
+        assert!(!moved);
+        assert!(ops.calls().is_empty());
+    }
+
+    /// The old Caddy rejects the admin block: the error says so.
+    #[tokio::test]
+    async fn rejected_move_before_stop_is_an_error() {
+        let (legacy, relay) = (FakeCaddy::start(), FakeCaddy::start());
+        legacy.admin_statuses(&[400]);
+        relay.probe_statuses(&[502]);
+        let ops = fake_host(&old_proxy_ports(), true);
+        ops.forward_loopback_to(LEGACY_HOST_PORT, legacy.port);
+        ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        let proxy = running_proxy(&host(), &ops).await.expect("proxy");
+        let err = move_legacy_admin_before_stop(&host(), &ops, &proxy)
+            .await
+            .expect_err("rejected");
+        assert!(
+            matches!(err, AdminError::AdminMoveRejected { status, .. } if status.as_u16() == 400),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("move of its admin API"),
+            "got: {err}"
+        );
     }
 
     /// The relay probe of an old proxy cannot reach the relay: yoink

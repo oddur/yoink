@@ -172,6 +172,14 @@ pub enum DeployEvent {
     ProxyAdminUpgradePending {
         hosts: Vec<String>,
     },
+    /// Before the stop of a proxy of yoink v0.22 or earlier on `host`,
+    /// yoink could not move its admin API to the socket. The deploy
+    /// continues: the new proxy starts without routes, and the push
+    /// after its healthcheck adds them.
+    ProxyAdminMoveFailed {
+        host: String,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1412,12 +1420,8 @@ async fn finalize_one_host(
     // validation rejects publish + replicas > 1), so the swap is
     // straightforward.
     let is_proxy = matches!(service.kind, Some(crate::config::ServiceKind::Proxy));
-    if is_proxy
-        && let Err(e) = move_old_proxy_admin_to_socket(ops, &host, config, secrets, &existing).await
-    {
-        // Nothing is stopped yet: the old proxy still serves.
-        remove_attempt_replicas(ops, &host, &replicas).await;
-        return Err(e);
+    if is_proxy {
+        move_old_proxy_admin_to_socket(ops, &host, &existing, on_event).await;
     }
 
     let mut stopped_old: Vec<String> = Vec::new();
@@ -1527,40 +1531,47 @@ async fn finalize_one_host(
 }
 
 /// Before a deploy of the proxy stops a proxy of yoink v0.22 or earlier,
-/// push the Caddy config to it. The push moves its admin API to the
-/// unix socket, and Caddy saves that in `autosave.json` on the config
-/// volume (see `crate::proxy::admin`). The new proxy resumes that file,
-/// so its admin API is on the socket from the start, where the deploy
-/// probe and the relay reach it. A failed deploy starts the old proxy
-/// again, and it resumes the same file.
+/// send it the socket admin block, see
+/// `crate::proxy::admin::move_legacy_admin_before_stop`. Caddy saves
+/// the move in `autosave.json` on the config volume. The new proxy
+/// resumes that file, so it serves the old routes from the start, and
+/// its admin API is on the socket, where the deploy probe and the relay
+/// reach it. A failed deploy starts the old proxy again, and it resumes
+/// the same file.
 ///
-/// When no old proxy runs, yoink cannot push. Then `autosave.json` can
-/// still have the old admin address `0.0.0.0:2019`. The start script
-/// of the new proxy does not resume such a file: the proxy starts from
-/// the bootstrap, and the push after its healthcheck adds the routes.
-///
-/// The push renders the routes of the containers that run now, as the
-/// final push of a run does. A proxy of this version gets no push here.
+/// The step is best-effort: a failure sends
+/// [`DeployEvent::ProxyAdminMoveFailed`], and the deploy continues.
+/// Then `autosave.json` keeps the old admin address `0.0.0.0:2019`. The
+/// start script of the new proxy does not resume such a file: the proxy
+/// starts from the bootstrap, and the push after its healthcheck adds
+/// the routes. The same happens when no old proxy runs. A proxy of this
+/// version gets no request here.
 async fn move_old_proxy_admin_to_socket(
     ops: &dyn DockerOps,
     host: &Host,
-    config: &Config,
-    secrets: Option<&SecretsBundle>,
     existing: &[ContainerInfo],
-) -> Result<(), DeployError> {
+    on_event: &mut (dyn FnMut(DeployEvent) + Send),
+) {
     for old in existing.iter().filter(|c| c.is_running()) {
-        let detail = ops
-            .inspect_container(host, &old.name)
-            .await
-            .map_err(|source| DeployError::Docker {
-                host: host.address.clone(),
-                source,
-            })?;
-        if crate::proxy::admin::is_legacy_proxy(&detail) {
-            return push_caddy_config(ops, host, config, secrets, None).await;
+        let result = match ops.inspect_container(host, &old.name).await {
+            Ok(detail) => crate::proxy::admin::move_legacy_admin_before_stop(host, ops, &detail)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match result {
+            Ok(false) => {}
+            Ok(true) => return,
+            Err(error) => {
+                warn!(host = %host.address, container = %old.name, %error, "could not move the admin API of the old proxy");
+                on_event(DeployEvent::ProxyAdminMoveFailed {
+                    host: host.address.clone(),
+                    error,
+                });
+                return;
+            }
         }
     }
-    Ok(())
 }
 
 /// Build the per-service upstream-name map fed into the Caddy config
@@ -1606,8 +1617,9 @@ async fn build_upstream_names(
 /// Render the Caddy config for `host`'s view of `config` and POST it
 /// to the proxy's admin API. Errors abort the deploy — old config
 /// stays active because Caddy's `/load` is atomic. A proxy of yoink
-/// v0.22 or earlier gets the push on its own admin port first, which
-/// moves its admin API to the unix socket, see `crate::proxy::admin`.
+/// v0.22 or earlier first gets the socket admin block on its own admin
+/// port, which moves its admin API to the unix socket, see
+/// `crate::proxy::admin`.
 ///
 /// `in_flight_upstreams` carries `(service_name, expected_names)` for
 /// the service the caller is currently reconciling. For that service,
@@ -5876,12 +5888,11 @@ services:
             .unwrap_or_else(|| panic!("no {wanted:?} in {calls:?}"))
     }
 
-    /// The old proxy listens on `0.0.0.0:2019`. If yoink stopped it
-    /// first, the new proxy would resume that address from
-    /// `autosave.json`: open to `yoink-ingress`, out of reach of the
-    /// relay. The deploy pushes the socket admin block to the old proxy
-    /// on its own port before it stops it. The probe of the new proxy
-    /// goes through the relay.
+    /// The old proxy listens on `0.0.0.0:2019`. Without a move, the new
+    /// proxy cannot resume its `autosave.json` and starts without
+    /// routes. The deploy sends only the socket admin block to the old
+    /// proxy on its own port before it stops it, not the routes. The
+    /// probe of the new proxy goes through the relay.
     #[tokio::test]
     async fn proxy_deploy_moves_the_old_admin_api_to_the_socket_before_the_stop() {
         use crate::proxy::admin::fake_caddy::FakeCaddy;
@@ -5889,7 +5900,7 @@ services:
         let proxy = cfg.service(crate::config::PROXY_SERVICE_NAME).unwrap();
         let (legacy, relay) = (FakeCaddy::start(), FakeCaddy::start());
         let (ops, prep) = host_with_an_old_proxy(&legacy, &relay);
-        script_push(&ops, OLD_PROXY);
+        ops.push_list_containers(Ok(vec![relay_container()]));
         ops.push_stop_container(Ok(()));
         ops.push_start_container(Ok(()));
         ops.push_healthcheck(Ok(200));
@@ -5911,11 +5922,10 @@ services:
             .position(|c| matches!(c, RecordedCall::StopContainer(_, n, _) if n == OLD_PROXY))
             .expect("old proxy stopped");
         assert!(legacy_push < stop, "got: {calls:?}");
-        assert_eq!(legacy.loads().len(), 1);
-        assert_eq!(legacy.loads()[0]["admin"], crate::config::admin_block());
-        // The read-back of the first push, then the push for the new
-        // proxy: both through the relay.
-        assert_eq!(relay.loads().len(), 2);
+        assert_eq!(legacy.admin_moves(), [crate::config::admin_block()]);
+        assert!(legacy.loads().is_empty());
+        // Only the push for the new proxy goes through the relay.
+        assert_eq!(relay.loads().len(), 1);
         assert!(calls.contains(&RecordedCall::Healthcheck(
             relay_host(),
             crate::config::ADMIN_NETWORK.into(),
@@ -5935,7 +5945,7 @@ services:
         let proxy = cfg.service(crate::config::PROXY_SERVICE_NAME).unwrap();
         let (legacy, relay) = (FakeCaddy::start(), FakeCaddy::start());
         let (ops, prep) = host_with_an_old_proxy(&legacy, &relay);
-        script_push(&ops, OLD_PROXY);
+        ops.push_list_containers(Ok(vec![relay_container()]));
         ops.push_stop_container(Ok(()));
         ops.push_start_container(Ok(()));
         // A daemon rejection ends the probe at once.
@@ -5976,44 +5986,63 @@ services:
             .rposition(|c| matches!(c, RecordedCall::StartContainer(_, n) if n == OLD_PROXY))
             .expect("old proxy restarted");
         assert!(legacy_push < stop && stop < removed && removed < restarted);
-        assert_eq!(legacy.loads().len(), 1);
+        assert_eq!(legacy.admin_moves().len(), 1);
         assert!(events.contains(&DeployEvent::OldContainerRestarted {
             host: "host-a".into(),
             container: OLD_PROXY.into(),
         }));
     }
 
-    /// Caddy rejects the push to the old proxy. Nothing is stopped: the
-    /// old proxy keeps serving, with its old config.
+    /// The move of the old admin API fails: the old Caddy rejects the
+    /// admin block, or nothing answers on its port. The move is
+    /// best-effort. yoink warns, and the stop-first swap continues: the
+    /// new proxy starts from the bootstrap, and the push after its
+    /// healthcheck adds the routes.
     #[tokio::test]
-    async fn rejected_move_of_the_old_admin_api_stops_nothing() {
-        use crate::proxy::admin::fake_caddy::FakeCaddy;
-        let cfg = config_proxied_service();
-        let proxy = cfg.service(crate::config::PROXY_SERVICE_NAME).unwrap();
-        let (legacy, relay) = (FakeCaddy::start(), FakeCaddy::start());
-        legacy.load_statuses(&[400]);
-        let (ops, prep) = host_with_an_old_proxy(&legacy, &relay);
-        script_push(&ops, OLD_PROXY);
-        ops.push_force_remove(Ok(()));
+    async fn failed_move_of_the_old_admin_api_warns_and_deploys() {
+        use crate::proxy::admin::fake_caddy::{FakeCaddy, closing_port};
+        for rejects in [true, false] {
+            let cfg = config_proxied_service();
+            let proxy = cfg.service(crate::config::PROXY_SERVICE_NAME).unwrap();
+            let (legacy, relay) = (FakeCaddy::start(), FakeCaddy::start());
+            legacy.admin_statuses(&[400]);
+            let (ops, prep) = host_with_an_old_proxy(&legacy, &relay);
+            if !rejects {
+                ops.forward_loopback_to(LEGACY_HOST_PORT, closing_port());
+            }
+            ops.push_list_containers(Ok(vec![relay_container()]));
+            ops.push_stop_container(Ok(()));
+            ops.push_start_container(Ok(()));
+            ops.push_healthcheck(Ok(200));
+            script_push(&ops, NEW_PROXY);
 
-        let mut sink = |_e: DeployEvent| {};
-        let err = finalize_one_host(&ops, &cfg, proxy, prep, None, &mut sink)
-            .await
-            .expect_err("rejected");
-        assert!(err.to_string().contains("status 400"), "got: {err}");
-        let calls = ops.calls();
-        assert!(
-            !calls.iter().any(|c| matches!(
-                c,
-                RecordedCall::StopContainer(..) | RecordedCall::StartContainer(..)
-            )),
-            "got: {calls:?}"
-        );
-        assert!(calls.contains(&RecordedCall::ForceRemoveContainer(
-            relay_host(),
-            NEW_PROXY.into()
-        )));
-        assert!(relay.loads().is_empty());
+            let mut events = Vec::new();
+            let mut sink = |e: DeployEvent| events.push(e);
+            finalize_one_host(&ops, &cfg, proxy, prep, None, &mut sink)
+                .await
+                .expect("the deploy continues");
+
+            let warning = events
+                .iter()
+                .find_map(|e| match e {
+                    DeployEvent::ProxyAdminMoveFailed { host, error } => Some((host, error)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no warning in {events:?}"));
+            assert_eq!(warning.0, "host-a");
+            if rejects {
+                assert!(warning.1.contains("status 400"), "got: {}", warning.1);
+            }
+            let calls = ops.calls();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| matches!(c, RecordedCall::StopContainer(_, n, _) if n == OLD_PROXY)),
+                "got: {calls:?}"
+            );
+            assert!(legacy.loads().is_empty());
+            assert_eq!(relay.loads().len(), 1, "rejects {rejects}");
+        }
     }
 
     const OLD_API: &str = "api-9f8e7d6";

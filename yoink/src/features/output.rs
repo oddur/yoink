@@ -208,6 +208,11 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
             hosts.join(", "),
             crate::config::PROXY_SERVICE_NAME,
         ),
+        DeployEvent::ProxyAdminMoveFailed { host, error } => format!(
+            "[{host}] warning: could not move the admin API of the old proxy to the socket \
+             before the stop: {error}. The deploy continues. The new proxy can start without \
+             routes. yoink adds them after its healthcheck."
+        ),
         DeployEvent::AdminRelaySkipped { host, image } => format!(
             "[{host}] warning: the admin relay {relay} does not run, and the proxy image \
              {image} is not on the host. This run does not deploy the proxy, so yoink does \
@@ -352,6 +357,25 @@ mod tests {
             line.contains("`yoink up --service yoink-proxy`"),
             "got: {line}"
         );
+    }
+
+    /// A failed move of the old admin API tells the operator that the
+    /// deploy continues.
+    #[test]
+    fn deploy_event_format_proxy_admin_move_failed() {
+        let line = format_deploy_event(
+            Some("yoink-proxy"),
+            &DeployEvent::ProxyAdminMoveFailed {
+                host: "h1".into(),
+                error: "status 400".into(),
+            },
+        );
+        assert!(
+            line.starts_with("[yoink-proxy] [h1] warning: could not move the admin API"),
+            "got: {line}"
+        );
+        assert!(line.contains("status 400"), "got: {line}");
+        assert!(line.contains("The deploy continues."), "got: {line}");
     }
 
     #[test]
