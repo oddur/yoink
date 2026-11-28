@@ -583,7 +583,8 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
                 vec![format!("{prefix}80:80"), format!("{prefix}443:443")]
             },
             // Override the official caddy:2 image's entrypoint to
-            // start with a minimal bootstrap config: the `admin_block`
+            // start with a minimal bootstrap config (written to
+            // `/config/caddy/bootstrap.json`): the `admin_block`
             // that every `/load` also sends. The admin API listens on
             // the unix socket `ADMIN_SOCKET`. The actual routes are
             // pushed via `/load` immediately after the container is
@@ -666,10 +667,15 @@ fn socket_autosave_prefix() -> String {
 ///   from the bootstrap: the admin API is on the socket, and the push
 ///   after the healthcheck adds the routes. Until that push, the proxy
 ///   has no routes.
-/// - `exec` with a quoted heredoc: Caddy replaces the shell, so it gets
-///   the stop signal. In `echo … | exec caddy`, Caddy runs in a
-///   subshell of the pipeline, and the shell gets the signal. The
-///   bootstrap and the prefix have no single quote.
+/// - The bootstrap goes to `bootstrap.json` in the config directory, on
+///   the volume. The root file system is read-only and has no `/tmp`,
+///   and a heredoc needs a temporary file in some shells (bash before
+///   5.1, zsh, mksh). `printf` is a built-in. With `--resume`, Caddy
+///   uses `autosave.json` when it exists, and the file only when not.
+/// - `exec`: Caddy replaces the shell, so it gets the stop signal. In
+///   `echo … | exec caddy`, Caddy runs in a subshell of the pipeline,
+///   and the shell gets the signal. The bootstrap and the prefix are in
+///   single quotes and have no single quote.
 fn start_script() -> String {
     start_script_in(admin_socket_dir())
 }
@@ -687,9 +693,8 @@ fn start_script_in(dir: &str) -> String {
             "*) set -- ;;\n",
             "esac\n",
             "rm -f {dir}/{socket}\n",
-            "exec caddy run --config /dev/stdin \"$@\" <<'EOF'\n",
-            "{bootstrap}\n",
-            "EOF",
+            "printf '%s' '{bootstrap}' > {dir}/bootstrap.json || exit 1\n",
+            "exec caddy run --config {dir}/bootstrap.json \"$@\"",
         ),
         dir = dir,
         socket = admin_socket_name(),
@@ -1263,9 +1268,9 @@ services:
             panic!("one shell command, got {:?}", proxy.run.cmd);
         };
         let json = cmd
-            .split_once("<<'EOF'\n")
-            .and_then(|(_, rest)| rest.strip_suffix("\nEOF"))
-            .unwrap_or_else(|| panic!("unexpected bootstrap: {cmd}"));
+            .split_once("printf '%s' '")
+            .and_then(|(_, rest)| rest.split_once("' > "))
+            .map_or_else(|| panic!("unexpected bootstrap: {cmd}"), |(json, _)| json);
         let bootstrap: serde_json::Value = serde_json::from_str(json).expect("bootstrap is JSON");
         assert_eq!(bootstrap["admin"], admin_block());
         assert_eq!(
@@ -1312,9 +1317,10 @@ services:
                 "\n*) set -- ;;\n",
                 "esac\n",
                 "rm -f /config/caddy/admin.sock\n",
-                "exec caddy run --config /dev/stdin \"$@\" <<'EOF'\n",
+                "printf '%s' '",
                 r#"{"admin":{"listen":"unix//config/caddy/admin.sock","origins":["127.0.0.1"]}}"#,
-                "\nEOF",
+                "' > /config/caddy/bootstrap.json || exit 1\n",
+                "exec caddy run --config /config/caddy/bootstrap.json \"$@\"",
             )]
         );
     }
@@ -1349,7 +1355,10 @@ services:
     /// What the stub `caddy` saw when the start script ran it.
     struct StubRun {
         args: String,
-        stdin: String,
+        /// The content of the file after `--config`.
+        config: String,
+        /// The config directory of the run.
+        dir: String,
         /// The stub ran in the process of the shell: `exec`, no fork.
         same_pid: bool,
         /// The admin socket file existed when the stub ran.
@@ -1391,7 +1400,7 @@ services:
                     "#!/bin/sh\n",
                     "echo $$ > {out}/pid\n",
                     "echo \"$*\" > {out}/args\n",
-                    "cat > {out}/stdin\n",
+                    "[ \"$2\" = --config ] && cat \"$3\" > {out}/config\n",
                     "if [ -e {socket} ]; then echo yes; else echo no; fi > {out}/socket\n",
                 ),
                 out = dir.display(),
@@ -1419,7 +1428,8 @@ services:
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect(name);
         StubRun {
             args: read("args").trim_end().to_string(),
-            stdin: read("stdin"),
+            config: read("config"),
+            dir: config_dir.to_string_lossy().into_owned(),
             same_pid: read("pid").trim() == shell_pid.to_string(),
             socket_left: read("socket").trim() == "yes",
         }
@@ -1431,8 +1441,12 @@ services:
         let autosave = format!(r#"{}"apps":{{}}}}"#, socket_autosave_prefix());
         for shell in shells() {
             let run = run_start_script(shell, Some(&autosave));
-            assert_eq!(run.args, "run --config /dev/stdin --resume", "{shell}");
-            assert_eq!(run.stdin, format!("{}\n", bootstrap_config()), "{shell}");
+            assert_eq!(
+                run.args,
+                format!("run --config {}/bootstrap.json --resume", run.dir),
+                "{shell}"
+            );
+            assert_eq!(run.config, bootstrap_config(), "{shell}");
             assert!(run.same_pid, "{shell}: caddy must replace the shell");
             assert!(!run.socket_left, "{shell}: the stale socket must go");
         }
@@ -1453,8 +1467,12 @@ services:
         for shell in shells() {
             for autosave in autosaves {
                 let run = run_start_script(shell, autosave);
-                assert_eq!(run.args, "run --config /dev/stdin", "{shell}: {autosave:?}");
-                assert_eq!(run.stdin, format!("{}\n", bootstrap_config()), "{shell}");
+                assert_eq!(
+                    run.args,
+                    format!("run --config {}/bootstrap.json", run.dir),
+                    "{shell}: {autosave:?}"
+                );
+                assert_eq!(run.config, bootstrap_config(), "{shell}");
                 assert!(run.same_pid, "{shell}: caddy must replace the shell");
                 assert!(!run.socket_left, "{shell}: the stale socket must go");
             }

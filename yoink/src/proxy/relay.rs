@@ -200,6 +200,28 @@ pub fn relay_config() -> String {
     )
 }
 
+/// The config directory of Caddy in the relay: a tmpfs, see
+/// [`relay_spec`].
+const RELAY_CONFIG_DIR: &str = "/config";
+
+/// The shell command of the relay, with the Caddy config directory
+/// `dir`. The tests run it in a temporary directory.
+///
+/// The command writes [`relay_config`] to `relay.json` in `dir` and
+/// starts Caddy with it. The root file system is read-only and has no
+/// `/tmp`, and a heredoc needs a temporary file in some shells (bash
+/// before 5.1, zsh, mksh). `dir` is a tmpfs with mode 1777, so the
+/// relay user can write there. `printf` is a built-in. `exec` makes
+/// Caddy the child of the init process, so it gets the stop signal. The
+/// JSON is in single quotes and has no single quote.
+fn relay_command_in(dir: &str) -> String {
+    format!(
+        "printf '%s' '{config}' > {dir}/relay.json || exit 1\n\
+         exec caddy run --config {dir}/relay.json",
+        config = relay_config(),
+    )
+}
+
 /// The run spec of the relay, without the spec hash label.
 fn relay_spec(image: &RelayImage) -> RunSpec {
     let labels = [
@@ -257,14 +279,10 @@ fn relay_spec(image: &RelayImage) -> RunSpec {
             user: Some("0:0".to_string()),
             ..RunOptions::default()
         },
-        // The same shape as the proxy bootstrap: the config comes on
-        // stdin. `exec` makes Caddy the child of the init process, so
-        // it gets the stop signal. The JSON has no single quote.
+        // The same shape as the proxy bootstrap, see
+        // `relay_command_in`.
         entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
-        command: vec![format!(
-            "exec caddy run --config /dev/stdin <<'EOF'\n{}\nEOF",
-            relay_config()
-        )],
+        command: vec![relay_command_in(RELAY_CONFIG_DIR)],
         publish: vec![format!("127.0.0.1:0:{RELAY_PORT}")],
         binds: Vec::new(),
         // Read-only: a connect to a unix socket needs no write access to
@@ -401,7 +419,8 @@ mod tests {
         assert_eq!(
             cmd[0],
             format!(
-                "exec caddy run --config /dev/stdin <<'EOF'\n{}\nEOF",
+                "printf '%s' '{}' > /config/relay.json || exit 1\n\
+                 exec caddy run --config /config/relay.json",
                 relay_config()
             )
         );
@@ -481,8 +500,56 @@ mod tests {
                 } } } },
             })
         );
-        // The shell command quotes the JSON in a quoted heredoc.
+        // The shell command puts the JSON in single quotes.
         assert!(!relay_config().contains('\''));
+    }
+
+    /// The relay command writes its config to a file in the tmpfs and
+    /// runs Caddy on it, in the process of the shell. A stub `caddy`
+    /// records what it got.
+    #[test]
+    fn relay_command_runs_caddy_on_the_written_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir bin");
+        let stub = bin.join("caddy");
+        std::fs::write(
+            &stub,
+            format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "echo $$ > {out}/pid\n",
+                    "echo \"$*\" > {out}/args\n",
+                    "cat \"$3\" > {out}/config\n",
+                ),
+                out = dir.display()
+            ),
+        )
+        .expect("stub");
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(relay_command_in(&dir.to_string_lossy()))
+            .env("PATH", path)
+            .spawn()
+            .expect("spawn sh");
+        let shell_pid = child.id();
+        let status = child.wait_with_output().expect("wait").status;
+        assert!(status.success(), "script failed: {status}");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect(name);
+        assert_eq!(
+            read("args").trim_end(),
+            format!("run --config {}/relay.json", dir.display())
+        );
+        assert_eq!(read("config"), relay_config());
+        assert_eq!(read("pid").trim(), shell_pid.to_string(), "exec, no fork");
     }
 
     /// Caddy up to v2.9 checks `Host` on the admin socket against
