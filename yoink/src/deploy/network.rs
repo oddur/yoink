@@ -32,7 +32,7 @@ pub enum AdminNetworkError {
     #[error(
         "network {ADMIN_NETWORK:?} was not created by yoink: it has no \
          `yoink.role=proxy-admin-network` label, and containers that yoink does not \
-         manage are on it ({}). yoink does not put the proxy admin API on it. {remedy}",
+         manage are on it ({}). yoink does not put the admin relay on it. {remedy}",
         foreign.join(", ")
     )]
     NotOwned {
@@ -74,8 +74,9 @@ pub struct AdminNetworkReady {
 }
 
 /// Make sure the admin network of the proxy exists and belongs to
-/// yoink. The admin API has no authentication, so yoink does not join
-/// a network that another tool made:
+/// yoink. The admin relay on it forwards to the admin API, which has no
+/// authentication, so yoink does not join a network that another tool
+/// made:
 ///
 /// - yoink creates the network with [`ADMIN_NETWORK_LABEL`].
 /// - A network with that label is yoink's.
@@ -85,10 +86,12 @@ pub struct AdminNetworkReady {
 ///   network without containers is accepted too.
 /// - Before v0.21, services joined the network by default. yoink
 ///   disconnects those app containers from an unlabeled network and
-///   reports them in [`AdminNetworkReady::disconnected`]. Only the proxy
-///   and the admin relay stay on it.
-/// - The deploy probe of the proxy joins the network. yoink removes a
-///   stopped probe from an earlier run and ignores a running probe.
+///   reports them in [`AdminNetworkReady::disconnected`]. Only the admin
+///   relay stays on it, and a proxy of yoink v0.22 or earlier until a
+///   deploy of the proxy replaces it. The new proxy is not on it.
+/// - The deploy probe of the proxy joins the network to reach the
+///   relay. yoink removes a stopped probe from an earlier run and
+///   ignores a running probe.
 /// - An internal network is refused: the relay publishes a port.
 pub async fn ensure_admin(
     ops: &dyn DockerOps,

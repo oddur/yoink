@@ -4068,7 +4068,6 @@ fn update_service_status(
         | DeployEvent::ContainerLogTail { .. }
         | DeployEvent::ContainerLogTailUnavailable { .. }
         | DeployEvent::OldContainerRestarted { .. }
-        | DeployEvent::ProxyAdminUpgradePending { .. }
         | DeployEvent::AdminNetworkContainersDisconnected { .. }
         | DeployEvent::AdminRelayCreated { .. }
         | DeployEvent::AdminRelaySkipped { .. } => return,

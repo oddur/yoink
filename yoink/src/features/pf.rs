@@ -31,7 +31,7 @@ use thiserror::Error;
 
 use crate::base::host::Host;
 use crate::config::{
-    ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, ADMIN_RELAY_NAME, Config, PROXY_SERVICE_NAME,
+    ADMIN_NETWORK, ADMIN_RELAY_NAME, ADMIN_SOCKET, Config, LEGACY_ADMIN_PORT, PROXY_SERVICE_NAME,
     ServiceConfig, ServiceKind,
 };
 use crate::docker_ops::DockerOps;
@@ -191,13 +191,12 @@ pub enum PfError {
     )]
     SidecarNoNetwork { service: String },
     #[error(
-        "the Caddy admin API of {PROXY_SERVICE_NAME:?} listens only on \
-         {ADMIN_API_HOST} on the {ADMIN_NETWORK} network, so `yoink pf` cannot reach port \
-         {ADMIN_PORT}. Use the admin relay: on the host, `docker port {ADMIN_RELAY_NAME} \
-         {RELAY_PORT}` shows its port P on 127.0.0.1. Then run `ssh -L 2019:127.0.0.1:P \
-         <user>@<host>` and send requests to http://127.0.0.1:2019. The relay sets the \
-         `Host: {ADMIN_API_HOST}` header. The admin API has no authentication: close the \
-         tunnel when you are done."
+        "the Caddy admin API of {PROXY_SERVICE_NAME:?} listens only on the unix socket \
+         {ADMIN_SOCKET}, so `yoink pf` cannot reach port {LEGACY_ADMIN_PORT}. Use the admin \
+         relay: on the host, `docker port {ADMIN_RELAY_NAME} {RELAY_PORT}` shows its port P \
+         on 127.0.0.1. Then run `ssh -L 2019:127.0.0.1:P <user>@<host>` and send requests \
+         to http://127.0.0.1:2019. The admin API has no authentication: close the tunnel \
+         when you are done."
     )]
     ProxyAdminPort,
     #[error(transparent)]
@@ -369,8 +368,8 @@ pub async fn resolve_target(
     mode: Mode,
 ) -> Result<ResolvedTarget, PfError> {
     // A sidecar on yoink-ingress gets "connection refused" on the admin
-    // port: Caddy listens there only on the admin network.
-    if service.kind == Some(ServiceKind::Proxy) && container_port == ADMIN_PORT {
+    // port: Caddy listens on a unix socket only.
+    if service.kind == Some(ServiceKind::Proxy) && container_port == LEGACY_ADMIN_PORT {
         return Err(PfError::ProxyAdminPort);
     }
     // 1. Try published unless the operator forced sidecar.
@@ -1015,7 +1014,7 @@ services:
         );
         assert!(msg.contains("ssh -L 2019:127.0.0.1:P"), "got: {msg}");
         assert!(
-            msg.contains("Host: yoink-proxy-admin-api:2019"),
+            msg.contains("unix socket /config/caddy/admin.sock"),
             "got: {msg}"
         );
         assert!(ops.calls().is_empty(), "got: {:?}", ops.calls());

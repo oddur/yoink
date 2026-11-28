@@ -20,53 +20,57 @@ pub const PROXY_SERVICE_NAME: &str = "yoink-proxy";
 /// name. Every service with `domain:` joins it automatically.
 pub const INGRESS_NETWORK: &str = "yoink-ingress";
 
-/// Docker network the Caddy admin API listens on. Only the proxy and
-/// the admin relay join it (see `crate::proxy::relay`). The name sorts
-/// after [`INGRESS_NETWORK`], so `yoink-ingress` stays the gateway
-/// endpoint of the proxy and keeps the published ports 80 and 443.
-/// Earlier versions of yoink created this network too.
+/// Docker network of the admin relay (see `crate::proxy::relay`). The
+/// relay needs a bridge network to publish its port on the host
+/// loopback. Only the relay joins it. The proxy does not: the Caddy
+/// admin API listens on [`ADMIN_SOCKET`], not on a network address.
+/// yoink v0.22 and earlier put the proxy (and before v0.21, every
+/// service) on this network too.
 pub const ADMIN_NETWORK: &str = "yoink-proxy-admin";
 
 /// Container name of the admin relay (see `crate::proxy::relay`). One
 /// relay per host.
 pub const ADMIN_RELAY_NAME: &str = "yoink-proxy-admin-relay";
 
-/// Network alias that the proxy has only on [`ADMIN_NETWORK`]. Caddy
-/// binds the admin API to the one address this name resolves to, the
-/// proxy IP on that network. A service on `yoink-ingress` with the
-/// default `cap_drop: [ALL]` cannot connect to that address. The bind
-/// is not access control: with `NET_ADMIN` or `NET_RAW`, a container
-/// on `yoink-ingress` can route or craft packets to it. See
-/// `Config::ingress_capability_warnings`.
-pub const ADMIN_API_ALIAS: &str = "yoink-proxy-admin-api";
+/// The port in the relay that its Caddy listens on. The relay publishes
+/// it on `127.0.0.1` of the host at an ephemeral port. It is not 2019,
+/// so that a `ssh -L` to the relay and a `ssh -L` to an old proxy
+/// cannot be mixed up.
+pub const ADMIN_RELAY_PORT: u16 = 2020;
 
-/// Container port the Caddy admin API listens on (Caddy default).
-pub const ADMIN_PORT: u16 = 2019;
+/// The admin port that the proxy of yoink v0.22 and earlier publishes
+/// on `127.0.0.1:0`. Caddy in such a proxy listens on `0.0.0.0:2019`.
+/// yoink finds an old proxy by this published port and moves its
+/// admin API to [`ADMIN_SOCKET`] with the first push, see
+/// `crate::proxy::admin`.
+pub const LEGACY_ADMIN_PORT: u16 = 2019;
 
-/// The `admin.listen` address of Caddy, and the only `Host` header
-/// value that the admin API accepts. With a listen address that is not
-/// a wildcard, Caddy rejects a request whose `Host` is not in
-/// `admin.origins`. yoink sends this value on every admin request, and
-/// the deploy probe and the Docker HEALTHCHECK send it because they
-/// use this name in the URL.
-pub const ADMIN_API_HOST: &str = "yoink-proxy-admin-api:2019";
+/// The named volume that holds the Caddy config directory of the
+/// proxy: `autosave.json` and the admin socket. The proxy mounts it at
+/// `/config`, the admin relay mounts it read-only. No other container
+/// mounts it.
+pub const CADDY_CONFIG_VOLUME: &str = "yoink_caddy_config";
+
+/// The unix socket of the Caddy admin API, in the proxy container. The
+/// path is on [`CADDY_CONFIG_VOLUME`]. Caddy creates the socket with
+/// mode 0200 and the owner of the Caddy process (root in the proxy).
+/// No container has a network path to the admin API: only a process
+/// that sees this file and runs as root can connect to it.
+pub const ADMIN_SOCKET: &str = "/config/caddy/admin.sock";
 
 /// The `admin` block of every Caddy config that yoink writes: the
 /// bootstrap of the proxy container and each `/load`. A `/load` that
 /// omits the block sets the admin API back to the Caddy default
 /// `localhost:2019`, which the admin relay cannot reach.
 ///
-/// `enforce_origin` stays false: then Caddy checks `Origin` only when
-/// a request carries `Origin` or `Sec-Fetch-Mode`, which yoink's
-/// clients do not send. The `Host` check is on because the listen
-/// address is not a wildcard.
+/// The block has no `origins` and no `enforce_origin`. With a unix
+/// listen address, Caddy 2.10 and later do not check `Host` (see
+/// `newAdminHandler` in Caddy's `admin.go`). Earlier versions accept
+/// the `Host` values `""`, `127.0.0.1` and `::1` on a unix socket. The
+/// relay sets `Host: 127.0.0.1`, so both work.
 #[must_use]
 pub fn admin_block() -> serde_json::Value {
-    serde_json::json!({
-        "listen": ADMIN_API_HOST,
-        "enforce_origin": false,
-        "origins": [ADMIN_API_HOST],
-    })
+    serde_json::json!({ "listen": format!("unix/{ADMIN_SOCKET}") })
 }
 
 impl Config {
@@ -245,8 +249,9 @@ impl Config {
         // operator declared, before the implicit ones are added below. A
         // service without `networks:` defaults to all of `deploy.networks`,
         // so without this pin it would also join `yoink-proxy-admin` and
-        // could reach the Caddy admin API, which has no authentication.
-        // Only the proxy belongs on that network. An operator who lists
+        // could reach the admin relay, which forwards each request to the
+        // Caddy admin API. The admin API has no authentication. Only the
+        // relay belongs on that network. An operator who lists
         // `yoink-ingress` in `deploy.networks` still gets it here.
         // `reject_admin_network` refuses `yoink-proxy-admin` there.
         let operator_networks = self.deploy.networks.clone();
@@ -295,8 +300,8 @@ impl Config {
 }
 
 impl Config {
-    /// Only the proxy and the admin relay may join [`ADMIN_NETWORK`].
-    /// The admin API has no
+    /// Only the admin relay may join [`ADMIN_NETWORK`]. The relay
+    /// forwards each request to the Caddy admin API, which has no
     /// authentication, so any other container on that network can
     /// change the proxy config. Rejects the name in `deploy.networks`
     /// and in the `networks:` of every service that is not the proxy.
@@ -306,7 +311,7 @@ impl Config {
         let reserved = |field: &str| {
             ConfigError::Invalid(format!(
                 "{field} lists {ADMIN_NETWORK:?}. This network is reserved for the \
-                 Caddy admin API of the proxy. Use a different network name."
+                 admin relay of the proxy. Use a different network name."
             ))
         };
         let injected = self
@@ -322,17 +327,19 @@ impl Config {
             {
                 return Err(reserved(&format!("service {:?}: networks", svc.name)));
             }
-            // Docker DNS in the proxy answers for every network of the
-            // proxy. The same name on `yoink-ingress` would give Caddy
-            // a second address for its admin listener.
-            let reserved_alias = [ADMIN_API_ALIAS, ADMIN_RELAY_NAME]
-                .into_iter()
-                .find(|name| svc.run.options.network_aliases.iter().any(|a| a == name));
-            if let Some(name) = reserved_alias {
+            // The deploy probe of the proxy calls the relay by its
+            // name. No other container answers to that name.
+            if svc
+                .run
+                .options
+                .network_aliases
+                .iter()
+                .any(|a| a == ADMIN_RELAY_NAME)
+            {
                 return Err(ConfigError::Invalid(format!(
-                    "service {:?}: run.options.network_aliases lists {name:?}. This name \
-                     is reserved for the Caddy admin API of the proxy. Use a different \
-                     alias.",
+                    "service {:?}: run.options.network_aliases lists {ADMIN_RELAY_NAME:?}. \
+                     This name is reserved for the admin relay of the proxy. Use a \
+                     different alias.",
                     svc.name
                 )));
             }
@@ -466,9 +473,10 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         labels: std::collections::BTreeMap::default(),
         pre_deploy: Vec::new(),
         depends_on: Vec::new(),
-        // `yoink-ingress` first: it is the gateway endpoint, which gets
-        // the published ports 80 and 443 (see `ADMIN_NETWORK`).
-        networks: Some(vec![INGRESS_NETWORK.to_string(), ADMIN_NETWORK.to_string()]),
+        // Only `yoink-ingress`: the admin API is on a unix socket, so
+        // the proxy needs no admin network. Docker forwards the
+        // published ports 80 and 443 to this network.
+        networks: Some(vec![INGRESS_NETWORK.to_string()]),
         domain: None,
         tls: TlsMode::Auto,
         tls_cert_secret: None,
@@ -482,18 +490,18 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
         hsts: false, // proxy itself doesn't serve TLS; this field is irrelevant
         run: ServiceRun {
             // The deploy healthcheck probes Caddy's admin endpoint
-            // (`/config/`) at `ADMIN_API_HOST` from the admin network.
-            // Eliminates the race where yoink-proxy is "started" per
-            // docker but Caddy's HTTP server hasn't bound yet —
-            // without this gate, the first /load can arrive before
-            // admin is up.
-            port: Some(ADMIN_PORT),
+            // (`/config/`) through the admin relay, on the admin
+            // network: the relay port, not a port of the proxy. That is
+            // the path of every later `/load`. Eliminates the race where
+            // yoink-proxy is "started" per docker but Caddy's admin API
+            // hasn't bound yet — without this gate, the first /load can
+            // arrive before admin is up. See `deploy::wait_until_healthy`.
+            port: Some(ADMIN_RELAY_PORT),
             healthcheck_path: Some("/config/".to_string()),
-            // Caddy serves :80 + :443 on the host. The proxy does not
-            // publish the admin port. Docker forwards every published
-            // port of a container to its gateway endpoint, which is
-            // `yoink-ingress`. The admin relay publishes it instead,
-            // on 127.0.0.1 only, see `crate::proxy::relay`.
+            // Caddy serves :80 + :443 on the host. The admin API has no
+            // port: it listens on `ADMIN_SOCKET`. The admin relay
+            // publishes a port on 127.0.0.1 only, see
+            // `crate::proxy::relay`.
             //
             // `proxy.bind:` (when set) prepends the bind address to
             // :80/:443 so the proxy is reachable only on that
@@ -514,9 +522,15 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // Override the official caddy:2 image's entrypoint to
             // start with a minimal bootstrap config: the `admin_block`
             // that every `/load` also sends. The admin API listens on
-            // `ADMIN_API_ALIAS`, the proxy IP on the admin network
-            // only. The actual routes are pushed via `/load`
-            // immediately after the container is healthy.
+            // the unix socket `ADMIN_SOCKET`. The actual routes are
+            // pushed via `/load` immediately after the container is
+            // healthy.
+            //
+            // Caddy creates `/config/caddy` only when it writes the
+            // first autosave, after the admin API is up. The official
+            // image ships the directory, and Docker copies it into a new
+            // volume. `mkdir -p` covers an image without it: else the
+            // admin socket cannot bind on a new volume.
             //
             // `--resume` makes Caddy fall back to its autosaved
             // runtime config (`/config/caddy/autosave.json` on the
@@ -529,7 +543,8 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // bootstrap takes effect as before.
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
             cmd: vec![format!(
-                "echo '{}' | exec caddy run --config /dev/stdin --resume",
+                "mkdir -p {} && echo '{}' | exec caddy run --config /dev/stdin --resume",
+                admin_socket_dir(),
                 bootstrap_config(),
             )],
             // Yoink's `cap_drop: [ALL]` default would block Caddy
@@ -550,7 +565,7 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
             // Caddy's autosave config so it can resume on restart.
             volumes: vec![
                 format!("{}:/data", p.resolved_cert_volume()),
-                "yoink_caddy_config:/config".to_string(),
+                format!("{CADDY_CONFIG_VOLUME}:/config"),
             ],
             ..ServiceRun::default()
         },
@@ -564,9 +579,14 @@ fn synthesized_proxy_service(p: &ProxyConfig) -> ServiceConfig {
 /// dependency that turns that feature on would otherwise change the
 /// hash and recreate the proxy on every host.
 fn bootstrap_config() -> String {
-    format!(
-        r#"{{"admin":{{"enforce_origin":false,"listen":"{ADMIN_API_HOST}","origins":["{ADMIN_API_HOST}"]}}}}"#
-    )
+    format!(r#"{{"admin":{{"listen":"unix/{ADMIN_SOCKET}"}}}}"#)
+}
+
+/// The directory of [`ADMIN_SOCKET`].
+fn admin_socket_dir() -> &'static str {
+    ADMIN_SOCKET
+        .rsplit_once('/')
+        .map_or(ADMIN_SOCKET, |(dir, _)| dir)
 }
 
 /// JSON shapes accepted by `validate_json_shape`.
@@ -622,9 +642,9 @@ fn validate_json_shape(
 /// are also yoink-managed but the realistic operator footguns are these two.
 /// `admin` is reserved whole.
 const RESERVED_CONFIG_EXTRA_PATHS: &[(&[&str], &str)] = &[
-    // yoink binds the admin API to the admin network only, and sends
-    // a fixed `Host`. Another `listen` can open the admin API to every
-    // routed service again, and other `origins` break the next push.
+    // yoink puts the admin API on a unix socket that only the admin
+    // relay shares. Another `listen` can open the admin API to every
+    // routed service again.
     (
         &["admin"],
         "remove the `admin` key from `proxy.config_extra`; yoink manages the admin block",
@@ -715,154 +735,6 @@ fn is_plausible_go_module(s: &str) -> bool {
         .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_graphic() && c != '@'))
 }
 
-// Warn about services on `yoink-ingress` that can send crafted
-// packets. Caddy binds its admin API to the proxy IP on the admin
-// network. That bind is not access control on Linux: the kernel
-// accepts a packet for any local address on any interface. A
-// container on `yoink-ingress` with `NET_ADMIN` can add a route to
-// the admin network through the proxy, and one with `NET_RAW` can
-// send such frames itself. yoink's default `cap_drop: [ALL]` removes
-// both capabilities.
-
-/// The capabilities that let a container reach the admin API through
-/// its `yoink-ingress` interface.
-const RISKY_CAPS: [&str; 2] = ["NET_ADMIN", "NET_RAW"];
-
-/// `NET_RAW` is in Docker's default capability set. `NET_ADMIN` is not.
-const DOCKER_DEFAULT_RISKY: [&str; 1] = ["NET_RAW"];
-
-/// What an ingress capability warning is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapabilitySource {
-    /// A service with `NET_ADMIN` or `NET_RAW`.
-    Service,
-    /// A container hook on `yoink-ingress`.
-    Hook,
-}
-
-impl Config {
-    /// One warning line per service on `yoink-ingress` that keeps
-    /// `NET_ADMIN` or `NET_RAW`, and one per container hook that runs
-    /// on `yoink-ingress`. Empty when the proxy is off. Pure: `main`
-    /// logs each line one time after it loads the config (and again in
-    /// `yoink up --watch` when the config changes), and `yoink doctor`
-    /// reports each line as a finding.
-    #[must_use]
-    pub fn ingress_capability_warnings(&self) -> Vec<String> {
-        self.ingress_capability_warnings_by_source()
-            .into_iter()
-            .map(|(_, warning)| warning)
-            .collect()
-    }
-
-    /// [`Self::ingress_capability_warnings`], each with its source. The
-    /// fix is not the same: a service drops the capabilities, a hook
-    /// moves off `yoink-ingress`.
-    #[must_use]
-    pub fn ingress_capability_warnings_by_source(&self) -> Vec<(CapabilitySource, String)> {
-        if !self.proxy_enabled() {
-            return Vec::new();
-        }
-        let services = self
-            .service_capability_warnings()
-            .into_iter()
-            .map(|w| (CapabilitySource::Service, w));
-        let hooks = self
-            .hook_capability_warnings()
-            .into_iter()
-            .map(|w| (CapabilitySource::Hook, w));
-        services.chain(hooks).collect()
-    }
-
-    fn service_capability_warnings(&self) -> Vec<String> {
-        self.services
-            .iter()
-            .filter(|s| s.kind != Some(ServiceKind::Proxy))
-            .filter(|s| self.networks_for(s).iter().any(|n| n == INGRESS_NETWORK))
-            .filter_map(|s| {
-                let caps = s.run.options.risky_caps();
-                (!caps.is_empty()).then(|| {
-                    format!(
-                        "service {:?} is on {INGRESS_NETWORK} and has {}. With these \
-                         capabilities, a process in the container can reach the Caddy \
-                         admin API of the proxy, which has no authentication. Remove \
-                         them from `run.options.cap_add`, or keep \
-                         `run.options.cap_drop: [ALL]`.",
-                        s.name,
-                        caps.join(" and "),
-                    )
-                })
-            })
-            .collect()
-    }
-
-    /// A container hook joins the first network of `deploy.networks`
-    /// and has the Docker default capabilities, which include
-    /// `NET_RAW`. yoink does not drop capabilities for hooks.
-    fn hook_capability_warnings(&self) -> Vec<String> {
-        if self.networks().first().map(String::as_str) != Some(INGRESS_NETWORK) {
-            return Vec::new();
-        }
-        let top_level = self.hooks.pre_deploy.iter().map(|h| (None, h));
-        let per_service = self
-            .services
-            .iter()
-            .flat_map(|s| s.pre_deploy.iter().map(move |h| (Some(s.name.as_str()), h)));
-        top_level
-            .chain(per_service)
-            .filter(|(_, h)| !h.is_subprocess())
-            .map(|(service, h)| {
-                let hook = match service {
-                    Some(service) => format!("hook {:?} of service {service:?}", h.name),
-                    None => format!("hook {:?}", h.name),
-                };
-                format!(
-                    "{hook} runs in a container on {INGRESS_NETWORK}, the first network of \
-                     `deploy.networks`. The container has the Docker default capabilities, \
-                     which include NET_RAW. With NET_RAW, a process in the container can \
-                     reach the Caddy admin API of the proxy, which has no authentication. \
-                     Put a network of your own first in `deploy.networks`."
-                )
-            })
-            .collect()
-    }
-}
-
-impl super::RunOptions {
-    /// The capabilities of [`RISKY_CAPS`] that a container with these
-    /// options has. Follows Docker: with `ALL` in `cap_add`, the
-    /// container has each capability that `cap_drop` does not name.
-    /// `ALL` in `cap_drop` does not remove a capability in that case.
-    /// Else `cap_drop: [ALL]` starts from no capability, or from the
-    /// Docker default set minus `cap_drop`, and `cap_add` adds to it.
-    fn risky_caps(&self) -> Vec<&'static str> {
-        let norm = |c: &String| {
-            let upper = c.trim().to_ascii_uppercase();
-            upper
-                .strip_prefix("CAP_")
-                .map_or(upper.clone(), str::to_string)
-        };
-        let dropped: Vec<String> = self.cap_drop.iter().map(norm).collect();
-        let added: Vec<String> = self.cap_add.iter().map(norm).collect();
-        let drop_all = dropped.iter().any(|c| c == "ALL");
-        let named_in_drop = |cap: &str| dropped.iter().any(|c| c == cap);
-        if added.iter().any(|c| c == "ALL") {
-            return RISKY_CAPS
-                .into_iter()
-                .filter(|cap| !named_in_drop(cap))
-                .collect();
-        }
-        RISKY_CAPS
-            .into_iter()
-            .filter(|cap| {
-                let in_base =
-                    !drop_all && DOCKER_DEFAULT_RISKY.contains(cap) && !named_in_drop(cap);
-                in_base || added.iter().any(|c| c == cap)
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,8 +771,9 @@ services:
 
     /// A service without `networks:` used to default to every entry of
     /// `deploy.networks`, which includes `yoink-proxy-admin` once the
-    /// proxy is on. It could then reach the unauthenticated Caddy
-    /// admin API. Only the proxy may be on that network.
+    /// proxy is on. It could then reach the admin relay and through it
+    /// the unauthenticated Caddy admin API. Only the relay may be on
+    /// that network.
     #[test]
     fn services_without_networks_stay_off_the_admin_network() {
         let mut cfg = Config::parse_str(
@@ -930,8 +803,10 @@ services:
         let nets = |name: &str| cfg.networks_for(cfg.service(name).unwrap());
         assert_eq!(nets("api"), ["app", INGRESS_NETWORK]);
         assert_eq!(nets("worker"), ["app"]);
-        assert_eq!(nets(PROXY_SERVICE_NAME), [INGRESS_NETWORK, ADMIN_NETWORK]);
-        // Still declared, so each host creates it for the proxy.
+        // The admin API is on a unix socket: the proxy is not on the
+        // admin network.
+        assert_eq!(nets(PROXY_SERVICE_NAME), [INGRESS_NETWORK]);
+        // Still declared, so each host creates it for the relay.
         assert!(cfg.deploy.networks.iter().any(|n| n == ADMIN_NETWORK));
     }
 
@@ -963,38 +838,46 @@ services:
             assert!(msg.contains(field), "got: {msg}");
             assert!(msg.contains("\"yoink-proxy-admin\""), "got: {msg}");
             assert!(
-                msg.contains("reserved for the Caddy admin API"),
+                msg.contains("reserved for the admin relay of the proxy"),
                 "got: {msg}"
             );
             assert!(msg.contains("Use a different network name"), "got: {msg}");
         }
     }
 
-    /// A user alias with the name of the admin API alias or of the
-    /// relay would add a second address for that name in the DNS of
-    /// the proxy.
+    /// The deploy probe of the proxy calls the relay by its name. The
+    /// former admin API alias is free again: no address of the proxy
+    /// serves the admin API.
     #[test]
-    fn admin_names_are_reserved_as_network_aliases() {
-        for alias in [ADMIN_API_ALIAS, ADMIN_RELAY_NAME] {
-            let yaml = format!(
-                "hosts: [{{ address: h, user: u }}]\nproxy: {{ email: o@example.com }}\n\
-                 services:\n  - name: api\n    image: a\n    tag: v1\n    \
-                 domain: api.example.com\n    \
-                 run: {{ port: 8080, options: {{ network_aliases: [api, {alias}] }} }}\n"
-            );
-            let msg = Config::parse_str(&yaml).expect_err(alias).to_string();
-            assert!(
-                msg.contains(&format!(
-                    "service \"api\": run.options.network_aliases lists \"{alias}\""
-                )),
-                "got: {msg}"
-            );
-        }
+    fn relay_name_is_reserved_as_a_network_alias() {
+        let alias = ADMIN_RELAY_NAME;
+        let yaml = format!(
+            "hosts: [{{ address: h, user: u }}]\nproxy: {{ email: o@example.com }}\n\
+             services:\n  - name: api\n    image: a\n    tag: v1\n    \
+             domain: api.example.com\n    \
+             run: {{ port: 8080, options: {{ network_aliases: [api, {alias}] }} }}\n"
+        );
+        let msg = Config::parse_str(&yaml).expect_err(alias).to_string();
+        assert!(
+            msg.contains(&format!(
+                "service \"api\": run.options.network_aliases lists \"{alias}\""
+            )),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn former_admin_api_alias_is_a_normal_alias() {
+        let yaml = "hosts: [{ address: h, user: u }]\nproxy: { email: o@example.com }\n\
+                    services:\n  - name: api\n    image: a\n    tag: v1\n    \
+                    domain: api.example.com\n    \
+                    run: { port: 8080, options: { network_aliases: [yoink-proxy-admin-api] } }\n";
+        Config::parse_str(yaml).expect("the alias is free");
     }
 
     /// `kind: proxy` in the YAML made a user service look like the
-    /// proxy. It then skipped `reject_admin_network` and got the admin
-    /// alias. Only yoink sets `kind`, so the YAML key is refused.
+    /// proxy. It then skipped `reject_admin_network` and could join the
+    /// admin network. Only yoink sets `kind`, so the YAML key is refused.
     #[test]
     fn kind_is_not_a_yaml_key() {
         let yaml = "hosts: [{ address: h, user: u }]\nproxy: { email: o@example.com }\n\
@@ -1196,37 +1079,44 @@ services:
     }
 
     /// The bootstrap config of the proxy used `0.0.0.0:2019`, so every
-    /// routed service on `yoink-ingress` could POST `/load`.
+    /// routed service on `yoink-ingress` could POST `/load`. Then it
+    /// used an address on the admin network, which a container on
+    /// `yoink-ingress` with `NET_ADMIN` or `NET_RAW` could still reach
+    /// through the proxy. Now the admin API is on a unix socket.
     #[test]
-    fn bootstrap_admin_listens_on_the_admin_alias() {
+    fn bootstrap_admin_listens_on_the_unix_socket() {
         let proxy = synthesized_proxy_service(&ProxyConfig::default());
         let [cmd] = proxy.run.cmd.as_slice() else {
             panic!("one shell command, got {:?}", proxy.run.cmd);
         };
         let json = cmd
-            .strip_prefix("echo '")
+            .strip_prefix("mkdir -p /config/caddy && echo '")
             .and_then(|rest| rest.split_once("' | exec caddy run --config /dev/stdin --resume"))
             .map_or_else(|| panic!("unexpected bootstrap: {cmd}"), |(json, _)| json);
         let bootstrap: serde_json::Value = serde_json::from_str(json).expect("bootstrap is JSON");
         assert_eq!(bootstrap["admin"], admin_block());
-        assert_eq!(bootstrap["admin"]["listen"], ADMIN_API_HOST);
         assert_eq!(
-            bootstrap["admin"]["origins"],
-            serde_json::json!([ADMIN_API_HOST])
+            bootstrap["admin"],
+            serde_json::json!({ "listen": "unix//config/caddy/admin.sock" })
         );
         assert!(!cmd.contains("0.0.0.0"), "got: {cmd}");
-        assert_eq!(ADMIN_API_HOST, format!("{ADMIN_API_ALIAS}:{ADMIN_PORT}"));
-        // Docker picks the network name that sorts first as the
-        // gateway, which gets the published ports 80 and 443. That
-        // must stay `yoink-ingress`.
-        assert!(INGRESS_NETWORK < ADMIN_NETWORK);
-        // The proxy does not publish the admin port: Docker would
-        // forward it to `yoink-ingress`, the gateway endpoint.
+        assert!(!cmd.contains("2019"), "got: {cmd}");
+        // The proxy is on `yoink-ingress` only and publishes no admin
+        // port.
+        assert_eq!(proxy.networks, Some(vec![INGRESS_NETWORK.to_string()]));
+        assert_eq!(proxy.run.publish, ["80:80", "443:443"]);
+        // The socket is on the config volume, which the relay mounts.
         assert!(
-            !proxy.run.publish.iter().any(|p| p.ends_with(":2019")),
+            proxy
+                .run
+                .volumes
+                .contains(&format!("{CADDY_CONFIG_VOLUME}:/config")),
             "got: {:?}",
-            proxy.run.publish
+            proxy.run.volumes
         );
+        assert!(ADMIN_SOCKET.starts_with("/config/"));
+        // The deploy probe goes through the relay.
+        assert_eq!(proxy.run.port, Some(ADMIN_RELAY_PORT));
     }
 
     /// The bootstrap is part of the spec hash of the proxy. It came from
@@ -1238,9 +1128,8 @@ services:
         assert_eq!(
             proxy.run.cmd,
             [concat!(
-                r#"echo '{"admin":{"enforce_origin":false,"#,
-                r#""listen":"yoink-proxy-admin-api:2019","#,
-                r#""origins":["yoink-proxy-admin-api:2019"]}}'"#,
+                "mkdir -p /config/caddy && ",
+                r#"echo '{"admin":{"listen":"unix//config/caddy/admin.sock"}}'"#,
                 " | exec caddy run --config /dev/stdin --resume",
             )]
         );
@@ -1376,141 +1265,5 @@ services:
         });
         let err = cfg.inject_implicit_proxy().unwrap_err();
         assert!(format!("{err}").contains("reserved"), "got: {err}");
-    }
-
-    // ---------- ingress capabilities ----------
-
-    fn ingress_config(run: &str, extra_service: &str) -> Config {
-        Config::parse_str(&format!(
-            r"
-hosts:
-  - {{ address: host-a, user: deploy }}
-deploy:
-  networks: [app]
-services:
-  - name: api
-    image: registry.example.com/api
-    domain: api.example.test
-    tls: off
-    run:
-      port: 8080
-{run}
-{extra_service}
-"
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn default_profile_has_no_warning() {
-        assert!(
-            ingress_config("", "")
-                .ingress_capability_warnings()
-                .is_empty()
-        );
-        let cfg = ingress_config("      options: { cap_add: [NET_BIND_SERVICE, CHOWN] }", "");
-        assert!(cfg.ingress_capability_warnings().is_empty());
-    }
-
-    #[test]
-    fn added_capabilities_are_named() {
-        let cfg = ingress_config("      options: { cap_add: [net_admin, CAP_NET_RAW] }", "");
-        let warnings = cfg.ingress_capability_warnings();
-        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
-        assert!(
-            warnings[0]
-                .starts_with("service \"api\" is on yoink-ingress and has NET_ADMIN and NET_RAW."),
-            "got: {warnings:?}"
-        );
-        let cfg = ingress_config("      options: { cap_add: [ALL] }", "");
-        assert!(cfg.ingress_capability_warnings()[0].contains("NET_ADMIN and NET_RAW"));
-    }
-
-    /// With `cap_add: [ALL]`, Docker removes each capability that
-    /// `cap_drop` names. `ALL` in `cap_drop` removes none.
-    #[test]
-    fn add_all_keeps_the_capabilities_that_cap_drop_does_not_name() {
-        let cfg = ingress_config("      options: { cap_add: [ALL], cap_drop: [NET_RAW] }", "");
-        let warnings = cfg.ingress_capability_warnings();
-        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
-        assert!(warnings[0].contains("has NET_ADMIN."), "got: {warnings:?}");
-
-        let cfg = ingress_config(
-            "      options: { cap_add: [ALL], cap_drop: [NET_ADMIN, CAP_NET_RAW] }",
-            "",
-        );
-        assert!(cfg.ingress_capability_warnings().is_empty());
-
-        let cfg = ingress_config("      options: { cap_add: [ALL], cap_drop: [ALL] }", "");
-        assert!(cfg.ingress_capability_warnings()[0].contains("NET_ADMIN and NET_RAW"));
-    }
-
-    /// Docker's default set has `NET_RAW` but not `NET_ADMIN`.
-    #[test]
-    fn opting_out_of_the_drop_keeps_net_raw() {
-        let cfg = ingress_config("      options: { cap_drop: [] }", "");
-        let warnings = cfg.ingress_capability_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("has NET_RAW."), "got: {warnings:?}");
-
-        let cfg = ingress_config("      options: { cap_drop: [NET_RAW] }", "");
-        assert!(cfg.ingress_capability_warnings().is_empty());
-    }
-
-    /// A container hook joins the first network of `deploy.networks`
-    /// and keeps `NET_RAW`. With no network of the operator, that is
-    /// `yoink-ingress`.
-    #[test]
-    fn container_hooks_on_the_ingress_network_are_named() {
-        let hooks = r"hooks:
-  pre_deploy:
-    - name: migrate
-      image: registry.example.com/api
-      tag: v1
-      cmd: [bin/migrate]
-    - name: plan
-      cmd: [terraform, plan]";
-        let service_hook = "    pre_deploy:
-      - name: seed
-        image: registry.example.com/api
-        tag: v1";
-        let mut cfg = ingress_config(service_hook, hooks);
-        cfg.deploy.networks.retain(|n| n != "app");
-        let warnings = cfg.ingress_capability_warnings();
-        assert_eq!(warnings.len(), 2, "got: {warnings:?}");
-        assert!(
-            warnings[0].starts_with("hook \"migrate\" runs in a container on yoink-ingress"),
-            "got: {warnings:?}"
-        );
-        assert!(warnings[0].contains("NET_RAW"), "got: {warnings:?}");
-        assert!(
-            warnings[1].starts_with("hook \"seed\" of service \"api\" runs"),
-            "got: {warnings:?}"
-        );
-
-        // With a network of the operator first, the hooks run there.
-        let cfg = ingress_config(service_hook, hooks);
-        assert_eq!(cfg.networks()[0], "app");
-        assert!(cfg.ingress_capability_warnings().is_empty());
-    }
-
-    /// A service that is not routed and does not list `yoink-ingress`
-    /// cannot reach the proxy. One that lists the network can.
-    #[test]
-    fn only_services_on_the_ingress_network_are_checked() {
-        let internal = r"  - name: worker
-    image: registry.example.com/worker
-    networks: [app]
-    run:
-      options: { cap_add: [NET_ADMIN] }
-  - name: sidecar
-    image: registry.example.com/sidecar
-    networks: [app, yoink-ingress]
-    run:
-      options: { cap_add: [NET_RAW] }";
-        let cfg = ingress_config("    networks: [app]", internal);
-        let warnings = cfg.ingress_capability_warnings();
-        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
-        assert!(warnings[0].contains("\"sidecar\""), "got: {warnings:?}");
     }
 }

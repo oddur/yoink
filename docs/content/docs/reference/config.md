@@ -233,7 +233,7 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `build` | [Build](#build) | unset | Local-build config. Required for the `--build` flow. |
 | `hosts` | list of string | all hosts | Restricts the hosts that run this service. The strings match `hosts[].address`. With an empty list, yoink deploys nothing for the service and runs none of its hooks. |
 | `depends_on` | list of string | `[]` | Names of other services. A topological sort of these names gives the wave order. Must be a DAG. |
-| `networks` | list of string | every network in `deploy.networks` | Docker networks to attach. Each one must be declared in `deploy.networks`. Config load rejects an empty list. The default does not include the proxy networks: a service with `domain:` also joins `yoink-ingress`, and only the proxy joins `yoink-proxy-admin`. Config load rejects `yoink-proxy-admin` in this list. |
+| `networks` | list of string | every network in `deploy.networks` | Docker networks to attach. Each one must be declared in `deploy.networks`. Config load rejects an empty list. The default does not include the proxy networks: a service with `domain:` also joins `yoink-ingress`, and only the admin relay joins `yoink-proxy-admin`. Config load rejects `yoink-proxy-admin` in this list. |
 | `secrets` | list of string | `[]` | Secret names. Each secret becomes an env var of the same name. |
 | `env_from_secrets` | map of string | `{}` | `ENV_VAR_NAME: SECRET_NAME`. Exposes a secret under a different env name. |
 | `env` | map of string | `{}` | Plain env vars. **Do not put secrets here.** |
@@ -290,14 +290,14 @@ The defaults are a hardened profile. Each service can override them.
 | `cpus` | string | unset | CPU limit in cores of CPU time (`"1.5"` = 1.5 cores). |
 | `pids_limit` | integer | `1024` | Limit against fork bombs. |
 | `cap_drop` | list of string | `["ALL"]` | Linux capabilities that the container loses. |
-| `cap_add` | list of string | `[]` | Capabilities that the container gets back, for example `NET_BIND_SERVICE` for Caddy. With `NET_ADMIN` or `NET_RAW`, a service on `yoink-ingress` can reach the admin API of the proxy. Config load shows a warning for this. |
+| `cap_add` | list of string | `[]` | Capabilities that the container gets back, for example `NET_BIND_SERVICE` for Caddy. |
 | `security_opt` | list of string | `["no-new-privileges:true"]` | Docker security options. |
 | `read_only` | bool | `true` | Read-only rootfs. `tmpfs:` adds writable scratch space. |
 | `init` | bool | `true` | Runs tini as PID 1 (zombie reaping and correct SIGTERM). |
 | `tmpfs` | map of string | `{}` | `mount_path: "size=N,mode=NNNN"`. yoink applies `noexec,nosuid,nodev` automatically. |
 | `restart` | enum | `unless-stopped` | Docker restart policy: `no`, `always`, `unless-stopped`, or `on-failure`. Write `'no'` with quotes, because YAML reads a bare `no` as a boolean. |
 | `user` | string | `"65534:65534"` (nobody) | UID/GID. The default is non-root. `"0:0"` is for images that need root. A specific value (`"1000:1000"`, `"redis"`) is for images with pre-baked file ownership. |
-| `network_aliases` | list of string | `[]` | Extra DNS aliases on the attached networks, in addition to the service `name`. For example, a legacy hostname. Config load rejects `yoink-proxy-admin-api` and `yoink-proxy-admin-relay`. |
+| `network_aliases` | list of string | `[]` | Extra DNS aliases on the attached networks, in addition to the service `name`. For example, a legacy hostname. Config load rejects `yoink-proxy-admin-relay`. |
 | `devices` | list of string | `[]` | Host devices to expose. Each entry is `<host-path>[:<container-path>[:<perms>]]` (the `--device` syntax of docker). `<perms>` is a combination of `r`, `w`, `m`, and the default is `rwm`. An entry bind-mounts the device file and adds it to the cgroup `devices.allow` list. Only the listed devices become accessible, which is narrower than `--privileged`. Examples: `/dev/nvidia*` (GPU), `/dev/dri` (Intel/AMD VAAPI), `/dev/ttyUSB*` (USB serial), `/dev/fuse` (with `cap_add: [SYS_ADMIN]`), `/dev/snd` (audio). |
 
 [Security defaults](/docs/explanation/security) explains the reasons for these defaults.

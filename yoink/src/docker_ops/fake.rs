@@ -68,6 +68,9 @@ struct FakeState {
     network_containers: HashMap<String, Vec<ContainerInfo>>,
     /// Container name → the body of the last `create_container`.
     created_bodies: HashMap<String, ContainerCreateBody>,
+    /// Remote port → local port of `forward_loopback`. A remote port
+    /// that is not here cannot be reached.
+    forwards: HashMap<u16, u16>,
     calls: Vec<RecordedCall>,
 }
 
@@ -99,6 +102,8 @@ pub enum RecordedCall {
     OpenLogStream(Host, String),
     RunOneShot(Host, String),
     SubscribeEvents(Host),
+    /// `(host, remote port)`.
+    ForwardLoopback(Host, u16),
 }
 
 impl FakeDockerOps {
@@ -190,6 +195,12 @@ impl FakeDockerOps {
             .network_containers
             .insert(network.into(), containers);
     }
+    /// Make `forward_loopback` to `remote_port` on any host connect to
+    /// `127.0.0.1:<local_port>` of the test, for example a test HTTP
+    /// server.
+    pub fn forward_loopback_to(&self, remote_port: u16, local_port: u16) {
+        self.lock().forwards.insert(remote_port, local_port);
+    }
     /// Answer every `inspect_container` for `detail.name` with `detail`.
     pub fn set_inspect(&self, detail: ContainerDetail) {
         self.lock().inspect.insert(detail.name.clone(), detail);
@@ -223,6 +234,24 @@ impl DockerOps for FakeDockerOps {
         let mut s = self.lock();
         s.calls.push(RecordedCall::Version(host.clone()));
         pop(&mut s.version, "version")
+    }
+    async fn forward_loopback(
+        &self,
+        host: &Host,
+        remote_port: u16,
+        ready_timeout: Duration,
+    ) -> Result<super::LoopbackForward, crate::ssh::tunnel::TunnelError> {
+        let mut s = self.lock();
+        s.calls
+            .push(RecordedCall::ForwardLoopback(host.clone(), remote_port));
+        match s.forwards.get(&remote_port) {
+            Some(local) => Ok(super::LoopbackForward::new(*local, Box::new(()))),
+            None => Err(crate::ssh::tunnel::TunnelError::NotReady {
+                host: host.address.clone(),
+                remote_port,
+                timeout: ready_timeout,
+            }),
+        }
     }
     async fn host_info(&self, host: &Host) -> Result<HostInfo, DockerError> {
         let mut s = self.lock();
