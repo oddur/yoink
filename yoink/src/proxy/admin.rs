@@ -181,12 +181,14 @@ impl PushError {
 /// gateway error (no socket), yoink sends the push to the published
 /// admin port first, see [`move_admin_to_socket`].
 ///
-/// Retries once on transport-class failures (tunnel didn't come up,
-/// readiness probe timed out, or `reqwest` errored mid-request) —
-/// each ssh tunnel is short-lived and CI environments occasionally
-/// see one drop between the readiness probe and the actual `/load`,
-/// surfacing as `error sending request`. Real Caddy errors propagate
-/// immediately without a retry.
+/// The push through the relay gets one retry after a transport-class
+/// failure: the tunnel did not come up, the readiness probe timed out,
+/// `reqwest` failed during the request, the relay answered 502-504, or
+/// the read-back of the routes failed after a 2xx `/load`. Each SSH
+/// tunnel is short-lived, and CI hosts sometimes drop one between the
+/// readiness probe and the `/load` (`error sending request`). `/load`
+/// is idempotent, so the retry is safe. A rejection by Caddy and a
+/// route count mismatch get no retry.
 pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
@@ -388,11 +390,15 @@ async fn push_through_relay(
 }
 
 /// A 502 comes from the relay: it could not reach the admin socket, or
-/// the connection broke. `/load` is idempotent, so one retry is safe.
+/// the connection broke. A failed read-back comes after a 2xx `/load`.
+/// `/load` is idempotent, so one retry is safe.
 fn is_transient(e: &AdminError) -> bool {
     matches!(
         e,
-        AdminError::Tunnel(_) | AdminError::NotReady { .. } | AdminError::Http { .. }
+        AdminError::Tunnel(_)
+            | AdminError::NotReady { .. }
+            | AdminError::Http { .. }
+            | AdminError::ReadBack { .. }
     ) || matches!(e, AdminError::LoadRejected { status, .. } if is_gateway_error(*status))
 }
 
@@ -649,6 +655,9 @@ pub(crate) mod fake_caddy {
         /// Status for each `GET /config/`. 200 when empty. A relay
         /// without an admin socket behind it answers 502.
         probe_status: Vec<u16>,
+        /// Number of next read-backs that answer 200 with a body that
+        /// is not JSON.
+        broken_readbacks: usize,
     }
 
     pub(crate) struct FakeCaddy {
@@ -680,6 +689,11 @@ pub(crate) mod fake_caddy {
         /// Answer the next `/load` requests with these statuses.
         pub(crate) fn load_statuses(&self, statuses: &[u16]) {
             self.lock().load_status = statuses.to_vec();
+        }
+
+        /// Answer the next `n` read-backs with a body that is not JSON.
+        pub(crate) fn break_readbacks(&self, n: usize) {
+            self.lock().broken_readbacks = n;
         }
 
         /// Answer the next `GET /config/` requests with these statuses.
@@ -774,6 +788,10 @@ pub(crate) mod fake_caddy {
                     Some(status) if status != 200 => (status, String::new()),
                     _ => (200, s.config.clone().unwrap_or(Value::Null).to_string()),
                 }
+            }
+            ("GET", "/config/apps/http/servers/main/routes/") if s.broken_readbacks > 0 => {
+                s.broken_readbacks -= 1;
+                (200, "not json".to_string())
             }
             ("GET", "/config/apps/http/servers/main/routes/") => {
                 let loaded = s
@@ -1164,6 +1182,35 @@ services:
             "got: {err}"
         );
         assert!(err.may_have_applied);
+    }
+
+    /// The read-back fails after a 2xx `/load`. `/load` is idempotent,
+    /// so yoink tries once more. When the second read-back fails too,
+    /// the push may have applied.
+    #[tokio::test]
+    async fn failed_read_back_is_retried_once() {
+        let relay = FakeCaddy::start();
+        relay.break_readbacks(1);
+        let ops = fake_host(&["80:80/tcp", "443:443/tcp"], true);
+        ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        push_config(&host(), &ops, &rendered())
+            .await
+            .expect("retry");
+        assert_eq!(relay.loads().len(), 2);
+
+        let relay = FakeCaddy::start();
+        relay.break_readbacks(2);
+        let ops = fake_host(&["80:80/tcp", "443:443/tcp"], true);
+        ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        let err = push_config(&host(), &ops, &rendered())
+            .await
+            .expect_err("read-back fails twice");
+        assert!(
+            matches!(err.error, AdminError::ReadBack { .. }),
+            "got: {err}"
+        );
+        assert!(err.may_have_applied);
+        assert_eq!(relay.loads().len(), 2);
     }
 
     /// A rejection by Caddy (4xx) and an error before the `/load`
