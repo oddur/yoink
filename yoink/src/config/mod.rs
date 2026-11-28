@@ -17,8 +17,8 @@ use crate::base::run_args;
 mod proxy;
 
 pub use proxy::{
-    ADMIN_API_ALIAS, ADMIN_API_HOST, ADMIN_NETWORK, ADMIN_PORT, ADMIN_RELAY_NAME, CapabilitySource,
-    INGRESS_NETWORK, PROXY_SERVICE_NAME, admin_block,
+    ADMIN_HOST, ADMIN_NETWORK, ADMIN_RELAY_NAME, ADMIN_RELAY_PORT, ADMIN_SOCKET,
+    CADDY_CONFIG_VOLUME, INGRESS_NETWORK, LEGACY_ADMIN_PORT, PROXY_SERVICE_NAME, admin_block,
 };
 
 #[derive(Debug, Error)]
@@ -826,7 +826,7 @@ pub struct ServiceConfig {
     /// Special-purpose service marker. Set automatically on the
     /// implicit `_proxy` service. It is not a YAML key: a user service
     /// with `kind: proxy` would skip the `yoink-proxy-admin` network check
-    /// and get the admin API alias. `deny_unknown_fields` refuses it.
+    /// and could join that network. `deny_unknown_fields` refuses it.
     #[serde(skip_deserializing)]
     pub kind: Option<ServiceKind>,
     /// Local-build instructions. When set, `yoink build [<service>]`

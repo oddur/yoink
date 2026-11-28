@@ -171,7 +171,7 @@ One for each outbound webhook call, success or failure. The origin is always `"o
 |---|---|---|
 | `containers` | array&lt;string&gt; | The yoink app containers that yoink disconnected from `yoink-proxy-admin`. |
 
-The `yoink-proxy-admin` network had no `yoink.role` label: an earlier yoink version created it. Before v0.21, services joined this network by default. yoink disconnected them, because the proxy admin API has no authentication.
+The `yoink-proxy-admin` network had no `yoink.role` label: an earlier yoink version created it. Before v0.21, services joined this network by default. yoink disconnected them, because the admin relay on this network sends requests to the proxy admin API, which has no authentication.
 
 ### `AdminRelayCreated`
 

@@ -19,6 +19,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::base::host::Host;
+use crate::ssh::tunnel::{SshTunnel, TunnelError};
 
 #[derive(Debug, Error)]
 pub enum DockerError {
@@ -435,11 +436,6 @@ pub struct ContainerDetail {
     pub mounts: Vec<String>,
     /// Network names this container is attached to.
     pub networks: Vec<String>,
-    /// Network name → the aliases and DNS names of the container on
-    /// that network. The proxy admin client reads it to find out if
-    /// the running proxy has the admin API alias.
-    #[serde(skip)]
-    pub network_aliases: BTreeMap<String, Vec<String>>,
     pub labels: BTreeMap<String, String>,
     /// Effective user (`container.config.user`). Empty string when
     /// the image's USER is in effect.
@@ -554,8 +550,31 @@ pub trait DockerOps: Send + Sync {
         None
     }
 
+    /// Forward a free local TCP port on the operator's machine to
+    /// `127.0.0.1:<remote_port>` on `host`, over SSH with
+    /// [`Self::ssh_keyfile`]. Returns once the local port accepts
+    /// connections. The forward closes when the result drops. The proxy
+    /// admin client uses it to reach a port that a container publishes
+    /// on the loopback of the host.
+    async fn forward_loopback(
+        &self,
+        host: &Host,
+        remote_port: u16,
+        ready_timeout: Duration,
+    ) -> Result<LoopbackForward, TunnelError> {
+        let keyfile = self.ssh_keyfile(host);
+        let tunnel = SshTunnel::open(host, remote_port, ready_timeout, keyfile.as_deref()).await?;
+        Ok(LoopbackForward::new(tunnel.local_port(), Box::new(tunnel)))
+    }
+
     /// Host-level info from `docker info` — capacity, container counts.
     async fn host_info(&self, host: &Host) -> Result<HostInfo, DockerError>;
+
+    /// The clock of the Docker daemon on `host`, in Unix seconds, from
+    /// `SystemTime` of `docker info`. Compare container `Created` times
+    /// with this, not with the clock of the operator: the two can be
+    /// hours apart.
+    async fn host_time_unix(&self, host: &Host) -> Result<i64, DockerError>;
 
     /// One-shot snapshot of CPU% + memory used for a single container.
     async fn container_stats(&self, host: &Host, name: &str)
@@ -922,6 +941,30 @@ pub trait DockerOps: Send + Sync {
         name: &str,
         tail_lines: u32,
     ) -> Result<mpsc::UnboundedReceiver<LogLine>, DockerError>;
+}
+
+/// A live forward from [`DockerOps::forward_loopback`]. The forward
+/// stays open while this value lives.
+pub struct LoopbackForward {
+    local_port: u16,
+    _guard: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl LoopbackForward {
+    /// `guard` keeps the forward open, for example the `ssh` child.
+    #[must_use]
+    pub fn new(local_port: u16, guard: Box<dyn std::any::Any + Send + Sync>) -> Self {
+        Self {
+            local_port,
+            _guard: guard,
+        }
+    }
+
+    /// The port on `127.0.0.1` of the operator's machine.
+    #[must_use]
+    pub fn local_port(&self) -> u16 {
+        self.local_port
+    }
 }
 
 /// `parse_inspect` (and `ContainerInfo`'s port rendering) format each

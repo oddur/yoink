@@ -4068,10 +4068,11 @@ fn update_service_status(
         | DeployEvent::ContainerLogTail { .. }
         | DeployEvent::ContainerLogTailUnavailable { .. }
         | DeployEvent::OldContainerRestarted { .. }
-        | DeployEvent::ProxyAdminUpgradePending { .. }
         | DeployEvent::AdminNetworkContainersDisconnected { .. }
         | DeployEvent::AdminRelayCreated { .. }
-        | DeployEvent::AdminRelaySkipped { .. } => return,
+        | DeployEvent::AdminRelaySkipped { .. }
+        | DeployEvent::ProxyAdminUpgradePending { .. }
+        | DeployEvent::ProxyAdminMoveFailed { .. } => return,
     };
     map.insert(service.to_string(), next);
 }
@@ -4213,6 +4214,11 @@ async fn reconcile_all(
     )
     .await
     {
+        // The same warning as at the end of a reconcile.
+        let mut report = |_svc: Option<&str>, e: crate::deploy::DeployEvent| {
+            send_event(crate::features::output::format_deploy_event(None, &e));
+        };
+        crate::deploy::report_legacy_proxies(&*ops, &config, &mut report).await;
         for lock in locks {
             lock.release(&*ops).await;
         }

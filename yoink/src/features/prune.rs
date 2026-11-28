@@ -42,8 +42,9 @@ pub enum PruneReason {
     /// `yoink.service` label refers to a service no longer in config
     /// (renamed or deleted).
     ServiceNotInConfig,
-    /// Container exited and isn't the current spec for its service.
-    /// Old containers from a previous reconcile.
+    /// Container exited, dead or never started (`created`), of a
+    /// service in the config. Old containers from a previous reconcile,
+    /// or the replica of a run that died between create and start.
     StaleExited,
 }
 
@@ -141,17 +142,24 @@ fn classify(c: &ContainerInfo, known: &BTreeSet<String>, proxy: bool) -> Option<
         return (!proxy).then_some(PruneReason::ServiceNotInConfig);
     }
     // A probe that leaked (Ctrl-C, a failed remove). A running probe
-    // belongs to a deploy that removes it when the probe ends.
+    // belongs to a deploy that removes it when the probe ends. A
+    // `created` probe is a leftover, for the same reason as a `created`
+    // container of a service below.
     if crate::docker_ops::is_probe(c) {
-        return matches!(c.state.as_str(), "exited" | "dead").then_some(PruneReason::StaleExited);
+        return matches!(c.state.as_str(), "exited" | "dead" | "created")
+            .then_some(PruneReason::StaleExited);
     }
     let svc = c.yoink_service.as_deref();
     match svc {
         Some(name) if !known.contains(name) => Some(PruneReason::ServiceNotInConfig),
-        // Only a container that has finished is stale. A paused,
-        // restarting or just-created container of a declared service
-        // is still in use.
-        Some(_) if matches!(c.state.as_str(), "exited" | "dead") => Some(PruneReason::StaleExited),
+        // A container that has finished is stale. A `created` one is
+        // stale too: a run that died between create and start left it.
+        // A prune that removes containers holds the deploy lock on the
+        // host, so no deploy that could start it is in flight. A paused
+        // or restarting container of a declared service is still in use.
+        Some(_) if matches!(c.state.as_str(), "exited" | "dead" | "created") => {
+            Some(PruneReason::StaleExited)
+        }
         // Any other container of a known service: keep.
         // Container with no `yoink.service` label but managed=true:
         // shouldn't happen (every yoink-created container gets the
@@ -224,7 +232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_keeps_paused_restarting_and_created_containers() {
+    async fn prune_removes_created_but_keeps_paused_and_restarting_containers() {
         let ops = FakeDockerOps::new();
         let with_state = |name: &str, state: &str| ContainerInfo {
             state: state.into(),
@@ -243,7 +251,9 @@ mod tests {
             .iter()
             .map(|p| p.container.as_str())
             .collect();
-        assert_eq!(names, ["api-dead", "api-exited"]);
+        // `api-created`: a run killed between create and start left it.
+        // Prune holds the deploy lock, so no deploy is about to start it.
+        assert_eq!(names, ["api-created", "api-dead", "api-exited"]);
     }
 
     /// The admin relay has no `yoink.service`. It stays while the proxy
@@ -271,18 +281,23 @@ mod tests {
         assert_eq!(report.planned[0].reason, PruneReason::ServiceNotInConfig);
     }
 
-    /// A leaked probe has no `yoink.service`. A stopped one goes, a
-    /// running one stays.
+    /// A leaked probe has no `yoink.service`. A stopped or `created`
+    /// one goes, a running one stays.
     #[tokio::test]
     async fn prune_removes_only_a_stopped_probe() {
         let probe = |name: &str, running: bool| ContainerInfo {
             yoink_service: None,
             ..container(name, "", running)
         };
+        let created = ContainerInfo {
+            state: "created".into(),
+            ..probe("yoink-probe-api-3", false)
+        };
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![
             probe("yoink-probe-api-1", false),
             probe("yoink-tcp-probe-api-2", true),
+            created,
         ]));
         let report = scan(&ops, &cfg(&["api"]), true).await.unwrap();
         let names: Vec<&str> = report
@@ -290,8 +305,13 @@ mod tests {
             .iter()
             .map(|p| p.container.as_str())
             .collect();
-        assert_eq!(names, ["yoink-probe-api-1"]);
-        assert_eq!(report.planned[0].reason, PruneReason::StaleExited);
+        assert_eq!(names, ["yoink-probe-api-1", "yoink-probe-api-3"]);
+        assert!(
+            report
+                .planned
+                .iter()
+                .all(|p| p.reason == PruneReason::StaleExited)
+        );
     }
 
     fn lock_free(ops: &FakeDockerOps) {

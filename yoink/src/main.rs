@@ -1385,10 +1385,6 @@ async fn run(cli: Cli) -> Result<()> {
         Config::load_from_path(&cli.config)
     }
     .with_context(|| format!("loading {}", cli.config.display()))?;
-    // `yoink doctor` reports these warnings as findings.
-    if !matches!(cli.command, Command::Doctor { .. }) {
-        log_config_warnings(&config.ingress_capability_warnings());
-    }
 
     // Warn (best-effort) if the config file's branch has upstream
     // commits touching the file that aren't pulled yet — operators
@@ -1455,7 +1451,6 @@ async fn run(cli: Cli) -> Result<()> {
                 // running up so the freshly-added service is included.
                 let mut reloaded = Config::load_from_path(&cli.config)
                     .with_context(|| format!("reloading {}", cli.config.display()))?;
-                log_config_warnings(&added_config_warnings(&config, &reloaded));
                 resolve_sealed_host_addresses(&mut reloaded, false).await?;
                 let no_services: Vec<String> = Vec::new();
                 let no_tags: Vec<String> = Vec::new();
@@ -1808,7 +1803,6 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
                     continue;
                 }
                 eprintln!("● config changed — reconciling");
-                log_config_warnings(&changed_config_warnings(&last_config, &next));
                 if let Err(e) = do_up_once(&next, &up, dry_run).await {
                     eprintln!("✗ reconcile failed: {e:#}");
                 }
@@ -1820,36 +1814,6 @@ async fn cmd_up(config: &Config, up: UpOptions<'_>) -> Result<()> {
 }
 
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Write each config warning to the log. `Config::load_from_path` does
-/// not log them, so that a command shows each warning one time.
-fn log_config_warnings(warnings: &[String]) {
-    for warning in warnings {
-        tracing::warn!(target: "yoink::config", "{warning}");
-    }
-}
-
-/// The config warnings of `next` that `last` does not have. `yoink add
-/// --up` logs the warnings of the config before the add, and after the
-/// add only the new ones, so each warning shows one time.
-fn added_config_warnings(last: &Config, next: &Config) -> Vec<String> {
-    let shown = last.ingress_capability_warnings();
-    next.ingress_capability_warnings()
-        .into_iter()
-        .filter(|w| !shown.contains(w))
-        .collect()
-}
-
-/// The config warnings to show after the watch loop of `yoink up
-/// --watch` loads the config again. Empty when the config did not
-/// change: the run showed them already.
-fn changed_config_warnings(last: &Config, next: &Config) -> Vec<String> {
-    if next == last {
-        Vec::new()
-    } else {
-        next.ingress_capability_warnings()
-    }
-}
 
 #[allow(clippy::too_many_lines)] // single linear up-once flow; splitting fragments the build → push → reconcile sequence
 async fn do_up_once(config: &Config, up: &UpOptions<'_>, dry_run: bool) -> Result<()> {
@@ -2196,7 +2160,8 @@ async fn run_locked_up(
     //
     // A prefetch failure skips the reconcile but still takes the
     // closing path below: locks released, LockReleased, RunFinished
-    // and the `run_failed` webhook.
+    // and the `run_failed` webhook. It also gives the warning for a
+    // proxy of yoink v0.22 or earlier, as a failed reconcile does.
     let prefetch_result = if prefetch {
         let prefetch_cb: std::sync::Arc<dyn Fn(deploy::DeployEvent) + Send + Sync> =
             std::sync::Arc::new(|e| {
@@ -2218,7 +2183,10 @@ async fn run_locked_up(
     };
 
     let (phase, reconcile_result) = match prefetch_result {
-        Err(e) => ("prefetch images", Err(e)),
+        Err(e) => {
+            deploy::report_legacy_proxies(&*ops, config, &mut sink).await;
+            ("prefetch images", Err(e))
+        }
         Ok(()) => (
             "reconcile",
             deploy::reconcile_with_options(
@@ -6730,8 +6698,8 @@ fn chrono_like_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitFallbackFailure, changed_config_warnings, check_git_fallback, extract_image_tag,
-        parse_as_pairs, parse_tag_overrides_with, previous_generation, rollback_tag,
+        GitFallbackFailure, check_git_fallback, extract_image_tag, parse_as_pairs,
+        parse_tag_overrides_with, previous_generation, rollback_tag,
     };
 
     /// `import --keychain` deletes a key file only when nothing is lost:
@@ -7163,54 +7131,6 @@ services:
             Some(name),
             std::path::Path::new("hosts"),
         )
-    }
-
-    /// `yoink up --watch` loads the config every 2 s. A warning shows
-    /// again only when the config changed.
-    #[test]
-    fn watch_shows_config_warnings_only_for_a_changed_config() {
-        let parse = |cap: &str| {
-            yoink::config::Config::parse_str(&format!(
-                "hosts:\n  - {{ address: host-a, user: deploy }}\n\
-                 services:\n  - name: api\n    image: registry.example.com/api\n\
-                 \x20   domain: api.example.test\n    tls: off\n\
-                 \x20   run: {{ port: 8080, options: {{ cap_add: [{cap}] }} }}\n"
-            ))
-            .unwrap()
-        };
-        let last = parse("NET_RAW");
-        assert_eq!(last.ingress_capability_warnings().len(), 1);
-        assert!(changed_config_warnings(&last, &last.clone()).is_empty());
-        let next = parse("NET_ADMIN");
-        let warnings = changed_config_warnings(&last, &next);
-        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
-        assert!(warnings[0].contains("NET_ADMIN"), "got: {warnings:?}");
-    }
-
-    /// `yoink add --up` logged every warning after the load and again
-    /// after the reload. The reload now logs only new warnings.
-    #[test]
-    fn add_up_shows_each_config_warning_once() {
-        let parse = |extra: &str| {
-            yoink::config::Config::parse_str(&format!(
-                "hosts:\n  - {{ address: host-a, user: deploy }}\n\
-                 services:\n  - name: api\n    image: registry.example.com/api\n\
-                 \x20   domain: api.example.test\n    tls: off\n\
-                 \x20   run: {{ port: 8080, options: {{ cap_add: [NET_RAW] }} }}\n{extra}"
-            ))
-            .unwrap()
-        };
-        let before = parse("");
-        assert_eq!(before.ingress_capability_warnings().len(), 1);
-        let same = parse("  - name: worker\n    image: img\n    tag: v1\n    run: {}\n");
-        assert!(crate::added_config_warnings(&before, &same).is_empty());
-        let added = parse(
-            "  - name: sniff\n    image: img\n    tag: v1\n    networks: [yoink-ingress]\n\
-             \x20   run: { options: { cap_add: [NET_ADMIN] } }\n",
-        );
-        let warnings = crate::added_config_warnings(&before, &added);
-        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
-        assert!(warnings[0].contains("\"sniff\""), "got: {warnings:?}");
     }
 
     #[test]

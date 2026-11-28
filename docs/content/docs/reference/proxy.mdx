@@ -92,7 +92,7 @@ Merge rules:
 
 | Reserved path | Effect of a write | Use |
 |---|---|---|
-| `admin` | moves the admin API. A wildcard `listen` lets every routed service change the proxy config. | none. The admin API always listens on `yoink-proxy-admin-api:2019`, on the `yoink-proxy-admin` network only. |
+| `admin` | moves the admin API. A wildcard `listen` lets every routed service change the proxy config. | none. The admin API always listens on the unix socket `/config/caddy/admin.sock`, which only the admin relay shares. |
 | `apps.http.servers.main.routes` | removes every per-service route | `proxy.global_handlers:` or `caddy_extra_json:` |
 | `apps.http.servers.main.tls_connection_policies` | disables the mTLS from `proxy.tls.client_auth:` | `proxy.tls.client_auth:` |
 

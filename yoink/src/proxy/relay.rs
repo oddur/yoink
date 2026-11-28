@@ -1,22 +1,18 @@
 //! The admin relay: a small Caddy container that gives yoink a path to
 //! the Caddy admin API.
 //!
-//! Docker forwards every published port of a container to its gateway
-//! endpoint. The gateway endpoint of the proxy is `yoink-ingress`, and
-//! it must stay there: ports 80 and 443 then go to the proxy IP on
-//! `yoink-ingress`, so a service on that network that calls a public
-//! domain of its own host reaches the proxy on the same bridge. A
-//! published admin port on the proxy would thus also land on
-//! `yoink-ingress`.
-//!
-//! The relay joins only [`ADMIN_NETWORK`], so that network is its
-//! gateway. It publishes `127.0.0.1:0:2020` ([`RELAY_PORT`]) and sends
-//! each request to [`ADMIN_API_HOST`] with that `Host` header. yoink
-//! SSH-tunnels to the published port of the relay.
+//! The admin API of the proxy listens on the unix socket
+//! [`ADMIN_SOCKET`], on the volume [`CADDY_CONFIG_VOLUME`]. It has no
+//! network address, so no container can reach it over a network, with
+//! or without `NET_ADMIN` or `NET_RAW`. The relay mounts the same volume
+//! read-only at [`RELAY_CONFIG_MOUNT`] and forwards HTTP from its port
+//! [`RELAY_PORT`] to the socket. It joins only [`ADMIN_NETWORK`], a
+//! bridge network, because Docker publishes ports only from a network.
+//! It publishes `127.0.0.1:0:2020`, and yoink SSH-tunnels to that port.
 //!
 //! The relay runs the image of the proxy, with the config of
 //! [`relay_config`]: its own admin API is off, and it opens a new
-//! connection to the admin API for each request. A recreated proxy thus
+//! connection to the socket for each request. A recreated proxy thus
 //! needs no relay restart. The proxy image is on each proxy host
 //! already, so the relay needs no other image and no other registry.
 //!
@@ -27,7 +23,9 @@
 //! takes it for a replica.
 
 use crate::base::host::Host;
-use crate::config::{ADMIN_API_HOST, ADMIN_NETWORK, Config, PROXY_SERVICE_NAME, RunOptions};
+use crate::config::{
+    ADMIN_NETWORK, ADMIN_SOCKET, CADDY_CONFIG_VOLUME, Config, PROXY_SERVICE_NAME, RunOptions,
+};
 use crate::docker::{self, RunSpec};
 use crate::docker_ops::{ContainerInfo, DockerError, DockerOps};
 
@@ -40,10 +38,27 @@ pub const RELAY_ROLE_LABEL: &str = "yoink.role";
 /// Value of [`RELAY_ROLE_LABEL`] on the relay.
 pub const RELAY_ROLE: &str = "proxy-admin-relay";
 
-/// The port in the relay that Caddy listens on. Not the admin port
-/// 2019, so that a `ssh -L` to the relay and a `ssh -L` to an old proxy
-/// cannot be mixed up.
-pub const RELAY_PORT: u16 = 2020;
+/// The port in the relay that Caddy listens on, see
+/// [`crate::config::ADMIN_RELAY_PORT`].
+pub const RELAY_PORT: u16 = crate::config::ADMIN_RELAY_PORT;
+
+/// Where the relay mounts [`CADDY_CONFIG_VOLUME`]. Not `/config`: the
+/// relay keeps its own Caddy config directory on a tmpfs there, and a
+/// path that the image does not have makes Docker copy no image files
+/// into the volume.
+pub const RELAY_CONFIG_MOUNT: &str = "/proxy-config";
+
+/// The admin socket of the proxy, as the relay sees it.
+#[must_use]
+pub fn relay_socket_path() -> String {
+    let in_volume = ADMIN_SOCKET.strip_prefix("/config").unwrap_or(ADMIN_SOCKET);
+    format!("{RELAY_CONFIG_MOUNT}{in_volume}")
+}
+
+/// The `Host` header that the relay sends to the admin API. The
+/// `origins` of [`crate::config::admin_block`] allow it on every Caddy
+/// version from v2.6.
+pub const RELAY_UPSTREAM_HOST: &str = crate::config::ADMIN_HOST;
 
 /// Label filter for `list_containers_by_label` that finds the relay.
 #[must_use]
@@ -154,11 +169,11 @@ pub async fn running_proxy_image(
 ///   config cannot change at run time; yoink recreates the relay.
 /// - `admin.config.persist: false`: no autosave file.
 /// - One HTTP server on [`RELAY_PORT`], automatic HTTPS off.
-/// - `reverse_proxy` to [`ADMIN_API_HOST`]. Caddy enforces the `Host`
-///   of the admin API, so the relay sets it. Keep-alive is off: each
-///   request dials and resolves the alias again, so a recreated proxy
-///   gets the next request. The relay sets no timeouts besides the
-///   default dial timeout, so a long `/load` is not cut.
+/// - `reverse_proxy` to the admin socket at [`relay_socket_path`], with
+///   `Host` [`RELAY_UPSTREAM_HOST`]. Keep-alive is off: each request
+///   dials the socket again, so a recreated proxy gets the next request.
+///   The relay sets no timeouts besides the default dial timeout, so a
+///   long `/load` is not cut. A socket that does not answer gives a 502.
 ///
 /// The string is part of the relay command, and thus of the spec hash.
 /// It is written out with a fixed key order, as `bootstrap_config` of
@@ -175,12 +190,35 @@ pub fn relay_config() -> String {
             r#""automatic_https":{{"disable":true}},"#,
             r#""listen":[":{port}"],"#,
             r#""routes":[{{"handle":[{{"handler":"reverse_proxy","#,
-            r#""headers":{{"request":{{"set":{{"Host":["{admin}"]}}}}}},"#,
+            r#""headers":{{"request":{{"set":{{"Host":["{host}"]}}}}}},"#,
             r#""transport":{{"keep_alive":{{"enabled":false}},"protocol":"http"}},"#,
-            r#""upstreams":[{{"dial":"{admin}"}}]}}]}}]}}}}}}}}}}"#,
+            r#""upstreams":[{{"dial":"unix/{socket}"}}]}}]}}]}}}}}}}}}}"#,
         ),
         port = RELAY_PORT,
-        admin = ADMIN_API_HOST,
+        host = RELAY_UPSTREAM_HOST,
+        socket = relay_socket_path(),
+    )
+}
+
+/// The config directory of Caddy in the relay: a tmpfs, see
+/// [`relay_spec`].
+const RELAY_CONFIG_DIR: &str = "/config";
+
+/// The shell command of the relay, with the Caddy config directory
+/// `dir`. The tests run it in a temporary directory.
+///
+/// The command writes [`relay_config`] to `relay.json` in `dir` and
+/// starts Caddy with it. The root file system is read-only and has no
+/// `/tmp`, and a heredoc needs a temporary file in some shells (bash
+/// before 5.1, zsh, mksh). `dir` is a tmpfs with mode 1777, so the
+/// relay user can write there. `printf` is a built-in. `exec` makes
+/// Caddy the child of the init process, so it gets the stop signal. The
+/// JSON is in single quotes and has no single quote.
+fn relay_command_in(dir: &str) -> String {
+    format!(
+        "printf '%s' '{config}' > {dir}/relay.json || exit 1\n\
+         exec caddy run --config {dir}/relay.json",
+        config = relay_config(),
     )
 }
 
@@ -215,36 +253,45 @@ fn relay_spec(image: &RelayImage) -> RunSpec {
         labels,
         env,
         // The secure default: all capabilities dropped, read-only root
-        // file system, user 65534, no-new-privileges, restart
-        // unless-stopped (as the proxy). Port 2020 needs no capability.
+        // file system, no-new-privileges, restart unless-stopped (as
+        // the proxy). Port 2020 needs no capability.
+        //
+        // User 0: Caddy in the proxy runs as root and creates the admin
+        // socket with mode 0200, owned by root. A connect to a unix
+        // socket needs write permission on the socket file. Without
+        // `CAP_DAC_OVERRIDE`, only the owner gets that permission, so
+        // the relay must be root too. Root without capabilities cannot
+        // override file permissions, change owners, or change its own
+        // user. It gets access only where it owns a file: its tmpfs,
+        // and the files on the read-only volume. The admin API that it
+        // forwards to exposes the same data anyway.
         //
         // The relay adds `NET_BIND_SERVICE` back all the same. The
         // official image sets `setcap cap_net_bind_service=+p` on the
         // caddy binary (caddy-docker `2.11/alpine/Dockerfile`, line
-        // 39). That file capability has no effective bit, so the exec
-        // works with all capabilities dropped. A custom `proxy.image`
-        // can use `+ep`. Then the kernel refuses the exec when the
-        // capability is not in the bounding set. With the capability
-        // in the bounding set, the exec works. no-new-privileges and
-        // user 65534 make sure that the process does not get it.
+        // 39). A custom `proxy.image` can use `+ep`. Then the kernel
+        // refuses the exec when the capability is not in the bounding
+        // set. The capability only lets the relay bind a port below
+        // 1024 in its own network namespace.
         options: RunOptions {
             tmpfs,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
+            user: Some("0:0".to_string()),
             ..RunOptions::default()
         },
-        // The same shape as the proxy bootstrap: the config comes on
-        // stdin. `exec` makes Caddy the child of the init process, so
-        // it gets the stop signal. The JSON has no single quote.
+        // The same shape as the proxy bootstrap, see
+        // `relay_command_in`.
         entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
-        command: vec![format!(
-            "exec caddy run --config /dev/stdin <<'EOF'\n{}\nEOF",
-            relay_config()
-        )],
+        command: vec![relay_command_in(RELAY_CONFIG_DIR)],
         publish: vec![format!("127.0.0.1:0:{RELAY_PORT}")],
         binds: Vec::new(),
-        volumes: Vec::new(),
+        // Read-only: a connect to a unix socket needs no write access to
+        // the mount. Linux checks only the permission bits of the socket
+        // file for a connect (`unix_find_bsd` calls `path_permission`
+        // with `MAY_WRITE`), not the read-only flag of the mount. The
+        // same is true for `/var/run/docker.sock:ro`.
+        volumes: vec![format!("{CADDY_CONFIG_VOLUME}:{RELAY_CONFIG_MOUNT}:ro")],
         docker_healthcheck: None,
-        proxy: false,
     }
 }
 
@@ -353,7 +400,8 @@ mod tests {
 
     /// The relay is on the admin network only, so that network is its
     /// gateway and gets the loopback publish. It runs the proxy image
-    /// with the hardened defaults.
+    /// with the hardened defaults, as root so that it can connect to the
+    /// admin socket, with the config volume read-only.
     #[test]
     fn relay_body_runs_the_proxy_image_on_the_admin_network() {
         let image = RelayImage {
@@ -371,7 +419,8 @@ mod tests {
         assert_eq!(
             cmd[0],
             format!(
-                "exec caddy run --config /dev/stdin <<'EOF'\n{}\nEOF",
+                "printf '%s' '{}' > /config/relay.json || exit 1\n\
+                 exec caddy run --config /config/relay.json",
                 relay_config()
             )
         );
@@ -396,7 +445,14 @@ mod tests {
         let mut paths: Vec<&String> = tmpfs.keys().collect();
         paths.sort();
         assert_eq!(paths, ["/config", "/data"]);
-        assert_eq!(body.user.as_deref(), Some("65534:65534"));
+        assert_eq!(relay_socket_path(), "/proxy-config/caddy/admin.sock");
+        // Root, for the owner match on the root-owned 0200 socket, and
+        // no capability besides `NET_BIND_SERVICE`.
+        assert_eq!(body.user.as_deref(), Some("0:0"));
+        assert_eq!(
+            host_config.binds,
+            Some(vec!["yoink_caddy_config:/proxy-config:ro".to_string()])
+        );
         let env = body.env.expect("env");
         assert!(env.contains(&"XDG_CONFIG_HOME=/config".to_string()));
         assert!(env.contains(&"XDG_DATA_HOME=/data".to_string()));
@@ -411,8 +467,9 @@ mod tests {
     }
 
     /// The relay config, pinned: no admin listener of its own, one
-    /// plain HTTP server on 2020, the `Host` of the admin API, no
-    /// keep-alive and no timeouts. The string itself is pinned too: it
+    /// plain HTTP server on 2020, the admin socket on the read-only
+    /// volume as the upstream, a fixed `Host`, no keep-alive and no
+    /// timeouts. The string itself is pinned too: it
     /// is part of the spec hash.
     #[test]
     fn relay_config_is_pinned() {
@@ -422,9 +479,9 @@ mod tests {
              \"apps\":{\"http\":{\"servers\":{\"relay\":{\
              \"automatic_https\":{\"disable\":true},\"listen\":[\":2020\"],\
              \"routes\":[{\"handle\":[{\"handler\":\"reverse_proxy\",\
-             \"headers\":{\"request\":{\"set\":{\"Host\":[\"yoink-proxy-admin-api:2019\"]}}},\
+             \"headers\":{\"request\":{\"set\":{\"Host\":[\"127.0.0.1\"]}}},\
              \"transport\":{\"keep_alive\":{\"enabled\":false},\"protocol\":\"http\"},\
-             \"upstreams\":[{\"dial\":\"yoink-proxy-admin-api:2019\"}]}]}]}}}}}"
+             \"upstreams\":[{\"dial\":\"unix//proxy-config/caddy/admin.sock\"}]}]}]}}}}}"
         );
         let parsed: serde_json::Value = serde_json::from_str(&relay_config()).expect("JSON");
         assert_eq!(
@@ -436,17 +493,79 @@ mod tests {
                     "automatic_https": { "disable": true },
                     "routes": [{ "handle": [{
                         "handler": "reverse_proxy",
-                        "upstreams": [{ "dial": "yoink-proxy-admin-api:2019" }],
-                        "headers": { "request": { "set": {
-                            "Host": ["yoink-proxy-admin-api:2019"]
-                        } } },
+                        "upstreams": [{ "dial": "unix//proxy-config/caddy/admin.sock" }],
+                        "headers": { "request": { "set": { "Host": ["127.0.0.1"] } } },
                         "transport": { "protocol": "http", "keep_alive": { "enabled": false } },
                     }] }],
                 } } } },
             })
         );
-        // The shell command quotes the JSON in a quoted heredoc.
+        // The shell command puts the JSON in single quotes.
         assert!(!relay_config().contains('\''));
+    }
+
+    /// The relay command writes its config to a file in the tmpfs and
+    /// runs Caddy on it, in the process of the shell. A stub `caddy`
+    /// records what it got.
+    #[test]
+    fn relay_command_runs_caddy_on_the_written_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir bin");
+        let stub = bin.join("caddy");
+        std::fs::write(
+            &stub,
+            format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "echo $$ > {out}/pid\n",
+                    "echo \"$*\" > {out}/args\n",
+                    "cat \"$3\" > {out}/config\n",
+                ),
+                out = dir.display()
+            ),
+        )
+        .expect("stub");
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(relay_command_in(&dir.to_string_lossy()))
+            .env("PATH", path)
+            .spawn()
+            .expect("spawn sh");
+        let shell_pid = child.id();
+        let status = child.wait_with_output().expect("wait").status;
+        assert!(status.success(), "script failed: {status}");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect(name);
+        assert_eq!(
+            read("args").trim_end(),
+            format!("run --config {}/relay.json", dir.display())
+        );
+        assert_eq!(read("config"), relay_config());
+        assert_eq!(read("pid").trim(), shell_pid.to_string(), "exec, no fork");
+    }
+
+    /// Caddy up to v2.9 checks `Host` on the admin socket against
+    /// `admin.origins`. v2.6 without `origins` allows only an empty
+    /// `Host`. The `Host` that the relay sends must be the one origin.
+    #[test]
+    fn relay_host_is_the_admin_origin() {
+        let parsed: serde_json::Value = serde_json::from_str(&relay_config()).expect("JSON");
+        let host = parsed
+            .pointer("/apps/http/servers/relay/routes/0/handle/0/headers/request/set/Host")
+            .expect("Host header");
+        assert_eq!(host, &serde_json::json!([RELAY_UPSTREAM_HOST]));
+        assert_eq!(
+            crate::config::admin_block()["origins"],
+            serde_json::json!([RELAY_UPSTREAM_HOST])
+        );
     }
 
     /// A new proxy image (a new tag, `proxy.image`, an xcaddy build)

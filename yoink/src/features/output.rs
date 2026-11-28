@@ -189,23 +189,24 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
             error,
         } => format!("[{host}] {container} log tail unavailable: {error}"),
         DeployEvent::Done { host, container } => format!("[{host}] done — {container}"),
-        DeployEvent::ProxyAdminUpgradePending { hosts } => format!(
-            "warning: the proxy on {} is from an earlier yoink version. Every container \
-             on yoink-ingress can reach its admin API. Run `yoink up --service {}` or an \
-             unscoped `yoink up` to recreate the proxy with the admin API on \
-             yoink-proxy-admin only.",
-            hosts.join(", "),
-            crate::config::PROXY_SERVICE_NAME,
-        ),
         DeployEvent::AdminNetworkContainersDisconnected { host, containers } => format!(
             "[{host}] warning: disconnected {} from {}. An earlier yoink version put \
-             these containers on it. Only the proxy and the admin relay stay on it.",
+             these containers on it. Only the admin relay stays on it, and a proxy of \
+             yoink v0.22 or earlier until a deploy recreates it.",
             containers.join(", "),
             crate::config::ADMIN_NETWORK,
         ),
         DeployEvent::AdminRelayCreated { host } => format!(
             "[{host}] admin relay {} created",
             crate::config::ADMIN_RELAY_NAME
+        ),
+        DeployEvent::ProxyAdminUpgradePending { hosts, exposed } => {
+            format_proxy_admin_upgrade_pending(hosts, exposed)
+        }
+        DeployEvent::ProxyAdminMoveFailed { host, error } => format!(
+            "[{host}] warning: could not move the admin API of the old proxy to the socket \
+             before the stop: {error}. The deploy continues. The new proxy can start without \
+             routes. yoink adds them after its healthcheck."
         ),
         DeployEvent::AdminRelaySkipped { host, image } => format!(
             "[{host}] warning: the admin relay {relay} does not run, and the proxy image \
@@ -216,6 +217,31 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
             proxy = crate::config::PROXY_SERVICE_NAME,
         ),
     }
+}
+
+/// The end-of-run warning for a proxy of yoink v0.22 or earlier on
+/// `hosts`. On the hosts in `exposed`, the admin API did not move to
+/// the socket.
+fn format_proxy_admin_upgrade_pending(hosts: &[String], exposed: &[String]) -> String {
+    let exposed = if exposed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " On {}, the admin API is still on 0.0.0.0:{}, and each container on {} \
+             can reach it.",
+            exposed.join(", "),
+            crate::config::LEGACY_ADMIN_PORT,
+            crate::config::INGRESS_NETWORK,
+        )
+    };
+    format!(
+        "warning: the proxy on {} is from yoink v0.22 or earlier.{exposed} Its Docker \
+         HEALTHCHECK uses the admin port 2019, so Docker shows the proxy as unhealthy \
+         after its admin API moves to the socket. Run `yoink up --service {}` or an \
+         unscoped `yoink up` to recreate the proxy.",
+        hosts.join(", "),
+        crate::config::PROXY_SERVICE_NAME,
+    )
 }
 
 /// Multi-line summary printed at the end of a successful reconcile.
@@ -310,25 +336,50 @@ mod tests {
         );
     }
 
-    /// A scoped run that keeps a proxy of an earlier version must tell
-    /// the operator how to finish the admin API move.
+    /// A run that keeps a v0.22 proxy tells the operator how to
+    /// recreate it, and why Docker shows it as unhealthy.
     #[test]
     fn deploy_event_format_proxy_admin_upgrade_pending() {
         let line = format_deploy_event(
             None,
             &DeployEvent::ProxyAdminUpgradePending {
                 hosts: vec!["h1".into(), "h2".into()],
+                exposed: Vec::new(),
+            },
+        );
+        assert!(!line.contains("0.0.0.0"), "got: {line}");
+        assert!(
+            line.starts_with("warning: the proxy on h1, h2 is from yoink v0.22 or earlier."),
+            "got: {line}"
+        );
+        assert!(
+            line.contains("`yoink up --service yoink-proxy` or an unscoped `yoink up`"),
+            "got: {line}"
+        );
+        assert!(
+            line.contains("Docker shows the proxy as unhealthy"),
+            "got: {line}"
+        );
+    }
+
+    /// An old proxy whose admin API did not move: the warning says that
+    /// the admin API is still open to `yoink-ingress`.
+    #[test]
+    fn deploy_event_format_proxy_admin_still_exposed() {
+        let line = format_deploy_event(
+            None,
+            &DeployEvent::ProxyAdminUpgradePending {
+                hosts: vec!["h1".into(), "h2".into()],
+                exposed: vec!["h2".into()],
             },
         );
         assert!(
-            line.starts_with("warning: the proxy on h1, h2 "),
+            line.contains(
+                "On h2, the admin API is still on 0.0.0.0:2019, and each container on \
+                 yoink-ingress can reach it."
+            ),
             "got: {line}"
         );
-        assert!(
-            line.contains("`yoink up --service yoink-proxy`"),
-            "got: {line}"
-        );
-        assert!(line.contains("on yoink-ingress can reach"), "got: {line}");
     }
 
     /// A scoped run that cannot create the relay tells the operator
@@ -348,6 +399,25 @@ mod tests {
             line.contains("`yoink up --service yoink-proxy`"),
             "got: {line}"
         );
+    }
+
+    /// A failed move of the old admin API tells the operator that the
+    /// deploy continues.
+    #[test]
+    fn deploy_event_format_proxy_admin_move_failed() {
+        let line = format_deploy_event(
+            Some("yoink-proxy"),
+            &DeployEvent::ProxyAdminMoveFailed {
+                host: "h1".into(),
+                error: "status 400".into(),
+            },
+        );
+        assert!(
+            line.starts_with("[yoink-proxy] [h1] warning: could not move the admin API"),
+            "got: {line}"
+        );
+        assert!(line.contains("status 400"), "got: {line}");
+        assert!(line.contains("The deploy continues."), "got: {line}");
     }
 
     #[test]

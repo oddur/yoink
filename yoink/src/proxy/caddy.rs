@@ -133,9 +133,9 @@ where
         // /load REPLACES the active config — if we omit the admin
         // block, Caddy reverts admin to the default `localhost:2019`,
         // which the admin relay cannot reach. Subsequent
-        // /load calls would then time out. For a proxy of an earlier
-        // yoink version, `proxy::admin::push_config` replaces this
-        // block with the earlier one.
+        // /load calls would then time out. The same block moves the
+        // admin API of a proxy of yoink v0.22 or earlier to the unix
+        // socket, see `proxy::admin::push_config`.
         "admin": crate::config::admin_block(),
         "apps": {
             "http": {
@@ -1372,9 +1372,10 @@ services:
     }
 
     /// Every `/load` used to set `admin.listen` to `0.0.0.0:2019`,
-    /// which every routed service on `yoink-ingress` could reach.
+    /// which every routed service on `yoink-ingress` could reach. Now
+    /// the admin API listens on a unix socket.
     #[test]
-    fn rendered_admin_listens_on_the_admin_alias() {
+    fn rendered_admin_listens_on_the_unix_socket() {
         let cfg = parse(
             r#"
 deploy: { networks: [n] }
@@ -1391,11 +1392,7 @@ services:
         );
         let json = render(&cfg, |_| vec!["api-1".into()], None).expect("render");
         assert_eq!(json["admin"], crate::config::admin_block());
-        assert_eq!(json["admin"]["listen"], crate::config::ADMIN_API_HOST);
-        assert_eq!(
-            json["admin"]["origins"],
-            serde_json::json!([crate::config::ADMIN_API_HOST])
-        );
+        assert_eq!(json["admin"]["listen"], "unix//config/caddy/admin.sock");
         assert!(!json["admin"].to_string().contains("0.0.0.0"));
     }
 

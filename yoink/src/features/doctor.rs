@@ -450,9 +450,7 @@ fn check_registry_consistency(config: &Config) -> Vec<Finding> {
 // ---------- config: proxy + domain shape ----------
 
 fn check_proxied_services(config: &Config) -> Vec<Finding> {
-    // A proxy without a routed service still runs on `yoink-ingress`,
-    // so the capability check runs before the early return.
-    let mut out = check_ingress_capabilities(config);
+    let mut out = Vec::new();
     let proxied: Vec<&ServiceConfig> = config.proxied_services();
     if proxied.is_empty() {
         out.push(Finding::pass(
@@ -501,29 +499,6 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
         }
     }
     out
-}
-
-/// One finding per container on `yoink-ingress` that keeps `NET_ADMIN`
-/// or `NET_RAW`. Empty when the proxy is off.
-fn check_ingress_capabilities(config: &Config) -> Vec<Finding> {
-    use crate::config::CapabilitySource;
-    config
-        .ingress_capability_warnings_by_source()
-        .into_iter()
-        .map(|(source, warning)| {
-            let fix = match source {
-                CapabilitySource::Service => {
-                    "remove NET_ADMIN and NET_RAW, or move the container off yoink-ingress"
-                }
-                // yoink does not change the capabilities of a hook.
-                CapabilitySource::Hook => {
-                    "put another network first in `deploy.networks`; hooks keep the Docker \
-                     default capabilities"
-                }
-            };
-            Finding::warn("config", warning).with_fix(fix)
-        })
-        .collect()
 }
 
 /// Catch the placeholders the docs and recipe templates ship with —
@@ -1345,10 +1320,11 @@ services:
         );
     }
 
-    /// A routed service with `NET_RAW` can reach the admin API of the
-    /// proxy. Doctor warns, and the exit code stays the same.
+    /// The admin API of the proxy is on a unix socket, so `NET_RAW` on
+    /// a routed service gives no path to it. Doctor has no capability
+    /// finding any more.
     #[test]
-    fn ingress_service_with_net_raw_is_a_warning() {
+    fn ingress_service_with_net_raw_is_no_finding() {
         let config = Config::parse_str(
             r#"
 deploy: { networks: [n] }
@@ -1365,9 +1341,7 @@ services:
         .unwrap();
         let findings = check_proxied_services(&config);
         assert!(
-            findings
-                .iter()
-                .any(|f| f.severity == Severity::Warn && f.title.contains("has NET_RAW")),
+            !findings.iter().any(|f| f.title.contains("NET_RAW")),
             "{:?}",
             titles(&findings)
         );
@@ -1445,86 +1419,6 @@ services:
                 .any(|f| f.severity == Severity::Warn && f.title.contains("placeholder")),
             "{:?}",
             titles(&findings)
-        );
-    }
-
-    /// Regression: with the proxy on and no service with `domain:`, the
-    /// check returned before the capability check.
-    #[test]
-    fn capability_check_runs_without_a_routed_service() {
-        let config = Config::parse_str(
-            r"
-deploy: { networks: [n] }
-hosts: [{ address: h1, user: deploy }]
-proxy: { enabled: true }
-services:
-  - name: worker
-    image: img
-    tag: t
-    networks: [n, yoink-ingress]
-    run:
-      options: { cap_add: [NET_RAW] }
-",
-        )
-        .unwrap();
-        let findings = check_proxied_services(&config);
-        assert!(
-            findings.iter().any(|f| f
-                .title
-                .starts_with("service \"worker\" is on yoink-ingress")),
-            "{:?}",
-            titles(&findings)
-        );
-        assert!(
-            findings.iter().any(|f| f.title.contains("checks skipped")),
-            "{:?}",
-            titles(&findings)
-        );
-    }
-
-    /// Regression: a hook finding got the fix of a service finding
-    /// (remove `NET_ADMIN` and `NET_RAW`). yoink does not change the
-    /// capabilities of a hook, so the fix moves it off yoink-ingress.
-    #[test]
-    fn hook_capability_finding_has_its_own_fix() {
-        let config = Config::parse_str(
-            r"
-hosts: [{ address: h1, user: deploy }]
-proxy: { enabled: true }
-hooks:
-  pre_deploy:
-    - name: migrate
-      image: registry.example.com/api
-      tag: v1
-      cmd: [bin/migrate]
-services:
-  - name: worker
-    image: img
-    tag: t
-    networks: [yoink-ingress]
-    run:
-      options: { cap_add: [NET_RAW] }
-",
-        )
-        .unwrap();
-        let mut config = config;
-        config.deploy.networks.retain(|n| n == "yoink-ingress");
-        let findings = check_ingress_capabilities(&config);
-        let fix_of = |prefix: &str| {
-            findings
-                .iter()
-                .find(|f| f.title.starts_with(prefix))
-                .and_then(|f| f.fix.clone())
-                .unwrap_or_else(|| panic!("no finding {prefix:?}: {:?}", titles(&findings)))
-        };
-        assert_eq!(
-            fix_of("hook \"migrate\""),
-            "put another network first in `deploy.networks`; hooks keep the Docker default \
-             capabilities"
-        );
-        assert_eq!(
-            fix_of("service \"worker\""),
-            "remove NET_ADMIN and NET_RAW, or move the container off yoink-ingress"
         );
     }
 

@@ -990,8 +990,9 @@ pub fn map_deploy_event(
         DeployEvent::Started { .. }
         | DeployEvent::PullFinished { .. }
         | DeployEvent::HealthcheckSkipped { .. }
+        | DeployEvent::AdminRelaySkipped { .. }
         | DeployEvent::ProxyAdminUpgradePending { .. }
-        | DeployEvent::AdminRelaySkipped { .. } => None,
+        | DeployEvent::ProxyAdminMoveFailed { .. } => None,
     }
 }
 

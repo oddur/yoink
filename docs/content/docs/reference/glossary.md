@@ -54,9 +54,9 @@ weight: 4
 
 **`yoink-ingress` network.** The docker network that yoink attaches the proxy and every service with a `domain:` to. Caddy reaches upstream containers by name on this network. Services keep their other networks.
 
-**`yoink-proxy-admin` network.** A network private to the proxy, for the admin API of Caddy. The admin API listens only on the address of the proxy on this network. yoink pushes new config to the admin API through an SSH tunnel and the admin relay, and does not restart Caddy.
+**`yoink-proxy-admin` network.** The network of the admin relay. Only the relay joins it. The admin API of Caddy listens on a unix socket in the proxy, not on a network. yoink pushes new config to the admin API through an SSH tunnel and the admin relay, and does not restart Caddy.
 
-**Admin relay.** The `yoink-proxy-admin-relay` container on each proxy host. It runs the image of the running proxy with a small Caddy config. When no proxy runs, it runs the configured proxy image. It joins only `yoink-proxy-admin`, publishes port 2020 on `127.0.0.1` of the host, and sends each request to the admin API of the proxy.
+**Admin relay.** The `yoink-proxy-admin-relay` container on each proxy host. It runs the image of the running proxy with a small Caddy config. When no proxy runs, it runs the configured proxy image. It mounts the config volume of the proxy read-only, joins only `yoink-proxy-admin`, publishes port 2020 on `127.0.0.1` of the host, and sends each request to the admin socket of the proxy.
 
 ## Networking
 
