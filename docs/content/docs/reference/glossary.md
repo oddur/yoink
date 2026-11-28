@@ -56,7 +56,7 @@ weight: 4
 
 **`yoink-proxy-admin` network.** A network private to the proxy, for the admin API of Caddy. The admin API listens only on the address of the proxy on this network. yoink pushes new config to the admin API through an SSH tunnel and the admin relay, and does not restart Caddy.
 
-**Admin relay.** The `yoink-proxy-admin-relay` container on each proxy host. It runs the proxy image with a small Caddy config. It joins only `yoink-proxy-admin`, publishes port 2020 on `127.0.0.1` of the host, and sends each request to the admin API of the proxy.
+**Admin relay.** The `yoink-proxy-admin-relay` container on each proxy host. It runs the image of the running proxy with a small Caddy config. When no proxy runs, it runs the configured proxy image. It joins only `yoink-proxy-admin`, publishes port 2020 on `127.0.0.1` of the host, and sends each request to the admin API of the proxy.
 
 ## Networking
 

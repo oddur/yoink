@@ -42,7 +42,7 @@ Chains that run on every request (CrowdSec, Coraza, fleet-wide rate limit) go in
 |---|---|---|---|
 | `enabled` | bool | implicit when any service has `domain:` | |
 | `email` | string | none | Registration email for Let's Encrypt. **Required when any service uses `tls: auto`.** Not used when `proxy.tls:` is set. |
-| `image` | string | `caddy:2` | Your own Caddy image, pulled from a registry. Mutually exclusive with `xcaddy:`. |
+| `image` | string | `caddy:2` | Your own Caddy image, pulled from a registry. Mutually exclusive with `xcaddy:`. The admin relay uses the image of the running proxy. It gets a new image on the first `yoink up` after the proxy runs that image. |
 | `xcaddy` | block | none | Builds a custom Caddy on each host with [`xcaddy`](https://github.com/caddyserver/xcaddy). Mutually exclusive with `image:`. See the [`xcaddy:` block](#proxyxcaddy-block-caddy-plugins-without-a-registry). |
 | `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. It persists across proxy restarts. |
 | `bind` | string | none (all interfaces) | Host IP that `:80` and `:443` bind to, for example a Tailscale IP. The admin relay publishes its port on `127.0.0.1` in all cases. |

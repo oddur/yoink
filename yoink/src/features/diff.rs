@@ -373,10 +373,11 @@ pub async fn compute(
 
 /// One row per proxy host where `yoink up` creates or replaces the
 /// admin relay: it is missing, it does not run, or its spec hash is not
-/// [`relay_spec_hash`] for the proxy image. Each reconcile with the
-/// proxy on, scoped or not, does this (see `crate::deploy`). A run that
-/// does not deploy the proxy keeps a running relay at any spec, and
-/// uses the image of the running proxy. A relay that stays gets no row.
+/// [`relay_spec_hash`] for the relay image. Each reconcile with the
+/// proxy on, scoped or not, does this (see `crate::deploy`). The relay
+/// image is the image of the running proxy, or the configured image
+/// when no proxy runs. A run that does not deploy the proxy keeps a
+/// running relay at any spec. A relay that stays gets no row.
 fn relay_diffs(
     config: &Config,
     tag_overrides: &BTreeMap<String, String>,
@@ -405,10 +406,8 @@ fn relay_diffs(
                 && c.is_running()
                 && !c.image.is_empty()
         });
-        let relay_image = match running_proxy {
-            Some(p) if !selects_proxy => RelayImage::parse(&p.image),
-            _ => configured.clone(),
-        };
+        let relay_image =
+            running_proxy.map_or_else(|| configured.clone(), |p| RelayImage::parse(&p.image));
         let desired_hash = relay_spec_hash(&relay_image);
         let desired_image = relay_image.reference();
         let change = match relay {
@@ -1171,8 +1170,9 @@ services:
                 .is_empty()
         );
 
-        // A scoped run creates a missing relay with the image of the
-        // running proxy.
+        // Each run creates a missing relay with the image of the
+        // running proxy, not the configured image. A run that deploys
+        // the proxy also replaces a relay at the configured image.
         let proxy = ContainerInfo {
             image: "caddy:2.7".into(),
             ..running(
@@ -1182,10 +1182,26 @@ services:
                 "running",
             )
         };
-        let rows = relay_rows(Some(&scoped), vec![proxy]).await;
+        for filter in [None, Some(&scoped[..])] {
+            let rows = relay_rows(filter, vec![proxy.clone()]).await;
+            assert!(
+                matches!(&rows[..], [ServiceDiff { change: ChangeKind::Create { desired_image }, .. }] if desired_image == "caddy:2.7"),
+                "got: {rows:?}"
+            );
+        }
+        let rows = relay_rows(None, vec![proxy.clone(), relay(&hash, "running")]).await;
         assert!(
-            matches!(&rows[..], [ServiceDiff { change: ChangeKind::Create { desired_image }, .. }] if desired_image == "caddy:2.7"),
+            matches!(&rows[..], [ServiceDiff { change: ChangeKind::Update { desired_image, .. }, .. }] if desired_image == "caddy:2.7"),
             "got: {rows:?}"
+        );
+        let running_hash = relay_spec_hash(&RelayImage {
+            image: "caddy".into(),
+            tag: "2.7".into(),
+        });
+        assert!(
+            relay_rows(None, vec![proxy, relay(&running_hash, "running")])
+                .await
+                .is_empty()
         );
     }
 
