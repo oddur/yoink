@@ -450,13 +450,16 @@ fn check_registry_consistency(config: &Config) -> Vec<Finding> {
 // ---------- config: proxy + domain shape ----------
 
 fn check_proxied_services(config: &Config) -> Vec<Finding> {
-    let mut out = Vec::new();
+    // A proxy without a routed service still runs on `yoink-ingress`,
+    // so the capability check runs before the early return.
+    let mut out = check_ingress_capabilities(config);
     let proxied: Vec<&ServiceConfig> = config.proxied_services();
     if proxied.is_empty() {
-        return vec![Finding::pass(
+        out.push(Finding::pass(
             "config",
             "proxy/domain checks skipped (no services have `domain:` set)",
-        )];
+        ));
+        return out;
     }
 
     let email = config.proxy_email();
@@ -483,13 +486,6 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
         );
     }
 
-    for warning in config.ingress_capability_warnings() {
-        out.push(
-            Finding::warn("config", warning)
-                .with_fix("drop NET_ADMIN and NET_RAW, or move the service off yoink-ingress"),
-        );
-    }
-
     for svc in &proxied {
         if svc.run.port.is_none() {
             // The proxy needs a port to forward to — yoink rejects
@@ -505,6 +501,19 @@ fn check_proxied_services(config: &Config) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// One finding per container on `yoink-ingress` that keeps `NET_ADMIN`
+/// or `NET_RAW`. Empty when the proxy is off.
+fn check_ingress_capabilities(config: &Config) -> Vec<Finding> {
+    config
+        .ingress_capability_warnings()
+        .into_iter()
+        .map(|warning| {
+            Finding::warn("config", warning)
+                .with_fix("remove NET_ADMIN and NET_RAW, or move the container off yoink-ingress")
+        })
+        .collect()
 }
 
 /// Catch the placeholders the docs and recipe templates ship with —
@@ -1424,6 +1433,40 @@ services:
             findings
                 .iter()
                 .any(|f| f.severity == Severity::Warn && f.title.contains("placeholder")),
+            "{:?}",
+            titles(&findings)
+        );
+    }
+
+    /// Regression: with the proxy on and no service with `domain:`, the
+    /// check returned before the capability check.
+    #[test]
+    fn capability_check_runs_without_a_routed_service() {
+        let config = Config::parse_str(
+            r"
+deploy: { networks: [n] }
+hosts: [{ address: h1, user: deploy }]
+proxy: { enabled: true }
+services:
+  - name: worker
+    image: img
+    tag: t
+    networks: [n, yoink-ingress]
+    run:
+      options: { cap_add: [NET_RAW] }
+",
+        )
+        .unwrap();
+        let findings = check_proxied_services(&config);
+        assert!(
+            findings.iter().any(|f| f
+                .title
+                .starts_with("service \"worker\" is on yoink-ingress")),
+            "{:?}",
+            titles(&findings)
+        );
+        assert!(
+            findings.iter().any(|f| f.title.contains("checks skipped")),
             "{:?}",
             titles(&findings)
         );
