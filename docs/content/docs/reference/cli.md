@@ -257,6 +257,8 @@ yoink up --service api --force                  # re-create + healthcheck all ap
 
 An at-spec container keeps its name, so the prepare phase removes the old container before the new one starts. The service is down for a short time (approximately the healthcheck time).
 
+If the new container does not start or fails its healthcheck, yoink cannot bring the old container back, because the old container is gone. This is also true for a service with `publish:` and for the proxy. Without `--force`, yoink starts the old container of such a service again after a failed deploy. With `--force`, no container of the service runs until the next successful deploy.
+
 ## Watch mode (`--watch`)
 
 `yoink up --watch` reconciles one time. Then it loads the config again every 2 s and reconciles on each change:
