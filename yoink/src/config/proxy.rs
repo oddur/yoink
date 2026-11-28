@@ -804,10 +804,11 @@ impl Config {
 
 impl super::RunOptions {
     /// The capabilities of [`RISKY_CAPS`] that a container with these
-    /// options has. Follows Docker: `cap_drop: [ALL]` starts from no
-    /// capability, else from the Docker default set minus `cap_drop`.
-    /// Then `cap_add` adds to it. `ALL` in `cap_add` adds every
-    /// capability.
+    /// options has. Follows Docker: with `ALL` in `cap_add`, the
+    /// container has each capability that `cap_drop` does not name.
+    /// `ALL` in `cap_drop` does not remove a capability in that case.
+    /// Else `cap_drop: [ALL]` starts from no capability, or from the
+    /// Docker default set minus `cap_drop`, and `cap_add` adds to it.
     fn risky_caps(&self) -> Vec<&'static str> {
         let norm = |c: &String| {
             let upper = c.trim().to_ascii_uppercase();
@@ -818,13 +819,19 @@ impl super::RunOptions {
         let dropped: Vec<String> = self.cap_drop.iter().map(norm).collect();
         let added: Vec<String> = self.cap_add.iter().map(norm).collect();
         let drop_all = dropped.iter().any(|c| c == "ALL");
+        let named_in_drop = |cap: &str| dropped.iter().any(|c| c == cap);
+        if added.iter().any(|c| c == "ALL") {
+            return RISKY_CAPS
+                .into_iter()
+                .filter(|cap| !named_in_drop(cap))
+                .collect();
+        }
         RISKY_CAPS
             .into_iter()
             .filter(|cap| {
-                let in_base = !drop_all
-                    && DOCKER_DEFAULT_RISKY.contains(cap)
-                    && !dropped.iter().any(|c| c == cap);
-                in_base || added.iter().any(|c| c == cap || c == "ALL")
+                let in_base =
+                    !drop_all && DOCKER_DEFAULT_RISKY.contains(cap) && !named_in_drop(cap);
+                in_base || added.iter().any(|c| c == cap)
             })
             .collect()
     }
@@ -1390,6 +1397,25 @@ services:
             "got: {warnings:?}"
         );
         let cfg = ingress_config("      options: { cap_add: [ALL] }", "");
+        assert!(cfg.ingress_capability_warnings()[0].contains("NET_ADMIN and NET_RAW"));
+    }
+
+    /// With `cap_add: [ALL]`, Docker removes each capability that
+    /// `cap_drop` names. `ALL` in `cap_drop` removes none.
+    #[test]
+    fn add_all_keeps_the_capabilities_that_cap_drop_does_not_name() {
+        let cfg = ingress_config("      options: { cap_add: [ALL], cap_drop: [NET_RAW] }", "");
+        let warnings = cfg.ingress_capability_warnings();
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("has NET_ADMIN."), "got: {warnings:?}");
+
+        let cfg = ingress_config(
+            "      options: { cap_add: [ALL], cap_drop: [NET_ADMIN, CAP_NET_RAW] }",
+            "",
+        );
+        assert!(cfg.ingress_capability_warnings().is_empty());
+
+        let cfg = ingress_config("      options: { cap_add: [ALL], cap_drop: [ALL] }", "");
         assert!(cfg.ingress_capability_warnings()[0].contains("NET_ADMIN and NET_RAW"));
     }
 
