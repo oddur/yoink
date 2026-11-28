@@ -55,7 +55,12 @@ yoink v0.22 and earlier published the admin port on the proxy, and the admin API
 
 A deploy of the proxy sends this push to the old proxy before it stops the old proxy. The new proxy loads the saved config at start, so the routes come back immediately and the admin API is on the socket. If the new proxy fails its healthcheck, yoink starts the old proxy again. The old proxy loads the same saved config, so the relay reaches it too.
 
-Use one version of yoink for all operators of a project. After the upgrade, yoink v0.22 finds no published port 2019 on the proxy, and its config push fails. The proxy continues to serve the saved routes. When yoink v0.22 recreates the proxy, the new proxy loads the saved config and listens on the socket again. To deploy again, run `yoink up` with the newer version.
+Use one version of yoink for all operators of a project. After the upgrade, yoink v0.22 cannot reach the admin API, and a `yoink up` with v0.22 can take sites down:
+
+- yoink v0.22 finds no published port 2019 on the proxy, and its config push fails. Then v0.22 removes the new replicas of the service. With `--force`, the old replica is already gone, so the service stops.
+- When yoink v0.22 deploys the proxy, its healthcheck uses port 2019 on `yoink-ingress`, which does not exist. The healthcheck fails, and v0.22 removes the new proxy. v0.22 does not start the old proxy again, so no proxy runs.
+
+To recover, run `yoink up` with the newer version. It deploys the proxy again, and the proxy loads its saved routes.
 
 Upstream entries name containers, not IPs. As a result, a container restart with a new IP does not break routing, because Docker DNS resolves the name. The active health checks of Caddy take dead backends out of rotation.
 
