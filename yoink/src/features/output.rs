@@ -207,6 +207,14 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
             "[{host}] admin relay {} created",
             crate::config::ADMIN_RELAY_NAME
         ),
+        DeployEvent::AdminRelaySkipped { host, image } => format!(
+            "[{host}] warning: the admin relay {relay} does not run, and the proxy image \
+             {image} is not on the host. This run does not deploy the proxy, so yoink does \
+             not pull the image and does not create the relay. Run `yoink up --service {proxy}` \
+             or an unscoped `yoink up` to create it.",
+            relay = crate::config::ADMIN_RELAY_NAME,
+            proxy = crate::config::PROXY_SERVICE_NAME,
+        ),
     }
 }
 
@@ -321,6 +329,25 @@ mod tests {
             "got: {line}"
         );
         assert!(line.contains("on yoink-ingress can reach"), "got: {line}");
+    }
+
+    /// A scoped run that cannot create the relay tells the operator
+    /// which run creates it.
+    #[test]
+    fn deploy_event_format_admin_relay_skipped() {
+        let line = format_deploy_event(
+            None,
+            &DeployEvent::AdminRelaySkipped {
+                host: "h1".into(),
+                image: "caddy:2".into(),
+            },
+        );
+        assert!(line.starts_with("[h1] warning: "), "got: {line}");
+        assert!(line.contains("proxy image caddy:2"), "got: {line}");
+        assert!(
+            line.contains("`yoink up --service yoink-proxy`"),
+            "got: {line}"
+        );
     }
 
     #[test]

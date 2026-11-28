@@ -66,6 +66,8 @@ struct FakeState {
     /// Network name → the `list_containers_on_network` answer. A name
     /// that is not here has no containers.
     network_containers: HashMap<String, Vec<ContainerInfo>>,
+    /// Container name → the body of the last `create_container`.
+    created_bodies: HashMap<String, ContainerCreateBody>,
     calls: Vec<RecordedCall>,
 }
 
@@ -201,6 +203,12 @@ impl FakeDockerOps {
 
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.lock().calls.clone()
+    }
+
+    /// The body of the last `create_container` for `name`.
+    #[must_use]
+    pub fn created_body(&self, name: &str) -> Option<ContainerCreateBody> {
+        self.lock().created_bodies.get(name).cloned()
     }
 }
 
@@ -406,9 +414,10 @@ impl DockerOps for FakeDockerOps {
         &self,
         host: &Host,
         name: &str,
-        _body: ContainerCreateBody,
+        body: ContainerCreateBody,
     ) -> Result<String, DockerError> {
         let mut s = self.lock();
+        s.created_bodies.insert(name.into(), body);
         s.calls
             .push(RecordedCall::CreateContainer(host.clone(), name.into()));
         pop(&mut s.create_container, "create_container")

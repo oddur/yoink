@@ -329,7 +329,12 @@ pub async fn compute(
         }
     }
 
-    services.extend(relay_diffs(config, tag_overrides, &snapshot));
+    services.extend(relay_diffs(
+        config,
+        tag_overrides,
+        services_filter,
+        &snapshot,
+    ));
 
     // With `--service`, the plan covers only the selected services, so
     // only their containers can be orphans. The containers of the other
@@ -363,27 +368,44 @@ pub async fn compute(
 
 /// One row per proxy host where `yoink up` creates or replaces the
 /// admin relay: it is missing, it does not run, or its spec hash is not
-/// [`relay_spec_hash`] for the proxy image. Each reconcile with the proxy on, scoped or
-/// not, does this (see `crate::proxy::relay::ensure`). A relay at spec
-/// gets no row.
+/// [`relay_spec_hash`] for the proxy image. Each reconcile with the
+/// proxy on, scoped or not, does this (see `crate::deploy`). A run that
+/// does not deploy the proxy keeps a running relay at any spec, and
+/// uses the image of the running proxy. A relay that stays gets no row.
 fn relay_diffs(
     config: &Config,
     tag_overrides: &BTreeMap<String, String>,
+    services_filter: Option<&[String]>,
     snapshot: &BTreeMap<String, Vec<ContainerInfo>>,
 ) -> Vec<ServiceDiff> {
-    use crate::proxy::relay::{RELAY_NAME, RelayImage, is_relay, relay_spec_hash};
-    let Some(relay_image) = RelayImage::of(config, tag_overrides) else {
+    use crate::proxy::relay::{
+        RELAY_NAME, RelayImage, is_relay, relay_spec_hash, run_selects_proxy,
+    };
+    let Some(configured) = RelayImage::of(config, tag_overrides) else {
         return Vec::new();
     };
     let Some(proxy) = config.service(crate::config::PROXY_SERVICE_NAME) else {
         return Vec::new();
     };
-    let desired_hash = relay_spec_hash(&relay_image);
-    let desired_image = relay_image.reference();
+    let selects_proxy = run_selects_proxy(services_filter);
     let mut out = Vec::new();
     for target in config.fleet_for(proxy) {
         let containers = snapshot.get(&target.address).map_or(&[][..], Vec::as_slice);
         let relay = containers.iter().find(|c| is_relay(c));
+        if !selects_proxy && relay.is_some_and(ContainerInfo::is_running) {
+            continue;
+        }
+        let running_proxy = containers.iter().find(|c| {
+            c.yoink_service.as_deref() == Some(crate::config::PROXY_SERVICE_NAME)
+                && c.is_running()
+                && !c.image.is_empty()
+        });
+        let relay_image = match running_proxy {
+            Some(p) if !selects_proxy => RelayImage::parse(&p.image),
+            _ => configured.clone(),
+        };
+        let desired_hash = relay_spec_hash(&relay_image);
+        let desired_image = relay_image.reference();
         let change = match relay {
             None => ChangeKind::Create {
                 desired_image: desired_image.clone(),
@@ -1048,18 +1070,21 @@ services:
 
     /// Each `yoink up` with the proxy on creates or replaces the admin
     /// relay when it is missing, stopped or at another spec. The
-    /// dry-run must show that. A relay at spec gets no row.
+    /// dry-run must show that. A relay at spec gets no row. A run that
+    /// does not deploy the proxy keeps a running relay at another spec.
     #[tokio::test]
     async fn dry_run_plans_the_admin_relay() {
         use crate::proxy::relay::{RELAY_NAME, RelayImage, relay_spec_hash};
-        async fn relay_rows(snapshot: Vec<ContainerInfo>) -> Vec<ServiceDiff> {
+        async fn relay_rows(
+            filter: Option<&[String]>,
+            snapshot: Vec<ContainerInfo>,
+        ) -> Vec<ServiceDiff> {
             let yaml = "hosts:\n  - { address: host-a, user: deploy }\nservices:\n  - name: api\n    \
                         image: img\n    tag: v1\n    domain: api.example.com\n    run: { port: 8080 }\n";
             let cfg = crate::config::Config::parse_str(yaml).unwrap();
             let ops = crate::docker_ops::FakeDockerOps::new();
             ops.push_list_containers(Ok(snapshot));
-            let filter = ["api".to_string()];
-            let report = compute(&ops, &cfg, &BTreeMap::new(), Some(&filter), None)
+            let report = compute(&ops, &cfg, &BTreeMap::new(), filter, None)
                 .await
                 .unwrap();
             report
@@ -1073,14 +1098,17 @@ services:
             image: "alpine/socat:1.8.1.3".into(),
             ..running("", RELAY_NAME, hash, state)
         };
+        let scoped = ["api".to_string()];
 
-        let rows = relay_rows(Vec::new()).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].host, "host-a");
-        assert!(
-            matches!(&rows[0].change, ChangeKind::Create { desired_image } if desired_image == "caddy:2"),
-            "got: {rows:?}"
-        );
+        for filter in [None, Some(&scoped[..])] {
+            let rows = relay_rows(filter, Vec::new()).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].host, "host-a");
+            assert!(
+                matches!(&rows[0].change, ChangeKind::Create { desired_image } if desired_image == "caddy:2"),
+                "got: {rows:?}"
+            );
+        }
 
         // The relay runs the proxy image. The socat relay of the
         // earlier version has another hash and gets an update row.
@@ -1088,8 +1116,12 @@ services:
             image: "caddy".into(),
             tag: "2".into(),
         });
-        for container in [relay(&hash, "exited"), relay("old", "running")] {
-            let rows = relay_rows(vec![container]).await;
+        for (filter, container) in [
+            (None, relay(&hash, "exited")),
+            (None, relay("old", "running")),
+            (Some(&scoped[..]), relay(&hash, "exited")),
+        ] {
+            let rows = relay_rows(filter, vec![container]).await;
             assert_eq!(rows.len(), 1, "got: {rows:?}");
             assert!(
                 matches!(&rows[0].change, ChangeKind::Update { .. }),
@@ -1097,7 +1129,33 @@ services:
             );
         }
 
-        assert!(relay_rows(vec![relay(&hash, "running")]).await.is_empty());
+        assert!(
+            relay_rows(None, vec![relay(&hash, "running")])
+                .await
+                .is_empty()
+        );
+        assert!(
+            relay_rows(Some(&scoped), vec![relay("old", "running")])
+                .await
+                .is_empty()
+        );
+
+        // A scoped run creates a missing relay with the image of the
+        // running proxy.
+        let proxy = ContainerInfo {
+            image: "caddy:2.7".into(),
+            ..running(
+                crate::config::PROXY_SERVICE_NAME,
+                "yoink-proxy-abc",
+                "p",
+                "running",
+            )
+        };
+        let rows = relay_rows(Some(&scoped), vec![proxy]).await;
+        assert!(
+            matches!(&rows[..], [ServiceDiff { change: ChangeKind::Create { desired_image }, .. }] if desired_image == "caddy:2.7"),
+            "got: {rows:?}"
+        );
     }
 
     fn running(service: &str, name: &str, hash: &str, state: &str) -> ContainerInfo {

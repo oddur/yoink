@@ -94,6 +94,58 @@ impl RelayImage {
     pub fn reference(&self) -> String {
         crate::base::image::image_reference(&self.image, &self.tag)
     }
+
+    /// Split an image reference, as the inspect of a container shows
+    /// it: `repo:tag` or `repo@sha256:…`. A reference without a tag
+    /// gets `latest`. The inverse of [`Self::reference`].
+    #[must_use]
+    pub fn parse(reference: &str) -> Self {
+        if let Some((image, digest)) = reference.split_once('@') {
+            return Self {
+                image: image.to_string(),
+                tag: digest.to_string(),
+            };
+        }
+        // A `:` before the last `/` is the port of a registry host.
+        let name_start = reference.rfind('/').map_or(0, |i| i + 1);
+        match reference[name_start..].rfind(':') {
+            Some(i) => Self {
+                image: reference[..name_start + i].to_string(),
+                tag: reference[name_start + i + 1..].to_string(),
+            },
+            None => Self {
+                image: reference.to_string(),
+                tag: "latest".to_string(),
+            },
+        }
+    }
+}
+
+/// True when a run with `services_filter` deploys the proxy: an
+/// unscoped run, or a run with `--service yoink-proxy`. Only such a run
+/// replaces a relay at another spec or gets the proxy image.
+#[must_use]
+pub fn run_selects_proxy(services_filter: Option<&[String]>) -> bool {
+    services_filter.is_none_or(|f| f.iter().any(|s| s == PROXY_SERVICE_NAME))
+}
+
+/// The image of the running proxy container on `host`, from its
+/// inspect. `None` when no proxy container runs there.
+pub async fn running_proxy_image(
+    ops: &dyn DockerOps,
+    host: &Host,
+) -> Result<Option<RelayImage>, DockerError> {
+    let proxies = ops
+        .list_containers_by_label(host, &format!("yoink.service={PROXY_SERVICE_NAME}"))
+        .await?;
+    let Some(running) = proxies.iter().find(|c| c.is_running()) else {
+        return Ok(None);
+    };
+    let detail = ops.inspect_container(host, &running.name).await?;
+    Ok(detail
+        .image
+        .filter(|i| !i.is_empty())
+        .map(|i| RelayImage::parse(&i)))
 }
 
 /// The Caddy config of the relay.
@@ -206,17 +258,23 @@ pub enum RelayPlan {
 }
 
 /// Find out whether the relay on `host` runs at the spec for `image`.
+/// With `image` `None`, a running relay is current at any spec: a run
+/// that does not deploy the proxy keeps it, see [`run_selects_proxy`].
 pub async fn plan(
     ops: &dyn DockerOps,
     host: &Host,
-    image: &RelayImage,
+    image: Option<&RelayImage>,
 ) -> Result<RelayPlan, DockerError> {
-    let hash = relay_spec_hash(image);
+    let hash = image.map(relay_spec_hash);
     let existing = ops
         .list_containers_by_label(host, &relay_label_filter())
         .await?;
     let current = existing.iter().any(|c| {
-        c.name == RELAY_NAME && c.is_running() && c.yoink_spec_hash.as_deref() == Some(&hash)
+        c.name == RELAY_NAME
+            && c.is_running()
+            && hash
+                .as_deref()
+                .is_none_or(|h| c.yoink_spec_hash.as_deref() == Some(h))
     });
     if current {
         return Ok(RelayPlan::Current);
@@ -419,7 +477,7 @@ mod tests {
         let ops = FakeDockerOps::new();
         ops.push_list_containers(Ok(vec![relay("running", &relay_spec_hash(&caddy()))]));
         assert_eq!(
-            plan(&ops, &host(), &caddy()).await.unwrap(),
+            plan(&ops, &host(), Some(&caddy())).await.unwrap(),
             RelayPlan::Current
         );
         assert_eq!(
@@ -441,7 +499,8 @@ mod tests {
         ] {
             let ops = FakeDockerOps::new();
             ops.push_list_containers(Ok(vec![existing]));
-            let RelayPlan::Create { stale } = plan(&ops, &host(), &caddy()).await.unwrap() else {
+            let RelayPlan::Create { stale } = plan(&ops, &host(), Some(&caddy())).await.unwrap()
+            else {
                 panic!("expected Create");
             };
             assert_eq!(stale, [RELAY_NAME]);
@@ -459,6 +518,55 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// Without an image, a running relay is current at any spec. A
+    /// stopped or missing relay is still created.
+    #[tokio::test]
+    async fn plan_without_image_keeps_a_running_relay() {
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![relay("running", "0000")]));
+        assert_eq!(plan(&ops, &host(), None).await.unwrap(), RelayPlan::Current);
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![relay("exited", "0000")]));
+        assert_eq!(
+            plan(&ops, &host(), None).await.unwrap(),
+            RelayPlan::Create {
+                stale: vec![RELAY_NAME.into()]
+            }
+        );
+    }
+
+    #[test]
+    fn relay_image_parse_is_the_inverse_of_reference() {
+        for (reference, image, tag) in [
+            ("caddy:2", "caddy", "2"),
+            ("caddy", "caddy", "latest"),
+            ("localhost:5000/caddy", "localhost:5000/caddy", "latest"),
+            (
+                "localhost:5000/me/caddy:2.8",
+                "localhost:5000/me/caddy",
+                "2.8",
+            ),
+            ("caddy@sha256:abc", "caddy", "sha256:abc"),
+        ] {
+            let parsed = RelayImage::parse(reference);
+            assert_eq!((parsed.image.as_str(), parsed.tag.as_str()), (image, tag));
+        }
+        assert_eq!(
+            RelayImage::parse("ghcr.io/a/b:1").reference(),
+            "ghcr.io/a/b:1"
+        );
+    }
+
+    #[test]
+    fn only_an_unscoped_or_proxy_run_selects_the_proxy() {
+        assert!(run_selects_proxy(None));
+        assert!(run_selects_proxy(Some(&[
+            "api".to_string(),
+            PROXY_SERVICE_NAME.to_string()
+        ])));
+        assert!(!run_selects_proxy(Some(&["api".to_string()])));
     }
 
     /// `create` never pulls: the deploy makes the proxy image present
