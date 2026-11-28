@@ -140,10 +140,10 @@ pub enum DeployEvent {
         container: String,
     },
     /// The proxy on `hosts` is from an earlier yoink version, so its
-    /// admin API still listens on every network of the proxy. yoink
-    /// pushed the earlier admin block to it. A deploy of the proxy
-    /// finishes the move of the admin API to the admin network. Fired
-    /// at most once per reconcile.
+    /// admin API still listens on `0.0.0.0:2019`, which every container
+    /// on `yoink-ingress` can reach. yoink pushed the earlier admin
+    /// block to it. A deploy of the proxy recreates it with the admin
+    /// API on the admin network only. Fired at most once per reconcile.
     ProxyAdminUpgradePending {
         hosts: Vec<String>,
     },
@@ -4998,6 +4998,49 @@ services:
             )
             .expect("snapshot");
         assert!(start < snapshot, "got: {calls:?}");
+    }
+
+    /// The admin API alias was not part of the spec hash. A proxy with
+    /// every other input at spec but without the alias counted as at
+    /// spec, and `yoink up --service yoink-proxy` kept it, so the
+    /// warning that told the operator to run it was wrong.
+    #[tokio::test(start_paused = true)]
+    async fn proxy_without_the_alias_is_not_at_spec() {
+        use crate::config::PROXY_SERVICE_NAME;
+        let cfg = config_proxied_service();
+        let proxy = cfg.service(PROXY_SERVICE_NAME).unwrap();
+        let tag = proxy.tag.clone().unwrap();
+        let mut spec = build_desired_spec(&cfg, proxy, &tag, None).unwrap();
+        spec.proxy = false; // the endpoint settings without the alias
+        let without_alias = docker::compute_spec_hash(&spec);
+        assert_ne!(without_alias, desired_hash_of(&cfg, PROXY_SERVICE_NAME));
+        let old = container_name(PROXY_SERVICE_NAME, &without_alias, 0, 1);
+        let ops = ops_with_snapshot(
+            &cfg,
+            vec![snapshot_container(
+                PROXY_SERVICE_NAME,
+                &old,
+                &without_alias,
+                "running",
+            )],
+        );
+        let filter = [PROXY_SERVICE_NAME.to_string()];
+        let (result, events) = reconcile_collect(&ops, &cfg, Some(&filter)).await;
+        // The deploy starts (and stops at the unscripted pull).
+        assert!(result.is_err());
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| matches!(e, DeployEvent::AlreadyAtSpec { .. })),
+            "got: {events:?}"
+        );
+        assert!(
+            ops.calls().iter().any(
+                |c| matches!(c, RecordedCall::PullImage(_, image, _) if image == &proxy.image)
+            ),
+            "the proxy deploy did not start: {:?}",
+            ops.calls()
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -287,6 +287,14 @@ pub fn compute_spec_hash(spec: &RunSpec) -> String {
     let mut networks_sorted = spec.networks.clone();
     networks_sorted.sort();
     feed_list(&mut h, "networks", &networks_sorted);
+    // Per-network endpoint settings beyond the container name and
+    // `network_aliases` (hashed below): today the admin API alias of the
+    // proxy. Fed only when present, so other hashes stay the same.
+    for net in &networks_sorted {
+        if let Some(extra) = endpoint_settings(net, &[], spec.proxy).aliases {
+            feed_list(&mut h, &format!("endpoint.{net}.aliases"), &extra);
+        }
+    }
     feed_map(&mut h, "env", &spec.env);
     feed_map(&mut h, "labels", &spec.labels);
     feed_opt_list(&mut h, "entrypoint", spec.entrypoint.as_deref());
@@ -677,6 +685,27 @@ mod tests {
         let mut v = sample_spec();
         v.volumes = vec!["data:/d".into()];
         assert_ne!(base, compute_spec_hash(&v));
+    }
+
+    /// The endpoint settings of the proxy are part of its spec hash, so
+    /// a proxy without the admin API alias is not at spec and
+    /// `yoink up --service yoink-proxy` recreates it. A service without
+    /// extra endpoint settings keeps its hash: the change recreates no
+    /// other container.
+    #[test]
+    fn spec_hash_includes_the_admin_endpoint_settings() {
+        use crate::config::{ADMIN_NETWORK, INGRESS_NETWORK};
+        // Pinned: the hash of a plain service did not change.
+        assert_eq!(compute_spec_hash(&sample_spec()), "fa432c4c0da0515f");
+        let mut proxy = sample_spec();
+        proxy.networks = vec![INGRESS_NETWORK.into(), ADMIN_NETWORK.into()];
+        let mut plain = proxy.clone();
+        proxy.proxy = true;
+        assert_ne!(compute_spec_hash(&proxy), compute_spec_hash(&plain));
+        // Without the admin network there are no extra settings.
+        plain.networks = vec![INGRESS_NETWORK.into()];
+        proxy.networks = plain.networks.clone();
+        assert_eq!(compute_spec_hash(&proxy), compute_spec_hash(&plain));
     }
 
     #[test]

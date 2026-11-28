@@ -187,9 +187,10 @@ fn format_deploy_event_body(event: &DeployEvent) -> String {
         } => format!("[{host}] {container} log tail unavailable: {error}"),
         DeployEvent::Done { host, container } => format!("[{host}] done — {container}"),
         DeployEvent::ProxyAdminUpgradePending { hosts } => format!(
-            "warning: the proxy on {} is from an earlier yoink version. Its admin API \
-             still listens on all proxy networks. Run `yoink up --service {}` or an \
-             unscoped `yoink up` to move it to the admin network.",
+            "warning: the proxy on {} is from an earlier yoink version. Every container \
+             on yoink-ingress can reach its admin API. Run `yoink up --service {}` or an \
+             unscoped `yoink up` to recreate the proxy with the admin API on \
+             yoink-proxy-admin only.",
             hosts.join(", "),
             crate::config::PROXY_SERVICE_NAME,
         ),
@@ -306,6 +307,7 @@ mod tests {
             line.contains("`yoink up --service yoink-proxy`"),
             "got: {line}"
         );
+        assert!(line.contains("on yoink-ingress can reach"), "got: {line}");
     }
 
     #[test]
