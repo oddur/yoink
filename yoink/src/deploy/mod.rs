@@ -167,10 +167,12 @@ pub enum DeployEvent {
     /// v0.22 or earlier: it publishes the admin port 2019. Its Docker
     /// HEALTHCHECK asks that port, so Docker shows the proxy as
     /// unhealthy after the move of the admin API to the socket. A
-    /// deploy of the proxy recreates it. Sent once per run, also when
-    /// the run fails.
+    /// deploy of the proxy recreates it. On the hosts in `exposed`, the
+    /// relay found no admin socket: the admin API is still on
+    /// `0.0.0.0:2019`. Sent once per run, also when the run fails.
     ProxyAdminUpgradePending {
         hosts: Vec<String>,
+        exposed: Vec<String>,
     },
     /// Before the stop of a proxy of yoink v0.22 or earlier on `host`,
     /// yoink could not move its admin API to the socket. The deploy
@@ -383,17 +385,43 @@ pub async fn reconcile_with_options(
         &mut *on_event,
     )
     .await;
-    let hosts = legacy_proxy_hosts(ops, config).await;
-    if !hosts.is_empty() {
-        on_event(None, DeployEvent::ProxyAdminUpgradePending { hosts });
-    }
+    report_legacy_proxies(ops, config, on_event).await;
     result
 }
 
+/// Send one [`DeployEvent::ProxyAdminUpgradePending`] when a proxy of
+/// yoink v0.22 or earlier runs on a proxy host of `config`.
+/// [`reconcile_with_options`] calls it at its end. A run that stops
+/// before the reconcile (a failed image prefetch) calls it itself.
+pub async fn report_legacy_proxies(
+    ops: &dyn DockerOps,
+    config: &Config,
+    on_event: &mut (dyn FnMut(Option<&str>, DeployEvent) + Send),
+) {
+    let legacy = legacy_proxy_hosts(ops, config).await;
+    if legacy.is_empty() {
+        return;
+    }
+    let exposed = legacy
+        .iter()
+        .filter(|(_, admin)| *admin == crate::proxy::admin::LegacyProxyAdmin::OnWildcardPort)
+        .map(|(host, _)| host.clone())
+        .collect();
+    let hosts = legacy.into_iter().map(|(host, _)| host).collect();
+    on_event(
+        None,
+        DeployEvent::ProxyAdminUpgradePending { hosts, exposed },
+    );
+}
+
 /// The proxy hosts of `config` on which a proxy of yoink v0.22 or
-/// earlier runs. Best effort: a host that yoink cannot inspect is left
-/// out, so that this check does not hide the error of the run.
-async fn legacy_proxy_hosts(ops: &dyn DockerOps, config: &Config) -> Vec<String> {
+/// earlier runs, with the state of its admin API. Best effort: a host
+/// that yoink cannot inspect is left out, so that this check does not
+/// hide the error of the run.
+async fn legacy_proxy_hosts(
+    ops: &dyn DockerOps,
+    config: &Config,
+) -> Vec<(String, crate::proxy::admin::LegacyProxyAdmin)> {
     if !config.proxy_enabled() {
         return Vec::new();
     }
@@ -402,11 +430,8 @@ async fn legacy_proxy_hosts(ops: &dyn DockerOps, config: &Config) -> Vec<String>
     };
     let mut hosts = Vec::new();
     for host in config.fleet_for(proxy) {
-        if matches!(
-            crate::proxy::admin::runs_legacy_proxy(&host, ops).await,
-            Ok(true)
-        ) {
-            hosts.push(host.address);
+        if let Ok(Some(admin)) = crate::proxy::admin::legacy_proxy_admin(&host, ops).await {
+            hosts.push((host.address, admin));
         }
     }
     hosts
@@ -5784,6 +5809,34 @@ services:
                 None,
                 DeployEvent::ProxyAdminUpgradePending {
                     hosts: vec!["host-a".into()],
+                    exposed: vec!["host-a".into()],
+                }
+            )]
+        );
+    }
+
+    /// A run that stops before the reconcile (a failed prefetch) sends
+    /// the warning itself, with the same check.
+    #[tokio::test]
+    async fn legacy_proxy_report_is_one_event() {
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(vec![proxy_container(OLD_PROXY, "running")]));
+        ops.set_inspect(crate::docker_ops::ContainerDetail {
+            name: OLD_PROXY.into(),
+            ports: vec![format!("{LEGACY_HOST_PORT}:2019/tcp")],
+            ..Default::default()
+        });
+        let mut events = Vec::new();
+        let mut sink = |svc: Option<&str>, e: DeployEvent| events.push((svc.map(String::from), e));
+        report_legacy_proxies(&ops, &cfg, &mut sink).await;
+        assert_eq!(
+            events,
+            [(
+                None,
+                DeployEvent::ProxyAdminUpgradePending {
+                    hosts: vec!["host-a".into()],
+                    exposed: vec!["host-a".into()],
                 }
             )]
         );

@@ -2160,7 +2160,8 @@ async fn run_locked_up(
     //
     // A prefetch failure skips the reconcile but still takes the
     // closing path below: locks released, LockReleased, RunFinished
-    // and the `run_failed` webhook.
+    // and the `run_failed` webhook. It also gives the warning for a
+    // proxy of yoink v0.22 or earlier, as a failed reconcile does.
     let prefetch_result = if prefetch {
         let prefetch_cb: std::sync::Arc<dyn Fn(deploy::DeployEvent) + Send + Sync> =
             std::sync::Arc::new(|e| {
@@ -2182,7 +2183,10 @@ async fn run_locked_up(
     };
 
     let (phase, reconcile_result) = match prefetch_result {
-        Err(e) => ("prefetch images", Err(e)),
+        Err(e) => {
+            deploy::report_legacy_proxies(&*ops, config, &mut sink).await;
+            ("prefetch images", Err(e))
+        }
         Ok(()) => (
             "reconcile",
             deploy::reconcile_with_options(

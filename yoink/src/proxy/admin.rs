@@ -316,14 +316,41 @@ pub fn is_legacy_proxy(proxy: &ContainerDetail) -> bool {
     legacy_admin_port(proxy).is_some()
 }
 
-/// True when the running proxy on `host` is from yoink v0.22 or
-/// earlier. False when no proxy runs.
-pub async fn runs_legacy_proxy(host: &Host, ops: &dyn DockerOps) -> Result<bool, AdminError> {
-    match running_proxy(host, ops).await {
-        Ok(proxy) => Ok(is_legacy_proxy(&proxy)),
-        Err(AdminError::ProxyNotRunning { .. }) => Ok(false),
-        Err(e) => Err(e),
+/// Where the admin API of a running proxy of yoink v0.22 or earlier
+/// listens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyProxyAdmin {
+    /// On the socket: the admin API answers through the relay.
+    OnSocket,
+    /// Still on `0.0.0.0:2019`, or yoink could not reach the relay to
+    /// make sure that it is not.
+    OnWildcardPort,
+}
+
+/// The admin API of the running proxy on `host` when that proxy is from
+/// yoink v0.22 or earlier. `None` for a proxy of this version and when
+/// no proxy runs. yoink asks the relay whether the socket answers.
+pub async fn legacy_proxy_admin(
+    host: &Host,
+    ops: &dyn DockerOps,
+) -> Result<Option<LegacyProxyAdmin>, AdminError> {
+    let proxy = match running_proxy(host, ops).await {
+        Ok(proxy) => proxy,
+        Err(AdminError::ProxyNotRunning { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !is_legacy_proxy(&proxy) {
+        return Ok(None);
     }
+    let on_socket = match relay_port(host, ops).await {
+        Ok(port) => socket_answers(host, ops, port).await.unwrap_or(false),
+        Err(_) => false,
+    };
+    Ok(Some(if on_socket {
+        LegacyProxyAdmin::OnSocket
+    } else {
+        LegacyProxyAdmin::OnWildcardPort
+    }))
 }
 
 /// The host port of the admin port that a proxy of yoink v0.22 or
@@ -1234,6 +1261,42 @@ services:
             msg.contains("`docker logs yoink-proxy-admin-relay`"),
             "got: {msg}"
         );
+    }
+
+    /// The end-of-run check asks the relay where the admin API of an
+    /// old proxy is. Without a relay, yoink cannot make sure that it
+    /// left port 2019.
+    #[tokio::test]
+    async fn legacy_proxy_admin_asks_the_relay() {
+        let relay = FakeCaddy::start();
+        let ops = fake_host(&old_proxy_ports(), true);
+        ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        assert_eq!(
+            legacy_proxy_admin(&host(), &ops).await.expect("check"),
+            Some(LegacyProxyAdmin::OnSocket)
+        );
+
+        let relay = FakeCaddy::start();
+        relay.probe_statuses(&[502]);
+        let ops = fake_host(&old_proxy_ports(), true);
+        ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        assert_eq!(
+            legacy_proxy_admin(&host(), &ops).await.expect("check"),
+            Some(LegacyProxyAdmin::OnWildcardPort)
+        );
+
+        let ops = fake_host(&old_proxy_ports(), false);
+        assert_eq!(
+            legacy_proxy_admin(&host(), &ops).await.expect("check"),
+            Some(LegacyProxyAdmin::OnWildcardPort)
+        );
+
+        let ops = fake_host(&["80:80/tcp", "443:443/tcp"], true);
+        assert_eq!(
+            legacy_proxy_admin(&host(), &ops).await.expect("check"),
+            None
+        );
+        assert!(forwards(&ops).is_empty());
     }
 
     #[test]

@@ -4214,6 +4214,11 @@ async fn reconcile_all(
     )
     .await
     {
+        // The same warning as at the end of a reconcile.
+        let mut report = |_svc: Option<&str>, e: crate::deploy::DeployEvent| {
+            send_event(crate::features::output::format_deploy_event(None, &e));
+        };
+        crate::deploy::report_legacy_proxies(&*ops, &config, &mut report).await;
         for lock in locks {
             lock.release(&*ops).await;
         }
