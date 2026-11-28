@@ -125,12 +125,45 @@ pub enum AdminError {
 /// alias. A proxy from an earlier yoink version does not have it, and
 /// Caddy cannot bind that address. For such a proxy, yoink sends the
 /// earlier block instead, see [`AdminListen::Legacy`]. The return value
-/// tells the caller which block it sent.
+/// tells the caller which block it sent. A [`PushError`] tells it too,
+/// when yoink found the proxy before the push failed.
 pub async fn push_config(
     host: &Host,
     ops: &dyn DockerOps,
     config: &Value,
-) -> Result<AdminListen, AdminError> {
+) -> Result<AdminListen, PushError> {
+    let (proxy, listen) = running_proxy(host, ops).await.map_err(|error| PushError {
+        listen: None,
+        error,
+    })?;
+    push_to(host, ops, config, proxy, listen)
+        .await
+        .map_err(|error| PushError {
+            listen: Some(listen),
+            error,
+        })?;
+    Ok(listen)
+}
+
+/// A failed [`push_config`]. `listen` is the admin address of the
+/// running proxy, when yoink found the proxy before the failure. An
+/// old proxy is still in place after a failed push, so the caller can
+/// still warn about it.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub struct PushError {
+    pub listen: Option<AdminListen>,
+    pub error: AdminError,
+}
+
+/// The push of [`push_config`], to the running proxy `proxy`.
+async fn push_to(
+    host: &Host,
+    ops: &dyn DockerOps,
+    config: &Value,
+    proxy: ContainerDetail,
+    listen: AdminListen,
+) -> Result<(), AdminError> {
     // The discovery phase (label lookup + inspect + port parse +
     // keyfile) is invariant across retries on transport-class
     // failures, so we run it once and only re-tunnel-and-load on
@@ -139,10 +172,9 @@ pub async fn push_config(
     // ssh-pool flakiness for those calls (see `RealDockerOps`),
     // adding another retry layer here would compound the wait on
     // genuinely down hosts.
-    let target = discover_admin_target(host, ops).await?;
+    let target = admin_target(host, ops, proxy, listen).await?;
     let config = &config_for(config, target.listen);
     match tunnel_and_load(host, &target, config).await {
-        Ok(()) => Ok(target.listen),
         Err(e) if is_transient(&e) => {
             tracing::debug!(
                 host = %host.address,
@@ -150,10 +182,9 @@ pub async fn push_config(
                 "transient proxy admin push error; reopening tunnel and retrying once",
             );
             tokio::time::sleep(RETRY_BACKOFF).await;
-            tunnel_and_load(host, &target, config).await?;
-            Ok(target.listen)
+            tunnel_and_load(host, &target, config).await
         }
-        Err(e) => Err(e),
+        other => other,
     }
 }
 
@@ -232,10 +263,21 @@ struct AdminTarget {
     listen: AdminListen,
 }
 
+#[cfg(test)]
 async fn discover_admin_target(
     host: &Host,
     ops: &dyn DockerOps,
 ) -> Result<AdminTarget, AdminError> {
+    let (proxy, listen) = running_proxy(host, ops).await?;
+    admin_target(host, ops, proxy, listen).await
+}
+
+/// The inspect of the running proxy container on `host`, and the admin
+/// address that it can bind.
+async fn running_proxy(
+    host: &Host,
+    ops: &dyn DockerOps,
+) -> Result<(ContainerDetail, AdminListen), AdminError> {
     let label = format!("yoink.service={PROXY_SERVICE_NAME}");
     let containers = ops
         .list_containers_by_label(host, &label)
@@ -253,6 +295,17 @@ async fn discover_admin_target(
 
     let detail = inspect(ops, host, &running.name).await?;
     let listen = AdminListen::of(&detail);
+    Ok((detail, listen))
+}
+
+/// The host-side port to tunnel to: of the relay for a proxy with the
+/// alias, of the proxy `detail` itself for an old proxy.
+async fn admin_target(
+    host: &Host,
+    ops: &dyn DockerOps,
+    detail: ContainerDetail,
+    listen: AdminListen,
+) -> Result<AdminTarget, AdminError> {
     let (published, port) = match listen {
         AdminListen::Legacy => (detail, ADMIN_PORT),
         AdminListen::Alias => {
@@ -632,6 +685,34 @@ services:
             status: reqwest::StatusCode::BAD_REQUEST,
             body: String::new(),
         }));
+    }
+
+    /// A failed push still tells the caller the admin address of the
+    /// proxy that it found. Without a running proxy, there is none.
+    #[tokio::test]
+    async fn failed_push_keeps_the_admin_listen_of_the_proxy() {
+        // An old proxy without a published admin port: the push fails
+        // after the discovery.
+        let ops = fake_proxy(&[], &[]);
+        let err = push_config(&host(), &ops, &serde_json::json!({}))
+            .await
+            .expect_err("no admin port");
+        assert_eq!(err.listen, Some(AdminListen::Legacy));
+        assert!(
+            matches!(err.error, AdminError::NoPublishedAdminPort { .. }),
+            "got: {err}"
+        );
+
+        let ops = crate::docker_ops::FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new()));
+        let err = push_config(&host(), &ops, &serde_json::json!({}))
+            .await
+            .expect_err("no proxy");
+        assert_eq!(err.listen, None);
+        assert!(
+            matches!(err.error, AdminError::ProxyNotRunning { .. }),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

@@ -1607,6 +1607,11 @@ async fn push_caddy_config(
     let listen = crate::proxy::admin::push_config(host, ops, &json)
         .await
         .map_err(|source| {
+            // The old proxy stays in place after a failed push, so the
+            // run must still warn about it.
+            if let Some(listen) = source.listen {
+                legacy.record(&host.address, listen);
+            }
             // When Caddy bounces /load, point the operator at the
             // services that have a `caddy_extra_json:` block —
             // those are the most likely sources of schema errors.
@@ -2737,6 +2742,36 @@ services:
                     hosts: vec!["h1".into()],
                 }
             )]
+        );
+    }
+
+    /// Regression: only a successful push recorded the admin address.
+    /// A push to an old proxy that failed did not warn, but the old
+    /// proxy stays in place. Now the failed push records it too.
+    #[tokio::test]
+    async fn failed_push_to_an_old_proxy_still_warns() {
+        let cfg = config_proxied_service();
+        let ops = FakeDockerOps::new();
+        ops.push_list_containers(Ok(Vec::new())); // the api upstreams
+        ops.push_list_containers(Ok(vec![ContainerInfo {
+            yoink_service: Some(crate::config::PROXY_SERVICE_NAME.into()),
+            ..container_with_state("yoink-proxy-abc", "running")
+        }]));
+        // No admin alias and no published admin port: the push fails.
+        ops.set_inspect(crate::docker_ops::ContainerDetail {
+            name: "yoink-proxy-abc".into(),
+            ..Default::default()
+        });
+        let legacy = LegacyAdminHosts::default();
+        let err = push_caddy_config(&ops, &relay_host(), &cfg, None, None, &legacy)
+            .await
+            .expect_err("push fails");
+        assert!(err.to_string().contains("push Caddy config"), "got: {err}");
+        assert_eq!(
+            legacy.into_notice(),
+            Some(DeployEvent::ProxyAdminUpgradePending {
+                hosts: vec!["host-a".into()],
+            })
         );
     }
 
