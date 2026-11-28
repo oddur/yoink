@@ -5748,6 +5748,8 @@ services:
         });
         ops.forward_loopback_to(LEGACY_HOST_PORT, legacy.port);
         ops.forward_loopback_to(RELAY_HOST_PORT, relay.port);
+        // The admin API is still on port 2019: the relay finds no socket.
+        relay.probe_statuses(&[502]);
         let prep = HostPrep {
             host: relay_host(),
             replicas: vec![ReplicaPrep {
@@ -5907,7 +5909,7 @@ services:
             relay_host(),
             NEW_PROXY.into()
         )));
-        assert!(relay.requests().is_empty());
+        assert!(relay.loads().is_empty());
     }
 
     const OLD_API: &str = "api-9f8e7d6";
