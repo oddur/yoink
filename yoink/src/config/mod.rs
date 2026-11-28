@@ -35,8 +35,19 @@ pub enum ConfigError {
     Invalid(String),
     /// A `--host` value names no declared host. Not a config error:
     /// the config is fine, the flag is wrong.
-    #[error("unknown --host {address:?}; {}", known_hosts_hint(.known))]
-    UnknownHost { address: String, known: Vec<String> },
+    ///
+    /// `unresolved` are the `address_secret` keys of sealed hosts whose
+    /// address is still blank: the `--host` can be one of them.
+    #[error(
+        "unknown --host {address:?}; {}{}",
+        known_hosts_hint(.known),
+        unresolved_hosts_hint(.unresolved)
+    )]
+    UnknownHost {
+        address: String,
+        known: Vec<String>,
+        unresolved: Vec<String>,
+    },
     #[error("invalid include glob {pattern:?}: {source}")]
     GlobPattern {
         pattern: String,
@@ -55,6 +66,21 @@ pub enum ConfigError {
         "malformed env var reference near {context:?} — expected `${{NAME}}` with NAME = [A-Za-z_][A-Za-z0-9_]*"
     )]
     EnvVarSyntax { context: String },
+}
+
+fn unresolved_hosts_hint(unresolved: &[String]) -> String {
+    if unresolved.is_empty() {
+        return String::new();
+    }
+    format!(
+        ". yoink could not resolve the sealed address of {}: the secrets bundle did not load, \
+         or it does not have the key",
+        unresolved
+            .iter()
+            .map(|key| format!("<address_secret: {key}>"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn known_hosts_hint(known: &[String]) -> String {
@@ -1703,9 +1729,16 @@ impl Config {
                     None => h.address.clone(),
                 })
                 .collect();
+            let unresolved = self
+                .hosts
+                .iter()
+                .filter(|h| h.address.is_empty())
+                .filter_map(|h| h.address_secret.clone())
+                .collect();
             return Err(ConfigError::UnknownHost {
                 address: address.to_string(),
                 known,
+                unresolved,
             });
         }
         Ok(hosts)
@@ -3251,7 +3284,15 @@ secrets:
         .unwrap();
         let expected = "unknown --host \"web-3\"; known: web-1, <address_secret: PROD_HOST>";
         let err = cfg.require_fleet_matching(Some("web-3")).unwrap_err();
-        assert_eq!(err.to_string(), expected);
+        // Before resolution the --host can be the sealed address.
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{expected}. yoink could not resolve the sealed address of \
+                 <address_secret: PROD_HOST>: the secrets bundle did not load, or it does \
+                 not have the key"
+            )
+        );
         // After resolution the address is the secret value.
         cfg.hosts[1].address = "10.0.0.7".into();
         let err = cfg.require_fleet_matching(Some("web-3")).unwrap_err();
