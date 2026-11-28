@@ -82,7 +82,12 @@ If a healthcheck or the config push fails, yoink removes the new replicas. The o
 
 A service with `publish:` is the exception. Its old container stops before the new one starts, because only one container can bind a host port. When the new container does not start, fails its healthcheck, or the config push fails, yoink removes it and starts the old container again. The proxy publishes ports 80 and 443, so this applies to the proxy too. One case is different: when the config push fails after a new proxy starts, yoink keeps the new proxy. It serves the saved config.
 
-A config push can fail after Caddy loaded the new config. For example, the route count that Caddy reports does not match, or the connection breaks after yoink sent the config. Then Caddy can route to the new replicas that yoink removed. Thus, after yoink starts the old containers again, it pushes the config a second time, with the containers that run now. When Caddy rejected the config, Caddy keeps the old config, and yoink does not push again. When the second push fails too, `yoink up` shows both errors.
+When a deploy of a routed service fails, yoink removes the new replicas. Caddy can still route to them, for two reasons:
+
+- The config push failed after Caddy loaded the new config. For example, the route count that Caddy reports does not match, or the connection breaks after yoink sent the config.
+- The config push of another service in the same wave added them. That push routes each running container of the service, also a new replica that has not passed its healthcheck yet.
+
+Thus, after each removal of new replicas, yoink starts the old containers again and then pushes the config again, with the containers that run now. This occurs after a failed healthcheck and after a failed config push, also when Caddy rejected the config. The push is idempotent. When the second push fails too, `yoink up` shows both errors.
 
 ## What yoink does not model
 
