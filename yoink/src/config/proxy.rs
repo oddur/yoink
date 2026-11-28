@@ -156,6 +156,7 @@ impl Config {
     #[allow(clippy::too_many_lines)] // mostly straight-line validation
     pub(crate) fn inject_implicit_proxy(&mut self) -> Result<(), ConfigError> {
         self.reject_admin_network()?;
+        self.reject_caddy_config_volume()?;
         if !self.proxy_enabled() {
             return Ok(());
         }
@@ -346,6 +347,56 @@ impl Config {
         }
         Ok(())
     }
+}
+
+impl Config {
+    /// Only the proxy and the admin relay may mount
+    /// [`CADDY_CONFIG_VOLUME`]. It holds the admin socket: a container
+    /// that mounts it and runs as root can change the proxy config.
+    /// Rejects the volume as the source of a `run.volumes` or
+    /// `run.binds` entry of every service that is not the proxy, and as
+    /// `proxy.cert_volume`. Hooks have no mounts.
+    fn reject_caddy_config_volume(&self) -> Result<(), ConfigError> {
+        let reserved = |field: &str| {
+            ConfigError::Invalid(format!(
+                "{field} uses the volume {CADDY_CONFIG_VOLUME:?}. This volume is reserved \
+                 for the admin socket of the proxy. Use a different volume name."
+            ))
+        };
+        if self
+            .proxy
+            .as_ref()
+            .and_then(|p| p.cert_volume.as_deref())
+            .is_some_and(|v| v == CADDY_CONFIG_VOLUME)
+        {
+            return Err(reserved("proxy.cert_volume"));
+        }
+        for svc in &self.services {
+            if svc.kind == Some(ServiceKind::Proxy) {
+                continue;
+            }
+            for (field, mounts) in [
+                ("run.volumes", &svc.run.volumes),
+                ("run.binds", &svc.run.binds),
+            ] {
+                if mounts
+                    .iter()
+                    .any(|m| mount_source(m) == CADDY_CONFIG_VOLUME)
+                {
+                    return Err(reserved(&format!("service {:?}: {field}", svc.name)));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The source of a docker-cli style mount `source:target[:options]`.
+fn mount_source(mount: &str) -> &str {
+    mount
+        .split_once(':')
+        .map_or(mount, |(source, _)| source)
+        .trim()
 }
 
 impl ProxyConfig {
@@ -889,6 +940,55 @@ services:
             );
             assert!(msg.contains("Use a different network name"), "got: {msg}");
         }
+    }
+
+    /// The config volume holds the admin socket. A service that mounts
+    /// it as root can change the proxy config, and as the cert volume
+    /// the proxy would mount it twice.
+    #[test]
+    fn caddy_config_volume_is_reserved_for_the_proxy() {
+        let cases = [
+            (
+                "proxy: { email: o@example.com, cert_volume: yoink_caddy_config }\n\
+                 services:\n  - { name: api, image: a, tag: v1, domain: api.example.com, run: { port: 8080 } }",
+                "proxy.cert_volume",
+            ),
+            (
+                "services:\n  - { name: worker, image: w, tag: v1, \
+                 run: { volumes: [\"yoink_caddy_config:/c:ro\"] } }",
+                "service \"worker\": run.volumes",
+            ),
+            (
+                "proxy: { email: o@example.com }\nservices:\n  - { name: api, image: a, tag: v1, \
+                 domain: api.example.com, run: { port: 8080, volumes: [\"yoink_caddy_config:/c\"] } }",
+                "service \"api\": run.volumes",
+            ),
+            (
+                "services:\n  - { name: worker, image: w, tag: v1, \
+                 run: { binds: [\"yoink_caddy_config:/c\"] } }",
+                "service \"worker\": run.binds",
+            ),
+        ];
+        for (body, field) in cases {
+            let yaml = format!("hosts: [{{ address: h, user: u }}]\n{body}\n");
+            let err = Config::parse_str(&yaml).expect_err(field);
+            let msg = err.to_string();
+            assert!(msg.contains(field), "got: {msg}");
+            assert!(msg.contains("\"yoink_caddy_config\""), "got: {msg}");
+            assert!(msg.contains("reserved for the admin socket"), "got: {msg}");
+        }
+        // The synthesized proxy mounts it, and other volumes stay free.
+        let ok = "hosts: [{ address: h, user: u }]\nproxy: { email: o@example.com }\n\
+                  services:\n  - { name: api, image: a, tag: v1, domain: api.example.com, \
+                  run: { port: 8080, volumes: [\"yoink_caddy_config_x:/c\", \"data:/d\"] } }\n";
+        let cfg = Config::parse_str(ok).expect("parses");
+        let proxy = cfg.service(PROXY_SERVICE_NAME).expect("proxy");
+        assert!(
+            proxy
+                .run
+                .volumes
+                .contains(&format!("{CADDY_CONFIG_VOLUME}:/config"))
+        );
     }
 
     /// The deploy probe of the proxy calls the relay by its name. The

@@ -186,7 +186,7 @@ The [proxy guide](/docs/explanation/proxy) explains how the bundled Caddy revers
 | `email` | string | unset | Registration email for Let's Encrypt. **Required when a service uses `tls: auto`.** Not used when `proxy.tls:` is set. |
 | `image` | string | `caddy:2` | Pre-built caddy image that yoink pulls from a registry. Mutually exclusive with `xcaddy:`. |
 | `xcaddy` | [Xcaddy](#xcaddy) | unset | Compiles a custom caddy with plugins on each proxy host. Mutually exclusive with `image:`. |
-| `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. If you remove the volume, Caddy requests new certs, and Let's Encrypt has strict rate limits. |
+| `cert_volume` | string | `yoink_caddy_data` | Named volume for ACME state and certs. If you remove the volume, Caddy requests new certs, and Let's Encrypt has strict rate limits. Config load rejects `yoink_caddy_config`: that volume holds the admin socket. |
 | `bind` | string | unset (all interfaces) | Host IP that `:80` and `:443` bind to. For example, a Tailscale IP makes the proxy reachable only over the tailnet. The admin relay always publishes its port on `127.0.0.1`. |
 | `tls` | [ProxyTls](#proxytls) | unset | Proxy-level TLS. Every routed service inherits this cert (and the optional mTLS) by default. When the field is set, ACME is off. |
 | `config_extra` | string (JSON) | unset | Top-level Caddy JSON object. yoink deep-merges it into the rendered config before `/load`. It is for global Caddy config that has no typed field: `trusted_proxies`, `storage`, plugin app blocks. |
@@ -276,7 +276,7 @@ When `proxy.tls:` is set, every routed service uses this cert by default, and yo
 | `cmd` | list of string | image default | Overrides `CMD`. |
 | `publish` | list of string | `[]` | Host port mappings (`"80:80"`, `"443:443/udp"`). |
 | `binds` | list of string | `[]` | Host bind mounts (`"src:dst"` or `"src:dst:mode"`). With no third field, the mode is `:ro`. A third field must contain `ro` or `rw`. Config load rejects a third field that is empty (`src:dst:`) or that has only other options (for example `src:dst:Z`). To keep an option, put the mode in front of it: `ro,Z` or `rw,Z`. yoink hashes each bind as you write it. When you add `ro` or `rw` to an existing bind, the spec hash changes, so yoink redeploys that service one time on the next `yoink up`. |
-| `volumes` | list of string | `[]` | Named docker volumes. |
+| `volumes` | list of string | `[]` | Named docker volumes. The volume `yoink_caddy_config` is reserved for the proxy admin socket. Config load rejects it here and in `binds`. |
 | `files` | list of string | `[]` | Files that yoink uploads to the host and mounts read-only (`"local_path:container_path[:ro]"`). `:ro` is optional. Validation rejects `rw` in the last field (`:rw`, `:rw,Z`) and an empty last field (`local:dst:`). yoink hashes the content into `spec_hash`, so an edit triggers a redeploy. yoink mounts an entry with options and no mode (`./app.conf:/etc/app.conf:Z`) as `ro,Z`. The spec hash does not change for this, so a running container keeps its old mount until it redeploys. To apply the new mount now, run `yoink up --force`. The files go to `~/.local/state/yoink/files/` of the SSH user on the host, so no root access is necessary. For data that the container must write, use `binds` or `volumes`. |
 | `options` | [RunOptions](#runoptions) | hardened defaults | Resource limits and security flags. |
 
